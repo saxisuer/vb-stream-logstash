@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,11 +20,11 @@ class PgOutputDecoderTest {
     }
 
     @Test
-    void placeholderParserWired() throws IOException {
-        // 'I' 属 DmlParsers，Task 3 阶段为占位实现；Task 5 完成后请将此用例改为断言正常解析
+    void insertDispatchesToDmlParser() throws IOException {
+        // 'I' 已由 Task 5 实现：dispatch 应正常解析出 Insert 消息（占位接线用例的最终形态）
         ByteBuffer payload = new MsgBuilder().type('I').i32(1).i8('N')
                 .i16(1).i8('t').bytes("x".getBytes(java.nio.charset.StandardCharsets.UTF_8)).build();
-        assertThrows(UnsupportedOperationException.class,
-                () -> new PgOutputDecoder(StreamingMode.OFF).decode(payload));
+        PgOutputMessage msg = new PgOutputDecoder(StreamingMode.OFF).decode(payload);
+        assertInstanceOf(PgOutputMessage.Insert.class, msg);
     }
 }
