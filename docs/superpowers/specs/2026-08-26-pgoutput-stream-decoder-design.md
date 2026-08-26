@@ -78,6 +78,7 @@ record StreamStopMessage()
 record StreamCommitMessage(long xid, long commitLsn, long endLsn, Instant commitTimestamp)
 record StreamAbortMessage(long xid, long subxid, OptionalLong abortLsn, OptionalLong abortTimestamp)
 // abortLsn/abortTimestamp 仅 streaming=parallel 时随消息附加（源码 write_abort_info=true），否则为 empty
+// 注意：StreamAbort 仅对"已流式"的（子）事务下发，未流式的子事务回滚是静默清理——发射链路源码摘录见附录 B
 
 // 族 4：两阶段（v3，two_phase=on；类型字节 'b'/'P'/'K'/'r'/'p'）
 record BeginPrepareMessage(long prepareLsn, long endLsn, Instant prepareTimestamp, long xid, String gid)
@@ -207,3 +208,153 @@ TupleData：`I16 ncols;` 每列 `'n'`（NULL，无负载）`| 'u'`（TOAST 未�
 ## 10. 多 agent 协作提示
 
 协议层按消息族天然分片（族 1+2 / 族 3 / 族 4），各 agent 只写自己的消息 record + 解析分支 + 单测，互不触碰同一文件；会话层、Main、集成测试为独立任务。实施计划（writing-plans 阶段产出）将据此拆分任务与依赖顺序。
+
+## 附录 B：PG 18 源码摘录（行为关键点的一手依据）
+
+> 版本锚定：[postgres/postgres `715d839`](https://github.com/postgres/postgres/tree/715d8397195c6435bae837446c3ae9b1dcd4221a)（REL_18_STABLE 分支头，2026-08-27 取）。路径注意：PG 18 起 `pgoutput.c` 从 `src/backend/replication/logical/` 移入独立子目录 `src/backend/replication/pgoutput/`。
+>
+> 以下摘录对应两个实现期踩过的行为关键点：**StreamAbort 的发射条件**（Task 12 用例 2 首跑失败的根因）与 **abortLsn/abortTimestamp 附加字段的 parallel 门槛**。后续涉及行为级断言的章节引用源码时，同样在此附录补充摘录。
+
+### B.1 子事务何时被打上"已流式"标记（`src/backend/replication/logical/reorderbuffer.c`）
+
+打标发生在 `ReorderBufferTruncateTXN`（流式发送一批变更后清空内存）时——即**只有真正参与过一次流式发送的子事务才可能被打标**：
+
+```c
+/*
+ * Mark the given transaction as streamed, if appropriate.
+ *
+ * A top-level transaction is always marked.  A subtransaction is marked
+ * only when it has changes and its top-level transaction is already
+ * marked as streamed.
+ */
+static void
+ReorderBufferMaybeMarkTXNStreamed(ReorderBuffer *rb, ReorderBufferTXN *txn)
+{
+	/*
+	 * The top-level transaction is marked as streamed always, even if it does
+	 * not contain any changes (that is, when all the changes are in
+	 * subtransactions).  The downstream always knows about it, since we send
+	 * its XID in every message.
+	 */
+	if (rbtxn_is_toptxn(txn))
+	{
+		/* We only reach here when streaming is supported. */
+		Assert(ReorderBufferCanStream(rb));
+		txn->txn_flags |= RBTXN_IS_STREAMED;
+		return;
+	}
+
+	/*
+	 * A subtransaction is marked only when it has changes, and only when its
+	 * top-level transaction has already been marked as streamed.  We never
+	 * stream XIDs of empty subxacts, and we must not send an abort for an XID
+	 * the downstream has never heard of.
+	 */
+	if (txn->nentries_mem != 0 && rbtxn_is_streamed(rbtxn_get_toptxn(txn)))
+		txn->txn_flags |= RBTXN_IS_STREAMED;
+}
+```
+
+### B.2 回滚时只有"已流式"事务才发 StreamAbort（`decode.c` + `reorderbuffer.c`）
+
+`DecodeAbort` 对 abort 记录里的每个子事务逐个调用 `ReorderBufferAbort`（PG ≤17 里叫 `ReorderBufferAbortSub`，18 已合并为同一函数）：
+
+```c
+/* src/backend/replication/logical/decode.c */
+		for (i = 0; i < parsed->nsubxacts; i++)
+		{
+			ReorderBufferAbort(ctx->reorder, parsed->subxacts[i],
+							   buf->record->EndRecPtr, abort_time);
+		}
+
+		ReorderBufferAbort(ctx->reorder, xid, buf->record->EndRecPtr,
+						   abort_time);
+```
+
+`ReorderBufferAbort` 中的门槛——未打标（从未流式发出）的事务回滚是**静默清理**，不下发任何消息：
+
+```c
+/* src/backend/replication/logical/reorderbuffer.c */
+void
+ReorderBufferAbort(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
+				   TimestampTz abort_time)
+{
+	...
+	/* For streamed transactions notify the remote node about the abort. */
+	if (rbtxn_is_streamed(txn))
+	{
+		rb->stream_abort(rb, txn, lsn);
+		...
+	}
+	...
+}
+```
+
+**推论**（Task 12 用例 2 的根因）：savepoint 后的子事务数据量必须超过 `logical_decoding_work_mem`、真正触发流式发送，其回滚才会产生 StreamAbort；计划稿原定的 5 行×4KB（≈20KB < 64kB）从未流式，回滚被静默丢弃。已按此把子事务数据量提为 60 行×8KB（≈480KB）。
+
+### B.3 附加字段仅 parallel 模式写入（`src/backend/replication/pgoutput/pgoutput.c`）
+
+```c
+/*
+ * Notify downstream to discard the streamed transaction (along with all
+ * its subtransactions, if it's a toplevel transaction).
+ */
+static void
+pgoutput_stream_abort(struct LogicalDecodingContext *ctx,
+					  ReorderBufferTXN *txn,
+					  XLogRecPtr abort_lsn)
+{
+	ReorderBufferTXN *toptxn;
+	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
+	bool		write_abort_info = (data->streaming == LOGICALREP_STREAM_PARALLEL);
+
+	/*
+	 * The abort should happen outside streaming block, even for streamed
+	 * transactions. The transaction has to be marked as streamed, though.
+	 */
+	Assert(!data->in_streaming);
+
+	/* determine the toplevel transaction */
+	toptxn = rbtxn_get_toptxn(txn);
+
+	Assert(rbtxn_is_streamed(toptxn));
+
+	OutputPluginPrepareWrite(ctx, true);
+	logicalrep_write_stream_abort(ctx->out, toptxn->xid, txn->xid, abort_lsn,
+								  txn->xact_time.abort_time, write_abort_info);
+	...
+}
+```
+
+### B.4 StreamAbort 线格式写入（`src/backend/replication/logical/proto.c`）
+
+与附录 A 中 `A` 消息行对应——`abort_lsn`/`abort_time` 仅在 `write_abort_info`（parallel 模式）时写入：
+
+```c
+/*
+ * Write STREAM ABORT to the output stream. Note that xid and subxid will be
+ * same for the top-level transaction abort.
+ *
+ * If write_abort_info is true, send the abort_lsn and abort_time fields,
+ * otherwise don't.
+ */
+void
+logicalrep_write_stream_abort(StringInfo out, TransactionId xid,
+							  TransactionId subxid, XLogRecPtr abort_lsn,
+							  TimestampTz abort_time, bool write_abort_info)
+{
+	pq_sendbyte(out, LOGICAL_REP_MSG_STREAM_ABORT);
+
+	Assert(TransactionIdIsValid(xid) && TransactionIdIsValid(subxid));
+
+	/* transaction ID */
+	pq_sendint32(out, xid);
+	pq_sendint32(out, subxid);
+
+	if (write_abort_info)
+	{
+		pq_sendint64(out, abort_lsn);
+		pq_sendint64(out, abort_time);
+	}
+}
+```

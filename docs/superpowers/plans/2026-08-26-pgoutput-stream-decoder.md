@@ -2301,8 +2301,12 @@ class StreamedTransactionTest {
                     st.execute("INSERT INTO t_par VALUES (" + i + ", repeat('p', 4096))");
                 }
                 st.execute("SAVEPOINT sp1");
-                for (int i = 900; i < 905; i++) {
-                    st.execute("INSERT INTO t_par VALUES (" + i + ", repeat('q', 4096))");
+                // 子事务数据量必须超过 logical_decoding_work_mem(64kB) 让其变更被流式发出——
+                // PG 只对"已流式"的子事务发 StreamAbort（ReorderBufferAbort 的
+                // rbtxn_is_streamed 门槛），未流式的子事务回滚是静默丢弃。
+                // 源码摘录见设计文档附录 B。
+                for (int i = 900; i < 960; i++) {
+                    st.execute("INSERT INTO t_par VALUES (" + i + ", repeat('q', 8192))");
                 }
                 st.execute("ROLLBACK TO SAVEPOINT sp1"); // 触发 StreamAbort
                 for (int i = 1000; i < 1100; i++) {
@@ -2329,6 +2333,8 @@ class StreamedTransactionTest {
 
 Run: `mvn test -Dtest=StreamedTransactionTest`
 Expected: `Tests run: 2, Failures: 0`。若 `StreamStart` 未出现（消息全为 B/R/I/C），说明 `logical_decoding_work_mem=64kB` 未生效或行总量不够——检查容器参数并把行数提到 1000。
+
+**实现修正记录（2026-08-27 首跑）**：用例 2 首跑失败——savepoint 后 5 行×4KB（≈20KB）不足 64kB work_mem，子事务从未参与流式发送、未被标记 streamed，回滚被 PG 静默清理（`ReorderBufferAbort` 仅对 `rbtxn_is_streamed` 的事务调用 `stream_abort`）。已将子事务数据量改为 60 行×8KB（≈480KB），两用例全绿。完整源码摘录链路见设计文档**附录 B**（postgres/postgres `715d839`）。
 
 - [ ] **Step 3: 提交并推送**
 
