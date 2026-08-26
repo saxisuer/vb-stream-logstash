@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.time.Instant;
 
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class TwoPhaseParsersTest {
@@ -53,6 +52,9 @@ class TwoPhaseParsersTest {
         PgOutputMessage.RollbackPrepared msg = (PgOutputMessage.RollbackPrepared) decoder.decode(payload);
         assertEquals(0x100L, msg.prepareEndLsn());
         assertEquals(0x500L, msg.rollbackEndLsn());
+        // 两次 pgMicrosToInstant 读取顺序不可交换：prepare=+42s 整，rollback=+42s 又 10µs
+        assertEquals(Instant.ofEpochSecond(946684800L + 42), msg.prepareTimestamp());
+        assertEquals(Instant.ofEpochSecond(946684800L + 42, 10_000L), msg.rollbackTimestamp());
         assertEquals("gid_1", msg.gid());
     }
 
@@ -60,6 +62,8 @@ class TwoPhaseParsersTest {
     void streamPrepare() throws IOException {
         ByteBuffer payload = new MsgBuilder().type('p')
                 .i8(0).i64(0x100L).i64(0x200L).i64(MICROS).i32(909).str("gid_1").build();
-        assertInstanceOf(PgOutputMessage.StreamPrepare.class, decoder.decode(payload));
+        PgOutputMessage.StreamPrepare msg = (PgOutputMessage.StreamPrepare) decoder.decode(payload);
+        assertEquals(0x100L, msg.prepareLsn());
+        assertEquals("gid_1", msg.gid());
     }
 }
