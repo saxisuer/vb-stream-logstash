@@ -2528,44 +2528,73 @@ public final class ConsoleListener implements PgOutputListener {
         System.out.println(Instant.now() + " | " + render(message, registry));
     }
 
+    // 注：record pattern switch 是 Java 21 正式特性，本项目约束 Java 17，故用 instanceof 链
     private String render(PgOutputMessage msg, RelationRegistry registry) {
-        return switch (msg) {
-            case PgOutputMessage.Begin m -> "BEGIN             xid=%d finalLsn=0x%s"
-                    .formatted(m.xid(), Long.toHexString(m.finalLsn()));
-            case PgOutputMessage.Commit m -> "COMMIT            commitLsn=0x%s endLsn=0x%s"
+        if (msg instanceof PgOutputMessage.Begin m) {
+            return "BEGIN             xid=%d finalLsn=0x%s".formatted(m.xid(), Long.toHexString(m.finalLsn()));
+        }
+        if (msg instanceof PgOutputMessage.Commit m) {
+            return "COMMIT            commitLsn=0x%s endLsn=0x%s"
                     .formatted(Long.toHexString(m.commitLsn()), Long.toHexString(m.endLsn()));
-            case PgOutputMessage.Origin m -> "ORIGIN            lsn=0x%s name=%s"
-                    .formatted(Long.toHexString(m.originCommitLsn()), m.originName());
-            case PgOutputMessage.Relation m -> "RELATION          %s.%s oid=%d cols=%d%s"
+        }
+        if (msg instanceof PgOutputMessage.Origin m) {
+            return "ORIGIN            lsn=0x%s name=%s".formatted(Long.toHexString(m.originCommitLsn()), m.originName());
+        }
+        if (msg instanceof PgOutputMessage.Relation m) {
+            return "RELATION          %s.%s oid=%d cols=%d%s"
                     .formatted(m.schema(), m.table(), m.relationOid(), m.columns().size(), suffix(m.streamXid()));
-            case PgOutputMessage.Type m -> "TYPE              %s.%s oid=%d%s"
-                    .formatted(m.schema(), m.name(), m.typeOid(), suffix(m.streamXid()));
-            case PgOutputMessage.Insert m -> "INSERT            %s %s%s"
-                    .formatted(tableOf(m.relationOid(), registry), tupleOf(m.relationOid(), m.newTuple(), registry), suffix(m.streamXid()));
-            case PgOutputMessage.Update m -> "UPDATE            %s %s%s"
-                    .formatted(tableOf(m.relationOid(), registry), tupleOf(m.relationOid(), m.newTuple(), registry), suffix(m.streamXid()));
-            case PgOutputMessage.Delete m -> "DELETE            %s %s%s"
-                    .formatted(tableOf(m.relationOid(), registry), tupleOf(m.relationOid(), m.oldTuple(), registry), suffix(m.streamXid()));
-            case PgOutputMessage.Truncate m -> "TRUNCATE          oids=%s options=%s%s"
+        }
+        if (msg instanceof PgOutputMessage.Type m) {
+            return "TYPE              %s.%s oid=%d%s".formatted(m.schema(), m.name(), m.typeOid(), suffix(m.streamXid()));
+        }
+        if (msg instanceof PgOutputMessage.Insert m) {
+            return "INSERT            %s %s%s".formatted(tableOf(m.relationOid(), registry),
+                    tupleOf(m.relationOid(), m.newTuple(), registry), suffix(m.streamXid()));
+        }
+        if (msg instanceof PgOutputMessage.Update m) {
+            return "UPDATE            %s %s%s".formatted(tableOf(m.relationOid(), registry),
+                    tupleOf(m.relationOid(), m.newTuple(), registry), suffix(m.streamXid()));
+        }
+        if (msg instanceof PgOutputMessage.Delete m) {
+            return "DELETE            %s %s%s".formatted(tableOf(m.relationOid(), registry),
+                    tupleOf(m.relationOid(), m.oldTuple(), registry), suffix(m.streamXid()));
+        }
+        if (msg instanceof PgOutputMessage.Truncate m) {
+            return "TRUNCATE          oids=%s options=%s%s"
                     .formatted(java.util.Arrays.toString(m.relationOids()), m.options(), suffix(m.streamXid()));
-            case PgOutputMessage.LogicalMsg m -> "MESSAGE           prefix=%s bytes=%d%s"
-                    .formatted(m.prefix(), m.content().length, suffix(m.streamXid()));
-            case PgOutputMessage.StreamStart m -> "STREAM-START      xid=%d firstSegment=%s"
-                    .formatted(m.xid(), m.firstSegment());
-            case PgOutputMessage.StreamStop m -> "STREAM-STOP";
-            case PgOutputMessage.StreamCommit m -> "STREAM-COMMIT     xid=%d commitLsn=0x%s"
-                    .formatted(m.xid(), Long.toHexString(m.commitLsn()));
-            case PgOutputMessage.StreamAbort m -> "STREAM-ABORT      xid=%d subxid=%d%s"
-                    .formatted(m.xid(), m.subxid(),
-                            m.abortLsn().isPresent()
-                                    ? " abortLsn=0x" + Long.toHexString(m.abortLsn().getAsLong())
-                                    : "");
-            case PgOutputMessage.BeginPrepare m -> "BEGIN-PREPARE     gid=%s xid=%d".formatted(m.gid(), m.xid());
-            case PgOutputMessage.Prepare m -> "PREPARE           gid=%s xid=%d".formatted(m.gid(), m.xid());
-            case PgOutputMessage.CommitPrepared m -> "COMMIT-PREPARED   gid=%s xid=%d".formatted(m.gid(), m.xid());
-            case PgOutputMessage.RollbackPrepared m -> "ROLLBACK-PREPARED gid=%s xid=%d".formatted(m.gid(), m.xid());
-            case PgOutputMessage.StreamPrepare m -> "STREAM-PREPARE    gid=%s xid=%d".formatted(m.gid(), m.xid());
-        };
+        }
+        if (msg instanceof PgOutputMessage.LogicalMsg m) {
+            return "MESSAGE           prefix=%s bytes=%d%s".formatted(m.prefix(), m.content().length, suffix(m.streamXid()));
+        }
+        if (msg instanceof PgOutputMessage.StreamStart m) {
+            return "STREAM-START      xid=%d firstSegment=%s".formatted(m.xid(), m.firstSegment());
+        }
+        if (msg instanceof PgOutputMessage.StreamStop) {
+            return "STREAM-STOP";
+        }
+        if (msg instanceof PgOutputMessage.StreamCommit m) {
+            return "STREAM-COMMIT     xid=%d commitLsn=0x%s".formatted(m.xid(), Long.toHexString(m.commitLsn()));
+        }
+        if (msg instanceof PgOutputMessage.StreamAbort m) {
+            return "STREAM-ABORT      xid=%d subxid=%d%s".formatted(m.xid(), m.subxid(),
+                    m.abortLsn().isPresent() ? " abortLsn=0x" + Long.toHexString(m.abortLsn().getAsLong()) : "");
+        }
+        if (msg instanceof PgOutputMessage.BeginPrepare m) {
+            return "BEGIN-PREPARE     gid=%s xid=%d".formatted(m.gid(), m.xid());
+        }
+        if (msg instanceof PgOutputMessage.Prepare m) {
+            return "PREPARE           gid=%s xid=%d".formatted(m.gid(), m.xid());
+        }
+        if (msg instanceof PgOutputMessage.CommitPrepared m) {
+            return "COMMIT-PREPARED   gid=%s xid=%d".formatted(m.gid(), m.xid());
+        }
+        if (msg instanceof PgOutputMessage.RollbackPrepared m) {
+            return "ROLLBACK-PREPARED gid=%s xid=%d".formatted(m.gid(), m.xid());
+        }
+        if (msg instanceof PgOutputMessage.StreamPrepare m) {
+            return "STREAM-PREPARE    gid=%s xid=%d".formatted(m.gid(), m.xid());
+        }
+        throw new IllegalStateException("未知消息类型: " + msg.getClass());
     }
 
     private static String suffix(OptionalLong streamXid) {
@@ -2587,15 +2616,19 @@ public final class ConsoleListener implements PgOutputListener {
                     .map(rel -> rel.columns().get(i).name())
                     .orElse("#" + i);
             TupleValue value = tuple.columns().get(i);
-            String rendered = switch (value) {
-                case TupleValue.Null ignored -> "NULL";
-                case TupleValue.UnchangedToast ignored -> "<toast-unchanged>";
-                case TupleValue.Text t -> {
-                    String s = t.value();
-                    yield s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
-                }
-                case TupleValue.Binary b -> "0x" + HexFormat.of().formatHex(b.value());
-            };
+            String rendered;
+            if (value instanceof TupleValue.Null) {
+                rendered = "NULL";
+            } else if (value instanceof TupleValue.UnchangedToast) {
+                rendered = "<toast-unchanged>";
+            } else if (value instanceof TupleValue.Text t) {
+                String s = t.value();
+                rendered = s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
+            } else if (value instanceof TupleValue.Binary b) {
+                rendered = "0x" + HexFormat.of().formatHex(b.value());
+            } else {
+                throw new IllegalStateException("未知列值类型: " + value.getClass());
+            }
             parts.add(column + "=" + rendered);
         }
         return parts.toString();
