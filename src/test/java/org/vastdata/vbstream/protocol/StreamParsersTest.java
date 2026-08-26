@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -16,7 +17,10 @@ class StreamParsersTest {
     @Test
     void streamStartStopToggleInStreamState() throws IOException {
         PgOutputDecoder decoder = new PgOutputDecoder(StreamingMode.ON);
-        decoder.decode(new MsgBuilder().type('S').i32(505).i8(1).build());
+        Object streamStart = decoder.decode(new MsgBuilder().type('S').i32(505).i8(1).build());
+        assertInstanceOf(PgOutputMessage.StreamStart.class, streamStart);
+        assertEquals(505L, ((PgOutputMessage.StreamStart) streamStart).xid());
+        assertTrue(((PgOutputMessage.StreamStart) streamStart).firstSegment());
         // inStream 置位后，流块内的 I 消息会先读 Int32 xid 前缀
         Object inBlock = decoder.decode(new MsgBuilder().type('I')
                 .i32(505).i32(16385).i8('N').i16(0).build());
@@ -39,6 +43,9 @@ class StreamParsersTest {
         assertEquals(505L, msg.xid());
         assertEquals(0x6000L, msg.commitLsn());
         assertEquals(0x7000L, msg.endLsn());
+        // 夹具为 PG epoch 秒数的微秒形式（偏移 946684800s ≈ 30 年）：
+        // 换算 = 2000-01-01 + 946684800s = 2029-12-31T00:00:00Z，覆盖 epoch 加法与微秒整除两条路径
+        assertEquals(Instant.parse("2029-12-31T00:00:00Z"), msg.commitTimestamp());
     }
 
     @Test
@@ -50,6 +57,7 @@ class StreamParsersTest {
         assertEquals(505L, msg.xid());
         assertEquals(606L, msg.subxid());
         assertFalse(msg.abortLsn().isPresent());
+        assertFalse(msg.abortTimestamp().isPresent()); // 与 PARALLEL 正例对称：附加字段整体缺席
     }
 
     @Test
