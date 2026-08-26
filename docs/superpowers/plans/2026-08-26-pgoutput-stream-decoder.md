@@ -742,8 +742,10 @@ class NormalParsersTest {
 
     @Test
     void begin() throws IOException {
+        // pgMicrosToInstant 的输入是 PG epoch（2000-01-01）起的微秒数，函数内部已加 946684800 Unix 秒偏移，
+        // 夹具不可再把 epoch 折成微码叠进输入（否则双重计入，得到 2029 年）
         ByteBuffer payload = new MsgBuilder().type('B')
-                .i64(0x1000L).i64(946684800_000_000L + 2_500_000L).i32(777).build();
+                .i64(0x1000L).i64(2_500_000L).i32(777).build();
         PgOutputMessage.Begin msg = (PgOutputMessage.Begin) decoder.decode(payload);
         assertEquals(0x1000L, msg.finalLsn());
         assertEquals(Instant.ofEpochSecond(946684800L + 2, 500_000_000L), msg.commitTimestamp());
