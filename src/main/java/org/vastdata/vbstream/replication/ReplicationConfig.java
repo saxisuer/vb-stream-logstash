@@ -31,9 +31,13 @@ public record ReplicationConfig(
         return "jdbc:postgresql://%s:%d/%s".formatted(host, port, database);
     }
 
-    /** pgjdbc 复制连接要求 replication=database。 */
+    /**
+     * pgjdbc 复制连接要求 replication=database，且必须同时 assumeMinServerVersion&ge;9.4——
+     * 否则驱动不把 replication 参数放进启动包（pgjdbc 文档规定），服务端按普通会话解析
+     * START_REPLICATION 直接报语法错（真实 PG 18 集成首跑发现）。
+     */
     public String replicationUrl() {
-        return jdbcUrl() + "?replication=database";
+        return jdbcUrl() + "?replication=database&assumeMinServerVersion=9.4";
     }
 
     /** START_REPLICATION 的 streaming 参数值。 */

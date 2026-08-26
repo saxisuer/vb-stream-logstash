@@ -49,7 +49,8 @@ class ReplicationConfigTest {
         ReplicationConfig config = new ReplicationConfig("h", 5432, "db", "u", "p",
                 "slot", "pub", 4, StreamingMode.PARALLEL, true, 10);
         assertEquals("jdbc:postgresql://h:5432/db", config.jdbcUrl());
-        assertEquals("jdbc:postgresql://h:5432/db?replication=database", config.replicationUrl());
+        assertEquals("jdbc:postgresql://h:5432/db?replication=database&assumeMinServerVersion=9.4",
+                config.replicationUrl());
         assertEquals("parallel", config.streamingParam());
     }
 }
