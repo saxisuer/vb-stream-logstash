@@ -49,38 +49,46 @@ PG 18 ──复制流──▶ replication/PgReplicationSession ──▶ Main(C
 
 ## 4. 协议数据模型（protocol/ 包）
 
+> 本节字段与字节格式已按 PostgreSQL 18 官方文档 54.9（Logical Replication Message Formats）与 PG 18 源码 `src/include/replication/logicalproto.h` 双源核对。
+
 `sealed interface PgOutputMessage`，四个消息族：
 
 ```java
 // 族 1：普通事务（v1）
 record BeginMessage(long finalLsn, Instant commitTimestamp, long xid)
-record CommitMessage(long commitLsn, long endLsn, Instant commitTimestamp)
-record InsertMessage(int relationOid, TupleData newTuple)
-record UpdateMessage(int relationOid, Optional<TupleData> oldTuple, TupleData newTuple)
-record DeleteMessage(int relationOid, TupleData oldTuple)
-record TruncateMessage(EnumSet<TruncateOption> options, int[] relationOids)
-record LogicalMessage(boolean transactional, String prefix, byte[] content)
+record CommitMessage(long commitLsn, long endLsn, Instant commitTimestamp)   // I8(0) flags 解析时消费，不建模
+record OriginMessage(long originCommitLsn, String originName)               // 级联复制场景出现
+record InsertMessage(OptionalLong streamXid, int relationOid, TupleData newTuple)
+record UpdateMessage(OptionalLong streamXid, int relationOid,
+                     Optional<TupleData> oldTuple, TupleData newTuple)
+record DeleteMessage(OptionalLong streamXid, int relationOid, TupleData oldTuple)
+record TruncateMessage(OptionalLong streamXid, EnumSet<TruncateOption> options, int[] relationOids)
+record LogicalMessage(OptionalLong streamXid, boolean transactional, long lsn,
+                      String prefix, byte[] content)
 
 // 族 2：元数据（消息流中随时插入）
-record RelationMessage(int relationOid, String schema, String table, char replicaIdentity,
-                       List<Column> columns)   // Column(name, typeId, isOptional)
-record TypeMessage(int typeOid, String schema, String name)
+record RelationMessage(OptionalLong streamXid, int relationOid, String schema, String table,
+                       char replicaIdentity, List<Column> columns)
+record Column(String name, int typeId, int typeModifier, boolean partOfKey) // typmod 为 PG 18 新增字段；flag 语义=属于复制键
+record TypeMessage(OptionalLong streamXid, int typeOid, String schema, String name)
 
-// 族 3：流式大事务（v2，streaming=on/parallel）
-// flags 仅在 streaming=parallel 时由协议附加；streaming=on 下恒为 0
-record StreamStartMessage(long xid, boolean firstSegment, int flags)
-record StreamStopMessage(int flags)
-record StreamCommitMessage(long commitLsn, long endLsn, Instant commitTimestamp, long xid, int flags)
-record StreamAbortMessage(long xid, long subxid, int flags)
+// 族 3：流式大事务（v2，streaming=on/parallel；类型字节 'S'/'E'/'c'/'A'）
+record StreamStartMessage(long xid, boolean firstSegment)
+record StreamStopMessage()
+record StreamCommitMessage(long xid, long commitLsn, long endLsn, Instant commitTimestamp)
+record StreamAbortMessage(long xid, long subxid, OptionalLong abortLsn, OptionalLong abortTimestamp)
+// abortLsn/abortTimestamp 仅 streaming=parallel 时随消息附加（源码 write_abort_info=true），否则为 empty
 
-// 族 4：两阶段（v3，two_phase=on）
-record BeginPrepareMessage(long finalLsn, Instant commitTimestamp, long xid, String gid)
-record PrepareMessage(long commitLsn, long endLsn, Instant prepareTimestamp, long xid, String gid)
-record CommitPreparedMessage(long commitLsn, long endLsn, Instant prepareTimestamp,
-                             Instant commitTimestamp, long xid, String gid)
-record AbortPreparedMessage(long commitLsn, long endLsn, Instant prepareTimestamp,
-                            Instant abortTimestamp, long xid, String gid)
+// 族 4：两阶段（v3，two_phase=on；类型字节 'b'/'P'/'K'/'r'/'p'）
+record BeginPrepareMessage(long prepareLsn, long endLsn, Instant prepareTimestamp, long xid, String gid)
+record PrepareMessage(long prepareLsn, long endLsn, Instant prepareTimestamp, long xid, String gid)
+record CommitPreparedMessage(long commitLsn, long endLsn, Instant commitTimestamp, long xid, String gid)
+record RollbackPreparedMessage(long prepareEndLsn, long rollbackEndLsn, Instant prepareTimestamp,
+                               Instant rollbackTimestamp, long xid, String gid)
+record StreamPrepareMessage(long prepareLsn, long endLsn, Instant prepareTimestamp, long xid, String gid)
 ```
+
+**streamXid 的含义（关键协议事实）**：M/R/Y/I/U/D/T 这些消息在**流式块内**（Stream Start 与 Stream Stop 之间）时会**前置一个 Int32 的 xid 字段**，顶层（非流式）消息没有该前缀。因此解码器必须跟踪流块状态。
 
 列值模型（`sealed interface TupleValue`）：
 
@@ -93,10 +101,38 @@ Tuple 前缀语义：`'N'` 新值 / `'K'` 复制键 / `'O'` 旧完整行，分�
 
 **实现纪律**：
 
-1. 每条消息的字段序列严格按 PostgreSQL 18 官方文档 [54.5.3 Logical Replication Protocol Messages](https://www.postgresql.org/docs/18/protocol-logical-replication.html#PROTOCOL-LOGICAL-REPLICATION-MESSAGES) 的格式表逐字节实现
-2. `PgOutputDecoder` 构造时携带 `StreamingMode`（OFF/ON/PARALLEL）——`streaming=parallel` 时部分流式控制消息会附加 flags 字节而 `streaming=on` 不会，解码器必须按模式决定是否消费该字节。构造后解码器仍不可变、可复用。哪些消息在 parallel 模式带 flags 以官方文档 54.5.3 为准逐一对照实现，并由集成测试用例 5 验证
+1. 每条消息的字段序列严格按附录 A 的字节格式表实现（来源：官方文档 54.9 + PG 18 源码 logicalproto.h 双源核对）
+2. `PgOutputDecoder` 构造时携带 `StreamingMode`（OFF/ON/PARALLEL）；运行期维护**最小流块状态** `inStream`（收到 Stream Start 置位、Stream Stop 复位）——`inStream=true` 时 M/R/Y/I/U/D/T 先读 Int32 xid 前缀；`streaming=parallel` 时 Stream Abort 额外读 Int64 abort_lsn + Int64 abort_time。除此之外无其他状态
 3. 解码器遇未知类型字节或字段错位必须 fail-fast 抛 `UnknownMessageTypeException`（带字节值与 hex 上下文），绝不静默跳过——错读一个字节会导致后续全部消息错位
-4. 解码器除构造期模式参数外无任何状态：`decode(ByteBuffer) → PgOutputMessage`
+4. 各消息中的 `Int8(0)` currently-unused flags 字段（Commit/Prepare/CommitPrepared/RollbackPrepared/StreamPrepare/StreamCommit 均有）解析时**必须消费但不建模**
+
+## 附录 A：pgoutput 消息字节格式表（PG 18）
+
+类型字节后按序读取；Int 均为 big-endian；String 为 null 结尾 UTF-8（CString）；时间戳为距 PG epoch（2000-01-01，Unix epoch + 946684800 秒）的微秒数。
+
+| 类型字节 | 消息 | 字段序列（类型字节之后） |
+|---|---|---|
+| 'B' | Begin | I64 final_lsn; I64 commit_ts; I32 xid |
+| 'C' | Commit | I8 flags(0); I64 commit_lsn; I64 end_lsn; I64 commit_ts |
+| 'O' | Origin | I64 origin_commit_lsn; Str origin_name |
+| 'R' | Relation | [流内: I32 xid]; I32 oid; Str schema; Str table; I8 replident; I16 ncols; cols×{ I8 flags(1=key); Str name; I32 type_oid; I32 typmod } |
+| 'Y' | Type | [流内: I32 xid]; I32 type_oid; Str schema; Str name |
+| 'I' | Insert | [流内: I32 xid]; I32 oid; 'N'; TupleData |
+| 'U' | Update | [流内: I32 xid]; I32 oid; [ 'K' TupleData \| 'O' TupleData ]; 'N'; TupleData |
+| 'D' | Delete | [流内: I32 xid]; I32 oid; ('K'\|'O'); TupleData |
+| 'T' | Truncate | [流内: I32 xid]; I32 nrel; I8 opts(1=CASCADE,2=RESTART); nrel×I32 oid |
+| 'M' | Message | [流内: I32 xid]; I8 flags(1=transactional); I64 lsn; Str prefix; I32 content_len; bytes |
+| 'S' | Stream Start | I32 xid; I8 first_segment |
+| 'E' | Stream Stop | （无字段） |
+| 'c' | Stream Commit | I32 xid; I8 flags(0); I64 commit_lsn; I64 end_lsn; I64 commit_ts |
+| 'A' | Stream Abort | I32 xid; I32 subxid; [仅 parallel: I64 abort_lsn; I64 abort_time] |
+| 'b' | Begin Prepare | I64 prepare_lsn; I64 end_lsn; I64 prepare_ts; I32 xid; Str gid |
+| 'P' | Prepare | I8 flags(0); I64 prepare_lsn; I64 end_lsn; I64 prepare_ts; I32 xid; Str gid |
+| 'K' | Commit Prepared | I8 flags(0); I64 commit_lsn; I64 end_lsn; I64 commit_ts; I32 xid; Str gid |
+| 'r' | Rollback Prepared | I8 flags(0); I64 prepare_end_lsn; I64 rollback_end_lsn; I64 prepare_ts; I64 rollback_ts; I32 xid; Str gid |
+| 'p' | Stream Prepare | I8 flags(0); I64 prepare_lsn; I64 end_lsn; I64 prepare_ts; I32 xid; Str gid |
+
+TupleData：`I16 ncols;` 每列 `'n'`（NULL，无负载）`| 'u'`（TOAST 未变，无负载）`| 't' I32 len bytes`（text）`| 'b' I32 len bytes`（binary）。
 
 ## 5. 会话层（replication/ 包）
 
@@ -151,9 +187,9 @@ Tuple 前缀语义：`'N'` 新值 / `'K'` 复制键 / `'O'` 旧完整行，分�
 | # | 用例 | 构造 | 断言 |
 |---|---|---|---|
 | 1 | 普通事务 | 小事务 INSERT/UPDATE/DELETE/COMMIT | `B→R→I/U/D→C` 完整序列，行数据正确 |
-| 2 | 流式大事务 | 单事务插入数千行（超 64kB work_mem） | `y(首段 firstSegment=true)→R→I×N→v` 块重复出现，最终 `E`(StreamCommit)，其后无 `C` |
-| 3 | 两阶段提交 | `PREPARE TRANSACTION 'gid'` → `COMMIT PREPARED` | `p→P` → `c`，gid 匹配 |
-| 4 | 两阶段回滚 | `PREPARE TRANSACTION 'gid'` → `ROLLBACK PREPARED` | `p→a`，gid 匹配 |
+| 2 | 流式大事务 | 单事务插入数千行（超 64kB work_mem） | `'S'(firstSegment=true)→R→I×N→'E'` 块重复出现，最终 `'c'`(StreamCommit)，其后无 `'C'`；流块内 R/I 带 streamXid |
+| 3 | 两阶段提交 | `PREPARE TRANSACTION 'gid'` → `COMMIT PREPARED` | `'b'→变更→'P'`，随后（流式 2PC 场景为 `'p'` StreamPrepare）`'K'` CommitPrepared，gid 匹配 |
+| 4 | 两阶段回滚 | `PREPARE TRANSACTION 'gid'` → `ROLLBACK PREPARED` | `'b'→'P'` 后 `'r'` RollbackPrepared，gid 匹配 |
 | 5 | 并行流式 | streaming=parallel 下重复用例 2 | 含附加 flags 的消息全部正确解析、序列无错位 |
 | 6 | LSN 反馈 | 处理若干消息后 `forceStatusUpdate()` | `pg_replication_slots.confirmed_flush_lsn` 前进 |
 | 7 | Truncate | `TRUNCATE`（含 CASCADE / RESTART IDENTITY 变体） | `T` 消息选项位与 oid 列表正确 |
