@@ -1,6 +1,7 @@
 package org.vastdata.vbstream.protocol;
 
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
@@ -27,11 +28,51 @@ public sealed interface PgOutputMessage {
 
     record Delete(OptionalLong streamXid, int relationOid, TupleData oldTuple) implements PgOutputMessage {}
 
+    /** relationOids 为 int[] 组件，需值相等语义（record 默认 equals 对数组退化为引用相等），故显式 override。 */
     record Truncate(OptionalLong streamXid, EnumSet<TruncateOption> options,
-                    int[] relationOids) implements PgOutputMessage {}
+                    int[] relationOids) implements PgOutputMessage {
 
+        @Override
+        public boolean equals(Object o) {
+            return o == this || o instanceof Truncate other
+                    && streamXid.equals(other.streamXid)
+                    && options.equals(other.options)
+                    && Arrays.equals(relationOids, other.relationOids);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = streamXid.hashCode();
+            result = 31 * result + options.hashCode();
+            result = 31 * result + Arrays.hashCode(relationOids);
+            return result;
+        }
+    }
+
+    /** content 为 byte[] 组件，需值相等语义（record 默认 equals 对数组退化为引用相等），故显式 override。 */
     record LogicalMsg(OptionalLong streamXid, boolean transactional, long lsn,
-                      String prefix, byte[] content) implements PgOutputMessage {}
+                      String prefix, byte[] content) implements PgOutputMessage {
+
+        @Override
+        public boolean equals(Object o) {
+            return o == this || o instanceof LogicalMsg other
+                    && streamXid.equals(other.streamXid)
+                    && transactional == other.transactional
+                    && lsn == other.lsn
+                    && prefix.equals(other.prefix)
+                    && Arrays.equals(content, other.content);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = streamXid.hashCode();
+            result = 31 * result + Boolean.hashCode(transactional);
+            result = 31 * result + Long.hashCode(lsn);
+            result = 31 * result + prefix.hashCode();
+            result = 31 * result + Arrays.hashCode(content);
+            return result;
+        }
+    }
 
     record StreamStart(long xid, boolean firstSegment) implements PgOutputMessage {}
 
