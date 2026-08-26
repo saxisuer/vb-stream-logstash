@@ -22,7 +22,7 @@ public record ReplicationConfig(
                 prop("vb.pg.slot", "vb_cdc_slot"),
                 prop("vb.pg.publication", "vb_pub"),
                 Integer.parseInt(prop("vb.pg.protoVersion", "4")),
-                StreamingMode.valueOf(prop("vb.pg.streaming", "parallel").toUpperCase()),
+                StreamingMode.valueOf(prop("vb.pg.streaming", "parallel").toUpperCase(java.util.Locale.ROOT)),
                 Boolean.parseBoolean(prop("vb.pg.twoPhase", "true")),
                 Integer.parseInt(prop("vb.pg.feedbackSeconds", "10")));
     }

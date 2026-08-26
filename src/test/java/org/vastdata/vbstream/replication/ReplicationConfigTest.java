@@ -10,10 +10,9 @@ class ReplicationConfigTest {
 
     @AfterEach
     void cleanupSystemProperties() {
-        System.clearProperty("vb.pg.host");
-        System.clearProperty("vb.pg.port");
-        System.clearProperty("vb.pg.slot");
-        System.clearProperty("vb.pg.streaming");
+        System.getProperties().stringPropertyNames().stream()
+                .filter(key -> key.startsWith("vb.pg."))
+                .forEach(System::clearProperty);
     }
 
     @Test
@@ -21,11 +20,15 @@ class ReplicationConfigTest {
         ReplicationConfig config = ReplicationConfig.fromSystemProperties();
         assertEquals("localhost", config.host());
         assertEquals(55432, config.port());
+        assertEquals("postgres", config.database());
+        assertEquals("postgres", config.user());
+        assertEquals("postgres", config.password());
         assertEquals("vb_cdc_slot", config.slotName());
         assertEquals("vb_pub", config.publicationNames());
         assertEquals(4, config.protoVersion());
         assertEquals(StreamingMode.PARALLEL, config.streamingMode());
         assertEquals(true, config.twoPhase());
+        assertEquals(10, config.feedbackIntervalSeconds());
     }
 
     @Test
