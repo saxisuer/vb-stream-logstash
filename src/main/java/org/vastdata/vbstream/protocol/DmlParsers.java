@@ -60,7 +60,7 @@ final class DmlParsers {
     }
 
     static PgOutputMessage.LogicalMsg logicalMsg(ByteBufferReader r, OptionalLong streamXid) {
-        boolean transactional = r.readByte() != 0;
+        boolean transactional = (r.readByte() & 0x01) != 0; // bit0 = transactional
         long lsn = r.readLong();
         String prefix = r.readString();
         int len = r.readInt();

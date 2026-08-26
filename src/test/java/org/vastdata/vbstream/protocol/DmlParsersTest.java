@@ -8,6 +8,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -50,11 +51,44 @@ class DmlParsersTest {
     }
 
     @Test
+    void updateWithFullOldRow() throws IOException {
+        // REPLICA IDENTITY FULL：'O' 携带完整旧行（非仅 key 列），与 'K' 同一解析路径
+        ByteBuffer payload = new MsgBuilder().type('U')
+                .i32(16385)
+                .i8('O').i16(2).i8('t').bytes(utf8("1")).i8('t').bytes(utf8("old"))
+                .i8('N').i16(1).i8('t').bytes(utf8("new"))
+                .build();
+        PgOutputMessage.Update msg = (PgOutputMessage.Update) decoder.decode(payload);
+        assertTrue(msg.oldTuple().isPresent());
+        assertEquals(2, msg.oldTuple().get().columns().size());
+        assertEquals(new TupleValue.Text("old"), msg.oldTuple().get().columns().get(1));
+        assertEquals(new TupleValue.Text("new"), msg.newTuple().columns().get(0));
+    }
+
+    @Test
     void updateWithoutOldTuple() throws IOException {
         ByteBuffer payload = new MsgBuilder().type('U')
                 .i32(16385).i8('N').i16(1).i8('t').bytes(utf8("x")).build();
         PgOutputMessage.Update msg = (PgOutputMessage.Update) decoder.decode(payload);
         assertEquals(Optional.empty(), msg.oldTuple());
+    }
+
+    @Test
+    void updateOldTupleFollowedByWrongTagFailsFast() throws IOException {
+        // 'K'/'O' 之后必须是 'N'：再来一个 'O'（K/O 非法并存序列）不得静默跳过
+        ByteBuffer payload = new MsgBuilder().type('U')
+                .i32(16385)
+                .i8('K').i16(1).i8('t').bytes(utf8("1"))
+                .i8('O')
+                .build();
+        assertThrows(UnknownMessageTypeException.class, () -> decoder.decode(payload));
+    }
+
+    @Test
+    void updateUnknownTagFailsFast() throws IOException {
+        ByteBuffer payload = new MsgBuilder().type('U')
+                .i32(16385).i8('X').build();
+        assertThrows(UnknownMessageTypeException.class, () -> decoder.decode(payload));
     }
 
     @Test
@@ -64,6 +98,14 @@ class DmlParsersTest {
         PgOutputMessage.Delete msg = (PgOutputMessage.Delete) decoder.decode(payload);
         assertEquals(16385, msg.relationOid());
         assertEquals(new TupleValue.Text("9"), msg.oldTuple().columns().get(0));
+    }
+
+    @Test
+    void deleteWithoutKeyOrOldTupleTagFailsFast() throws IOException {
+        // 'D' 必有 'K' 或 'O'：'N' 不是合法的 delete tag
+        ByteBuffer payload = new MsgBuilder().type('D')
+                .i32(16385).i8('N').build();
+        assertThrows(UnknownMessageTypeException.class, () -> decoder.decode(payload));
     }
 
     @Test
@@ -83,6 +125,12 @@ class DmlParsersTest {
         assertTrue(msg.transactional());
         assertEquals("prefix", msg.prefix());
         assertArrayEquals(utf8("hello"), msg.content());
+
+        // flags 只有 bit0 表示 transactional：其他位（如 bit1）不得误读为事务消息
+        ByteBuffer nonTxPayload = new MsgBuilder().type('M')
+                .i8(2).i64(0x5000L).str("prefix").bytes(utf8("hello")).build();
+        PgOutputMessage.LogicalMsg nonTx = (PgOutputMessage.LogicalMsg) decoder.decode(nonTxPayload);
+        assertFalse(nonTx.transactional());
     }
 
     @Test
