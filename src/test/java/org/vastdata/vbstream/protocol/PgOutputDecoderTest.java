@@ -20,8 +20,9 @@ class PgOutputDecoderTest {
 
     @Test
     void placeholderParserWired() throws IOException {
-        // Task 3 阶段各族 parser 为占位实现；此用例锁定 dispatch 已接线（实现后此用例仍应通过）
-        ByteBuffer payload = new MsgBuilder().type('B').i64(1).i64(2).i32(3).build();
+        // 'I' 属 DmlParsers，Task 3 阶段为占位实现；Task 5 完成后请将此用例改为断言正常解析
+        ByteBuffer payload = new MsgBuilder().type('I').i32(1).i8('N')
+                .i16(1).i8('t').bytes("x".getBytes()).build();
         assertThrows(UnsupportedOperationException.class,
                 () -> new PgOutputDecoder(StreamingMode.OFF).decode(payload));
     }
