@@ -1,0 +1,37 @@
+# vb-stream-logstash 的 PostgreSQL 测试环境（逻辑解码 stream 模式）
+#
+# 用法：
+#   cd src/docker
+#   docker compose up -d             # 启动（首次会自动 initdb 并执行 initdb.d/）
+#   docker compose restart postgres  # 修改 postgresql.conf 后重启生效
+#   docker compose down              # 停止（数据保留在 ./pgdata，不会丢失）
+#
+# 连接信息：jdbc:postgresql://localhost:55432/postgres  用户 postgres / 密码 postgres
+# 复制连接：jdbc:postgresql://localhost:55432/postgres?replication=database
+
+name: vb-stream-logstash
+
+services:
+  postgres:
+    image: postgres:18              # stream 模式需 PG 14+，直接用最新稳定大版本
+    container_name: vb-stream-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "55432:5432"                # 宿主机端口用 55432，避免与本机已装的 PG 冲突
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/vb-postgresql.conf
+    volumes:
+      # PG 18+ 镜像约定：挂载父目录，数据实际落在版本化子目录 <major>/docker 下
+      - ./pgdata:/var/lib/postgresql
+      - ./postgresql.conf:/etc/postgresql/vb-postgresql.conf:ro
+      - ./initdb.d:/docker-entrypoint-initdb.d:ro    # 仅首次初始化（pgdata 为空）时执行
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
