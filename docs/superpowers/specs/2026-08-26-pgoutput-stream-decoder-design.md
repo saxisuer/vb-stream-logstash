@@ -358,3 +358,119 @@ logicalrep_write_stream_abort(StringInfo out, TransactionId xid,
 	}
 }
 ```
+
+### B.5 两阶段提交线格式写入（`src/backend/replication/logical/proto.c`）
+
+族 4（b/P/K/r/p）的写入函数，与附录 A 对应行逐一印证。注意 `P`（Prepare）与 `p`（StreamPrepare）共用 `logicalrep_write_prepare_common`，仅类型字节不同；`r`（RollbackPrepared）是唯一带**两个**时间戳（prepare_time + rollback_time）的消息：
+
+```c
+/*
+ * Write BEGIN PREPARE to the output stream.
+ */
+void
+logicalrep_write_begin_prepare(StringInfo out, ReorderBufferTXN *txn)
+{
+	pq_sendbyte(out, LOGICAL_REP_MSG_BEGIN_PREPARE);
+
+	/* fixed fields */
+	pq_sendint64(out, txn->final_lsn);
+	pq_sendint64(out, txn->end_lsn);
+	pq_sendint64(out, txn->xact_time.prepare_time);
+	pq_sendint32(out, txn->xid);
+
+	/* send gid */
+	pq_sendstring(out, txn->gid);
+}
+
+/*
+ * The core functionality for logicalrep_write_prepare and
+ * logicalrep_write_stream_prepare.
+ */
+static void
+logicalrep_write_prepare_common(StringInfo out, LogicalRepMsgType type,
+								ReorderBufferTXN *txn, XLogRecPtr prepare_lsn)
+{
+	uint8		flags = 0;
+
+	pq_sendbyte(out, type);
+	...
+	/* send the flags field */
+	pq_sendbyte(out, flags);
+
+	/* send fields */
+	pq_sendint64(out, prepare_lsn);
+	pq_sendint64(out, txn->end_lsn);
+	pq_sendint64(out, txn->xact_time.prepare_time);
+	pq_sendint32(out, txn->xid);
+
+	/* send gid */
+	pq_sendstring(out, txn->gid);
+}
+
+/*
+ * Write COMMIT PREPARED to the output stream.
+ */
+void
+logicalrep_write_commit_prepared(StringInfo out, ReorderBufferTXN *txn,
+								 XLogRecPtr commit_lsn)
+{
+	uint8		flags = 0;
+
+	pq_sendbyte(out, LOGICAL_REP_MSG_COMMIT_PREPARED);
+	...
+	/* send the flags field */
+	pq_sendbyte(out, flags);
+
+	/* send fields */
+	pq_sendint64(out, commit_lsn);
+	pq_sendint64(out, txn->end_lsn);
+	pq_sendint64(out, txn->xact_time.commit_time);
+	pq_sendint32(out, txn->xid);
+
+	/* send gid */
+	pq_sendstring(out, txn->gid);
+}
+
+/*
+ * Write ROLLBACK PREPARED to the output stream.
+ */
+void
+logicalrep_write_rollback_prepared(StringInfo out, ReorderBufferTXN *txn,
+								   XLogRecPtr prepare_end_lsn,
+								   TimestampTz prepare_time)
+{
+	uint8		flags = 0;
+
+	pq_sendbyte(out, LOGICAL_REP_MSG_ROLLBACK_PREPARED);
+	...
+	/* send the flags field */
+	pq_sendbyte(out, flags);
+
+	/* send fields */
+	pq_sendint64(out, prepare_end_lsn);
+	pq_sendint64(out, txn->end_lsn);
+	pq_sendint64(out, prepare_time);
+	pq_sendint64(out, txn->xact_time.commit_time);
+	pq_sendint32(out, txn->xid);
+
+	/* send gid */
+	pq_sendstring(out, txn->gid);
+}
+
+/*
+ * Write STREAM PREPARE to the output stream.
+ */
+void
+logicalrep_write_stream_prepare(StringInfo out,
+								ReorderBufferTXN *txn,
+								XLogRecPtr prepare_lsn)
+{
+	logicalrep_write_prepare_common(out, LOGICAL_REP_MSG_STREAM_PREPARE,
+									txn, prepare_lsn);
+}
+```
+
+**两点行为结论**（Task 13 用例 3 修正的依据）：
+
+1. **空的 prepared 事务同样下发 b/P/K**：`DecodePrepare`（decode.c）在非跳过路径上无条件调用 `ReorderBufferPrepare(ctx->reorder, xid, parsed->twophase_gid)`，与事务是否有变更无关。因此"先普通提交大事务、再 prepare 空事务"的用例只会看到 b/P/K，永远触发不了 `p`。
+2. **`p`（StreamPrepare）只属于"被流式发送过"的 prepared 事务**：与附录 B.1/B.2 同一逻辑——2MB 大事务（>64kB work_mem）整体进入 PREPARE 时，其变更先以流块（S/E）下发，PREPARE 记录解码时以 `p` 收尾，随后 COMMIT PREPARED 产生 `K`。

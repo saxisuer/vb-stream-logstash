@@ -2428,42 +2428,47 @@ class TwoPhaseTransactionTest {
         }
     }
 
-    /** 大 2PC 事务走流式路径：流块 + StreamPrepare('p') 收尾。 */
+    /**
+     * spec 用例 3 深化：大 2PC 事务走流式路径——流块下发 + StreamPrepare('p') 收尾 + K 提交确认。
+     * 计划稿原版先把大事务普通提交再 prepare 空事务，永远触发不了 'p'（空 prepare 只发 b/P/K）；
+     * 修正：autocommit 连接 + 裸语句让 500 行整体进 PREPARE（驱动不插手事务状态，规避 pgjdbc
+     * autocommit 管理与服务器端两阶段命令混用的问题）。停止条件取 K——按 WAL 顺序 'p' 必先入列。
+     */
     @Test
     void largePreparedTransactionEndsWithStreamPrepare() throws Exception {
         prepareTable();
         try (SessionHarness harness = SessionHarness.start(
                 PgTestEnv.newConfig("slot_2pc", "pub_2pc"),
-                msg -> msg instanceof PgOutputMessage.StreamPrepare
-                        || msg instanceof PgOutputMessage.CommitPrepared)) {
-            try (Connection c = PgTestEnv.newSqlConnection()) {
-                c.setAutoCommit(false);
+                msg -> msg instanceof PgOutputMessage.CommitPrepared)) {
+            try (Connection c = PgTestEnv.newSqlConnection()) { // autocommit=true，裸语句管理事务
                 Statement st = c.createStatement();
+                st.execute("BEGIN");
                 for (int i = 0; i < 500; i++) {
                     st.execute("INSERT INTO t_2pc VALUES (" + (1000 + i) + ", repeat('z', 4096))");
                 }
-                c.commit();          // 先结束 JDBC 事务
-                st = c.createStatement();
-                st.execute("BEGIN"); // 再以裸语句做 PREPARE
                 st.execute("PREPARE TRANSACTION 'gid_big1'");
                 st.execute("COMMIT PREPARED 'gid_big1'");
             }
             harness.awaitTermination(Duration.ofSeconds(60));
-            boolean streamed = harness.messages().stream()
-                    .anyMatch(m -> m instanceof PgOutputMessage.StreamStart);
-            boolean streamPrepareOrCommit = harness.messages().stream()
-                    .anyMatch(m -> m instanceof PgOutputMessage.StreamPrepare
-                            || m instanceof PgOutputMessage.CommitPrepared);
-            assertTrue(streamPrepareOrCommit, "大 2PC 事务应以 StreamPrepare 或 CommitPrepared 收尾");
-            // streamed 可能为 false（取决于服务器分块决策），仅作信息记录
-            System.out.println("largePreparedTransaction: streamed=" + streamed
-                    + ", messages=" + harness.messages().size());
+
+            long insertCount = harness.messages().stream()
+                    .filter(m -> m instanceof PgOutputMessage.Insert).count();
+            assertEquals(500, insertCount, "500 行 Insert 应全部下发");
+
+            assertTrue(harness.messages().stream().anyMatch(m -> m instanceof PgOutputMessage.StreamStart),
+                    "2MB 大事务（>64kB work_mem）应出现流式块");
+            assertTrue(harness.messages().stream().anyMatch(m -> m instanceof PgOutputMessage.StreamPrepare p
+                    && "gid_big1".equals(p.gid())), "流式 2PC 应以 StreamPrepare(gid_big1) 收尾");
+            assertTrue(harness.messages().stream().anyMatch(m -> m instanceof PgOutputMessage.CommitPrepared k
+                    && "gid_big1".equals(k.gid())), "COMMIT PREPARED 应产生 CommitPrepared(gid_big1)");
+            assertFalse(harness.messages().stream().anyMatch(m -> m instanceof PgOutputMessage.Commit),
+                    "prepared 事务以 p/K 收尾，不应出现顶层 Commit");
         }
     }
 }
 ```
 
-说明：`largePreparedTransactionEndsWithStreamPrepare` 中 JDBC 事务与裸 `PREPARE TRANSACTION` 分两步走，是因为 pgjdbc 的 autocommit 管理与服务器端两阶段命令混用易出错；服务器端 `BEGIN` 后紧接 `PREPARE TRANSACTION` 即可。
+**实现修正记录（2026-08-27 首跑前审视）**：计划稿原版把 500 行先普通 `c.commit()`（走 StreamCommit），再 `BEGIN`+`PREPARE` 一个**空**事务——空 prepare 只发 b/P/K（`DecodePrepare` 无条件走 `ReorderBufferPrepare`），用例会"空转通过"且永远触发不了 `StreamPrepare('p')`。已改为 autocommit 连接 + 裸语句让大事务整体进 PREPARE；首跑即绿（`Tests run: 3, Failures: 0`）。行为结论与源码摘录见设计文档**附录 B.5**。
 
 - [ ] **Step 2: 运行验证**
 
