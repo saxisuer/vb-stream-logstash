@@ -42,7 +42,8 @@ class NormalTransactionTest {
                     "DELETE FROM t_norm WHERE id = 1");
             harness.awaitTermination(Duration.ofSeconds(30));
 
-            List<Class<?>> types = harness.messages().stream().map(Object::getClass).toList();
+            // 显式类型见证 <Class<?>>：裸 Object::getClass 触发 IDEA 捕获误报，改转型 lambda 则 javac 报错，见证写法两边皆过
+            List<Class<?>> types = harness.messages().stream().<Class<?>>map(Object::getClass).toList();
             assertTrue(types.contains(PgOutputMessage.Begin.class), "缺 Begin: " + types);
             assertTrue(types.contains(PgOutputMessage.Relation.class), "缺 Relation: " + types);
             assertTrue(types.contains(PgOutputMessage.Insert.class), "缺 Insert: " + types);
