@@ -17,11 +17,11 @@ class NormalParsersTest {
     void begin() throws IOException {
         // commit_ts 为 PG epoch(2000-01-01) 起的微秒数：2_500_000µs = epoch+2.5s（勿再叠加 epoch 秒数）
         ByteBuffer payload = new MsgBuilder().type('B')
-                .i64(0x1000L).i64(2_500_000L).i32(777).build();
+                .i64(0x1000L).i64(2_500_000L).i32(0x80000001).build(); // 高位 xid 钉住无符号语义
         PgOutputMessage.Begin msg = (PgOutputMessage.Begin) decoder.decode(payload);
         assertEquals(0x1000L, msg.finalLsn());
         assertEquals(Instant.ofEpochSecond(946684800L + 2, 500_000_000L), msg.commitTimestamp());
-        assertEquals(777L, msg.xid());
+        assertEquals(2147483649L, msg.xid());
     }
 
     @Test

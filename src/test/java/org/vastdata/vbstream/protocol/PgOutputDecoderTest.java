@@ -22,7 +22,7 @@ class PgOutputDecoderTest {
     void placeholderParserWired() throws IOException {
         // 'I' 属 DmlParsers，Task 3 阶段为占位实现；Task 5 完成后请将此用例改为断言正常解析
         ByteBuffer payload = new MsgBuilder().type('I').i32(1).i8('N')
-                .i16(1).i8('t').bytes("x".getBytes()).build();
+                .i16(1).i8('t').bytes("x".getBytes(java.nio.charset.StandardCharsets.UTF_8)).build();
         assertThrows(UnsupportedOperationException.class,
                 () -> new PgOutputDecoder(StreamingMode.OFF).decode(payload));
     }

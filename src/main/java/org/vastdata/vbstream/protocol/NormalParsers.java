@@ -19,7 +19,7 @@ final class NormalParsers {
     }
 
     static PgOutputMessage.Commit commit(ByteBufferReader r) {
-        r.readByte(); // currently-unused flags，消费不建模
+        r.readByte(); // currently-unused flags，消费不建模；漏读 1 字节即后续字段全部错位
         long commitLsn = r.readLong();
         long endLsn = r.readLong();
         Instant commitTs = ByteBufferReader.pgMicrosToInstant(r.readLong());
@@ -40,7 +40,7 @@ final class NormalParsers {
         int ncols = r.readUnsignedShort();
         List<Column> cols = new ArrayList<>(ncols);
         for (int i = 0; i < ncols; i++) {
-            boolean partOfKey = (r.readByte() & 0x01) != 0;
+            boolean partOfKey = (r.readByte() & 0x01) != 0; // bit0 = key 列
             String name = r.readString();
             int typeId = r.readInt();
             int typmod = r.readInt();
