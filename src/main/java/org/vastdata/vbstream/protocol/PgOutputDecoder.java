@@ -7,6 +7,7 @@ import java.util.OptionalLong;
  * pgoutput 消息解码器。构造时指定 StreamingMode；运行期维护最小流块状态 inStream：
  * 收到 'S'(StreamStart) 置位、'E'(StreamStop) 复位；inStream 期间 M/R/Y/I/U/D/T
  * 会前置 Int32 xid（spec 附录 A）。解码结束若有多余字节立即抛 ProtocolMisalignmentException。
+ * 非线程安全；每个复制流一个实例，由读取该流的线程调用。
  */
 public final class PgOutputDecoder {
 
