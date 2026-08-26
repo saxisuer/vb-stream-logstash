@@ -96,7 +96,7 @@ class ByteBufferReaderTest {
 
     @Test
     void readsBigEndianIntegers() {
-        ByteBuffer buf = ByteBuffer.allocate(10)
+        ByteBuffer buf = ByteBuffer.allocate(11)
                 .put((byte) 1).putShort((short) 2).putInt(3).putInt(4);
         buf.flip();
         ByteBufferReader r = new ByteBufferReader(buf);
