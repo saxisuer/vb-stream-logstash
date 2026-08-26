@@ -166,8 +166,8 @@ TupleData：`I16 ncols;` 每列 `'n'`（NULL，无负载）`| 'u'`（TOAST 未�
 | 情形 | 行为 |
 |---|---|
 | 未知消息类型字节 / 字段错位 | `UnknownMessageTypeException` fail-fast（带字节值与 hex 上下文） |
-| 连接中断（SQLException/IOException） | 包装为 `PgStreamException`；Main 打印「槽 X 已保留，最后 LSN Y，重启即续传」→ exit 1 |
-| 建槽冲突（槽已存在） | warn + 复用现有槽 |
+| 连接中断（SQLException，含复制流 read() 返回 null 即连接不活跃） | `PgReplicationSession.run()` 抛描述性 SQLException（不引入独立包装类型——里程碑 1 YAGNI）；Main 打印「槽 X 已保留，最后 LSN Y，重启即续传」→ exit 1（Y 取自 session 暴露的 lastReceiveLsn） |
+| 建槽冲突（槽已存在） | warn + 复用现有槽（warn 中提示槽的 two_phase 属性需与配置匹配，否则 start 时将由服务端报错） |
 | 配置校验失败 | 打印 usage → exit 2 |
 
 ## 8. 测试矩阵
