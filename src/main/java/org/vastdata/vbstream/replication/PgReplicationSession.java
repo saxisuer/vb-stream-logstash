@@ -22,6 +22,9 @@ import java.util.concurrent.TimeUnit;
  */
 public final class PgReplicationSession implements AutoCloseable {
 
+    /** PostgreSQL duplicate_object：复制槽已存在。 */
+    private static final String SQLSTATE_DUPLICATE_OBJECT = "42710";
+
     private final ReplicationConfig config;
     private Connection sqlConnection;
     private Connection replicationConnection;
@@ -36,7 +39,13 @@ public final class PgReplicationSession implements AutoCloseable {
         props.setProperty("user", config.user());
         props.setProperty("password", config.password());
         sqlConnection = DriverManager.getConnection(config.jdbcUrl(), props);
-        replicationConnection = DriverManager.getConnection(config.replicationUrl(), props);
+        try {
+            replicationConnection = DriverManager.getConnection(config.replicationUrl(), props);
+        } catch (SQLException e) {
+            closeQuietly(sqlConnection);
+            sqlConnection = null;
+            throw e;
+        }
     }
 
     /** 幂等建槽：two_phase 随槽开启；SQLState 42710（duplicate_object）表示已存在，复用。 */
@@ -49,8 +58,9 @@ public final class PgReplicationSession implements AutoCloseable {
                 // 只需副作用：建槽
             }
         } catch (SQLException e) {
-            if ("42710".equals(e.getSQLState())) {
-                System.err.println("WARN: 复制槽 " + config.slotName() + " 已存在，直接复用");
+            if (SQLSTATE_DUPLICATE_OBJECT.equals(e.getSQLState())) {
+                System.err.println("WARN: 复制槽 " + config.slotName() + " 已存在，直接复用；"
+                        + "注意槽的 two_phase 属性需与配置匹配，否则 start 时将由服务端报错");
             } else {
                 throw e;
             }
@@ -72,14 +82,17 @@ public final class PgReplicationSession implements AutoCloseable {
                 .start();
     }
 
-    /** 消息循环：阻塞读 → 解码 → 缓存 Relation → 回调；按周期 forceStatusUpdate 反馈 LSN。 */
+    /** 消息循环：阻塞读 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。 */
     public void run(PgOutputListener listener) throws SQLException, IOException {
         PgOutputDecoder decoder = new PgOutputDecoder(config.streamingMode());
         RelationRegistry registry = new RelationRegistry();
         long feedbackIntervalNanos = config.feedbackIntervalSeconds() * 1_000_000_000L;
         long lastFeedbackNanos = System.nanoTime();
         while (true) {
-            ByteBuffer payload = stream.read(); // 阻塞直到下一条消息
+            ByteBuffer payload = stream.read(); // 阻塞直到下一条消息；连接不活跃时可能返回 null
+            if (payload == null) {
+                throw new SQLException("复制流已结束（连接断开）");
+            }
             PgOutputMessage message = decoder.decode(payload);
             registry.accept(message);
             listener.onMessage(message, registry);
@@ -91,6 +104,11 @@ public final class PgReplicationSession implements AutoCloseable {
                 lastFeedbackNanos = System.nanoTime();
             }
         }
+    }
+
+    /** 供上层在异常退出时打印续传位点；流未启动时返回 INVALID_LSN。 */
+    public LogSequenceNumber lastReceiveLsn() {
+        return stream != null ? stream.getLastReceiveLSN() : LogSequenceNumber.INVALID_LSN;
     }
 
     /** 关闭顺序：流 → 复制连接 → SQL 连接。close 会令阻塞中的 read 抛出异常从而结束 run 循环。 */
