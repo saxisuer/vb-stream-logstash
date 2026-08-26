@@ -44,15 +44,18 @@ public final class ConsoleListener implements PgOutputListener {
             return "TYPE              %s.%s oid=%d%s".formatted(m.schema(), m.name(), m.typeOid(), suffix(m.streamXid()));
         }
         if (msg instanceof PgOutputMessage.Insert m) {
-            return "INSERT            %s %s%s".formatted(tableOf(m.relationOid(), registry),
+            return "INSERT            %s BEFORE=- AFTER=%s%s".formatted(tableOf(m.relationOid(), registry),
                     tupleOf(m.relationOid(), m.newTuple(), registry), suffix(m.streamXid()));
         }
         if (msg instanceof PgOutputMessage.Update m) {
-            return "UPDATE            %s %s%s".formatted(tableOf(m.relationOid(), registry),
+            // BEFORE 镜像取决于 replica identity：默认（'d'）仅在键列被修改时携带键元组，
+            // REPLICA IDENTITY FULL 恒携带整行；无旧镜像时打 "-"
+            return "UPDATE            %s BEFORE=%s AFTER=%s%s".formatted(tableOf(m.relationOid(), registry),
+                    m.oldTuple().map(t -> tupleOf(m.relationOid(), t, registry)).orElse("-"),
                     tupleOf(m.relationOid(), m.newTuple(), registry), suffix(m.streamXid()));
         }
         if (msg instanceof PgOutputMessage.Delete m) {
-            return "DELETE            %s %s%s".formatted(tableOf(m.relationOid(), registry),
+            return "DELETE            %s BEFORE=%s AFTER=-%s".formatted(tableOf(m.relationOid(), registry),
                     tupleOf(m.relationOid(), m.oldTuple(), registry), suffix(m.streamXid()));
         }
         if (msg instanceof PgOutputMessage.Truncate m) {

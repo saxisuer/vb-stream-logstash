@@ -58,11 +58,13 @@ java -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
 ```
 2026-08-27 02:40:04.661 [main] INFO  o.v.v.r.PgReplicationSession - 复制流已启动: 槽=vb_cdc_slot ...
 2026-08-27 02:40:07.060 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - BEGIN-PREPARE     gid=lg1 xid=769
-2026-08-27 02:40:07.067 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - INSERT            public.t_stream_test [id=1404, payload=logback-smoke, ...]
+2026-08-27 02:40:07.067 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - INSERT            public.t_stream_test BEFORE=- AFTER=[id=1404, payload=logback-smoke, ...]
 2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - PREPARE           gid=lg1 xid=769
 ```
 
 四种事务场景的输出标记：`BEGIN/COMMIT`（普通）、`STREAM-START/STREAM-COMMIT`（流式大事务）、`BEGIN-PREPARE/COMMIT-PREPARED`（两阶段）、`STREAM-PREPARE`（流式 2PC）。
+
+DML 统一带 `BEFORE=`/`AFTER=` 镜像（缺失侧为 `-`）。注意 BEFORE 的有无取决于表的 **replica identity**：默认（DEFAULT）下 UPDATE 仅在键列被修改时携带键元组、DELETE 携带键元组；`ALTER TABLE ... REPLICA IDENTITY FULL` 后 UPDATE/DELETE 恒携带变更前整行。
 
 ### 注意事项
 
