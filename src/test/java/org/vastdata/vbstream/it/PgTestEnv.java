@@ -1,5 +1,7 @@
 package org.vastdata.vbstream.it;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.vastdata.vbstream.protocol.StreamingMode;
 import org.vastdata.vbstream.replication.ReplicationConfig;
@@ -12,6 +14,8 @@ import java.sql.Statement;
 
 /** 集成测试共享的单例 PG 18 容器与工具。类加载即启动（需要本机 Docker）。 */
 public final class PgTestEnv {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PgTestEnv.class);
 
     public static final PostgreSQLContainer PG = new PostgreSQLContainer("postgres:18")
             .withDatabaseName("testdb")
@@ -28,6 +32,7 @@ public final class PgTestEnv {
 
     static {
         PG.start();
+        LOG.info("测试容器就绪: {}（logical_decoding_work_mem=64kB）", PG.getJdbcUrl());
     }
 
     private PgTestEnv() {
@@ -68,7 +73,7 @@ public final class PgTestEnv {
                 ps.executeQuery();
             }
         } catch (Exception e) {
-            System.err.println("WARN: 清理槽 " + slotName + " 失败: " + e.getMessage());
+            LOG.warn("清理槽 {} 失败: {}", slotName, e.getMessage());
         }
     }
 }

@@ -10,7 +10,8 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 - 工具链：Java 17 + Maven
 - 当前状态：**里程碑 1 已完成**（pgoutput 流式解码器：19 种协议消息解析 + 复制会话 + `Main`/`ConsoleListener` + 4 组 Testcontainers 集成用例，`mvn test` 全绿）。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
-    - `net.openhft:chronicle-queue`（持久化低延迟队列；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`，注意日志实现尚未引入）
+    - `net.openhft:chronicle-queue`（持久化低延迟队列；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`）
+    - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
 
 ## 常用命令
 

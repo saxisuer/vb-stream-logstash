@@ -1,5 +1,8 @@
 package org.vastdata.vbstream.protocol;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.nio.ByteBuffer;
 import java.util.OptionalLong;
 
@@ -10,6 +13,9 @@ import java.util.OptionalLong;
  * 非线程安全；每个复制流一个实例，由读取该流的线程调用。
  */
 public final class PgOutputDecoder {
+
+    /** 逐消息 DEBUG（默认关闭）：类型字节 + 解析结果，排障协议问题时的第一现场。 */
+    private static final Logger LOG = LoggerFactory.getLogger(PgOutputDecoder.class);
 
     private final StreamingMode streamingMode;
     private boolean inStream;
@@ -25,6 +31,7 @@ public final class PgOutputDecoder {
         if (r.remaining() != 0) {
             throw new ProtocolMisalignmentException(type, r.remaining());
         }
+        LOG.debug("解码: '{}' {}", (char) type, msg);
         return msg;
     }
 

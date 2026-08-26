@@ -1,5 +1,7 @@
 package org.vastdata.vbstream.it;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.replication.PgReplicationSession;
 import org.vastdata.vbstream.replication.ReplicationConfig;
@@ -13,6 +15,8 @@ import java.util.function.Predicate;
 
 /** 在守护线程跑复制会话并录制消息，直到满足停止条件或超时。 */
 public final class SessionHarness implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SessionHarness.class);
 
     private final PgReplicationSession session;
     private final List<PgOutputMessage> messages = new CopyOnWriteArrayList<>();
@@ -49,6 +53,7 @@ public final class SessionHarness implements AutoCloseable {
             session.close(); // 防中途失败泄漏连接（Task 10 审查修正）
             throw e;
         }
+        LOG.info("会话 harness 已启动: 槽={}", config.slotName());
         return new SessionHarness(session, stopCondition);
     }
 
@@ -68,5 +73,6 @@ public final class SessionHarness implements AutoCloseable {
     @Override
     public void close() {
         session.close();
+        LOG.info("会话 harness 已关闭: 槽={} 共录制 {} 条消息", session.config().slotName(), messages.size());
     }
 }

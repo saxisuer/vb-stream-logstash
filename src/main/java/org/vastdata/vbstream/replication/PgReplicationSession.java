@@ -3,6 +3,8 @@ package org.vastdata.vbstream.replication;
 import org.postgresql.PGConnection;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputDecoder;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 
@@ -22,6 +24,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class PgReplicationSession implements AutoCloseable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(PgReplicationSession.class);
+
     /** PostgreSQL duplicate_object：复制槽已存在。 */
     private static final String SQLSTATE_DUPLICATE_OBJECT = "42710";
 
@@ -32,6 +36,11 @@ public final class PgReplicationSession implements AutoCloseable {
 
     public PgReplicationSession(ReplicationConfig config) {
         this.config = config;
+    }
+
+    /** 供上层（如 harness 打日志）读取会话配置。 */
+    public ReplicationConfig config() {
+        return config;
     }
 
     public void open() throws SQLException {
@@ -46,6 +55,7 @@ public final class PgReplicationSession implements AutoCloseable {
             sqlConnection = null;
             throw e;
         }
+        LOG.info("连接建立: {} 与复制连接 replication=database", config.jdbcUrl());
     }
 
     /** 幂等建槽：two_phase 随槽开启；SQLState 42710（duplicate_object）表示已存在，复用。 */
@@ -57,10 +67,11 @@ public final class PgReplicationSession implements AutoCloseable {
             try (ResultSet ignored = ps.executeQuery()) {
                 // 只需副作用：建槽
             }
+            LOG.info("复制槽已创建: {}（two_phase={}）", config.slotName(), config.twoPhase());
         } catch (SQLException e) {
             if (SQLSTATE_DUPLICATE_OBJECT.equals(e.getSQLState())) {
-                System.err.println("WARN: 复制槽 " + config.slotName() + " 已存在，直接复用；"
-                        + "注意槽的 two_phase 属性需与配置匹配，否则 start 时将由服务端报错");
+                LOG.warn("复制槽 {} 已存在，直接复用；注意槽的 two_phase 属性需与配置匹配，否则 start 时将由服务端报错",
+                        config.slotName());
             } else {
                 throw e;
             }
@@ -80,6 +91,9 @@ public final class PgReplicationSession implements AutoCloseable {
                 .withStartPosition(LogSequenceNumber.INVALID_LSN)
                 .withStatusInterval(config.feedbackIntervalSeconds(), TimeUnit.SECONDS)
                 .start();
+        LOG.info("复制流已启动: 槽={} publication={} proto=v{} streaming={} twoPhase={}",
+                config.slotName(), config.publicationNames(), config.protoVersion(),
+                config.streamingParam(), config.twoPhase());
     }
 
     /** 消息循环：阻塞读 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。 */
@@ -101,6 +115,7 @@ public final class PgReplicationSession implements AutoCloseable {
             stream.setFlushedLSN(last);
             if (System.nanoTime() - lastFeedbackNanos >= feedbackIntervalNanos) {
                 stream.forceUpdateStatus();
+                LOG.debug("LSN 反馈: applied=flushed={}", last);
                 lastFeedbackNanos = System.nanoTime();
             }
         }
@@ -118,11 +133,12 @@ public final class PgReplicationSession implements AutoCloseable {
             try {
                 stream.close();
             } catch (SQLException e) {
-                System.err.println("WARN: 关闭复制流失败: " + e.getMessage());
+                LOG.warn("关闭复制流失败: {}", e.getMessage());
             }
         }
         closeQuietly(replicationConnection);
         closeQuietly(sqlConnection);
+        LOG.info("复制会话已关闭: 槽={}", config.slotName());
     }
 
     private static void closeQuietly(Connection connection) {
@@ -131,7 +147,7 @@ public final class PgReplicationSession implements AutoCloseable {
                 connection.close();
             }
         } catch (SQLException e) {
-            System.err.println("WARN: 关闭连接失败: " + e.getMessage());
+            LOG.warn("关闭连接失败: {}", e.getMessage());
         }
     }
 }

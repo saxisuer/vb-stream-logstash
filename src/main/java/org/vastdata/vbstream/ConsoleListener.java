@@ -1,12 +1,13 @@
 package org.vastdata.vbstream;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
 import org.vastdata.vbstream.replication.PgOutputListener;
 import org.vastdata.vbstream.replication.RelationRegistry;
 
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -15,9 +16,12 @@ import java.util.OptionalLong;
 /** 控制台打印 listener：每条消息一行可读输出。 */
 public final class ConsoleListener implements PgOutputListener {
 
+    /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
+    private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
+
     @Override
     public void onMessage(PgOutputMessage message, RelationRegistry registry) {
-        System.out.println(Instant.now() + " | " + render(message, registry));
+        CDC.info("{}", render(message, registry));
     }
 
     // 注：record pattern switch 是 Java 21 正式特性，本项目约束 Java 17，故用 instanceof 链
