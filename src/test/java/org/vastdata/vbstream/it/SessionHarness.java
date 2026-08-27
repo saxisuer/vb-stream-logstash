@@ -25,6 +25,11 @@ public final class SessionHarness implements AutoCloseable {
     private final CountDownLatch done = new CountDownLatch(1);
     private volatile Exception failure;
 
+    /**
+     * 私有构造：绑定会话与停止条件，启动守护读取线程逐消息录制。
+     * 线程内命中停止条件或会话抛异常都只 countDown latch——异常记入 failure，
+     * 由 awaitTermination 统一上抛，不在本方法同步暴露。
+     */
     private SessionHarness(PgReplicationSession session, Predicate<PgOutputMessage> stopCondition) {
         this.session = session;
         Thread worker = new Thread(() -> {
@@ -44,6 +49,10 @@ public final class SessionHarness implements AutoCloseable {
         worker.start();
     }
 
+    /**
+     * 建立复制会话（open → ensureSlot → start）并包装为 harness，返回时读取线程已在录制。
+     * 契约：任一建流环节失败即关闭已建立的会话（防连接泄漏）后原样上抛，不返回半成品 harness。
+     */
     public static SessionHarness start(ReplicationConfig config,
                                        Predicate<PgOutputMessage> stopCondition) throws Exception {
         PgReplicationSession session = new PgReplicationSession(config);
@@ -59,6 +68,13 @@ public final class SessionHarness implements AutoCloseable {
         return new SessionHarness(session, stopCondition);
     }
 
+    /**
+     * 已录制消息的实时视图。
+     * 契约：停止条件仅 countDown latch——awaitTermination 返回后读取线程仍会持续追加，
+     * 直至 close() 才停；返回 CopyOnWriteArrayList，遍历线程安全（迭代为创建时快照），
+     * 但要做确定性的全量断言必须先 close() 再读（本测试类"先 close 后断言"的既定顺序，
+     * 未来作者新增用例需遵守此顺序约束，否则可能读到仍在增长的列表）。
+     */
     public List<PgOutputMessage> messages() {
         return messages;
     }
@@ -93,6 +109,10 @@ public final class SessionHarness implements AutoCloseable {
                 .toString();
     }
 
+    /**
+     * 关闭复制会话：终止读取线程的阻塞读，close 返回后消息列表不再增长，
+     * 此后方可对录制流做确定性的断言/离线回放；同时记录录制总数便于日志对账。
+     */
     @Override
     public void close() {
         session.close();

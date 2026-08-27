@@ -145,9 +145,10 @@ class TransactionAssemblyTest {
      * 逐行 INSERT 30 行；载荷用 RAND_PAYLOAD（约 16KB 不可压缩随机十六进制）——rb->size 按 TOAST 后实际数据量记账，
      * 实测可压缩的 repeat 载荷被 pglz 压到百字节级、41 行总记账远不到 64kB，永不触发流式
      * （首版用 repeat(md5,512) 即栽在此，整事务走 Begin..Commit 的 NORMAL 路径）。
-     * 驱逐时机：reorder buffer 在变更入队时按逐变更内存记账检查触发，与 WAL 何时 flush 无关
-     * （StreamedTransactionTest 无 sleep 的紧循环同样触发）；行间 sleep 是第二道保险——让驱逐
-     * 发生在事务仍进行中，更贴近 stream 模式的真实路径，非触发流式的必要条件。
+     * 驱逐时机：reorder buffer 在变更入队时按逐变更内存记账检查触发，与 wal writer 的周期 flush
+     * 节律无关（大体量下 WAL 缓冲压力自然推动 flush，紧循环同样触发——StreamedTransactionTest
+     * 无 sleep 即证）；行间 sleep 是第二道保险——让驱逐发生在事务仍进行中，更贴近 stream 模式的
+     * 真实路径，非触发流式的必要条件。
      * 随机载荷下约第 5 行起 rb->size 越过 64kB 触发驱逐 → SAVEPOINT 内再写 10 行后 ROLLBACK TO
      * （子事务变更随顶层事务流式下发——PG 只对已流式子事务发 StreamAbort，未流式子事务回滚是
      * 静默丢弃）→ 尾行 → commit。断言（按依赖顺序）：先确认录制流中 StreamAbort 存在——
@@ -170,7 +171,7 @@ class TransactionAssemblyTest {
                 c.setAutoCommit(false);
                 for (int i = 1; i <= 30; i++) {
                     st.execute("INSERT INTO t_assembly_stream VALUES (" + i + ", " + RAND_PAYLOAD + ")");
-                    // 第二道保险：驱逐发生在事务仍进行中（驱逐由入队内存记账触发、与 WAL flush 无关，非必要条件）
+                    // 第二道保险：驱逐发生在事务仍进行中（驱逐由入队内存记账触发、不依赖 wal writer 周期 flush 节律，非必要条件）
                     Thread.sleep(75);
                 }
                 // 子事务：写入后回滚（这些变更会被流式下发，再由 StreamAbort 剔除）
@@ -213,7 +214,8 @@ class TransactionAssemblyTest {
      * 单连接顺序两个 PREPARE TRANSACTION——每次 PREPARE 后服务端事务块即结束、prepared 事务脱离会话，
      * 连接可直接开新事务，close 时无未决事务 → 新连接先 COMMIT PREPARED 提交侧、再 ROLLBACK PREPARED
      * 回滚侧；按 WAL 顺序 RollbackPrepared 是序列中最后到达的终结消息，停止条件取它保证全量录制不漏。
-     * 断言：恰一个 TWO_PHASE 事务、gid 为提交侧 gid_commit、1 条 INSERT 变更——回滚侧 gid 一条不输出。
+     * 断言：恰一个 TWO_PHASE 事务、gid 为提交侧 gid_commit、xid>0、1 条 INSERT 变更且行数据
+     * （id=1、v=x）正确——回滚侧 gid 一条不输出。
      * 超时或会话异常由 awaitTermination 抛 AssertionError。
      */
     @Test
@@ -240,10 +242,15 @@ class TransactionAssemblyTest {
             List<Transaction> txns = assembleRecording(harness.messages());
             assertEquals(1, txns.size(), () -> "仅 COMMIT PREPARED 的 gid 输出: " + summarize(txns));
             Transaction t = txns.get(0);
-            assertEquals(TransactionKind.TWO_PHASE, t.kind());
+            assertEquals(TransactionKind.TWO_PHASE, t.kind(), () -> summarize(txns));
             assertEquals("gid_commit", t.gid());
-            assertEquals(1, t.changes().size());
-            assertEquals(DmlKind.INSERT, ((RowChange) t.changes().get(0)).dml());
+            assertTrue(t.xid() > 0, "xid 应来自 BeginPrepare: " + t.xid());
+            assertEquals(1, t.changes().size(), () -> "提交侧仅 1 条变更: " + summarize(txns));
+            RowChange first = (RowChange) t.changes().get(0);
+            assertEquals(DmlKind.INSERT, first.dml());
+            // 行数据断言（场景 1 的列值写法）：确认输出的是提交侧那行的内容
+            assertEquals("1", ((TupleValue.Text) first.after().orElseThrow().columns().get(0)).value());
+            assertEquals("x", ((TupleValue.Text) first.after().orElseThrow().columns().get(1)).value());
         }
     }
 
@@ -253,7 +260,7 @@ class TransactionAssemblyTest {
      * 轮番驱逐两事务，流段交错下发（组装器多桶设计的真实路径验证）。
      * 关键步骤：A 写 id 1..10、B 写 id 100001..100010 逐行交替 INSERT，轮间 sleep 同场景 2 的定位
      * （第二道保险：驱逐发生在两事务仍进行中、更贴近 stream 模式真实路径；驱逐由入队内存记账
-     * 触发、与 WAL flush 无关，非必要条件）；载荷同场景 2 用
+     * 触发、不依赖 wal writer 周期 flush 节律，非必要条件）；载荷同场景 2 用
      * RAND_PAYLOAD（16KB 不可压缩）——每行真实记账 16KB，单事务 10 行 160KB 独立超限，两事务必然
      * 都被驱逐流式 → 先 commit A 后 commit B → 等第 2 个 StreamCommit（AtomicInteger 计数避免
      * 首个 StreamCommit 即停、漏录 B）。断言：恰两个 STREAMED 事务、xid 各异、各 10 行完整、
