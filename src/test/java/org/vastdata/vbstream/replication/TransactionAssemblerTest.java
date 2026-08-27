@@ -33,6 +33,8 @@ class TransactionAssemblerTest {
     private static final long TOP_B = 7002L;
     /** 子事务 xid（TOP_A 的 sub）：验证流块内（子）事务归属与 StreamAbort 剔除。 */
     private static final long SUB = 7003L;
+    /** 两阶段事务全局 id 夹具值。 */
+    private static final String GID = "gid-1";
 
     /** 构造默认 oid 的 Relation 消息，供单表场景使用。 */
     private static PgOutputMessage.Relation relation() {
@@ -361,5 +363,74 @@ class TransactionAssemblerTest {
     void rejectsStreamAbortForUnknownTopXid() {
         assertThrows(IllegalStateException.class, () -> run(
                 new PgOutputMessage.StreamAbort(404L, 405L, OptionalLong.empty(), OptionalLong.empty())));
+    }
+
+    @Test
+    void twoPhaseCommitEmitsOnCommitPrepared() {
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.BeginPrepare(0x10L, 0x18L, TS, 601L, GID),
+                insert("1", "a"),
+                new PgOutputMessage.Prepare(0x10L, 0x18L, TS, 601L, GID),
+                new PgOutputMessage.CommitPrepared(0x20L, 0x28L, TS, 601L, GID));
+        assertEquals(1, out.size());
+        Transaction t = out.get(0);
+        assertEquals(TransactionKind.TWO_PHASE, t.kind());
+        assertEquals(GID, t.gid());
+        assertEquals(601L, t.xid());
+        assertEquals(0x20L, t.commitLsn());
+        assertEquals(1, t.changes().size());
+    }
+
+    @Test
+    void rollbackPreparedDiscardsSilently() {
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.BeginPrepare(0x10L, 0x18L, TS, 601L, GID),
+                insert("1", "a"),
+                new PgOutputMessage.Prepare(0x10L, 0x18L, TS, 601L, GID),
+                new PgOutputMessage.RollbackPrepared(0x10L, 0x30L, TS, TS, 601L, GID));
+        assertEquals(0, out.size());
+    }
+
+    @Test
+    void streamedTwoPhaseEmitsOnCommitPrepared() {
+        // 流式 2PC：StreamPrepare 前必有最后一个流段并已闭合（spec B.6），桶从 streamedByXid 转挂起池
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                streamedInsert(TOP_A, "1", "a"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamPrepare(0x10L, 0x18L, TS, TOP_A, GID),
+                new PgOutputMessage.CommitPrepared(0x20L, 0x28L, TS, TOP_A, GID));
+        assertEquals(1, out.size());
+        Transaction t = out.get(0);
+        assertEquals(TransactionKind.TWO_PHASE, t.kind());
+        assertEquals(GID, t.gid());
+        assertEquals(TOP_A, t.xid());
+        assertEquals(1, t.changes().size());
+    }
+
+    @Test
+    void rejectsCommitPreparedForUnknownGid() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.CommitPrepared(1L, 2L, TS, 1L, "no-such-gid")));
+    }
+
+    @Test
+    void rejectsDuplicatePrepareGid() {
+        assertThrows(IllegalStateException.class, () -> run(
+                relation(),
+                new PgOutputMessage.BeginPrepare(1L, 2L, TS, 601L, GID),
+                new PgOutputMessage.Prepare(1L, 2L, TS, 601L, GID),
+                // 同 gid 第二次 Prepare：挂起池已存在 → fail-fast
+                new PgOutputMessage.BeginPrepare(3L, 4L, TS, 602L, GID),
+                new PgOutputMessage.Prepare(3L, 4L, TS, 602L, GID)));
+    }
+
+    @Test
+    void rejectsPrepareWithoutBeginPrepare() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.Prepare(1L, 2L, TS, 601L, GID)));
     }
 }

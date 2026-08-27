@@ -40,13 +40,13 @@ public final class TransactionAssembler {
 
     /** 活动普通事务桶（Begin 置位，Commit 封箱清空；协议保证 Begin..Commit 串行不嵌套）。 */
     private TxBuffer currentNormalTx;
-    /** 活动两阶段事务桶（BeginPrepare 置位，Prepare 转挂起池）。Task 5 使用。 */
+    /** 活动两阶段事务桶（BeginPrepare 置位，Prepare 转挂起池）。 */
     private TxBuffer currentPrepareTx;
     /** 当前流块上下文：stream_start..stream_stop 之间非 null，指向 streamedByXid 中某桶。 */
     private TxBuffer currentStream;
     /** 流式事务桶，key=顶层 xid（多桶并存，段间交错——spec §4.2）。 */
     private final Map<Long, TxBuffer> streamedByXid = new HashMap<>();
-    /** 两阶段挂起池，key=gid（PREPARE 至 COMMIT/ROLLBACK PREPARED 之间，可能长期挂起）。Task 5 使用。 */
+    /** 两阶段挂起池，key=gid（PREPARE 至 COMMIT/ROLLBACK PREPARED 之间，可能长期挂起）。 */
     private final Map<String, TxBuffer> preparedByGid = new HashMap<>();
 
     /** 组装缓冲：xid 与变更序列；gid 仅两阶段桶非 null。非线程安全（仅 run 线程触碰）。 */
@@ -109,15 +109,15 @@ public final class TransactionAssembler {
         } else if (message instanceof PgOutputMessage.StreamAbort m) {
             streamAbort(m);
         } else if (message instanceof PgOutputMessage.BeginPrepare m) {
-            throw new IllegalStateException("两阶段路径尚未实现（Task 5）: " + m);
+            beginPrepare(m);
         } else if (message instanceof PgOutputMessage.Prepare m) {
-            throw new IllegalStateException("两阶段路径尚未实现（Task 5）: " + m);
+            prepare(m);
         } else if (message instanceof PgOutputMessage.CommitPrepared m) {
-            throw new IllegalStateException("两阶段路径尚未实现（Task 5）: " + m);
+            commitPrepared(m);
         } else if (message instanceof PgOutputMessage.RollbackPrepared m) {
-            throw new IllegalStateException("两阶段路径尚未实现（Task 5）: " + m);
+            rollbackPrepared(m);
         } else if (message instanceof PgOutputMessage.StreamPrepare m) {
-            throw new IllegalStateException("两阶段路径尚未实现（Task 5）: " + m);
+            streamPrepare(m);
         } else if (message instanceof PgOutputMessage.Relation || message instanceof PgOutputMessage.Type) {
             // 元数据消息：registry 职责（调用方已转发），组装器不处理
         } else if (message instanceof PgOutputMessage.Origin) {
@@ -263,6 +263,69 @@ public final class TransactionAssembler {
             streamedByXid.remove(m.xid());
         } else {
             bucket.changes.removeIf(c -> c.streamXid().isPresent() && c.streamXid().getAsLong() == m.subxid());
+        }
+    }
+
+    /** BeginPrepare：开活动两阶段桶（记 gid/xid）；已有未闭合两阶段桶即 fail-fast（b..P 串行不嵌套）。 */
+    private void beginPrepare(PgOutputMessage.BeginPrepare m) {
+        if (currentPrepareTx != null) {
+            throw new IllegalStateException("BeginPrepare 到达但两阶段事务未闭合: gid=" + currentPrepareTx.gid);
+        }
+        currentPrepareTx = new TxBuffer(m.xid());
+        currentPrepareTx.gid = m.gid();
+    }
+
+    /**
+     * Prepare：活动两阶段桶转挂起池（gid 已存在 → fail-fast）。
+     * 事务自此挂起，等待 CommitPrepared（输出）或 RollbackPrepared（丢弃），可能长期等待甚至跨重启（持久化非目标，spec §7）。
+     */
+    private void prepare(PgOutputMessage.Prepare m) {
+        if (currentPrepareTx == null || currentPrepareTx.xid != m.xid()
+                || !currentPrepareTx.gid.equals(m.gid())) {
+            throw new IllegalStateException("Prepare 与活动两阶段事务不匹配: gid=" + m.gid() + " xid=" + m.xid());
+        }
+        TxBuffer bucket = currentPrepareTx;
+        currentPrepareTx = null;
+        if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
+            throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+        }
+    }
+
+    /** CommitPrepared：挂起池取桶（miss → fail-fast）封箱 TWO_PHASE Transaction 回调（用户确认的输出时机）。 */
+    private void commitPrepared(PgOutputMessage.CommitPrepared m) {
+        TxBuffer bucket = preparedByGid.remove(m.gid());
+        if (bucket == null) {
+            throw new IllegalStateException("CommitPrepared 对应 gid 不存在: " + m.gid());
+        }
+        listener.onTransaction(new Transaction(bucket.xid, TransactionKind.TWO_PHASE, bucket.gid,
+                m.commitLsn(), m.endLsn(), m.commitTimestamp(), bucket.changes));
+    }
+
+    /** RollbackPrepared：挂起池取桶（miss → fail-fast）静默丢弃，不回调（用户确认的回滚语义）。 */
+    private void rollbackPrepared(PgOutputMessage.RollbackPrepared m) {
+        TxBuffer bucket = preparedByGid.remove(m.gid());
+        if (bucket == null) {
+            throw new IllegalStateException("RollbackPrepared 对应 gid 不存在: " + m.gid());
+        }
+        LOG.warn("两阶段事务回滚，丢弃已缓冲变更: gid={} xid={} changes={}",
+                m.gid(), m.xid(), bucket.changes.size());
+    }
+
+    /**
+     * StreamPrepare(xid, gid)：流式 2PC 的 prepare。流桶从 streamedByXid 移出（miss 或流块未闭合 → fail-fast，
+     * stream_prepare 前服务端必已发完最后一个流段并 stream_stop，spec B.6），记 gid 后转入挂起池。
+     */
+    private void streamPrepare(PgOutputMessage.StreamPrepare m) {
+        if (currentStream != null) {
+            throw new IllegalStateException("StreamPrepare 到达但流块未闭合: xid=" + currentStream.xid);
+        }
+        TxBuffer bucket = streamedByXid.remove(m.xid());
+        if (bucket == null) {
+            throw new IllegalStateException("StreamPrepare 对应流式事务桶不存在: xid=" + m.xid());
+        }
+        bucket.gid = m.gid();
+        if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
+            throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
         }
     }
 
