@@ -289,6 +289,8 @@ public final class TransactionAssembler {
         if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
             throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
         }
+        LOG.debug("两阶段事务 PREPARE 入挂起池: gid={} changes={} pending={}",
+                bucket.gid, bucket.changes.size(), preparedByGid.size());
     }
 
     /** CommitPrepared：挂起池取桶（miss → fail-fast）封箱 TWO_PHASE Transaction 回调（用户确认的输出时机）。 */
@@ -308,7 +310,7 @@ public final class TransactionAssembler {
             throw new IllegalStateException("RollbackPrepared 对应 gid 不存在: " + m.gid());
         }
         LOG.warn("两阶段事务回滚，丢弃已缓冲变更: gid={} xid={} changes={}",
-                m.gid(), m.xid(), bucket.changes.size());
+                m.gid(), bucket.xid, bucket.changes.size());
     }
 
     /**
@@ -327,6 +329,8 @@ public final class TransactionAssembler {
         if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
             throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
         }
+        LOG.debug("流式两阶段事务 StreamPrepare 入挂起池: gid={} changes={} pending={}",
+                bucket.gid, bucket.changes.size(), preparedByGid.size());
     }
 
     /**

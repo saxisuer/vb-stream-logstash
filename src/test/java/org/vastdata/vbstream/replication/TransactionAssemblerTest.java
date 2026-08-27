@@ -433,4 +433,45 @@ class TransactionAssemblerTest {
         assertThrows(IllegalStateException.class, () -> run(
                 new PgOutputMessage.Prepare(1L, 2L, TS, 601L, GID)));
     }
+
+    @Test
+    void rejectsDuplicateBeginPrepare() {
+        // 两阶段桶未闭合（无 Prepare）又来 BeginPrepare：b..P 串行不嵌套守卫
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.BeginPrepare(1L, 2L, TS, 601L, GID),
+                new PgOutputMessage.BeginPrepare(3L, 4L, TS, 602L, "gid-2")));
+    }
+
+    @Test
+    void rejectsPrepareMismatchedXidOrGid() {
+        // Prepare 与活动两阶段桶的 xid/gid 不匹配（rejectsPrepareWithoutBeginPrepare 仅覆盖 null 短路，此处测另一半）
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.BeginPrepare(1L, 2L, TS, 601L, GID),
+                new PgOutputMessage.Prepare(1L, 2L, TS, 602L, GID)));   // xid 不匹配
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.BeginPrepare(1L, 2L, TS, 601L, GID),
+                new PgOutputMessage.Prepare(1L, 2L, TS, 601L, "gid-2")));   // gid 不匹配
+    }
+
+    @Test
+    void rejectsRollbackPreparedForUnknownGid() {
+        // 挂起池 miss：回滚路径同样 fail-fast，不静默吞掉未知 gid
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.RollbackPrepared(1L, 2L, TS, TS, 601L, "no-such-gid")));
+    }
+
+    @Test
+    void rejectsStreamPrepareWithOpenStreamBlock() {
+        // stream_prepare 前服务端必已发完流段并 stream_stop（spec B.6）：流块未闭合守卫
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                new PgOutputMessage.StreamPrepare(0x10L, 0x18L, TS, TOP_A, GID)));
+    }
+
+    @Test
+    void rejectsStreamPrepareForUnknownXid() {
+        // 无对应流桶的 StreamPrepare：挂起池不能凭空接纳未知 xid
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamPrepare(0x10L, 0x18L, TS, 404L, GID)));
+    }
 }
