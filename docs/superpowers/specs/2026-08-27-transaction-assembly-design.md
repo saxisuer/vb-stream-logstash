@@ -93,15 +93,15 @@ public void accept(PgOutputMessage message, RelationRegistry registry)
 
 ```java
 private final TransactionListener listener;
-private final Map<Long, TxBuffer> pendingByXid = new HashMap<>();    // 普通事务（key=Begin.xid；流式事务不发 Begin，与此池天然无交集）
+private TxBuffer currentNormalTx;                                     // 活动普通事务（Begin 置位、Commit 封箱清空——Commit 消息无 xid，协议保证 Begin..Commit 串行不嵌套）
 private final Map<Long, TxBuffer> streamedByXid = new HashMap<>();   // 流式事务桶（key=StreamStart.xid=顶层 xid，多桶并存——依据见 §4.2）
 private TxBuffer currentStream;                                       // 当前流块上下文：stream_start..stream_stop 之间非 null（§4.2 已证流块不重叠）
+private TxBuffer currentPrepareTx;                                    // 活动两阶段事务（BeginPrepare 置位、Prepare 转挂起池）
 private final Map<String, TxBuffer> preparedByGid = new HashMap<>(); // 2PC 挂起池（key=gid）
 
 private static final class TxBuffer {
-    long xid; String gid; boolean twoPhase; boolean streamed;
-    long beginLsn; Instant beginTs;              // Begin/BeginPrepare 携带的时间戳
-    List<TxChange> changes = new ArrayList<>();  // TxChange 自带 streamXid，无需额外包装
+    final long xid; String gid;                  // gid 仅两阶段桶非 null；事务形态由所在容器隐含（普通指针/流式 Map/挂起池）
+    final List<TxChange> changes = new ArrayList<>();  // TxChange 自带 streamXid，无需额外包装
 }
 ```
 
@@ -109,7 +109,7 @@ private static final class TxBuffer {
 
 | 消息 | 动作 |
 |---|---|
-| `Begin(xid, finalLsn, ts)` | 新建 TxBuffer 入 `pendingByXid`（已存在同 xid → fail-fast） |
+| `Begin(xid, finalLsn, ts)` | 新建 TxBuffer 置为 `currentNormalTx`（已有未闭合普通事务 → fail-fast） |
 | `Insert/Update/Delete(oid, ...)` | 活动桶 = `currentStream`（流块内）否则按 §4.3 顺序找普通/2PC 桶；构造 RowChange（relation 取 `registry.require(oid)` 快照，miss 即 fail-fast）入桶 |
 | `Truncate(oids...)` | 同上，每 oid 一次 `registry.require` 快照，构造 TruncateChange 入桶 |
 | `LogicalMsg` | 构造 MsgChange 入当前活动桶 |
@@ -147,7 +147,7 @@ private static final class TxBuffer {
 
 ### 4.3 2PC 活动桶与普通事务的区分
 
-`BeginPrepare` 后至 `Prepare` 前的变更也走"当前活动桶"逻辑。桶查找顺序：`currentStream`（流块内，最高优先）→ 活动 2PC 桶 → 最近 Begin 桶。活动 2PC 桶与普通 Begin 桶用同一 Map 亦可（key=xid，桶带 twoPhase/gid 标记），`Prepare(gid,xid)` 时按 xid 取出转挂起池——简化实现，行为一致。
+`BeginPrepare` 后至 `Prepare` 前的变更也走"当前活动桶"逻辑。桶查找顺序：`currentStream`（流块内，最高优先）→ `currentPrepareTx`（活动 2PC）→ `currentNormalTx`（活动普通）。活动 2PC 桶与普通桶各用**单指针**而非 Map（walsender 按事务边界串行输出，同时至多一个未闭合），`Prepare(gid,xid)` 时直接把 `currentPrepareTx` 转入挂起池。
 
 ### 4.4 协议异常（fail-fast）
 
@@ -188,6 +188,7 @@ private static final class TxBuffer {
 8. 2PC 回滚：b→I→P→r 不回调
 9. 流式 2PC：StreamStart→I→E→p(gid)→K(gid) 输出 TWO_PHASE
 10. 负例：无桶 Commit / 无活动桶的 Insert / 重复 Begin 同 xid / 未知 gid 的 K / StreamStart(first=false) 未知 xid / 无流块的 StreamStop → IllegalStateException
+11. （质量审查后补）Truncate 多表快照组装（relations 逐 oid 快照 + 未知 oid fail-fast）与 LogicalMsg 路由（事务性入桶 / 非事务性无桶 WARN 丢弃不抛）——TruncateChange/MsgChange 生产行为的组装器级覆盖
 
 ### 6.2 集成测试（Testcontainers，`TransactionAssemblyIT` 风格，沿用 SessionHarness）
 
