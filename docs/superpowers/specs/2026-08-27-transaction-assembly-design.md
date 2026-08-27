@@ -60,14 +60,14 @@ public sealed interface TxChange permits RowChange, TruncateChange, MsgChange {}
  * 协议会重发 Relation，逐变更快照天然对齐；下游自包含，无需 registry）。
  */
 public record RowChange(DmlKind dml, PgOutputMessage.Relation relation,
-                        Optional<TupleData> before, TupleData after,
-                        OptionalLong streamXid) {}
+                        Optional<TupleData> before, Optional<TupleData> after,
+                        OptionalLong streamXid) {}   // before/after 均为 Optional（INSERT before=empty、DELETE after=empty），避免 null 组件——实现细化 #2
 
 public enum DmlKind { INSERT, UPDATE, DELETE }
 
 /** TRUNCATE 可涉及多表：一次操作一条 TxChange，携带全部受影响表的 Relation 快照。 */
 public record TruncateChange(List<PgOutputMessage.Relation> relations,
-                              EnumSet<TruncateOption> options, OptionalLong streamXid) {}
+                              Set<TruncateOption> options, OptionalLong streamXid) {}   // Set（紧凑构造器 Set.copyOf 归一），非 EnumSet
 
 /** pg_logical_emit_message 产生的事务内逻辑消息。 */
 public record MsgChange(boolean transactional, String prefix, byte[] content,
@@ -165,7 +165,7 @@ private static final class TxBuffer {
 - `Main`：`session.run((msg, registry) -> { registry.accept(msg); assembler.accept(msg, registry); })`；assembler 构造时注入事务回调
 - `ConsoleListener`：保留逐消息渲染方法（复用现有 render/tupleOf），**新增事务块输出**（`onTransaction`）：
   ```
-  TXN-BEGIN xid=505 kind=STREAMED gid=null commitLsn=0/1BD9E70 commitTs=2026-.. changes=402
+  TXN-BEGIN xid=505 kind=STREAMED gid=null commitLsn=0x1BD9E70 commitTs=2026-.. changes=402
     [1] INSERT public.t_stream BEFORE=- AFTER=[id=1, payload=xxx...]
     [2] UPDATE ...
   TXN-END   xid=505
