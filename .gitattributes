@@ -1,0 +1,6 @@
+# 跨机开发（macOS ↔ Windows）行尾保护：
+# Windows 侧 core.autocrlf=true 会在 checkout 时把文本文件重写为 CRLF，
+# 进容器的脚本 shebang 因此带上 \r 导致 "cannot execute: required file not found"（src/docker 重建实测踩坑）。
+# 规则：所有 shell 脚本与 initdb.d 下全部文件强制 LF，与 checkout 平台无关。
+*.sh text eol=lf
+src/docker/initdb.d/* text eol=lf
