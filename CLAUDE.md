@@ -47,6 +47,7 @@ java -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
 - 源码结构：`org.vastdata.vbstream.protocol`（协议解析，纯函数）、`org.vastdata.vbstream.replication`（会话）、`Main`/`ConsoleListener`
 - 集成测试（`org.vastdata.vbstream.it`）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部
 - src/docker 的 postgresql.conf 已含冒烟所需 `max_prepared_transactions=16` 与 `logical_decoding_work_mem=64kB`（改 conf 后 `docker compose restart postgres`）。注意：walsender 已追平时，单语句 `INSERT..SELECT` 批量写入的大事务不触发流式（整段于提交后回放）；构造流式场景需事务内分批/跨秒写入
+- **流式驱逐的内存记账按 TOAST 压缩后大小（实测，构造流式测试数据必读）**：reorder buffer 的 `rb->size` 按变更元组 TOAST 压缩后的实际字节数记账，不是 SQL 文本长度。规则图案载荷（`repeat('x',8192)`、`repeat(md5,N)`）被 pglz 压到百字节级——少量行永远越不过 `logical_decoding_work_mem=64kB`，事务整体走 Begin..Commit 的 NORMAL 路径（事务组装 Task 8 首版实测踩坑）。要少量行即触发流式，用不可压缩载荷：`(SELECT string_agg(md5(random()::text),'') FROM generate_series(1,512))` ≈16KB（`pg_column_size` 实测存满 16384）；数百行可压缩载荷靠总量也能触发（`StreamedTransactionTest` 的 500 行方案）。另注意阈值是**全局** `rb->size`（所有进行中事务合计），双连接并发大事务会轮番驱逐、流段交错下发（`TransactionAssemblyTest` 场景 4 即此构造）
 
 ## 领域要点（实现时的关键约束）
 
