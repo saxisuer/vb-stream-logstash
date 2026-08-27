@@ -324,4 +324,81 @@ class TransactionAssemblyTest {
                 .map(t -> "Transaction[xid=" + t.xid() + ", kind=" + t.kind() + ", changes=" + t.changes().size() + "]")
                 .toList().toString();
     }
+
+    /**
+     * 场景 5（类型覆盖，用户补充需求）：日期/时间/整数/浮点/字符串各类型列值端到端往返——
+     * pgoutput 默认 text 格式下所有列值都以后端文本表示传输（TupleValue.Text），本场景验证
+     * "PG 列类型 → 文本编码 → decoder → 组装 RowChange"全链路对各类型的正确性。
+     * 关键步骤：8 列表（int 主键/text/bigint/double precision/numeric/date/time/timestamp）单事务
+     * I/U/D → 断言 INSERT after 逐列文本值（含 UTF-8 中文与微秒精度 timestamp）；UPDATE 只改
+     * 非键列（v_float/v_date）——REPLICA IDENTITY DEFAULT 下 pgoutput 不发旧镜像（before 为 empty）
+     * 且新值正确；DELETE 的 before 为键元组（'K'——按 Relation 全列宽发送、非键列 NULL 占位，实测
+     * [1, Null×7]），after 为 empty。
+     * 预期文本表示均为 PG 后端标准输出：float8 shortest-round-trip（3.14159）、numeric 原样、
+     * date/time 无时区后缀、timestamp 保留微秒。
+     */
+    @Test
+    void multiTypeValuesRoundTripThroughAssembly() throws Exception {
+        PgTestEnv.execSql(
+                "CREATE TABLE IF NOT EXISTS t_assembly_types("
+                        + "id int PRIMARY KEY, v_text text, v_bigint bigint, v_float double precision, "
+                        + "v_numeric numeric, v_date date, v_time time, v_ts timestamp)",
+                "DROP PUBLICATION IF EXISTS pub_assembly_types",
+                "CREATE PUBLICATION pub_assembly_types FOR TABLE t_assembly_types",
+                "TRUNCATE t_assembly_types");
+        try (SessionHarness harness = SessionHarness.start(
+                PgTestEnv.newConfig(SLOT, "pub_assembly_types"),
+                msg -> msg instanceof PgOutputMessage.Commit)) {
+            try (Connection c = PgTestEnv.newSqlConnection(); Statement st = c.createStatement()) {
+                c.setAutoCommit(false);
+                st.execute("INSERT INTO t_assembly_types VALUES (1, 'hello 世界', 42, 3.14159, "
+                        + "12345.6789, '2026-08-27', '10:30:00', '2026-08-27 10:30:00.123456')");
+                st.execute("UPDATE t_assembly_types SET v_float=2.5, v_date='2026-12-31' WHERE id=1");
+                st.execute("DELETE FROM t_assembly_types WHERE id=1");
+                c.commit();
+            }
+            harness.awaitTermination(Duration.ofSeconds(30));
+
+            List<Transaction> txns = assembleRecording(harness.messages());
+            assertEquals(1, txns.size(), () -> "应恰一个事务: " + summarize(txns));
+            Transaction t = txns.get(0);
+            assertEquals(3, t.changes().size(), () -> "I/U/D 三条变更: " + summarize(txns));
+
+            // INSERT：after 整行 8 列逐值断言（各类型的标准文本表示）
+            RowChange insert = (RowChange) t.changes().get(0);
+            assertEquals(DmlKind.INSERT, insert.dml());
+            assertEquals(List.of("1", "hello 世界", "42", "3.14159", "12345.6789",
+                    "2026-08-27", "10:30:00", "2026-08-27 10:30:00.123456"),
+                    textsOf(insert.after().orElseThrow()), "INSERT 各类型列值文本表示");
+
+            // UPDATE：只改非键列——REPLICA IDENTITY DEFAULT 下不发旧镜像；after 两列新值、其余不变
+            RowChange update = (RowChange) t.changes().get(1);
+            assertEquals(DmlKind.UPDATE, update.dml());
+            assertTrue(update.before().isEmpty(), "非键列更新不应携带旧镜像（replica identity 默认）");
+            assertEquals(List.of("1", "hello 世界", "42", "2.5", "12345.6789",
+                    "2026-12-31", "10:30:00", "2026-08-27 10:30:00.123456"),
+                    textsOf(update.after().orElseThrow()), "UPDATE 后各类型列值");
+
+            // DELETE：before 为键元组——pgoutput 按 Relation 全列宽发送，WAL 未记录的非键列取值为 NULL
+            //（实测行为：[1, Null×7]），after 为 empty
+            RowChange delete = (RowChange) t.changes().get(2);
+            assertEquals(DmlKind.DELETE, delete.dml());
+            assertTrue(delete.after().isEmpty(), "DELETE 无 after 元组");
+            assertEquals(List.of("1", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL"),
+                    textsOf(delete.before().orElseThrow()), "DELETE 键元组：主键有值、非键列 NULL 占位");
+        }
+    }
+
+    /**
+     * 提取元组全部列值的文本序列（断言各类型列的文本表示）。
+     * Text 值取其文本；Null 渲染为 "NULL"（DELETE 键元组的非键列占位）；
+     * UnchangedToast/Binary 不属于本场景列，出现即以类型名暴露在断言差异里。
+     */
+    private static List<String> textsOf(org.vastdata.vbstream.protocol.TupleData tuple) {
+        return tuple.columns().stream()
+                .map(v -> v instanceof TupleValue.Text t ? t.value()
+                        : v instanceof TupleValue.Null ? "NULL"
+                        : "<" + v.getClass().getSimpleName() + ">")
+                .toList();
+    }
 }
