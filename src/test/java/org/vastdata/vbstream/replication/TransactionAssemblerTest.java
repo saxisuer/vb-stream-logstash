@@ -3,17 +3,21 @@ package org.vastdata.vbstream.replication;
 import org.junit.jupiter.api.Test;
 import org.vastdata.vbstream.protocol.Column;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
+import org.vastdata.vbstream.protocol.TruncateOption;
 import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * TransactionAssembler 状态机单测：直接以 protocol record 构造消息序列（组装器输入是已解析消息，
@@ -24,9 +28,18 @@ class TransactionAssemblerTest {
     private static final Instant TS = Instant.parse("2026-08-27T00:00:00Z");
     private static final int OID = 16384;
 
-    /** 构造两列 (id int, v text) 的 Relation 消息，列序与 {@link #row} 对齐。 */
+    /** 构造默认 oid 的 Relation 消息，供单表场景使用。 */
     private static PgOutputMessage.Relation relation() {
-        return new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t", 'd',
+        return relation(OID);
+    }
+
+    /**
+     * 按指定 oid 构造两列 (id int, v text) 的 Relation 消息，列序与 {@link #row} 对齐，
+     * 供 Truncate 多表等需要多个不同 oid 的场景使用。表名默认 "t"，非默认 oid 用 "t"+oid 区分。
+     */
+    private static PgOutputMessage.Relation relation(int oid) {
+        return new PgOutputMessage.Relation(OptionalLong.empty(), oid, "public",
+                oid == OID ? "t" : "t" + oid, 'd',
                 List.of(new Column("id", 23, -1, true), new Column("v", 25, -1, false)));
     }
 
@@ -67,7 +80,7 @@ class TransactionAssemblerTest {
                 relation(),
                 insert("1", "a"),
                 new PgOutputMessage.Update(OptionalLong.empty(), OID,
-                        java.util.Optional.empty(), row("1", "b")),
+                        Optional.empty(), row("1", "b")),
                 new PgOutputMessage.Delete(OptionalLong.empty(), OID, row("1", "b")),
                 new PgOutputMessage.Commit(0x100L, 0x180L, TS));
         assertEquals(1, out.size());
@@ -125,5 +138,53 @@ class TransactionAssemblerTest {
         assertThrows(IllegalStateException.class, () -> run(
                 new PgOutputMessage.Begin(1L, TS, 1L),
                 insert("1", "a")));   // 未发 Relation：registry.require miss
+    }
+
+    @Test
+    void truncateAssemblesRelationSnapshotsPerOid() {
+        List<Transaction> out = run(
+                new PgOutputMessage.Begin(0x1L, TS, 1L),
+                relation(16384),
+                relation(16385),
+                new PgOutputMessage.Truncate(OptionalLong.empty(),
+                        EnumSet.of(TruncateOption.CASCADE), new int[]{16384, 16385}),
+                new PgOutputMessage.Commit(0x1L, 0x2L, TS));
+        assertEquals(1, out.size());
+        assertEquals(TransactionKind.NORMAL, out.get(0).kind());
+        assertEquals(1, out.get(0).changes().size());
+        TruncateChange tc = (TruncateChange) out.get(0).changes().get(0);
+        assertEquals(List.of("t", "t16385"),   // 每个 oid 各自的快照，顺序与消息一致
+                tc.relations().stream().map(PgOutputMessage.Relation::table).toList());
+        assertTrue(tc.options().contains(TruncateOption.CASCADE));
+        assertTrue(tc.streamXid().isEmpty());
+    }
+
+    @Test
+    void truncateFailsOnUnknownOid() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.Begin(1L, TS, 1L),
+                relation(16384),
+                new PgOutputMessage.Truncate(OptionalLong.empty(),
+                        EnumSet.noneOf(TruncateOption.class), new int[]{16384, 404})));
+    }
+
+    @Test
+    void transactionalMsgGoesIntoBucket() {
+        List<Transaction> out = run(
+                new PgOutputMessage.Begin(1L, TS, 1L),
+                new PgOutputMessage.LogicalMsg(OptionalLong.empty(), true, 0x1L, "p", new byte[]{1}),
+                new PgOutputMessage.Commit(1L, 2L, TS));
+        assertEquals(1, out.size());
+        assertEquals(1, out.get(0).changes().size());
+        MsgChange mc = (MsgChange) out.get(0).changes().get(0);
+        assertTrue(mc.transactional());
+        assertEquals("p", mc.prefix());
+    }
+
+    @Test
+    void nonTransactionalMsgWithoutBucketIsDropped() {
+        List<Transaction> out = run(
+                new PgOutputMessage.LogicalMsg(OptionalLong.empty(), false, 0x1L, "p", new byte[]{1}));
+        assertTrue(out.isEmpty());   // 丢弃路径：不抛异常、不产生 Transaction
     }
 }

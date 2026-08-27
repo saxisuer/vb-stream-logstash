@@ -85,19 +85,19 @@ public final class TransactionAssembler {
         } else if (message instanceof PgOutputMessage.Commit m) {
             commit(m);
         } else if (message instanceof PgOutputMessage.Insert m) {
-            activeBucket().changes.add(new RowChange(DmlKind.INSERT, registry.require(m.relationOid()),
+            activeBucket(m).changes.add(new RowChange(DmlKind.INSERT, registry.require(m.relationOid()),
                     Optional.empty(), Optional.of(m.newTuple()), m.streamXid()));
         } else if (message instanceof PgOutputMessage.Update m) {
-            activeBucket().changes.add(new RowChange(DmlKind.UPDATE, registry.require(m.relationOid()),
+            activeBucket(m).changes.add(new RowChange(DmlKind.UPDATE, registry.require(m.relationOid()),
                     m.oldTuple(), Optional.of(m.newTuple()), m.streamXid()));
         } else if (message instanceof PgOutputMessage.Delete m) {
-            activeBucket().changes.add(new RowChange(DmlKind.DELETE, registry.require(m.relationOid()),
+            activeBucket(m).changes.add(new RowChange(DmlKind.DELETE, registry.require(m.relationOid()),
                     Optional.of(m.oldTuple()), Optional.empty(), m.streamXid()));
         } else if (message instanceof PgOutputMessage.Truncate m) {
             List<PgOutputMessage.Relation> snapshots = Arrays.stream(m.relationOids())
                     .mapToObj(registry::require)
                     .toList();
-            activeBucket().changes.add(new TruncateChange(snapshots, m.options(), m.streamXid()));
+            activeBucket(m).changes.add(new TruncateChange(snapshots, m.options(), m.streamXid()));
         } else if (message instanceof PgOutputMessage.LogicalMsg m) {
             logicalMsg(m);
         } else if (message instanceof PgOutputMessage.StreamStart m) {
@@ -131,9 +131,12 @@ public final class TransactionAssembler {
      * 取当前应接收变更的活动桶。
      *
      * <p>查找顺序（spec §4.3）：流块上下文（最高优先）→ 活动两阶段桶 → 活动普通桶；
-     * 三者皆空说明变更消息游离在任何事务外，协议流异常。
+     * 三者皆空说明变更消息游离在任何事务外，协议流异常，fail-fast 异常携带触发消息的
+     * 类型与 relationOid/prefix 上下文（{@link #describeTrigger}）以便定位。
+     *
+     * @param trigger 触发本次查找的变更消息（Insert/Update/Delete/Truncate/LogicalMsg）
      */
-    private TxBuffer activeBucket() {
+    private TxBuffer activeBucket(PgOutputMessage trigger) {
         if (currentStream != null) {
             return currentStream;
         }
@@ -143,7 +146,32 @@ public final class TransactionAssembler {
         if (currentNormalTx != null) {
             return currentNormalTx;
         }
-        throw new IllegalStateException("变更消息到达但无任何活动事务桶");
+        throw new IllegalStateException("变更消息到达但无任何活动事务桶: " + describeTrigger(trigger));
+    }
+
+    /** 是否存在任一活动桶（流块/两阶段/普通三指针）——桶集合不变性的唯一判定入口，logicalMsg 丢弃路径等使用。 */
+    private boolean hasActiveBucket() {
+        return currentStream != null || currentPrepareTx != null || currentNormalTx != null;
+    }
+
+    /** 描述触发 fail-fast 的消息：类型 + relationOid(s)（LogicalMsg 用 prefix），供异常消息定位协议流断点。 */
+    private static String describeTrigger(PgOutputMessage trigger) {
+        if (trigger instanceof PgOutputMessage.Insert m) {
+            return "Insert relationOid=" + m.relationOid();
+        }
+        if (trigger instanceof PgOutputMessage.Update m) {
+            return "Update relationOid=" + m.relationOid();
+        }
+        if (trigger instanceof PgOutputMessage.Delete m) {
+            return "Delete relationOid=" + m.relationOid();
+        }
+        if (trigger instanceof PgOutputMessage.Truncate m) {
+            return "Truncate relationOids=" + Arrays.toString(m.relationOids());
+        }
+        if (trigger instanceof PgOutputMessage.LogicalMsg m) {
+            return "LogicalMsg prefix=" + m.prefix();
+        }
+        return trigger.getClass().getSimpleName();
     }
 
     /** Begin：开新普通事务桶；已有未闭合普通事务即 fail-fast（协议上 Begin..Commit 不嵌套）。 */
@@ -154,10 +182,11 @@ public final class TransactionAssembler {
         currentNormalTx = new TxBuffer(m.xid());
     }
 
-    /** Commit（无 xid 字段）：封箱当前普通事务桶为 NORMAL Transaction 回调并清空指针；无桶即 fail-fast。 */
+    /** Commit（无 xid 字段）：封箱当前普通事务桶为 NORMAL Transaction 回调并清空指针；无桶即 fail-fast（异常带 commitLsn 定位）。 */
     private void commit(PgOutputMessage.Commit m) {
         if (currentNormalTx == null) {
-            throw new IllegalStateException("Commit 到达但无活动普通事务");
+            throw new IllegalStateException("Commit 到达但无活动普通事务: commitLsn=0x"
+                    + Long.toHexString(m.commitLsn()));
         }
         TxBuffer bucket = currentNormalTx;
         currentNormalTx = null;
@@ -172,11 +201,11 @@ public final class TransactionAssembler {
      */
     private void logicalMsg(PgOutputMessage.LogicalMsg m) {
         if (m.transactional()) {
-            activeBucket().changes.add(new MsgChange(true, m.prefix(), m.content(), m.streamXid()));
+            activeBucket(m).changes.add(new MsgChange(true, m.prefix(), m.content(), m.streamXid()));
             return;
         }
-        if (currentStream != null || currentPrepareTx != null || currentNormalTx != null) {
-            activeBucket().changes.add(new MsgChange(false, m.prefix(), m.content(), m.streamXid()));
+        if (hasActiveBucket()) {
+            activeBucket(m).changes.add(new MsgChange(false, m.prefix(), m.content(), m.streamXid()));
             return;
         }
         LOG.warn("非事务性消息游离于任何事务之外，丢弃: prefix={} lsn=0x{}",
