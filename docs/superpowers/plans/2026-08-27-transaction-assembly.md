@@ -580,7 +580,7 @@ public final class TransactionAssembler {
             List<PgOutputMessage.Relation> snapshots = Arrays.stream(m.relationOids())
                     .mapToObj(registry::require)
                     .toList();
-            activeBucket().changes.add(new TruncateChange(m.options(), snapshots, m.streamXid()));
+            activeBucket().changes.add(new TruncateChange(snapshots, m.options(), m.streamXid()));
         } else if (message instanceof PgOutputMessage.LogicalMsg m) {
             logicalMsg(m);
         } else if (message instanceof PgOutputMessage.StreamStart m) {
