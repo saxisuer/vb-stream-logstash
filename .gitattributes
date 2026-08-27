@@ -4,3 +4,5 @@
 # 规则：所有 shell 脚本与 initdb.d 下全部文件强制 LF，与 checkout 平台无关。
 *.sh text eol=lf
 src/docker/initdb.d/* text eol=lf
+# SQL 喂给容器内 psql：字面量若被 checkout 成 CRLF，\r 会混进字符串数据（如 E'...\n' 多行文本），故同样强制 LF
+*.sql text eol=lf
