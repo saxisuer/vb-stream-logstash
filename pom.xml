@@ -66,6 +66,11 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>${maven-surefire-plugin.version}</version>
+                <configuration>
+                    <!-- Chronicle Queue 在 Java 17+ 需开放内部包（mmap 经反射调 sun.nio.ch.FileChannelImpl.map0），
+                         官方支持说明见 https://chronicle.software/chronicle-support-java-17 -->
+                    <argLine>--add-opens java.base/jdk.internal.ref=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens jdk.unsupported/jdk.internal.misc=ALL-UNNAMED --add-opens java.base/sun.nio.fs=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED</argLine>
+                </configuration>
             </plugin>
         </plugins>
     </build>
