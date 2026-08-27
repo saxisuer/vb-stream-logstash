@@ -41,6 +41,8 @@ class TransactionAssemblyTest {
      * 且不可压缩（pg_column_size 实测存满 16384 字节）。必须不可压缩——reorder buffer 的
      * rb->size 按 TOAST 后实际数据量记账，规则图案（如 repeat(md5,512)）被 pglz 压到约 232 字节，
      * 少量行永不越过 64kB work_mem 触发流式驱逐（本项目实测踩坑）。全核心函数、无扩展依赖。
+     * 规模对账：可压缩载荷并非不可用，只是需数百行规模才能靠总量越过阈值
+     * （StreamedTransactionTest 的 500 行×8KB repeat 方案即此路线，与本类"少量行×不可压缩"互补）。
      */
     private static final String RAND_PAYLOAD =
             "(SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 512))";
@@ -117,7 +119,7 @@ class TransactionAssemblyTest {
             harness.awaitTermination(Duration.ofSeconds(30));
 
             List<Transaction> txns = assembleRecording(harness.messages());
-            assertEquals(1, txns.size(), "应恰一个事务: " + txns);
+            assertEquals(1, txns.size(), () -> "应恰一个事务: " + summarize(txns));
             Transaction t = txns.get(0);
             assertEquals(TransactionKind.NORMAL, t.kind());
             assertNull(t.gid());
@@ -140,16 +142,19 @@ class TransactionAssemblyTest {
      * 场景 2（spec §6.2）：流式大事务 + 子事务回滚——单事务逐行 16KB 写入越过 64kB work_mem
      * 触发流式驱逐；SAVEPOINT 后写入的子事务变更同样被流式下发，ROLLBACK TO 由 StreamAbort 剔除。
      * 关键步骤：建表/publication/TRUNCATE 先于 harness.start（槽收不到创建位点之前的 DDL）→
-     * 逐行 INSERT 30 行，行间 sleep 让写入跨秒展开（COMMIT 前服务端不 flush WAL，walsender 只能读
-     * 已 flush 的 WAL——跨秒让前段 WAL 被 wal writer 周期性 flush，驱逐发生在事务仍进行中）；
-     * 载荷用 RAND_PAYLOAD（约 16KB 不可压缩随机十六进制）——rb->size 按 TOAST 后实际数据量记账，
+     * 逐行 INSERT 30 行；载荷用 RAND_PAYLOAD（约 16KB 不可压缩随机十六进制）——rb->size 按 TOAST 后实际数据量记账，
      * 实测可压缩的 repeat 载荷被 pglz 压到百字节级、41 行总记账远不到 64kB，永不触发流式
-     * （首版用 repeat(md5,512) 即栽在此，整事务走 Begin..Commit 的 NORMAL 路径）；
+     * （首版用 repeat(md5,512) 即栽在此，整事务走 Begin..Commit 的 NORMAL 路径）。
+     * 驱逐时机：reorder buffer 在变更入队时按逐变更内存记账检查触发，与 WAL 何时 flush 无关
+     * （StreamedTransactionTest 无 sleep 的紧循环同样触发）；行间 sleep 是第二道保险——让驱逐
+     * 发生在事务仍进行中，更贴近 stream 模式的真实路径，非触发流式的必要条件。
      * 随机载荷下约第 5 行起 rb->size 越过 64kB 触发驱逐 → SAVEPOINT 内再写 10 行后 ROLLBACK TO
      * （子事务变更随顶层事务流式下发——PG 只对已流式子事务发 StreamAbort，未流式子事务回滚是
-     * 静默丢弃）→ 尾行 → commit。断言：恰一个 STREAMED 事务、存活 31 条变更（30 行 + 尾行）、
-     * 被回滚子事务的 id（201..210）一条不混入。若流式未触发（kind 落成 NORMAL）或剔除失效
-     * （计数 41），对应断言即失败并给出摘要化上下文。
+     * 静默丢弃）→ 尾行 → commit。断言（按依赖顺序）：先确认录制流中 StreamAbort 存在——
+     * 若子事务未被流式，回滚被 PG 静默丢弃、可观察结果与本场景预期相同（31 条、无 201..210），
+     * 缺此前置断言场景会在流式未触发时空转通过；再断言恰一个 STREAMED 事务、存活 31 条变更
+     * （30 行 + 尾行）、被回滚子事务的 id（201..210）一条不混入。若流式未触发（kind 落成 NORMAL）
+     * 或剔除失效（计数 41），对应断言即失败并给出摘要化上下文。
      */
     @Test
     void streamedTransactionWithSubtransactionRollbackAssemblesCleanly() throws Exception {
@@ -165,7 +170,8 @@ class TransactionAssemblyTest {
                 c.setAutoCommit(false);
                 for (int i = 1; i <= 30; i++) {
                     st.execute("INSERT INTO t_assembly_stream VALUES (" + i + ", " + RAND_PAYLOAD + ")");
-                    Thread.sleep(75); // 跨秒展开：让前段 WAL 被 wal writer flush，驱逐在事务进行中发生
+                    // 第二道保险：驱逐发生在事务仍进行中（驱逐由入队内存记账触发、与 WAL flush 无关，非必要条件）
+                    Thread.sleep(75);
                 }
                 // 子事务：写入后回滚（这些变更会被流式下发，再由 StreamAbort 剔除）
                 st.execute("SAVEPOINT sp1");
@@ -178,6 +184,11 @@ class TransactionAssemblyTest {
                 c.commit();
             }
             harness.awaitTermination(Duration.ofSeconds(60));
+
+            // 前置存在断言（I1）：确认回滚的子事务真的走了流式路径——PG 只对已流式子事务发 StreamAbort，
+            // 未流式的回滚被静默丢弃且可观察结果相同，缺此断言场景会在流式未触发时空转通过
+            assertTrue(harness.messages().stream().anyMatch(m -> m instanceof PgOutputMessage.StreamAbort),
+                    () -> "子事务回滚应产生 StreamAbort（未流式的子事务被 PG 静默丢弃，场景将空转）");
 
             List<Transaction> txns = assembleRecording(harness.messages());
             assertEquals(1, txns.size(), () -> "应恰一个流式事务: " + summarize(txns));
@@ -196,11 +207,53 @@ class TransactionAssemblyTest {
     }
 
     /**
+     * 场景 3（spec §6.2）：2PC 双路——COMMIT PREPARED 的 gid 经 CommitPrepared 输出为 TWO_PHASE 事务，
+     * ROLLBACK PREPARED 的 gid 由 RollbackPrepared 静默丢弃（组装器不回调）。
+     * 关键步骤：建表/publication/TRUNCATE 先于 harness.start（槽收不到创建位点之前的 DDL）→
+     * 单连接顺序两个 PREPARE TRANSACTION——每次 PREPARE 后服务端事务块即结束、prepared 事务脱离会话，
+     * 连接可直接开新事务，close 时无未决事务 → 新连接先 COMMIT PREPARED 提交侧、再 ROLLBACK PREPARED
+     * 回滚侧；按 WAL 顺序 RollbackPrepared 是序列中最后到达的终结消息，停止条件取它保证全量录制不漏。
+     * 断言：恰一个 TWO_PHASE 事务、gid 为提交侧 gid_commit、1 条 INSERT 变更——回滚侧 gid 一条不输出。
+     * 超时或会话异常由 awaitTermination 抛 AssertionError。
+     */
+    @Test
+    void twoPhaseCommitAndRollbackBothHandled() throws Exception {
+        PgTestEnv.execSql(
+                "CREATE TABLE IF NOT EXISTS t_assembly_2pc(id int PRIMARY KEY, v text)",
+                "DROP PUBLICATION IF EXISTS pub_assembly_2pc",
+                "CREATE PUBLICATION pub_assembly_2pc FOR TABLE t_assembly_2pc",
+                "TRUNCATE t_assembly_2pc");
+        try (SessionHarness harness = SessionHarness.start(
+                PgTestEnv.newConfig(SLOT, "pub_assembly_2pc"),
+                msg -> msg instanceof PgOutputMessage.RollbackPrepared)) {
+            try (Connection c = PgTestEnv.newSqlConnection(); Statement st = c.createStatement()) {
+                c.setAutoCommit(false);
+                st.execute("INSERT INTO t_assembly_2pc VALUES (1,'x')");
+                st.execute("PREPARE TRANSACTION 'gid_commit'");
+                st.execute("INSERT INTO t_assembly_2pc VALUES (2,'y')");
+                st.execute("PREPARE TRANSACTION 'gid_rollback'");
+            }
+            PgTestEnv.execSql("COMMIT PREPARED 'gid_commit'");
+            PgTestEnv.execSql("ROLLBACK PREPARED 'gid_rollback'");
+            harness.awaitTermination(Duration.ofSeconds(30));
+
+            List<Transaction> txns = assembleRecording(harness.messages());
+            assertEquals(1, txns.size(), () -> "仅 COMMIT PREPARED 的 gid 输出: " + summarize(txns));
+            Transaction t = txns.get(0);
+            assertEquals(TransactionKind.TWO_PHASE, t.kind());
+            assertEquals("gid_commit", t.gid());
+            assertEquals(1, t.changes().size());
+            assertEquals(DmlKind.INSERT, ((RowChange) t.changes().get(0)).dml());
+        }
+    }
+
+    /**
      * 场景 4（spec §6.2/§4.2）：双连接并发大事务多桶交错——两条连接各自 BEGIN 后交替逐行写入，
      * 两事务在 WAL 中交错且各自独立越过 64kB work_mem，全局 rb->size 超限时 LargestStreamableTopTXN
      * 轮番驱逐两事务，流段交错下发（组装器多桶设计的真实路径验证）。
-     * 关键步骤：A 写 id 1..10、B 写 id 100001..100010 逐行交替 INSERT，轮间 sleep 跨秒展开
-     * （同场景 2：让前段 WAL 被 wal writer flush，驱逐在两事务仍进行中发生）；载荷同场景 2 用
+     * 关键步骤：A 写 id 1..10、B 写 id 100001..100010 逐行交替 INSERT，轮间 sleep 同场景 2 的定位
+     * （第二道保险：驱逐发生在两事务仍进行中、更贴近 stream 模式真实路径；驱逐由入队内存记账
+     * 触发、与 WAL flush 无关，非必要条件）；载荷同场景 2 用
      * RAND_PAYLOAD（16KB 不可压缩）——每行真实记账 16KB，单事务 10 行 160KB 独立超限，两事务必然
      * 都被驱逐流式 → 先 commit A 后 commit B → 等第 2 个 StreamCommit（AtomicInteger 计数避免
      * 首个 StreamCommit 即停、漏录 B）。断言：恰两个 STREAMED 事务、xid 各异、各 10 行完整、
@@ -226,7 +279,8 @@ class TransactionAssemblyTest {
                     for (int i = 1; i <= 10; i++) {
                         sa.execute("INSERT INTO t_assembly_inter VALUES (" + i + ", " + RAND_PAYLOAD + ")");
                         sb.execute("INSERT INTO t_assembly_inter VALUES (" + (100000 + i) + ", " + RAND_PAYLOAD + ")");
-                        Thread.sleep(150); // 跨秒展开：两事务前段 WAL 均被 flush，驱逐在各自仍进行中发生
+                        // 第二道保险：驱逐发生在两事务仍进行中（非必要条件，见方法 javadoc）
+                        Thread.sleep(150);
                     }
                 }
                 a.commit();
