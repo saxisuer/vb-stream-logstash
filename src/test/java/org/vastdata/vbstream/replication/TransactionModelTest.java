@@ -48,6 +48,23 @@ class TransactionModelTest {
     }
 
     @Test
+    void rowChangeNormalizesNullTuples() {
+        // 紧凑构造器 null 宽容归一：组装器传 null 的 before/after 应归一为 Optional.empty()，避免 null 组件
+        RowChange rc = new RowChange(DmlKind.INSERT, relation(1), null, null, OptionalLong.empty());
+        assertEquals(Optional.empty(), rc.before());
+        assertEquals(Optional.empty(), rc.after());
+    }
+
+    @Test
+    void truncateChangeDefensivelyCopiesRelations() {
+        // 验证紧凑构造器的 List.copyOf：外部改动源 List 不得影响 TruncateChange（复现 Transaction 用例的检查模式）
+        var relations = new java.util.ArrayList<PgOutputMessage.Relation>(List.of(relation(1), relation(2)));
+        TruncateChange tc = new TruncateChange(relations, EnumSet.of(TruncateOption.CASCADE), OptionalLong.empty());
+        relations.clear();
+        assertEquals(2, tc.relations().size());
+    }
+
+    @Test
     void msgChangeHasValueEqualsForByteArray() {
         // byte[] 组件必须值相等（record 默认对数组退化为引用相等，同 PgOutputMessage.LogicalMsg 的处理）
         MsgChange a = new MsgChange(true, "p", new byte[]{1, 2}, OptionalLong.empty());

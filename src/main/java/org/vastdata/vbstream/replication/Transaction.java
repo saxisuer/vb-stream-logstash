@@ -18,7 +18,7 @@ public record Transaction(long xid, TransactionKind kind, String gid,
                           long commitLsn, long endLsn, Instant commitTimestamp,
                           List<TxChange> changes) {
 
-    /** 防御性拷贝：changes 收集为不可变 List，回调后调用方持有的源缓冲不再影响本对象。 */
+    /** 防御性拷贝：changes 收集为不可变 List，回调后调用方持有的源缓冲不再影响本对象；changes 为 null 或含 null 元素时抛 NullPointerException（List.copyOf 行为）。 */
     public Transaction {
         changes = List.copyOf(changes);
     }

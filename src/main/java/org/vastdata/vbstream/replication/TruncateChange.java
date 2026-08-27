@@ -17,7 +17,7 @@ import java.util.Set;
 public record TruncateChange(List<PgOutputMessage.Relation> relations, Set<TruncateOption> options,
                              OptionalLong streamXid) implements TxChange {
 
-    /** 防御性拷贝：options/relations 收集为不可变集合，保证值对象语义。 */
+    /** 防御性拷贝：options/relations 收集为不可变集合，保证值对象语义；relations/options 为 null 或含 null 元素时抛 NullPointerException（List.copyOf/Set.copyOf 行为）。 */
     public TruncateChange {
         relations = List.copyOf(relations);
         options = Set.copyOf(options);
