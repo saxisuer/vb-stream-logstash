@@ -20,20 +20,49 @@ import java.util.List;
 import java.util.OptionalLong;
 
 /**
- * 控制台打印 listener（Main 默认事务形态，spec §5）：事务块（TXN-BEGIN/TXN-END 头尾 + 逐变更行）
- * 走 CDC logger INFO；逐消息细节降为 DEBUG（默认关闭），仅供排障时开启。
+ * 控制台打印 listener（Main 默认事务形态，spec §5）：事务块（TXN-BEGIN/TXN-END 头尾 + 逐变更行）与
+ * 事务生命周期控制消息（流式分段边界 + 两阶段信号）走 CDC logger INFO；行级数据与元数据等逐消息细节
+ * 降为 DEBUG（默认关闭），仅供排障时开启。INFO 级保证任何事务形态至少留一行痕迹，不吞噬事务信息。
  */
 public final class ConsoleListener implements PgOutputListener, TransactionListener {
 
     /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
 
-    /** 逐消息渲染出口（DEBUG，默认不发射）；排障时可调 CDC logger 级别观察原始消息流。级别守卫避免 DEBUG 关闭时的无谓渲染开销——render 是实参、急切求值。 */
+    /**
+     * 逐消息渲染出口，按消息类别分流级别（spec §5）：事务生命周期控制消息升 INFO
+     * （低量高信号，且 StreamAbort/RollbackPrepared 不产生组装后事务块，降 DEBUG 会吞掉唯一事务级线索），
+     * 其余（行级数据/元数据）维持 DEBUG 默认不发射。级别守卫避免关闭时的无谓渲染开销——render 是实参、急切求值。
+     */
     @Override
     public void onMessage(PgOutputMessage message, RelationRegistry registry) {
+        if (isTxLifecycle(message)) {
+            if (CDC.isInfoEnabled()) {
+                CDC.info("{}", render(message, registry));
+            }
+            return;
+        }
         if (CDC.isDebugEnabled()) {
             CDC.debug("{}", render(message, registry));
         }
+    }
+
+    /**
+     * 事务生命周期控制消息判定：流式（StreamStart/StreamStop/StreamCommit/StreamAbort/StreamPrepare）
+     * 与两阶段（BeginPrepare/Prepare/CommitPrepared/RollbackPrepared）共 9 种——它们标记事务状态的迁移
+     * 而非数据内容。行级（Insert/Update/Delete/Truncate/LogicalMsg）与元数据（Relation/Type/Origin）
+     * 以及普通路径 Begin/Commit 不在此列：提交路径已由组装后事务块在 INFO 覆盖，保持 DEBUG 防刷屏。
+     */
+    private static boolean isTxLifecycle(PgOutputMessage message) {
+        return message instanceof PgOutputMessage.StreamStart
+                || message instanceof PgOutputMessage.StreamStop
+                || message instanceof PgOutputMessage.StreamCommit
+                || message instanceof PgOutputMessage.StreamAbort
+                || message instanceof PgOutputMessage.StreamPrepare
+                || message instanceof PgOutputMessage.BeginPrepare
+                || message instanceof PgOutputMessage.Prepare
+                || message instanceof PgOutputMessage.CommitPrepared
+                || message instanceof PgOutputMessage.RollbackPrepared;
     }
 
     /**

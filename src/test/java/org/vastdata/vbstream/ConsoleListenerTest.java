@@ -100,4 +100,46 @@ class ConsoleListenerTest {
                                 && e.getFormattedMessage().startsWith("TXN-BEGIN")),
                 "事务块应以 INFO 输出: " + appender.list);
     }
+
+    /**
+     * 级别分工修订（spec §5）：事务生命周期控制消息（流式分段边界 + 两阶段信号，共 9 种）升 INFO——
+     * 其中 StreamAbort/RollbackPrepared 不产生组装后事务块，若维持 DEBUG 会在 INFO 级吞掉唯一的事务级线索；
+     * 行级数据与元数据（Insert/Begin/Relation 等）维持 DEBUG（提交路径已由事务块 INFO 覆盖）。
+     * 断言：9 条生命周期消息各产生且仅产生一条 INFO（内容与逐消息渲染一致），
+     * 随后的 Insert/Begin/Relation 不产生任何 INFO。
+     */
+    @Test
+    void transactionLifecycleMessagesEmitInfoWhileRowDataStaysDebug() {
+        ConsoleListener listener = new ConsoleListener();
+        RelationRegistry registry = new RelationRegistry();
+
+        // 流式生命周期（分段边界与终局信号）
+        listener.onMessage(new PgOutputMessage.StreamStart(505L, true), registry);
+        listener.onMessage(new PgOutputMessage.StreamStop(), registry);
+        listener.onMessage(new PgOutputMessage.StreamCommit(505L, 0x10L, 0x18L, Instant.EPOCH), registry);
+        listener.onMessage(new PgOutputMessage.StreamAbort(505L, 505L, OptionalLong.empty(), OptionalLong.empty()), registry);
+        // 两阶段生命周期
+        listener.onMessage(new PgOutputMessage.BeginPrepare(0x10L, 0x18L, Instant.EPOCH, 506L, "gid-a"), registry);
+        listener.onMessage(new PgOutputMessage.Prepare(0x10L, 0x18L, Instant.EPOCH, 506L, "gid-a"), registry);
+        listener.onMessage(new PgOutputMessage.CommitPrepared(0x20L, 0x28L, Instant.EPOCH, 506L, "gid-a"), registry);
+        listener.onMessage(new PgOutputMessage.RollbackPrepared(0x10L, 0x30L, Instant.EPOCH, Instant.EPOCH, 507L, "gid-b"), registry);
+        listener.onMessage(new PgOutputMessage.StreamPrepare(0x10L, 0x18L, Instant.EPOCH, 508L, "gid-c"), registry);
+
+        List<String> infoLines = appender.list.stream()
+                .filter(e -> e.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
+        assertEquals(9, infoLines.size(), "9 条生命周期消息应各产生一条 INFO: " + infoLines);
+        assertTrue(infoLines.get(0).startsWith("STREAM-START"), "首条应为 STREAM-START: " + infoLines.get(0));
+        assertTrue(infoLines.get(1).startsWith("STREAM-STOP"), "次条应为 STREAM-STOP: " + infoLines.get(1));
+        assertTrue(infoLines.get(3).startsWith("STREAM-ABORT"), "第 4 条应为 STREAM-ABORT: " + infoLines.get(3));
+        assertTrue(infoLines.get(7).startsWith("ROLLBACK-PREPARED"), "第 8 条应为 ROLLBACK-PREPARED: " + infoLines.get(7));
+
+        // 对照组：行级数据与元数据维持 DEBUG，不得产生 INFO
+        listener.onMessage(new PgOutputMessage.Insert(OptionalLong.empty(), 16384, row("1", "aaa")), registry);
+        listener.onMessage(new PgOutputMessage.Begin(1L, Instant.EPOCH, 505L), registry);
+        listener.onMessage(relation(), registry);
+        long infoCount = appender.list.stream().filter(e -> e.getLevel() == Level.INFO).count();
+        assertEquals(9, infoCount, "行级/元数据消息不应追加 INFO: " + appender.list);
+    }
 }

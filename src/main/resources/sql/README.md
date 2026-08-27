@@ -31,6 +31,7 @@ docker exec -i vb-stream-pg psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   阈值 `logical_decoding_work_mem=64kB` 是全局值；随机 md5 拼接（~16KB/行）不可压缩，4~5 行即越过，
   且事务内分批 + 间隔保证 walsender 在提交前完成解码驱逐。规则图案（`repeat('x',N)`）会被 pglz
   压到百字节级，少量行永远触发不了。
-- **逐消息观察**：Stream\* 分段等原始消息走 DEBUG 渲染，默认关闭；临时调
-  `src/main/resources/logback.xml` 中对应 logger 为 `DEBUG` 可见。
+- **流式分段观察**：StreamStart/StreamStop/StreamCommit/StreamAbort 与两阶段信号已升 INFO，
+  默认级别即可见（回滚的流式事务 INFO 级无事务块，但有 STREAM-ABORT 一行）；行级/元数据逐消息
+  仍走 DEBUG，排障时调 `src/main/resources/logback.xml` 中 CDC logger 为 `DEBUG` 可见。
 - **极值注意**：id=4 的 `v_float=-1e+308`，对其做乘法会 double 溢出（语句级回滚，不产生 CDC 事件）。

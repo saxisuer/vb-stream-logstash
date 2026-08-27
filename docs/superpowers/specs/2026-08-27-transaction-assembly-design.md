@@ -1,7 +1,7 @@
 # 事务组装与原子输出设计（里程碑 1.5）
 
 日期：2026-08-27
-状态：已与用户确认（2PC 输出时机经 AskUserQuestion 拍板）；**2026-08-27 修订**：§4.2 经 PG 18 源码定位验证，原"单活动流式事务假设"**被推翻**，流式桶改为按顶层 xid 多桶并存（§4.1/§4.2/§4.4/§6 同步修订，源码摘录见附录 B）
+状态：已与用户确认（2PC 输出时机经 AskUserQuestion 拍板）；**2026-08-27 修订**：§4.2 经 PG 18 源码定位验证，原"单活动流式事务假设"**被推翻**，流式桶改为按顶层 xid 多桶并存（§4.1/§4.2/§4.4/§6 同步修订，源码摘录见附录 B）；同日 §5 二次修订：逐消息级别按类别分流，事务生命周期控制消息（9 种）升 INFO
 
 ## 1. 背景与目标
 
@@ -170,7 +170,10 @@ private static final class TxBuffer {
     [2] UPDATE ...
   TXN-END   xid=505
   ```
-  头尾各一行 CDC logger INFO，变更行复用现有渲染。逐消息的 `onMessage` 输出保留（受日志级别控制：事务块 INFO、逐消息 DEBUG——**Main 默认走事务形态**）。（Main 装配中显式调用 onMessage——置于 isDebugEnabled 守卫内，避免 DEBUG 关闭时实参急切渲染的热路径开销）
+  头尾各一行 CDC logger INFO，变更行复用现有渲染。逐消息的 `onMessage` 输出保留，按消息类别分流（**2026-08-27 修订**：原"逐消息一律 DEBUG"会吞掉无组装块路径的事务线索）：
+  - **事务生命周期控制消息升 INFO**（共 9 种：流式 StreamStart/StreamStop/StreamCommit/StreamAbort/StreamPrepare + 两阶段 BeginPrepare/Prepare/CommitPrepared/RollbackPrepared）——低量高信号；其中 StreamAbort/RollbackPrepared 不产生组装后事务块，升 INFO 保证**任何事务形态在 INFO 级至少留一行痕迹**；
+  - **行级数据与元数据维持 DEBUG**（Insert/Update/Delete/Truncate/LogicalMsg/Relation/Type/Origin/Begin/Commit）——提交路径已由事务块 INFO 覆盖，保持 DEBUG 防大事务刷屏（**Main 默认走事务形态**）。
+  两类均置于各自级别守卫内（isInfoEnabled/isDebugEnabled），避免级别关闭时实参急切渲染的热路径开销。
 
 ## 6. 测试
 

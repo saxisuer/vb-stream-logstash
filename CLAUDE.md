@@ -29,7 +29,7 @@ mvn dependency:tree                  # 查看依赖树
 ## 开发规约
 
 - **日志输出一律走 slf4j**（`private static final Logger LOG = LoggerFactory.getLogger(Xxx.class)`），**禁止 `System.out` / `System.err`**（主代码与测试代码均适用；临时调试打印不得提交）：
-  - 级别语义：CDC 数据输出走专用 logger `org.vastdata.vbstream.cdc`（INFO，与系统日志分离、可独立调级）；生命周期/状态变更用 INFO，可恢复异常用 WARN，失败/退出路径用 ERROR，逐消息细节用 DEBUG（默认关闭）
+  - 级别语义：CDC 数据输出走专用 logger `org.vastdata.vbstream.cdc`（INFO，与系统日志分离、可独立调级）——事务块与**事务生命周期控制消息**（流式 StreamStart/Stop/Commit/Abort/Prepare + 两阶段信号，共 9 种）用 INFO，保证任何事务形态（含回滚/无组装块路径）在 INFO 级至少留一行痕迹；生命周期/状态变更用 INFO，可恢复异常用 WARN，失败/退出路径用 ERROR，行级/元数据逐消息细节用 DEBUG（默认关闭，大事务防刷屏）
   - 消息用 `{}` 占位符拼参（不做 `+` 字符串拼接，避免无效格式化开销）；异常对象作为最后一个参数传入以保留堆栈
 - **每个函数必须有 javadoc 逻辑描述**（含私有方法与测试辅助方法），不得只复述方法名：
   - 说清**职责**（做什么）、**关键步骤**（分支/循环/算法的意图，复杂逻辑分步）、**边界与异常语义**（null/失败/越界时的行为）、**线程约束**（非线程安全需注明单写者假设，参照 `PgOutputDecoder` 的写法）
