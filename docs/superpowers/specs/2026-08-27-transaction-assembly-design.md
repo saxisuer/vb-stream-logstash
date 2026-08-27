@@ -113,7 +113,7 @@ private static final class TxBuffer {
 | `Insert/Update/Delete(oid, ...)` | 活动桶 = `currentStream`（流块内）否则按 §4.3 顺序找普通/2PC 桶；构造 RowChange（relation 取 `registry.require(oid)` 快照，miss 即 fail-fast）入桶 |
 | `Truncate(oids...)` | 同上，每 oid 一次 `registry.require` 快照，构造 TruncateChange 入桶 |
 | `LogicalMsg` | 构造 MsgChange 入当前活动桶 |
-| `Commit(xid, ...)` | 从 `pendingByXid` 取桶（miss → fail-fast），封箱为 `Transaction(NORMAL, gid=null, ...)` 回调，移除桶 |
+| `Commit(...)` | **消息无 xid 字段**——封箱当前普通事务桶 `currentNormalTx`（无桶 → fail-fast）为 `Transaction(NORMAL, gid=null, ...)` 回调并清空指针；普通/2PC 活动桶实现为单指针（协议保证 Begin..Commit / BeginPrepare..Prepare 串行不嵌套），对应地 §4 内部结构 `pendingByXid` 由两指针替代 |
 | `StreamStart(xid, firstSegment)` | xid 恒为**顶层 xid**（源码证据 B.3）；`firstSegment=true`（该顶层事务首段）→ 新建桶入 `streamedByXid`（已存在同 xid → fail-fast）；`false`（后续段）→ `streamedByXid` 必须已有该桶（miss → fail-fast）；两种情况都置 `currentStream=该桶` |
 | `StreamStop` | `currentStream` 必须非 null（否则 fail-fast），置 null——流块边界（消息本身不携带 xid，源码 B.3） |
 | `StreamAbort(top, sub)` | 桶 = `streamedByXid[top]`（miss → fail-fast；到达时 currentStream 必为 null，见 B.4）；`top==sub`（整顶层回滚，B.4）→ **移除整个桶**；否则从桶的 changes 中**移除所有 `streamXid==sub` 的变更**（子事务回滚的已流式数据不得下发） |
