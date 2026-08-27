@@ -107,7 +107,7 @@ public final class TransactionAssembler {
         } else if (message instanceof PgOutputMessage.StreamCommit m) {
             streamCommit(m);
         } else if (message instanceof PgOutputMessage.StreamAbort m) {
-            throw new IllegalStateException("StreamAbort 尚未实现（Task 4）: " + m);
+            streamAbort(m);
         } else if (message instanceof PgOutputMessage.BeginPrepare m) {
             throw new IllegalStateException("两阶段路径尚未实现（Task 5）: " + m);
         } else if (message instanceof PgOutputMessage.Prepare m) {
@@ -242,6 +242,28 @@ public final class TransactionAssembler {
         }
         listener.onTransaction(new Transaction(m.xid(), TransactionKind.STREAMED, null,
                 m.commitLsn(), m.endLsn(), m.commitTimestamp(), bucket.changes));
+    }
+
+    /**
+     * StreamAbort(top, sub)：已流式事务的（子）事务回滚，剔除其已下发的变更（spec B.4）。
+     *
+     * <p>top==sub（整顶层回滚，decode 层"先子后顶"的最后一条）→ 移除整个桶；
+     * 否则从桶中剔除所有 streamXid==sub 的变更（Message 的 streamXid=顶层 xid，不会误删）。
+     * 桶 miss 或流块未闭合均 fail-fast（abort 必在流块外）。
+     */
+    private void streamAbort(PgOutputMessage.StreamAbort m) {
+        if (currentStream != null) {
+            throw new IllegalStateException("StreamAbort 到达但流块未闭合: xid=" + currentStream.xid);
+        }
+        TxBuffer bucket = streamedByXid.get(m.xid());
+        if (bucket == null) {
+            throw new IllegalStateException("StreamAbort 对应流式事务桶不存在: xid=" + m.xid());
+        }
+        if (m.xid() == m.subxid()) {
+            streamedByXid.remove(m.xid());
+        } else {
+            bucket.changes.removeIf(c -> c.streamXid().isPresent() && c.streamXid().getAsLong() == m.subxid());
+        }
     }
 
     /**

@@ -27,8 +27,11 @@ class TransactionAssemblerTest {
 
     private static final Instant TS = Instant.parse("2026-08-27T00:00:00Z");
     private static final int OID = 16384;
+    /** 顶层流式事务 A 的 xid——双事务交错用例。 */
     private static final long TOP_A = 7001L;
+    /** 顶层流式事务 B 的 xid——双事务交错用例。 */
     private static final long TOP_B = 7002L;
+    /** 子事务 xid（TOP_A 的 sub）：验证流块内（子）事务归属与 StreamAbort 剔除。 */
     private static final long SUB = 7003L;
 
     /** 构造默认 oid 的 Relation 消息，供单表场景使用。 */
@@ -49,6 +52,14 @@ class TransactionAssemblerTest {
     /** 构造一行文本元组 (id, v)。 */
     private static TupleData row(String id, String v) {
         return new TupleData(List.of(new TupleValue.Text(id), new TupleValue.Text(v)));
+    }
+
+    /** 提取事务内全部行变更首列（id）的文本值序列，用于桶间不混/桶内保序的逐值断言。 */
+    private static List<String> idsOf(Transaction t) {
+        return t.changes().stream()
+                .map(ch -> ((TupleValue.Text) ((RowChange) ch).after().orElseThrow()
+                        .columns().get(0)).value())
+                .toList();
     }
 
     /** 流式块外的 Insert 消息。 */
@@ -237,8 +248,10 @@ class TransactionAssemblerTest {
         // A 桶两段共 2 条、B 桶两段共 2 条——段间交错不丢不混
         assertEquals(2, out.get(0).changes().size());
         assertEquals(2, out.get(1).changes().size());
-        RowChange first = (RowChange) out.get(0).changes().get(0);
-        assertEquals("1", ((TupleValue.Text) first.after().orElseThrow().columns().get(0)).value());
+        // 桶间不混不丢、桶内保序：逐值断言四个 id（错换任意两段会打破预期序列）
+        assertEquals(List.of("1", "2"), idsOf(out.get(0)));
+        assertEquals(List.of("9", "8"), idsOf(out.get(1)));
+        assertEquals(TransactionKind.STREAMED, out.get(1).kind());
     }
 
     @Test
@@ -263,6 +276,40 @@ class TransactionAssemblerTest {
     }
 
     @Test
+    void streamAbortRemovesSubtransactionChanges() {
+        // 子事务回滚：仅剔除 streamXid==sub 的已流式变更，其余保留
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                streamedInsert(TOP_A, "1", "a"),
+                streamedInsert(SUB, "2", "b"),
+                streamedInsert(SUB, "3", "c"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamAbort(TOP_A, SUB, OptionalLong.empty(), OptionalLong.empty()),
+                new PgOutputMessage.StreamCommit(TOP_A, 1L, 2L, TS));
+        assertEquals(1, out.size());
+        assertEquals(1, out.get(0).changes().size());
+        assertEquals(OptionalLong.of(TOP_A), out.get(0).changes().get(0).streamXid());
+    }
+
+    @Test
+    void streamAbortOfWholeTopTransactionDropsBucket() {
+        // 整顶层回滚（decode 层先逐子后顶，最后一条 top==sub，spec B.4）：桶整体移除，StreamCommit 无从回调
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                streamedInsert(TOP_A, "1", "a"),
+                streamedInsert(SUB, "2", "b"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamAbort(TOP_A, SUB, OptionalLong.empty(), OptionalLong.empty()),
+                new PgOutputMessage.StreamAbort(TOP_A, TOP_A, OptionalLong.empty(), OptionalLong.empty()));
+        assertEquals(0, out.size());
+        // 桶已移除：后续同 xid 的 StreamCommit 应 fail-fast（非静默）
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamCommit(TOP_A, 1L, 2L, TS)));
+    }
+
+    @Test
     void rejectsStreamContinueForUnknownXid() {
         assertThrows(IllegalStateException.class, () -> run(
                 new PgOutputMessage.StreamStart(TOP_A, false)));   // 首段标记 false 但无桶
@@ -280,5 +327,24 @@ class TransactionAssemblerTest {
     void rejectsStreamStopWithoutStreamBlock() {
         assertThrows(IllegalStateException.class, () ->
                 run(new PgOutputMessage.StreamStop()));
+    }
+
+    @Test
+    void rejectsStreamCommitForUnknownXid() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamCommit(404L, 1L, 2L, TS)));
+    }
+
+    @Test
+    void rejectsStreamCommitWithOpenStreamBlock() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                new PgOutputMessage.StreamCommit(TOP_A, 1L, 2L, TS)));   // 流块未闭合
+    }
+
+    @Test
+    void rejectsStreamAbortForUnknownTopXid() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamAbort(404L, 405L, OptionalLong.empty(), OptionalLong.empty())));
     }
 }
