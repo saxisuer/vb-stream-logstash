@@ -7,7 +7,8 @@
 #   docker compose down              # 停止（数据保留在 ./pgdata，不会丢失）
 #
 # 连接信息：jdbc:postgresql://localhost:55432/postgres  用户 postgres / 密码 postgres
-# 复制连接：jdbc:postgresql://localhost:55432/postgres?replication=database
+# 复制连接：jdbc:postgresql://localhost:55432/postgres?replication=database&assumeMinServerVersion=9.4
+#           （pgjdbc 需搭配 assumeMinServerVersion>=9.4 才会把 replication 参数放进启动包，否则 START_REPLICATION 报语法错）
 
 name: vb-stream-logstash
 

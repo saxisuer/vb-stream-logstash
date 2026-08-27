@@ -96,20 +96,36 @@ public final class PgReplicationSession implements AutoCloseable {
                 config.streamingParam(), config.twoPhase());
     }
 
-    /** 消息循环：阻塞读 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。 */
+    /** 轮询间隔：readPending 非阻塞，空转 sleep 控 CPU，消息到达延迟上界即此值。 */
+    private static final long POLL_INTERVAL_MILLIS = 100;
+
+    /**
+     * 消息循环：readPending 非阻塞轮询 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。
+     * 用轮询而非阻塞 read()：实测（pgjdbc 42.7.13 + PG 18）阻塞 read 在空闲期不按 statusInterval 醒来，
+     * status 依赖服务端 keepalive（约 wal_sender_timeout/2，默认 ~30s）才被触发；轮询使 status 周期
+     * 独立于消息到达（反馈间隔 = feedbackIntervalSeconds，运维可从 pg_stat_replication.flush_lsn 及时
+     * 看到客户端进度），且断连感知更快（isClosed 检查每轮执行）。
+     *
+     * 关于 confirmed_flush_lsn 的服务端行为（Diag 实证，勿再当 bug 排查）：standby status 到达后
+     * 服务端先采纳进 pg_stat_replication.flush_lsn；槽的 confirmed_flush_lsn 由 walsender 在
+     * 解码推进时（candidate 机制）落库——空闲期不推进，但确认不丢失：下一次任何 WAL 活动会使其
+     * 一步跳到客户端已确认的最新位点。
+     */
     public void run(PgOutputListener listener) throws SQLException, IOException {
         PgOutputDecoder decoder = new PgOutputDecoder(config.streamingMode());
         RelationRegistry registry = new RelationRegistry();
         long feedbackIntervalNanos = config.feedbackIntervalSeconds() * 1_000_000_000L;
         long lastFeedbackNanos = System.nanoTime();
         while (true) {
-            ByteBuffer payload = stream.read(); // 阻塞直到下一条消息；连接不活跃时可能返回 null
-            if (payload == null) {
+            if (stream.isClosed()) {
                 throw new SQLException("复制流已结束（连接断开）");
             }
-            PgOutputMessage message = decoder.decode(payload);
-            registry.accept(message);
-            listener.onMessage(message, registry);
+            ByteBuffer payload = stream.readPending(); // 非阻塞；无消息返回 null 属正常
+            if (payload != null) {
+                PgOutputMessage message = decoder.decode(payload);
+                registry.accept(message);
+                listener.onMessage(message, registry);
+            }
             LogSequenceNumber last = stream.getLastReceiveLSN();
             stream.setAppliedLSN(last);
             stream.setFlushedLSN(last);
@@ -117,6 +133,12 @@ public final class PgReplicationSession implements AutoCloseable {
                 stream.forceUpdateStatus();
                 LOG.debug("LSN 反馈: applied=flushed={}", last);
                 lastFeedbackNanos = System.nanoTime();
+            }
+            try {
+                Thread.sleep(POLL_INTERVAL_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new SQLException("复制循环被中断", e);
             }
         }
     }
@@ -126,7 +148,7 @@ public final class PgReplicationSession implements AutoCloseable {
         return stream != null ? stream.getLastReceiveLSN() : LogSequenceNumber.INVALID_LSN;
     }
 
-    /** 关闭顺序：流 → 复制连接 → SQL 连接。close 会令阻塞中的 read 抛出异常从而结束 run 循环。 */
+    /** 关闭顺序：流 → 复制连接 → SQL 连接。stream.close 置关闭标志，轮询循环经 isClosed 守卫/readPending 抛错退出。 */
     @Override
     public void close() {
         if (stream != null) {
