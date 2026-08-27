@@ -5,10 +5,8 @@ import org.junit.jupiter.api.Test;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.TupleValue;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -44,12 +42,21 @@ class NormalTransactionTest {
 
             // 显式类型见证 <Class<?>>：裸 Object::getClass 触发 IDEA 捕获误报，改转型 lambda 则 javac 报错，见证写法两边皆过
             List<Class<?>> types = harness.messages().stream().<Class<?>>map(Object::getClass).toList();
-            assertTrue(types.contains(PgOutputMessage.Begin.class), "缺 Begin: " + types);
-            assertTrue(types.contains(PgOutputMessage.Relation.class), "缺 Relation: " + types);
-            assertTrue(types.contains(PgOutputMessage.Insert.class), "缺 Insert: " + types);
-            assertTrue(types.contains(PgOutputMessage.Update.class), "缺 Update: " + types);
-            assertTrue(types.contains(PgOutputMessage.Delete.class), "缺 Delete: " + types);
-            assertTrue(types.contains(PgOutputMessage.Commit.class), "缺 Commit: " + types);
+
+            // 首个事务精确子序列：第一个 Begin 到其后第一个 Commit（含）
+            int firstBegin = types.indexOf(PgOutputMessage.Begin.class);
+            int firstCommit = types.indexOf(PgOutputMessage.Commit.class);
+            assertTrue(firstBegin >= 0 && firstCommit > firstBegin, "消息序列异常: " + types);
+            assertEquals(List.of(PgOutputMessage.Begin.class, PgOutputMessage.Relation.class,
+                            PgOutputMessage.Insert.class, PgOutputMessage.Commit.class),
+                    types.subList(firstBegin, firstCommit + 1), "首个事务消息序列不符");
+
+            // 计数：三条 autocommit 语句 = 三个事务，容器内无其他写者
+            assertEquals(3, Collections.frequency(types, PgOutputMessage.Begin.class), "Begin 计数: " + types);
+            assertEquals(3, Collections.frequency(types, PgOutputMessage.Commit.class), "Commit 计数: " + types);
+            assertEquals(1, Collections.frequency(types, PgOutputMessage.Insert.class), "Insert 计数: " + types);
+            assertEquals(1, Collections.frequency(types, PgOutputMessage.Update.class), "Update 计数: " + types);
+            assertEquals(1, Collections.frequency(types, PgOutputMessage.Delete.class), "Delete 计数: " + types);
 
             PgOutputMessage.Insert insert = (PgOutputMessage.Insert) harness.messages().stream()
                     .filter(m -> m instanceof PgOutputMessage.Insert)
@@ -69,17 +76,23 @@ class NormalTransactionTest {
         try (SessionHarness harness = SessionHarness.start(
                 PgTestEnv.newConfig("slot_lsn", "pub_lsn"),
                 msg -> msg instanceof PgOutputMessage.Commit)) {
+            // 槽刚创建，confirmed_flush_lsn = 创建位点，即反馈必须超越的基线
+            String before = PgTestEnv.queryConfirmedFlushLsn("slot_lsn");
+            assertTrue(before != null && !"0/0".equals(before), "基线应为创建位点，实际: " + before);
+
             PgTestEnv.execSql("INSERT INTO t_lsn VALUES (1, 'x')");
             harness.awaitTermination(Duration.ofSeconds(30));
-            Thread.sleep(2_500); // 等 feedbackInterval=2s 的 forceUpdateStatus
-        }
-        try (Connection c = PgTestEnv.newSqlConnection();
-             PreparedStatement ps = c.prepareStatement(
-                     "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'slot_lsn'")) {
-            ResultSet rs = ps.executeQuery();
-            assertTrue(rs.next(), "槽应存在");
-            assertTrue(rs.getString(1) != null && !"0/0".equals(rs.getString(1)),
-                    "confirmed_flush_lsn 应已推进，实际: " + rs.getString(1));
+
+            // 会话保持打开下轮询：run() 设置 flushed LSN 后由 pgjdbc 周期状态包上报，服务端推进
+            // confirmed_flush_lsn；若反馈代码缺失则 flushed 恒 0/0，永不超过基线（非恒真断言）
+            String after = before;
+            long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            while (!PgTestEnv.confirmedFlushBeyond("slot_lsn", before)) {
+                assertTrue(System.nanoTime() < deadline,
+                        "confirmed_flush_lsn 10s 内未越过基线，before=" + before + ", after=" + after);
+                Thread.sleep(250);
+                after = PgTestEnv.queryConfirmedFlushLsn("slot_lsn");
+            }
         }
     }
 }

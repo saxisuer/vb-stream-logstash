@@ -2,13 +2,16 @@ package org.vastdata.vbstream.it;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.testcontainers.postgresql.PostgreSQLContainer;
+// 2.0.5 的规范类 org.testcontainers.postgresql.PostgreSQLContainer 是非泛型（无 <?> 形态），
+// 此处用保留泛型签名的兼容类，保持与 1.x 一致的 PostgreSQLContainer<?> 用法便于后续用例照抄
+import org.testcontainers.containers.PostgreSQLContainer;
 import org.vastdata.vbstream.protocol.StreamingMode;
 import org.vastdata.vbstream.replication.ReplicationConfig;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 
@@ -17,7 +20,7 @@ public final class PgTestEnv {
 
     private static final Logger LOG = LoggerFactory.getLogger(PgTestEnv.class);
 
-    public static final PostgreSQLContainer PG = new PostgreSQLContainer("postgres:18")
+    public static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:18")
             .withDatabaseName("testdb")
             .withUsername("test")
             .withPassword("test")
@@ -58,14 +61,45 @@ public final class PgTestEnv {
         }
     }
 
+    /** 槽的 confirmed_flush_lsn；槽不存在返回 null。 */
+    public static String queryConfirmedFlushLsn(String slotName) throws SQLException {
+        try (Connection c = newSqlConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = ?")) {
+            ps.setString(1, slotName);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    /** confirmed_flush_lsn 是否已越过基线（SQL 侧 pg_lsn 比较）；槽不存在返回 false。 */
+    public static boolean confirmedFlushBeyond(String slotName, String baselineLsn) throws SQLException {
+        try (Connection c = newSqlConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT confirmed_flush_lsn > ?::pg_lsn FROM pg_replication_slots WHERE slot_name = ?")) {
+            ps.setString(1, baselineLsn);
+            ps.setString(2, slotName);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
     /** 先杀 walsender 再删槽；槽不存在等情况静默忽略。 */
     public static void dropSlotQuietly(String slotName) {
         try (Connection c = newSqlConnection()) {
+            boolean killed = false;
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots "
                             + "WHERE slot_name = ? AND active_pid IS NOT NULL")) {
                 ps.setString(1, slotName);
-                ps.executeQuery();
+                try (ResultSet rs = ps.executeQuery()) {
+                    killed = rs.next(); // 有行即存在活跃 walsender，已被要求终止
+                }
+            }
+            if (killed) {
+                Thread.sleep(200); // walsender 退出竞态：立即 drop 会报 replication slot is active
             }
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = ?")) {
