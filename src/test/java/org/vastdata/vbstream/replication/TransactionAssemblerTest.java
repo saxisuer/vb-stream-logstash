@@ -27,6 +27,9 @@ class TransactionAssemblerTest {
 
     private static final Instant TS = Instant.parse("2026-08-27T00:00:00Z");
     private static final int OID = 16384;
+    private static final long TOP_A = 7001L;
+    private static final long TOP_B = 7002L;
+    private static final long SUB = 7003L;
 
     /** 构造默认 oid 的 Relation 消息，供单表场景使用。 */
     private static PgOutputMessage.Relation relation() {
@@ -186,5 +189,96 @@ class TransactionAssemblerTest {
         List<Transaction> out = run(
                 new PgOutputMessage.LogicalMsg(OptionalLong.empty(), false, 0x1L, "p", new byte[]{1}));
         assertTrue(out.isEmpty());   // 丢弃路径：不抛异常、不产生 Transaction
+    }
+
+    @Test
+    void assemblesSingleStreamedTransaction() {
+        List<Transaction> out = run(
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                relation(),
+                streamedInsert(TOP_A, "1", "a"),
+                streamedInsert(SUB, "2", "b"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamCommit(TOP_A, 0x500L, 0x580L, TS));
+        assertEquals(1, out.size());
+        Transaction t = out.get(0);
+        assertEquals(TOP_A, t.xid());
+        assertEquals(TransactionKind.STREAMED, t.kind());
+        assertNull(t.gid());
+        assertEquals(2, t.changes().size());
+        // streamXid 逐变更保留（子事务归属可追溯）
+        assertEquals(OptionalLong.of(TOP_A), t.changes().get(0).streamXid());
+        assertEquals(OptionalLong.of(SUB), t.changes().get(1).streamXid());
+    }
+
+    @Test
+    void interleavedStreamingTransactionsEmitIndependently() {
+        // spec §4.2 场景：两个并发大事务流段交错，多桶各自独立（B.1 全局内存阈值 + B.2 轮番驱逐）
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                streamedInsert(TOP_A, "1", "a"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamStart(TOP_B, true),
+                streamedInsert(TOP_B, "9", "i"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamStart(TOP_A, false),
+                streamedInsert(TOP_A, "2", "b"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamStart(TOP_B, false),
+                streamedInsert(TOP_B, "8", "h"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamCommit(TOP_A, 0x1L, 0x2L, TS),
+                new PgOutputMessage.StreamCommit(TOP_B, 0x3L, 0x4L, TS));
+        assertEquals(2, out.size());
+        assertEquals(TOP_A, out.get(0).xid());
+        assertEquals(TransactionKind.STREAMED, out.get(0).kind());
+        assertEquals(TOP_B, out.get(1).xid());
+        // A 桶两段共 2 条、B 桶两段共 2 条——段间交错不丢不混
+        assertEquals(2, out.get(0).changes().size());
+        assertEquals(2, out.get(1).changes().size());
+        RowChange first = (RowChange) out.get(0).changes().get(0);
+        assertEquals("1", ((TupleValue.Text) first.after().orElseThrow().columns().get(0)).value());
+    }
+
+    @Test
+    void smallNormalTransactionBetweenStreamSegmentsRoutesCorrectly() {
+        // 流段间隙插入的普通小事务先行输出，流事务随后（currentStream 在 stream_stop 后让位）
+        List<Transaction> out = run(
+                relation(),
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                streamedInsert(TOP_A, "1", "a"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.Begin(99L, TS, 99L),
+                insert("5", "x"),
+                new PgOutputMessage.Commit(1L, 2L, TS),
+                new PgOutputMessage.StreamStart(TOP_A, false),
+                streamedInsert(TOP_A, "2", "b"),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamCommit(TOP_A, 3L, 4L, TS));
+        assertEquals(List.of(99L, TOP_A), out.stream().map(Transaction::xid).toList());
+        assertEquals(TransactionKind.NORMAL, out.get(0).kind());
+        assertEquals(TransactionKind.STREAMED, out.get(1).kind());
+        assertEquals(2, out.get(1).changes().size());
+    }
+
+    @Test
+    void rejectsStreamContinueForUnknownXid() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamStart(TOP_A, false)));   // 首段标记 false 但无桶
+    }
+
+    @Test
+    void rejectsDuplicateFirstSegment() {
+        assertThrows(IllegalStateException.class, () -> run(
+                new PgOutputMessage.StreamStart(TOP_A, true),
+                new PgOutputMessage.StreamStop(),
+                new PgOutputMessage.StreamStart(TOP_A, true)));   // 同顶层事务再次 first=true
+    }
+
+    @Test
+    void rejectsStreamStopWithoutStreamBlock() {
+        assertThrows(IllegalStateException.class, () ->
+                run(new PgOutputMessage.StreamStop()));
     }
 }

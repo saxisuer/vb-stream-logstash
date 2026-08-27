@@ -42,9 +42,9 @@ public final class TransactionAssembler {
     private TxBuffer currentNormalTx;
     /** 活动两阶段事务桶（BeginPrepare 置位，Prepare 转挂起池）。Task 5 使用。 */
     private TxBuffer currentPrepareTx;
-    /** 当前流块上下文：stream_start..stream_stop 之间非 null，指向 streamedByXid 中某桶。Task 3 使用。 */
+    /** 当前流块上下文：stream_start..stream_stop 之间非 null，指向 streamedByXid 中某桶。 */
     private TxBuffer currentStream;
-    /** 流式事务桶，key=顶层 xid（多桶并存，段间交错——spec §4.2）。Task 3 使用。 */
+    /** 流式事务桶，key=顶层 xid（多桶并存，段间交错——spec §4.2）。 */
     private final Map<Long, TxBuffer> streamedByXid = new HashMap<>();
     /** 两阶段挂起池，key=gid（PREPARE 至 COMMIT/ROLLBACK PREPARED 之间，可能长期挂起）。Task 5 使用。 */
     private final Map<String, TxBuffer> preparedByGid = new HashMap<>();
@@ -101,11 +101,11 @@ public final class TransactionAssembler {
         } else if (message instanceof PgOutputMessage.LogicalMsg m) {
             logicalMsg(m);
         } else if (message instanceof PgOutputMessage.StreamStart m) {
-            throw new IllegalStateException("流式路径尚未实现（Task 3）: " + m);
+            streamStart(m);
         } else if (message instanceof PgOutputMessage.StreamStop m) {
-            throw new IllegalStateException("流式路径尚未实现（Task 3）: " + m);
+            streamStop();
         } else if (message instanceof PgOutputMessage.StreamCommit m) {
-            throw new IllegalStateException("流式路径尚未实现（Task 3）: " + m);
+            streamCommit(m);
         } else if (message instanceof PgOutputMessage.StreamAbort m) {
             throw new IllegalStateException("StreamAbort 尚未实现（Task 4）: " + m);
         } else if (message instanceof PgOutputMessage.BeginPrepare m) {
@@ -191,6 +191,56 @@ public final class TransactionAssembler {
         TxBuffer bucket = currentNormalTx;
         currentNormalTx = null;
         listener.onTransaction(new Transaction(bucket.xid, TransactionKind.NORMAL, null,
+                m.commitLsn(), m.endLsn(), m.commitTimestamp(), bucket.changes));
+    }
+
+    /**
+     * StreamStart(xid, firstSegment)：xid 恒为顶层 xid（spec B.3——ReorderBufferStreamTXN 断言 toptxn，
+     * firstSegment=!rbtxn_is_streamed(txn)）。
+     *
+     * <p>firstSegment=true（该顶层事务首段）→ 新建桶入 streamedByXid（已存在同 xid → fail-fast）；
+     * false（后续段）→ 桶必须已存在（miss → fail-fast）。两种情况都切换 currentStream 到该桶。
+     */
+    private void streamStart(PgOutputMessage.StreamStart m) {
+        TxBuffer bucket;
+        if (m.firstSegment()) {
+            bucket = new TxBuffer(m.xid());
+            if (streamedByXid.putIfAbsent(m.xid(), bucket) != null) {
+                throw new IllegalStateException("流式事务桶已存在: xid=" + m.xid());
+            }
+        } else {
+            bucket = streamedByXid.get(m.xid());
+            if (bucket == null) {
+                throw new IllegalStateException("StreamStart(first=false) 但顶层事务无桶: xid=" + m.xid());
+            }
+        }
+        currentStream = bucket;
+    }
+
+    /**
+     * StreamStop：流块边界（消息不携带 xid——spec B.3）。currentStream 必须非 null（否则 fail-fast），
+     * 置 null。流桶保留在 streamedByXid 中等待后续段或 StreamCommit/StreamAbort/StreamPrepare。
+     */
+    private void streamStop() {
+        if (currentStream == null) {
+            throw new IllegalStateException("StreamStop 到达但无进行中的流块");
+        }
+        currentStream = null;
+    }
+
+    /**
+     * StreamCommit(xid)：顶层事务全部流段已收齐，封箱 STREAMED Transaction 回调并移除桶；
+     * 桶 miss 或仍有未闭合流块均 fail-fast（协议保证 stream_commit 必在流块外，spec B.3）。
+     */
+    private void streamCommit(PgOutputMessage.StreamCommit m) {
+        if (currentStream != null) {
+            throw new IllegalStateException("StreamCommit 到达但流块未闭合: xid=" + currentStream.xid);
+        }
+        TxBuffer bucket = streamedByXid.remove(m.xid());
+        if (bucket == null) {
+            throw new IllegalStateException("StreamCommit 对应流式事务桶不存在: xid=" + m.xid());
+        }
+        listener.onTransaction(new Transaction(m.xid(), TransactionKind.STREAMED, null,
                 m.commitLsn(), m.endLsn(), m.commitTimestamp(), bucket.changes));
     }
 
