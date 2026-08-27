@@ -100,9 +100,16 @@ public final class PgReplicationSession implements AutoCloseable {
     private static final long POLL_INTERVAL_MILLIS = 100;
 
     /**
-     * 消息循环：readPending 轮询 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。
-     * 用非阻塞 readPending 而非阻塞 read：实测（pgjdbc 42.7.13 + PG 18）空闲时阻塞 read 不会按
-     * statusInterval 醒来发送状态包，confirmed_flush_lsn 将永远停在创建位点；轮询使反馈独立于消息到达。
+     * 消息循环：readPending 非阻塞轮询 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。
+     * 用轮询而非阻塞 read()：实测（pgjdbc 42.7.13 + PG 18）阻塞 read 在空闲期不按 statusInterval 醒来，
+     * status 依赖服务端 keepalive（约 wal_sender_timeout/2，默认 ~30s）才被触发；轮询使 status 周期
+     * 独立于消息到达（反馈间隔 = feedbackIntervalSeconds，运维可从 pg_stat_replication.flush_lsn 及时
+     * 看到客户端进度），且断连感知更快（isClosed 检查每轮执行）。
+     *
+     * 关于 confirmed_flush_lsn 的服务端行为（Diag 实证，勿再当 bug 排查）：standby status 到达后
+     * 服务端先采纳进 pg_stat_replication.flush_lsn；槽的 confirmed_flush_lsn 由 walsender 在
+     * 解码推进时（candidate 机制）落库——空闲期不推进，但确认不丢失：下一次任何 WAL 活动会使其
+     * 一步跳到客户端已确认的最新位点。
      */
     public void run(PgOutputListener listener) throws SQLException, IOException {
         PgOutputDecoder decoder = new PgOutputDecoder(config.streamingMode());

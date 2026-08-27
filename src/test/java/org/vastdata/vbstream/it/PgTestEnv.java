@@ -86,6 +86,23 @@ public final class PgTestEnv {
         }
     }
 
+    /**
+     * walsender 视角的客户端 flush 位点（来自 standby status update）是否已越过基线。
+     * 行不存在（无活跃 walsender）或 flush_lsn 为 NULL 时返回 false——反馈代码缺失时恒 false，可作非恒真断言。
+     */
+    public static boolean standbyFlushBeyond(String slotName, String baselineLsn) throws SQLException {
+        try (Connection c = newSqlConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT r.flush_lsn > ?::pg_lsn FROM pg_stat_replication r "
+                             + "JOIN pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = ?")) {
+            ps.setString(1, baselineLsn);
+            ps.setString(2, slotName);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
     /** 先杀 walsender 再删槽；槽不存在等情况静默忽略。 */
     public static void dropSlotQuietly(String slotName) {
         try (Connection c = newSqlConnection()) {

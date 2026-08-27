@@ -42,7 +42,8 @@ java -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
 ## 领域要点（实现时的关键约束）
 
 - 目标是 stream 模式（**流式发送进行中的大事务**），而不是等事务提交后整体回放的传统模式。需要 PG 14+（复制槽 `streaming` 选项），pgoutput 插件需 `proto_version >= 2` 才会收到流式消息。
-- pgjdbc 复制 API 的入口链路：JDBC URL 带 `replication=database` 参数 → `PGConnection.getReplicationAPI()` → `ReplicationConnection.createReplicationSlot().logical()...` 建槽 → `createReplicationStream().withSlotOption(...)` 建流 → 循环 `PGReplicationStream.readPending()/read()`，并周期性 `setAppliedLSN()/setFlushedLSN()/forceStatusUpdate()` 回传确认位点。
+- pgjdbc 复制 API 的入口链路（42.7.13 实际签名）：JDBC URL 带 `replication=database` **且必须 `assumeMinServerVersion=9.4`**（否则 replication 参数被驱动静默丢弃，START_REPLICATION 报语法错）→ `PGConnection.getReplicationAPI()`（返回 `PGReplicationConnection`）→ `replicationStream().logical()` 建流（slot options：`proto_version`/`publication_names`/`streaming`/`two_phase`）；本项目建槽走 SQL `pg_create_logical_replication_slot`。消费循环用非阻塞 `readPending()` 轮询（阻塞 `read()` 空闲期不按 statusInterval 醒来），周期 `setAppliedLSN()/setFlushedLSN()` + `forceUpdateStatus()` 回传确认。
+- **confirmed_flush_lsn 的服务端行为（Diag 实证，勿当 bug 排查）**：standby status 先被服务端采纳进 `pg_stat_replication.flush_lsn`；槽的 `confirmed_flush_lsn` 由 walsender 在**解码推进时**（candidate 机制）落库——空闲期不推进但确认不丢失，下一次任何 WAL 活动会使其一步跳到客户端已确认的最新位点；`max_slot_wal_keep_size` 兜底磁盘。
 - 输出插件与 publication 的关系（已核实 PG 18 官方文档）：复制槽与 publication 相互独立，publication 只是 `START_REPLICATION` 的过滤参数。**pgoutput 必须传 `publication_names`（协议硬性要求，至少一个）**；`test_decoding` 无需 publication 且支持流式（stream-changes），定位是测试/示例，适合冒烟联调；wal2json 等第三方插件也免 publication 但需在 PG 侧安装。计划：联调用 test_decoding，生产用 pgoutput + `FOR ALL TABLES` publication。
 - 具体细节（快照导出、错误恢复/断线重连、与 Logstash 的集成方式等）尚未确定，涉及这类决策应先与用户确认，不要自行臆断。
 
