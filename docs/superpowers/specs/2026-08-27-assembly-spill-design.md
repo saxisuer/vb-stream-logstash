@@ -18,12 +18,12 @@
 
 ## 2. 架构总览：混合模式与单一存储格式
 
-**内存模式存的不是解码后的 `TxChange` 对象，而是每条消息的原始字节（`byte[]` 列表）。** 这是整个混合设计的支点：
+**内存模式存的不是解码后的 `TxChange` 对象，而是每条消息的原始字节（`PayloadUnit` 单元列表，payload 即原始字节）。** 这是整个混合设计的支点：
 
-- **切换 = 纯字节转储**：内存桶越限 → 已有 `byte[]` 逐条 `writeBytes` 进 CQ、后续消息直写 CQ。自始至终只有一种存储格式（pgoutput 原始字节），不存在"数据转移时的表示形态变化"
+- **切换 = 纯字节转储**：内存桶越限 → 已有单元逐条加信封帧（seq + 可选 streamXid，§5）后 `writeBytes` 进 CQ、后续单元直写 CQ。自始至终只有一种存储格式（pgoutput 原始字节 + 定长信封帧头），不存在"数据转移时的表示形态变化"
 - **内存模式占用更小**：原始字节比解码对象致密（解码形态每列一个 `TupleValue` 对象 + String，对象头/引用开销远超原始字节）；阈值按"缓冲的原始字节数"记账，语义与 PG reorder buffer 记账（`rb->size` 按 TOAST 压缩后字节）对齐
 - **解码推迟到提交时**：小事务从内存 `byte[]` 解码、大事务从 CQ tailer 回读解码——两种模式走完全相同的解码路径（`PgOutputDecoder` 只认字节）。附带红利：回滚的大事务从未被解码（省 CPU），提交前只解码一次
-- **代价**：路由需要"轻窥"（peek）——只读类型字节 + 流块内 xid 前缀即可路由，不完整解码；run 循环契约变化（见 §4.5）
+- **代价**：路由需要"轻窥"（peek）——只读类型字节 + 流块内 xid 前缀即可路由，不完整解码；run 循环增设 raw 接缝、旧解码契约由桥保留（见 §4.5）
 
 ```
                         ┌────────────────────────────────────────────┐
@@ -31,12 +31,12 @@
   readPending ──byte[]──▶ peek 路由 ──┬─ 'R'  → 立即解码 → registry    │
                         │             │         （版本日志, seq 戳）   │
                         │             ├─ 开桶/关桶/abort 记账          │
-                        │             ├─ MEMORY 桶: List<byte[]> ─────┼─▶ 阈值内
+                        │             ├─ MEMORY 桶: List<PayloadUnit> ─┼─▶ 阈值内
                         │             │   （全局字节记账）              │
-                        │             └─ 越限 → dump 转储 ─▶ CQ append │
+                        │             └─ 越限 → 信封帧转储 ─▶ CQ append │
                         │                                （后续直写） │
                         │  提交信号:                                    │
-                        │    MEMORY → 逐 byte[] 解码 ┐                 │
+                        │    MEMORY → 逐单元解码 ┐                      │
                         │    SPILLED → tailer 回读 ──┴─▶ decode →      │
                         │        TxChange(按 asOf 版本) → Transaction  │
                         └────────────────────────────────────────────┘
@@ -44,32 +44,34 @@
 
 **阈值策略**：全局记账（所有 MEMORY 桶原始字节总和，跨桶共享，与 PG 全局 `rb->size` 语义一致）。越过阈值时把所有 MEMORY 态桶一次性转储（简单可预测，切换每桶一次）；之后水位仍高时新桶直接以 SPILLED 起步。
 
-## 3. 组件（新增 2 + 改造 2）
+## 3. 组件（新增 3 + 改造 2）
 
 | 组件 | 角色 |
 |---|---|
-| `MessageSpool`（新） | CQ 单例管理者：`append(bytes)→index`、`dump(List<byte[]>)→(first,last)`、`readRange(first,last)` 回读、全局单调序号分配、低水位删滚动文件、close 顺序收敛。持有 ChronicleQueue/Appender/Tailer 生命周期 |
-| `MessagePeek`（新，纯函数） | 只读类型字节 + 流块内 xid 前缀（duplicate buffer 不消耗原字节），产出路由最小信息（类型/xid/subxid）。自带 inStream 状态机（S/E 驱动，与 decoder 同规则） |
+| `MessageSpool`（新） | CQ 单例管理者：`append(bytes)→index`、`dump(List<PayloadUnit>)→(first,last)`、`readRange(first,last)` 回读、全局单调序号分配、低水位删滚动文件、close 顺序收敛。持有 ChronicleQueue/Appender/Tailer 生命周期 |
+| `PayloadUnit`（新，record） | 桶内存储单元 `(byte[] payload, long seq, OptionalLong streamXid)`：payload 为完整单条消息字节（含类型字节与可选 xid 前缀），seq 供 Relation asOf 取版，streamXid 有无即"流块内/外"（前缀值即 xid） |
+| `SpoolFrame`（新，纯函数） | SPILLED 单元信封帧/解帧：`[I64 seq][I8 xidPresent][I32 xid?][payload]`（big-endian；无 xid 帧头 9 字节、有 xid 13 字节）；帧结构非法抛 IllegalArgumentException |
 | `RelationRegistry` 改造 | 升级为**版本日志**：oid → 按到达序号的 `(seq, Relation)` 列表；`lookup(oid, asOfSeq)` 二分取"当时版本"；低于全局最低未决序号可剪枝（DDL 稀少，日志极短） |
-| `TransactionAssembler` 改造 | 桶改持 `List<byte[]>`（MEMORY）或 `(firstIndex,lastIndex)`（SPILLED）+ 字节记账；新增全局水位与 spillAll 触发；提交路径改为"回放→全量解码→组 TxChange→封箱" |
+| `TransactionAssembler` 改造 | **payload 路由窥探内置于组装器**（非独立组件）：只读类型字节 + 流块内 Int32 xid 前缀即可选桶，不完整解码；inStream 上下文由 live 解码的 StreamStart/StreamStop 驱动，不需独立状态机。桶改持 `List<PayloadUnit>`（MEMORY）或 `(firstIndex,lastIndex)`（SPILLED）+ 字节记账；新增全局水位与 spillAll 触发；提交路径改为"遍历单元 → 滤 abortedSubxids → `decodeSingle` → 组 TxChange → 封箱"（回放不路由） |
 
-内存侧每桶只剩：xid、gid（2PC）、kind、mode、`List<byte[]>` 或 index 区间、abortedSubxids 集合、字节计数——几十字节到 KB 级。100GB 事务的堆占用也是平的。
+内存侧每桶只剩：xid、gid（2PC）、kind、mode、`List<PayloadUnit>`（MEMORY）或 index 区间（SPILLED）、abortedSubxids 集合、字节计数——几十字节到 KB 级；SPILLED 后逐单元元数据只存在于 CQ 信封帧，堆内为零。100GB 事务的堆占用也是平的。
 
 ## 4. 线上不变量与路由
 
-### 4.1 回放可行性的根基（复用 spec 已验证结论）
+### 4.1 回放免路由的根基（复用 spec 已验证结论）
 
 普通事务 `B..C` 与非流式 2PC `b..P` 在线上**串行独占**（walsender 按 LSN 序输出，同时至多一个活动普通事务，Commit 无 xid 字段），区间内无外来消息可混入；**只有并发流式事务的流块会交错**，而流块内消息全部带 xid 前缀（spec §4.2 已源码验证）。
 
-因此：回放 `[first..last]` → peek 路由（与 live 同一套代码）→ 外来 xid 跳过 → 可精确重建该桶。**live 路由与回放路由是同一套代码**，规则由线上不变量保证在子序列上同样成立。
+因此路由只在 live 发生一次：块外消息归当前串行事务桶、流块内按 xid 前缀选桶，**桶存储只含本桶 payload 单元（I/U/D/T/M）**——外来消息在 live 就被分流，桶内没有回放期需要甄别的字节。回放 = 遍历单元 → 跳过 abortedSubxids → `decodeSingle` → 构造 TxChange，**无需路由**。
 
 ### 4.2 live 数据流（每消息）
 
 ```
-readPending → byte[] 拷贝 → seq = spool.nextSeq() → peek 路由
+readPending → byte[] 拷贝 → seq = spool.nextSeq() → peek 路由（内置于组装器）
   ├─ 'R' Relation   → 立即全量解码 → registry.accept(seq, rel)（字节不入桶）
   ├─ 'B'/'S'/'b'    → 开桶（内存水位已高则 SPILLED 起步）
-  ├─ DML/'T'/'M'/'Y' → append 进归属桶（流块内按 peek 的 xid 选桶），记账 → 越限则 spillAll
+  ├─ DML/'T'/'M' → 组 PayloadUnit（seq + 流块内 xid）append 进归属桶（流块内按 peek 的 xid 选桶），记账 → 越限则 spillAll
+  ├─ 'Y' Type / 'O' Origin → 不入桶，直接丢弃
   ├─ 'A' StreamAbort → 桶记 abortedSubxids（回放时过滤，不删数据）
   ├─ 'C'/'c'/'K' → 提交路径；'P' → 挂起池；'r' → 丢弃桶；'E' → 关流块
   └─ LSN 反馈逻辑不变（session 层，与组装解耦）
@@ -78,9 +80,9 @@ readPending → byte[] 拷贝 → seq = spool.nextSeq() → peek 路由
 ### 4.3 提交路径
 
 ```
-关桶 → 回放：MEMORY 逐 byte[] / SPILLED tailer 读 [first..last]
-  → 每条全量 decode → 流块内按 xid 前缀滤外来/滤 abortedSubxids
-  → RowChange.relation = registry.lookup(oid, asOf=该消息 seq)
+关桶 → 回放：MEMORY 遍历 List<PayloadUnit> / SPILLED tailer 读 [first..last] 逐条解信封帧
+  → 每单元 decodeSingle（inStream = streamXid.isPresent()）→ 滤 abortedSubxids（单元 streamXid 命中即剔除）
+  → RowChange.relation = registry.lookup(oid, asOf=该单元 seq)
   → 组 TxChange 序列 → Transaction 封箱 → listener 回调
   → 低水位推进 → 触发滚动文件删除检查
 ```
@@ -89,15 +91,16 @@ readPending → byte[] 拷贝 → seq = spool.nextSeq() → peek 路由
 
 事务进行中若并发连接做了 DDL（如 `ALTER TABLE ADD COLUMN`），协议会在流里重发新版 Relation。回放构造 `RowChange` 时**不能用当前 registry**（可能已是新版，列数与事务前段的 TupleData 错位）。`lookup(oid, asOfSeq)` 按消息自身序号取"变更时刻版本"，事务前后段各自对齐——这是本设计正确性的机制保障，集成测试有专项场景（§9.2）。
 
-Relation 字节不进桶（registry 版本日志已持对象），桶存储更省。
+Relation/Type/Origin 字节均不入桶（'R' 解码进版本日志持对象，'Y'/'O' 直接丢弃），桶内只有 payload 单元。回放解码由 `PgOutputDecoder` 新增的 `decodeSingle(ByteBuffer, boolean inStream)` 重载承担——单元自带前缀有无信息（`streamXid.isPresent()`），免 S/E 包裹即可单条解码。
 
 ### 4.5 run 循环接缝改造
 
-`PgReplicationSession.run` 的回调契约从 `onMessage(已解码消息, registry)` 改为交付**原始字节**（`onRaw(bytes)` 语义）；Relation 的即时解码移到组装侧；LSN 反馈、readPending 轮询、100ms 节奏均不变。decoder 的 inStream 状态机移到回放侧使用（每个桶回放一个 decoder 实例，桶区间天然以开桶控制消息起始、以关桶控制消息终止，状态机自洽）。
+`PgReplicationSession.run` 的接缝从 `onMessage(已解码消息, registry)` 增设**原始字节交付**（新 `RawMessageListener.onRaw(bytes)`，bytes 为完整单条消息、含类型字节与可选 xid 前缀）；decoder 与 registry 移出 session，Relation 的即时解码移到组装侧；LSN 反馈、readPending 轮询、100ms 节奏均不变。旧 `PgOutputListener`（解码后契约）**保留不改**——由新 `DecodedMessageBridge`（自持 decoder/registry，onRaw → decode → accept → onMessage）承接给里程碑 2 输出队列与既有测试，新增的是并行接缝而非替换语义（§11）。回放侧不运行 inStream 状态机：`decodeSingle` 以 `streamXid.isPresent()` 显式传入（§4.4）。
 
 ## 5. CQ 生命周期与清理策略
 
 - **单例队列**：`SingleChronicleQueue`（专属 spill 目录），roll cycle 默认 MINUTELY。appender 单写者（run 线程）；回放也在 run 线程同步执行（提交回调本就在 run 线程），单 tailer 即可
+- **SPILLED 单元带信封帧**：入队字节 = 信封帧（seq + 可选 streamXid + payload，`SpoolFrame` 纯函数帧/解帧），堆内不保留逐单元元数据——桶只记 `(firstIndex, lastIndex)` 区间，seq/streamXid 随字节落盘、回读复原
 - **低水位线** = 所有 SPILLED 桶的 `min(firstIndex)`；无 spilled 桶时为 +∞（全部已完成内容皆垃圾）。MEMORY 桶数据在堆里、不引用 CQ 索引，与水位无关
 - **删除粒度 = 整个滚动文件**：水位线所在 cycle 的前一档以下全部可删（永不碰当前 cycle 与上一档）；文件名解析 cycle 号比对纯函数化（便于单测注入文件名列表）；每次删除 WARN 留痕；失败仅 WARN，下次推进重试
 - **不跨重启续用**：spill 队列是瞬态工作区，真源是复制槽——重启后 PG 从槽确认位点重发未完事务。打开时发现残留目录直接整体清空重建，杜绝陈旧状态复活
@@ -149,7 +152,7 @@ Relation 字节不进桶（registry 版本日志已持对象），桶存储更�
 
 ### 9.1 单测（纯 JVM）
 
-- `MessagePeek`：19 种消息 peek 正确性 + 流块状态机（S/E 交界、xid 前缀有无）
+- `SpoolFrame`：信封帧/解帧往返（有/无 streamXid、非法帧 fail-fast）；payload 路由窥探内置于组装器（无独立组件），其正确性随组装器/回放测试覆盖
 - registry 版本日志：多版本 bisect、asOf 边界（恰在版本切换 seq 上）、剪枝安全性
 - `MessageSpool`：temp 目录 append/readRange 往返、dump 转储、删除比对纯函数
 - 组装器混合模式（构造 pgoutput 字节序列，同 parser 测试手法）：小事务全程 MEMORY、越限转储、越限后新桶 SPILLED 起步、abortedSubxids 回放过滤、2PC 挂起跨转储
@@ -171,7 +174,7 @@ Relation 字节不进桶（registry 版本日志已持对象），桶存储更�
 
 ## 11. 交付物
 
-- `MessageSpool`、`MessagePeek`、`SpillConfig`（新）；`RelationRegistry`、`TransactionAssembler`、`PgReplicationSession`/`PgOutputListener`（改造）
+- `MessageSpool`、`PayloadUnit`/`SpoolFrame`、`SpillConfig`、`RawMessageListener`/`DecodedMessageBridge`（新）；`RelationRegistry`、`TransactionAssembler`、`PgReplicationSession`（改造）；`PgOutputListener`（解码后契约）**保留不改**——旧接缝由 `DecodedMessageBridge` 承接给里程碑 2 输出队列与既有测试，新增的 `RawMessageListener` 是并行 raw 接缝而非替换语义
 - JMH profile + 基准类 + 语料录制 + `docs/benchmarks-baseline.md`
 - 单测 + 集成场景（含等价性验收）
 - 本设计文档
