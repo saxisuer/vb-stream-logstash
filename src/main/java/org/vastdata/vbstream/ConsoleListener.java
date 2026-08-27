@@ -5,25 +5,104 @@ import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
+import org.vastdata.vbstream.replication.MsgChange;
 import org.vastdata.vbstream.replication.PgOutputListener;
 import org.vastdata.vbstream.replication.RelationRegistry;
+import org.vastdata.vbstream.replication.RowChange;
+import org.vastdata.vbstream.replication.Transaction;
+import org.vastdata.vbstream.replication.TransactionListener;
+import org.vastdata.vbstream.replication.TruncateChange;
+import org.vastdata.vbstream.replication.TxChange;
 
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.OptionalLong;
 
-/** 控制台打印 listener：每条消息一行可读输出。 */
-public final class ConsoleListener implements PgOutputListener {
+/**
+ * 控制台打印 listener（Main 默认事务形态，spec §5）：事务块（TXN-BEGIN/TXN-END 头尾 + 逐变更行）
+ * 走 CDC logger INFO；逐消息细节降为 DEBUG（默认关闭），仅供排障时开启。
+ */
+public final class ConsoleListener implements PgOutputListener, TransactionListener {
 
     /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
 
+    /** 逐消息渲染出口（DEBUG，默认不发射）；排障时可调 CDC logger 级别观察原始消息流。 */
     @Override
     public void onMessage(PgOutputMessage message, RelationRegistry registry) {
-        CDC.info("{}", render(message, registry));
+        CDC.debug("{}", render(message, registry));
     }
 
+    /**
+     * 事务块输出：头/尾各一行 INFO（CDC logger），变更行逐条基于内嵌 Relation 快照渲染（不依赖 registry）。
+     * 调用线程 = run 循环线程（与 onMessage 同约束，同步执行应快速返回）。
+     */
+    @Override
+    public void onTransaction(Transaction transaction) {
+        CDC.info("TXN-BEGIN xid={} kind={} gid={} commitLsn=0x{} commitTs={} changes={}",
+                transaction.xid(), transaction.kind(), transaction.gid(),
+                Long.toHexString(transaction.commitLsn()), transaction.commitTimestamp(),
+                transaction.changes().size());
+        int seq = 1;
+        for (TxChange change : transaction.changes()) {
+            CDC.info("  [{}] {}", seq++, renderChange(change));
+        }
+        CDC.info("TXN-END   xid={}", transaction.xid());
+    }
+
+    /** 单条变更渲染：列名取自嵌入的 Relation 快照（下游自包含，无需 registry）。 */
+    private static String renderChange(TxChange change) {
+        if (change instanceof RowChange rc) {
+            return "%s %s BEFORE=%s AFTER=%s%s".formatted(rc.dml(), tableOf(rc.relation()),
+                    rc.before().map(t -> tupleOf(t, rc.relation())).orElse("-"),
+                    rc.after().map(t -> tupleOf(t, rc.relation())).orElse("-"),
+                    suffix(rc.streamXid()));
+        }
+        if (change instanceof TruncateChange tc) {
+            return "TRUNCATE %s options=%s%s".formatted(
+                    tc.relations().stream().map(ConsoleListener::tableOf).toList(),
+                    tc.options(), suffix(tc.streamXid()));
+        }
+        if (change instanceof MsgChange mc) {
+            return "MESSAGE prefix=%s bytes=%d%s".formatted(mc.prefix(), mc.content().length, suffix(mc.streamXid()));
+        }
+        throw new IllegalStateException("未知变更类型: " + change.getClass());
+    }
+
+    /** 表名渲染（基于内嵌快照，schema.table 形式）。 */
+    private static String tableOf(PgOutputMessage.Relation relation) {
+        return relation.schema() + "." + relation.table();
+    }
+
+    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationRegistry)} 同规则：text 截断 64 字符，NULL/TOAST 显式标注）。 */
+    private static String tupleOf(TupleData tuple, PgOutputMessage.Relation relation) {
+        List<String> parts = new ArrayList<>();
+        for (int i = 0; i < tuple.columns().size(); i++) {
+            String column = i < relation.columns().size() ? relation.columns().get(i).name() : "#" + i;
+            TupleValue value = tuple.columns().get(i);
+            String rendered;
+            if (value instanceof TupleValue.Null) {
+                rendered = "NULL";
+            } else if (value instanceof TupleValue.UnchangedToast) {
+                rendered = "<toast-unchanged>";
+            } else if (value instanceof TupleValue.Text t) {
+                String s = t.value();
+                rendered = s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
+            } else if (value instanceof TupleValue.Binary b) {
+                rendered = "0x" + HexFormat.of().formatHex(b.value());
+            } else {
+                throw new IllegalStateException("未知列值类型: " + value.getClass());
+            }
+            parts.add(column + "=" + rendered);
+        }
+        return parts.toString();
+    }
+
+    /**
+     * 逐消息可读渲染：19 种 pgoutput 消息各一行（BEGIN/COMMIT/DML/TRUNCATE/流式与两阶段控制消息等），
+     * DML 的表名/列名经 registry 解析。未知消息类型抛 {@link IllegalStateException}（fail-fast）。
+     */
     // 注：record pattern switch 是 Java 21 正式特性，本项目约束 Java 17，故用 instanceof 链
     private String render(PgOutputMessage msg, RelationRegistry registry) {
         if (msg instanceof PgOutputMessage.Begin m) {
@@ -96,10 +175,12 @@ public final class ConsoleListener implements PgOutputListener {
         throw new IllegalStateException("未知消息类型: " + msg.getClass());
     }
 
+    /** 流式块内消息的尾缀标注：携带 xid 时追加 " [streamed xid=N]"，顶层消息返回空串。 */
     private static String suffix(OptionalLong streamXid) {
         return streamXid.isPresent() ? " [streamed xid=" + streamXid.getAsLong() + "]" : "";
     }
 
+    /** 表名渲染（registry 版）：命中返回 schema.table，miss（DML 先于 Relation，协议流异常）退化为 "oid:N"。 */
     private static String tableOf(int oid, RelationRegistry registry) {
         return registry.find(oid)
                 .map(rel -> rel.schema() + "." + rel.table())
