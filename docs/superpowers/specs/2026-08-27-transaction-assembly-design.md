@@ -170,7 +170,7 @@ private static final class TxBuffer {
     [2] UPDATE ...
   TXN-END   xid=505
   ```
-  头尾各一行 CDC logger INFO，变更行复用现有渲染。逐消息的 `onMessage` 输出保留（受日志级别控制：事务块 INFO、逐消息 DEBUG——**Main 默认走事务形态**）。
+  头尾各一行 CDC logger INFO，变更行复用现有渲染。逐消息的 `onMessage` 输出保留（受日志级别控制：事务块 INFO、逐消息 DEBUG——**Main 默认走事务形态**）。（Main 装配中显式调用 onMessage——置于 isDebugEnabled 守卫内，避免 DEBUG 关闭时实参急切渲染的热路径开销）
 
 ## 6. 测试
 

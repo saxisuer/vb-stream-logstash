@@ -28,10 +28,12 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
     /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
 
-    /** 逐消息渲染出口（DEBUG，默认不发射）；排障时可调 CDC logger 级别观察原始消息流。 */
+    /** 逐消息渲染出口（DEBUG，默认不发射）；排障时可调 CDC logger 级别观察原始消息流。级别守卫避免 DEBUG 关闭时的无谓渲染开销——render 是实参、急切求值。 */
     @Override
     public void onMessage(PgOutputMessage message, RelationRegistry registry) {
-        CDC.debug("{}", render(message, registry));
+        if (CDC.isDebugEnabled()) {
+            CDC.debug("{}", render(message, registry));
+        }
     }
 
     /**
@@ -75,28 +77,32 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
         return relation.schema() + "." + relation.table();
     }
 
-    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationRegistry)} 同规则：text 截断 64 字符，NULL/TOAST 显式标注）。 */
+    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationRegistry)} 同规则：列名取快照、越界退化为 "#i"，值渲染规则见 {@link #renderValue}）。 */
     private static String tupleOf(TupleData tuple, PgOutputMessage.Relation relation) {
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < tuple.columns().size(); i++) {
             String column = i < relation.columns().size() ? relation.columns().get(i).name() : "#" + i;
-            TupleValue value = tuple.columns().get(i);
-            String rendered;
-            if (value instanceof TupleValue.Null) {
-                rendered = "NULL";
-            } else if (value instanceof TupleValue.UnchangedToast) {
-                rendered = "<toast-unchanged>";
-            } else if (value instanceof TupleValue.Text t) {
-                String s = t.value();
-                rendered = s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
-            } else if (value instanceof TupleValue.Binary b) {
-                rendered = "0x" + HexFormat.of().formatHex(b.value());
-            } else {
-                throw new IllegalStateException("未知列值类型: " + value.getClass());
-            }
-            parts.add(column + "=" + rendered);
+            parts.add(column + "=" + renderValue(tuple.columns().get(i)));
         }
         return parts.toString();
+    }
+
+    /** 单列值渲染规则：NULL / TOAST 未变显式标注，text 截断到 64 字符（超出附原长字节数），binary 走十六进制；未知列值类型抛 {@link IllegalStateException}（fail-fast）。 */
+    private static String renderValue(TupleValue value) {
+        if (value instanceof TupleValue.Null) {
+            return "NULL";
+        }
+        if (value instanceof TupleValue.UnchangedToast) {
+            return "<toast-unchanged>";
+        }
+        if (value instanceof TupleValue.Text t) {
+            String s = t.value();
+            return s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
+        }
+        if (value instanceof TupleValue.Binary b) {
+            return "0x" + HexFormat.of().formatHex(b.value());
+        }
+        throw new IllegalStateException("未知列值类型: " + value.getClass());
     }
 
     /**
@@ -187,7 +193,7 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
                 .orElse("oid:" + oid);
     }
 
-    /** 列名=值 打印；TOAST 未变与 NULL 显式标注（打印 text 值截断到 64 字符）。 */
+    /** 列名=值 打印；列名经 registry 解析（miss 或越界退化为 "#i"），值渲染规则见 {@link #renderValue}。 */
     private static String tupleOf(int oid, TupleData tuple, RelationRegistry registry) {
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < tuple.columns().size(); i++) {
@@ -196,21 +202,7 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
                     .filter(rel -> idx < rel.columns().size())
                     .map(rel -> rel.columns().get(idx).name())
                     .orElse("#" + idx);
-            TupleValue value = tuple.columns().get(i);
-            String rendered;
-            if (value instanceof TupleValue.Null) {
-                rendered = "NULL";
-            } else if (value instanceof TupleValue.UnchangedToast) {
-                rendered = "<toast-unchanged>";
-            } else if (value instanceof TupleValue.Text t) {
-                String s = t.value();
-                rendered = s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
-            } else if (value instanceof TupleValue.Binary b) {
-                rendered = "0x" + HexFormat.of().formatHex(b.value());
-            } else {
-                throw new IllegalStateException("未知列值类型: " + value.getClass());
-            }
-            parts.add(column + "=" + rendered);
+            parts.add(column + "=" + renderValue(tuple.columns().get(i)));
         }
         return parts.toString();
     }

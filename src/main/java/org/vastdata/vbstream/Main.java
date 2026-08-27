@@ -16,8 +16,9 @@ public final class Main {
     /**
      * 装配并启动复制会话：ConsoleListener 一个实例同时充当逐消息消费者（DEBUG）与事务回调（INFO），
      * TransactionAssembler 在 reader 线程内把消息流组装为原子事务。
-     * 关键步骤：校验配置 → 会话 open/ensureSlot/start → reader 线程逐消息先喂 registry 再喂组装器 →
-     * 主线程 await 停机信号（Ctrl+C 触发 shutdown hook）→ try-with-resources 关闭会话。
+     * 关键步骤：校验配置 → 会话 open/ensureSlot/start → reader 线程逐消息分发到组装器与逐消息 DEBUG
+     * 渲染（Relation 元数据缓存由 run 循环内置先行）→ 主线程 await 停机信号（Ctrl+C 触发 shutdown hook）
+     * → try-with-resources 关闭会话。
      * 配置缺失 exit 2，启动失败 exit 1，复制流中断保持槽位并倒计时停机（重启续传）。
      */
     public static void main(String[] args) throws Exception {
@@ -43,8 +44,8 @@ public final class Main {
             Thread worker = new Thread(() -> {
                 try {
                     session.run((msg, registry) -> {
-                        registry.accept(msg);            // 元数据先入缓存（Relation 必先于 DML）
-                        assembler.accept(msg, registry); // 组装器随后消费同一消息流
+                        console.onMessage(msg, registry);   // 逐消息 DEBUG（守卫内，关闭时零渲染开销）
+                        assembler.accept(msg, registry);    // 组装 → 事务块 INFO
                     });
                 } catch (Exception e) {
                     LOG.error("复制流中断: {}（槽 {} 已保留，重启续传）", e.toString(), config.slotName(), e);
