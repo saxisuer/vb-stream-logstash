@@ -7,29 +7,31 @@ import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.OptionalLong;
-import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
- * pgoutput 事务组装状态机：消费原始字节，把同一事务的变更攒进桶里，收到提交信号后回放成完整的
- * {@link Transaction} 交给监听器（spec §4 / assembly-spill 设计 §2-§5）。
+ * pgoutput 事务组装状态机：消费原始字节，把同一事务的变更以 **纯 CQ index 段记账** 攒进桶里
+ * （1.7 设计 §2/§4.1），收到提交信号后同步内联回放成完整的 {@link Transaction} 交给监听器
+ * （spec §4 / assembly-spill 设计 §2-§5 的 1.7a 形态）。
  *
  * <p>与消息驱动旧版的核心区别：**数据消息先不解码**。Insert/Update/Delete/Truncate/Message
- * 五类消息的原始字节直接包成 {@link PayloadUnit} 入桶；控制消息和 Relation 才当场解码，驱动
- * 桶状态流转。解码推迟到提交那一刻——回滚的大事务从未被解码过，提交的事务也只解一次。
+ * 五类消息的原始字节只在 {@link #onRaw} 首行追加一次管道（{@link MessagePipe}），桶里只记
+ * CQ index 的连续段（堆占用 = 段数 × long[2]，不随单元数增长）；控制消息和 Relation 才当场
+ * 解码，驱动桶状态流转。解码推迟到提交那一刻——回滚的大事务从未被解码过，提交的事务也只解一次。
  *
- * <p>桶模型（语义与旧版逐条等价，等价基线 = 移植后的 33 例既有单测）：
+ * <p>seq ≡ CQ index（1.7 设计 §2）：**每条消息（含控制消息与 'R'）先 append 取 index 作 seq，
+ * 再做记账路由**——数据单元与 'R' 版本天然同序。Relation 以到达时的 seq 记入
+ * {@link VersionedRelationRegistry} 版本日志；回放时按单元自己的 seq（即其 CQ index）取
+ * "变更那一刻"的表定义——事务中途若有并发 DDL，前后段的行仍按各自的表结构解释（设计 §4.4）。
+ * 版本日志在每次桶完结时按存活桶的最老 index 剪枝（2PC 挂起桶算存活），防止长期膨胀。
+ *
+ * <p>桶模型（语义与 1.6 逐条等价，等价基线 = 移植后的既有单测期望值不变）：
  * <ul>
  *   <li>普通事务：单指针 {@code currentNormalTx}。Commit 消息不带 xid，且 walsender 按 LSN 序
  *       串行输出 Begin..Commit——同一时刻至多一个活动普通事务</li>
@@ -41,29 +43,17 @@ import java.util.function.Supplier;
  *       {@code abortedSubxids}，等回放时跳过对应单元——与旧版即时剔除的可观察行为等价</li>
  * </ul>
  *
- * <p>seq（消息序号）：每条消息到达时领取一个单调递增序号（控制消息与 Relation 也领）。Relation
- * 以到达时的 seq 记入 {@link VersionedRelationRegistry} 版本日志；回放时按单元自己的 seq 取
- * "变更那一刻"的表定义——事务中途若有并发 DDL，前后段的行仍按各自的表结构解释（设计 §4.4）。
- * 版本日志在每次桶完结时按存活桶的最老 seq 剪枝（2PC 挂起桶算存活），防止长期膨胀。
+ * <p>低水位（1.7 设计 §3.2，两个作用域）：CQ 删除低水位
+ * {@link #pipeWatermark()} = min(存活桶 firstIndex, maxAppendedIndex+1)，交
+ * {@link MessagePipe#releaseBelow} 删除过老的滚动文件；registry 剪枝低水位 = 全部存活桶
+ * firstIndex 的最小值，驱动 {@link VersionedRelationRegistry#pruneBelow}。两者都挂在桶完结点。
  *
- * <p>混合缓冲（组装期内存有界）——桶有两种存储形态 {@link TxBuffer.Mode}：
- * <ul>
- *   <li>MEMORY：单元留在堆里，字节计入全局水位 {@code memoryBytes}</li>
- *   <li>SPILLED：单元加 {@link SpoolFrame} 信封帧写入 Chronicle Queue，堆里不为单个单元保留
- *       任何数据，只记 CQ index 的连续段（并发桶的写入在队列里交错，见
- *       {@link TxBuffer#spillSegments}）</li>
- * </ul>
- * 任何一次堆内写入让水位越过阈值，就把全部 MEMORY 桶整体转储（{@link #spillAll}，正在追加的桶
- * 也在转储之列）；之后水位仍不低于阈值时，新开的桶直接以 SPILLED 起步。两种形态的提交回放走
- * 同一个 {@link BucketReplayer}——同一字节流的输出严格相等（spill 无损）。桶完结时按低水位
- * {@link #spillWatermark()} 让 {@link MessageSpool#releaseBelow} 删除过老的滚动文件。
- * 队列惰性创建（首次转储时才建）；spill 关闭（阈值 ≤0）时全程纯内存、永不建队列。
- *
- * <p>注意"内存有界"只覆盖组装期：提交回放仍会把整桶单元临时物化回堆，峰值 O(事务大小)，
- * 流式输出属里程碑 2 范畴。
+ * <p>注意"内存有界"只覆盖组装期：提交回放仍会把整桶单元从管道读回堆（原始字节 + 解码出的
+ * TxChange 双份瞬态并存，峰值 O(事务大小)），流式输出属里程碑 2 范畴。
  *
  * <p>线程约束：非线程安全。全部方法设计为由 run 循环的单一线程调用（decoder 的流块状态与
- * 全部桶指针都要求单写者）；产出的 Transaction 不可变，可跨线程传递。
+ * 全部桶指针都要求单写者）；本任务（1.7a）回放也内联在同一线程，Task 6 起移交 consumer 线程。
+ * 产出的 Transaction 不可变，可跨线程传递。
  */
 public final class TransactionAssembler implements RawMessageListener, AutoCloseable {
 
@@ -74,23 +64,19 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private final PgOutputDecoder decoder;
     /** Relation 版本日志：'R' 到达即记入（带 seq），回放时按单元 seq 取当时的版本。 */
     private final VersionedRelationRegistry registry;
-    /** spill 配置（阈值/目录/滚动周期）；关闭（阈值 ≤0）时溢写路径全部短路。 */
-    private final SpillConfig spill;
+    /** 主缓冲管道（构造时急切建立——管道是地基，构造即 wipe 目录）：每条消息 append 一次，回放按段读回。 */
+    private final MessagePipe pipe;
     /** 每个解码点（控制消息、'R'、回放单元）回调一次——ConsoleListener 逐消息 DEBUG 挂在这里。 */
     private final Consumer<PgOutputMessage> decodedObserver;
     /** 桶回放器：提交路径把桶单元渲染为 TxChange（自带独立 decoder，不影响本类的 live 解码状态）。 */
     private final BucketReplayer replayer;
 
-    /** 下一个待分配的消息序号（从 1 起单调递增；每条 onRaw 消耗一个）。 */
-    private long nextSeq = 1L;
-
-    /** 溢写池（惰性单例）：首次转储时才经 {@link #spool()} 建立；spill 关闭或从未越限则始终为 null。 */
-    private MessageSpool spool;
-    /** 全局堆内水位 = 所有 MEMORY 桶的 bytesTotal 之和（SPILLED 桶不占）；桶转储或完结时回退。 */
-    private long memoryBytes;
-    /** 最近一次向溢写池写入的桶（null = 还没写过）。连续段判定依据：同桶连续写入就顺延上一段，
-     *  中间夹了别的桶就新开一段。 */
-    private TxBuffer lastSpillAppender;
+    /** 最近一次 append 的 index（reader 记账，替代 pipe.lastAppendedIndex()——空队列时后者会抛；
+     *  未 append 过为 -1）。watermark 的"已落盘内容全是垃圾"上界由此 +1 派生。 */
+    private long maxAppendedIndex = -1L;
+    /** 最近一次全局 append 的归属桶（null = 上一次 append 是控制消息/被丢弃消息，不属任何桶）。
+     *  连续段判定依据：同桶相邻 append 顺延当前段，他人（或控制消息）插队就新开一段。 */
+    private TxBuffer lastAppendOwner;
 
     /** 活动普通事务桶（Begin 置位，Commit 封箱清空；协议保证 Begin..Commit 串行不嵌套）。 */
     private TxBuffer currentNormalTx;
@@ -104,116 +90,88 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private final Map<String, TxBuffer> preparedByGid = new HashMap<>();
 
     /**
-     * 组装桶（spec §4）：xid/gid 定位事务，{@link Mode} 决定单元存在哪里——MEMORY 放堆内
-     * units 列表（bytesTotal 计入全局水位，转储后冻结不再累计）；SPILLED 已全部落盘
-     * （units 始终为空，seq/streamXid 随信封帧字节走，回读时复原）。
-     *
-     * <p>SPILLED 桶的落盘条目按**连续段**记账（{@link #spillSegments}）：多个桶共用一个队列，
-     * 写入会互相交错，同一桶的条目在队列里不保证连成一片。判定规则：本次写入与上一次全局写入
-     * 是同一个桶，两条记录在队列里就相邻，顺延当前段；中间夹了别的桶的写入，就新开一段。
-     * 回放时逐段读回。堆内只为每个段保留一个 long[2]（段数 = 交错次数），不随单元数增长。
-     * firstIndex/lastIndex 是全部落盘条目的全局端点（算低水位和打日志用）。
-     *
-     * <p>abortedSubxids 收集被回滚子事务的 xid（桶的元数据，与存储形态无关，回放时过滤）；
-     * minSeq 记桶内最老单元的 seq（同样与存储形态无关，桶完结时与全部存活桶取最小值，
-     * 驱动 {@link VersionedRelationRegistry#pruneBelow} 剪枝）。
-     *
-     * <p>非线程安全（只在 run 线程里被触碰）。
-     */
-    private static final class TxBuffer {
-
-        /** 桶存储形态：决定单元往哪写、提交回放从哪取。 */
-        private enum Mode {
-            /** 堆内存储：单元在 units 列表里，bytesTotal 计入全局 memoryBytes。 */
-            MEMORY,
-            /** 落盘存储：单元在溢写池的若干连续段（spillSegments）里，units 始终为空、不占堆水位。 */
-            SPILLED
-        }
-
-        final long xid;
-        String gid;
-        Mode mode = Mode.MEMORY;
-        /** 落盘条目的全局端点（CQ index，含端点）；firstIndex&lt;0 表示还没写过任何条目。 */
-        long firstIndex = -1L;
-        long lastIndex = -1L;
-        /** 桶内最老单元的 seq（MEMORY/SPILLED 两种形态都在 storeUnit 记账；无单元时为 Long.MAX_VALUE，不参与低水位取最小值）。 */
-        long minSeq = Long.MAX_VALUE;
-        /** 落盘条目的连续段列表（[first,last] 闭区间，按写入顺序排列）；MEMORY 桶始终为空。 */
-        final ArrayDeque<long[]> spillSegments = new ArrayDeque<>();
-        final List<PayloadUnit> units = new ArrayList<>();
-        /** MEMORY 期间累计的单元字节数（全局 memoryBytes 的分项；转储后冻结，只用于日志）。 */
-        long bytesTotal;
-        final Set<Long> abortedSubxids = new HashSet<>();
-
-        TxBuffer(long xid) {
-            this.xid = xid;
-        }
-    }
-
-    /**
-     * 构造组装器。
+     * 构造组装器（急切建立管道——{@link MessagePipe} 构造即清空目录建队列，失败原样上抛
+     * fail-fast：管道是地基，建不起来就没有可运行形态）。
      *
      * @param listener        完整事务到达时的回调（同步调用，调用线程与本组装器的调用线程一致）
      * @param mode            流式模式（仅影响 decoder 对 StreamAbort 附加字段的解析，须与
      *                        START_REPLICATION 的 streaming 参数一致，否则 abort 解析错位 fail-fast）
      * @param registry        Relation 版本日志（'R' 路由与回放渲染共用，本组装器独占写入）
-     * @param spill           spill 配置（spillEnabled()==false 为纯内存逃生门：溢写路径全短路、
-     *                        spool 永不创建）
+     * @param pipeConfig      管道配置（目录/滚动周期；目录是瞬态工作区，打开即整体清空）
      * @param decodedObserver 每个解码点回调（控制消息 + 'R' + 回放单元；Y/O 不解码不回调）
      */
     public TransactionAssembler(TransactionListener listener, StreamingMode mode,
-            VersionedRelationRegistry registry, SpillConfig spill,
+            VersionedRelationRegistry registry, PipeConfig pipeConfig,
             Consumer<PgOutputMessage> decodedObserver) {
         this.listener = Objects.requireNonNull(listener, "listener");
         this.decoder = new PgOutputDecoder(Objects.requireNonNull(mode, "mode"));
         this.registry = Objects.requireNonNull(registry, "registry");
-        this.spill = Objects.requireNonNull(spill, "spill");
+        Objects.requireNonNull(pipeConfig, "pipeConfig");
+        this.pipe = new MessagePipe(pipeConfig.dir(), pipeConfig.rollCycle());
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
-        this.replayer = new BucketReplayer(mode, this.registry, this.decodedObserver);
+        this.replayer = new BucketReplayer(mode, this.decodedObserver);
     }
 
     /**
      * 便捷构造：解码观察者置为空消费（不需要逐消息透出的场景）。
      *
-     * @param listener 完整事务到达时的回调
-     * @param mode     流式模式
-     * @param registry Relation 版本日志
-     * @param spill    spill 配置
+     * @param listener    完整事务到达时的回调
+     * @param mode        流式模式
+     * @param registry    Relation 版本日志
+     * @param pipeConfig  管道配置
      */
     public TransactionAssembler(TransactionListener listener, StreamingMode mode,
-            VersionedRelationRegistry registry, SpillConfig spill) {
-        this(listener, mode, registry, spill, msg -> { });
+            VersionedRelationRegistry registry, PipeConfig pipeConfig) {
+        this(listener, mode, registry, pipeConfig, msg -> { });
     }
 
     /**
      * 消费一条完整的 pgoutput 消息原始字节，推进组装状态机。
      *
-     * <p>先分配 seq（每条消息一个，控制消息与 Relation 也算），再按类型字节路由：
+     * <p>先 append 进管道取 seq（每条消息一个——含控制消息与 Relation，seq 即 CQ index，
+     * 数据单元与 'R' 版本天然同序），再按类型字节路由：
      * <ul>
      *   <li>'B'/'C'/'S'/'E'/'c'/'A'/'b'/'P'/'K'/'r'/'p'：当场解码（decoder 顺带维护流块状态），
      *       按控制规则处理——旧版的全部 fail-fast 语义逐条保留</li>
      *   <li>'R'：当场解码后记入 registry 版本日志（带 seq），字节不入桶</li>
-     *   <li>'I'/'U'/'D'/'T'：不完整解码，窥一眼流式前缀后包成 PayloadUnit 入当前活动桶
-     *       （没有活动桶则 fail-fast）</li>
+     *   <li>'I'/'U'/'D'/'T'：不完整解码，校验桶级前缀不变量、窥 oid 后把 index 记入当前活动桶
+     *       的连续段（没有活动桶则 fail-fast）</li>
      *   <li>'M'：先窥 flags 的 bit0 判断事务性——事务性必须落在活动桶里（无桶 fail-fast）；
      *       非事务性有桶随桶走、无桶 WARN 丢弃（协议允许，不算异常）</li>
      *   <li>'Y'/'O'：DEBUG 记录后丢弃（沿用旧组装器的忽略语义）</li>
      *   <li>未知类型字节：交给 decoder 抛 UnknownMessageTypeException（fail-fast 由解码层承担）</li>
      * </ul>
      *
-     * <p>边界：raw 为 null 抛 NPE；空数组违反调用契约（首字节访问抛数组越界）；桶缺失/重复/
-     * 流块状态异常抛 {@link IllegalStateException}；字节与协议不符经 decoder 抛协议异常——
-     * 都原样上抛，终止会话线程。
+     * <p>边界：raw 为 null 抛 NPE；空数组违反调用契约（首字节访问抛数组越界）；管道写失败
+     * （磁盘满/IO）以 Chronicle 运行时异常上抛；桶缺失/重复/流块状态异常抛
+     * {@link IllegalStateException}；字节与协议不符经 decoder 抛协议异常——都原样上抛，
+     * 终止会话线程。
      *
      * @param raw 完整单条消息字节（含类型字节，流式块内还含 Int32 xid 前缀）
      */
     @Override
     public void onRaw(byte[] raw) {
         Objects.requireNonNull(raw, "raw");
-        long seq = nextSeq++;
+        long seq = pipe.append(raw);
+        maxAppendedIndex = seq;
         char type = (char) raw[0];
         // 注：record pattern switch 是 Java 21 正式特性，本项目约束 Java 17；此处 switch 的是
         // 类型字节（char）而非 record，合法；解码产物仍走 instanceof 链
+        switch (type) {
+            case 'I', 'U', 'D', 'T' -> routeData(raw, seq);
+            case 'M' -> routeLogicalMsg(raw, seq);
+            default -> routeControl(raw, type, seq);
+        }
+    }
+
+    /**
+     * 控制消息与非数据类的统一路由（onRaw 的 default 分支收拢）：控制消息 live 解码后分发到
+     * 桶状态规则，'R' 以到达 seq 记入版本日志，'Y'/'O' 丢弃，未知类型经 decoder fail-fast。
+     * 处理完把 {@code lastAppendOwner} 置 null——这类消息的 append 不属于任何桶，必须断开
+     * 连续段（否则本桶下一次追加会把中间的控制消息 index 误并入段内，回放读回错位）。
+     * 未知类型的 default 分支解码即抛，置空不可达，无副作用。
+     */
+    private void routeControl(byte[] raw, char type, long seq) {
         switch (type) {
             case 'B' -> begin((PgOutputMessage.Begin) decode(raw));
             case 'C' -> commit((PgOutputMessage.Commit) decode(raw));
@@ -227,28 +185,25 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
             case 'r' -> rollbackPrepared((PgOutputMessage.RollbackPrepared) decode(raw));
             case 'p' -> streamPrepare((PgOutputMessage.StreamPrepare) decode(raw));
             case 'R' -> registry.accept(seq, (PgOutputMessage.Relation) decode(raw));
-            case 'I', 'U', 'D', 'T' -> routeData(raw, seq);
-            case 'M' -> routeLogicalMsg(raw, seq);
             case 'Y', 'O' -> LOG.debug("元数据消息 '{}' 不入桶，直接丢弃", type);
             default -> decode(raw);   // 未知类型：解码层 fail-fast（UnknownMessageTypeException）
         }
+        lastAppendOwner = null;
     }
 
     /**
-     * 关闭溢写池（如果建立过）。
+     * 关闭管道。
      *
-     * <p>从未建池（spill 关闭或全程没越限）则什么都不做。关闭失败只记 WARN 不上抛——close 不应
-     * 掩盖业务异常（{@link MessageSpool#close} 内部已逐段 WARN 吸收，这里只兜住意外逃逸的异常）。
-     * 在 run 线程收尾或调用方线程调用一次，不可与 onRaw 并发。
+     * <p>{@link MessagePipe#close} 内部已逐资源 WARN 吸收，这里只兜住意外逃逸的异常——
+     * close 不应掩盖业务异常（最坏代价是句柄延迟回收）。在 run 线程收尾或调用方线程调用一次，
+     * 不可与 onRaw 并发。
      */
     @Override
     public void close() {
-        if (spool != null) {
-            try {
-                spool.close();
-            } catch (RuntimeException e) {
-                LOG.warn("溢写池关闭失败（忽略）", e);
-            }
+        try {
+            pipe.close();
+        } catch (RuntimeException e) {
+            LOG.warn("管道关闭失败（忽略）", e);
         }
     }
 
@@ -260,10 +215,10 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 数据消息（I/U/D/T）入桶：不解码，只窥一眼流式前缀，包成 PayloadUnit 存入当前活动桶。
-     * 活动桶按"流块上下文 → 两阶段 → 普通"的顺序取，一个都没有就 fail-fast（异常消息带
-     * {@link #describeData} 生成的触发消息上下文）。MEMORY 记账还是 SPILLED 落盘由
-     * {@link #storeUnit} 分流。
+     * 数据消息（I/U/D/T）入桶：不解码，校验桶级前缀不变量、窥 relation oid 后把 append 返回的
+     * index 记入当前活动桶的连续段。活动桶按"流块上下文 → 两阶段 → 普通"的顺序取，一个都没有
+     * 就 fail-fast（异常消息带 {@link #describeData} 生成的触发消息上下文）。字节本身已在
+     * onRaw 首行 append 进管道，此处不再写 CQ。
      */
     private void routeData(byte[] raw, long seq) {
         TxBuffer bucket = activeBucket(() -> describeData(raw));
@@ -276,7 +231,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * 事务性消息必须落在活动桶里（没有桶就 fail-fast，与 DML 相同）；非事务性消息有桶就随桶走
      * （将来 abort 剔除按 streamXid 判断，语义安全），没有桶则 WARN 后丢弃——协议允许它游离在
      * 任何事务之外，不算异常。flags 偏移由 currentStream 是否在流块内决定，与 decoder 的
-     * inStream 状态同步变化。
+     * inStream 状态同步变化。丢弃路径同样要断开连续段：这条消息的 append 已进管道但不属任何桶，
+     * 不断开会让"下一次同桶追加"把它的 index 误并入段（回放读回错位）。
      */
     private void routeLogicalMsg(byte[] raw, long seq) {
         int flagsOffset = currentStream != null ? 5 : 1;   // 流内前缀 4 字节在前
@@ -286,72 +242,66 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
             appendUnit(bucket, raw, seq);
             return;
         }
+        lastAppendOwner = null;   // 游离消息的 append 不属任何桶：断段
         LOG.warn("非事务性消息游离于任何事务之外，丢弃: prefix={} lsn=0x{}",
-                cstringAt(raw, flagsOffset + 1 + 8), Long.toHexString(longAt(raw, flagsOffset + 1)));
+                RawPeeks.cstringAt(raw, flagsOffset + 1 + 8), Long.toHexString(RawPeeks.longAt(raw, flagsOffset + 1)));
     }
 
     /**
-     * 把一条数据消息字节包装成 PayloadUnit 交给 {@link #storeUnit} 入桶。
-     * 在流式块内时，从 raw[1..4] 按无符号读出前缀 xid 作为 streamXid——与 decodeSingle 的
-     * 回放契约对齐：单元的 streamXid 有值，当且仅当 payload 带 4 字节前缀且两者相等。
+     * 数据消息入桶（1.7 设计 §4.1）：判定流式前缀有无（inStream）→ 校验桶级 hasPrefix 不变量
+     * （首个单元定型，此后混现即 ISE fail-fast——协议不允许，防御）→ 窥 oid 入 oidSet →
+     * appendIndex 记段。字节本身已在 onRaw 首行 append 进管道（index 即 seq），此处不再写 CQ；
+     * 前缀的具体 xid 值推迟到回放期重窥（{@link BucketReplayer} 按 hasPrefix 决定 decodeSingle
+     * 的 inStream 实参并重窥作 streamXid）。只在 reader 线程调用。
      */
     private void appendUnit(TxBuffer bucket, byte[] raw, long seq) {
-        OptionalLong streamXid = currentStream != null
-                ? OptionalLong.of(unsignedInt(raw, 1))
-                : OptionalLong.empty();
-        storeUnit(bucket, new PayloadUnit(raw, seq, streamXid));
-    }
-
-    /**
-     * 单元入桶的统一入口，按桶当前形态分流（spec §4.2）。
-     *
-     * <p>步骤：先记桶的最老 seq（minSeq 取最小值，两种形态都要记，供桶完结时的 registry 剪枝用）。
-     * MEMORY 形态：加入 units、累计字节到桶和全局水位，水位越过阈值（spill 启用时）就触发
-     * {@link #spillAll}——正在追加的这个桶也在转储之列，转储完它后续的写入自然走 SPILLED 分支。
-     * SPILLED 形态：单元帧化后写入溢写池，返回的 index 经 {@link #appendSpillIndex} 记入桶的
-     * 连续段（首次写入时建立 firstIndex）。
-     *
-     * <p>边界：队列写失败（磁盘满/IO 错误）以 Chronicle 的运行时异常原样上抛，不吞不重试，
-     * 会话线程随之终止（spec §6）；spill 关闭时跳过水位检查（永远是 MEMORY，水位无上限）。
-     * 只在 run 线程内调用（单写者，无并发）。
-     */
-    private void storeUnit(TxBuffer bucket, PayloadUnit unit) {
-        bucket.minSeq = Math.min(bucket.minSeq, unit.seq());
-        if (bucket.mode == TxBuffer.Mode.MEMORY) {
-            bucket.units.add(unit);
-            bucket.bytesTotal += unit.payload().length;
-            memoryBytes += unit.payload().length;
-            if (spill.spillEnabled() && memoryBytes > spill.thresholdBytes()) {
-                spillAll();
-            }
-            return;
+        boolean inStream = currentStream != null;
+        if (!bucket.prefixKnown) {
+            bucket.hasPrefix = inStream;
+            bucket.prefixKnown = true;
+        } else if (bucket.hasPrefix != inStream) {
+            throw new IllegalStateException("桶内单元流式前缀混现: xid=" + bucket.xid
+                    + " hasPrefix=" + bucket.hasPrefix + " 当前 inStream=" + inStream);
         }
-        appendSpillIndex(bucket, spool().append(SpoolFrame.frame(unit)));
+        collectOids(bucket, raw);
+        appendIndex(bucket, seq);
     }
 
     /**
-     * 把一次成功写入返回的 CQ index 记入桶的落盘区间（SPILLED 桶唯一记 index 的地方）。
-     *
-     * <p>连续段判定：本次写入与上一次全局写入是同一个桶（{@code lastSpillAppender == bucket}），
-     * 两条记录在队列里就是相邻的，把当前段的右端推到 index；中间夹了别的桶的写入（比如另一个桶
-     * 在本桶两次写入之间做了转储或直写），就新开一段 {@code [index,index]}。随后维护全局端点
-     * firstIndex/lastIndex，并把 lastSpillAppender 指向本桶。
-     *
-     * <p>注意判定依据是**写入顺序**而不是 index 的数值差——cycle 滚动处 index 不连续递增，
-     * 不能拿来做算术比较。堆内只为每个段保留一个 long[2]。
-     * 只在 run 线程内调用（写入和记账紧挨着发生，无并发窗口）。
+     * 窥数据消息的 relation oid 记入桶的 oidSet（快照圈定用）：I/U/D 在类型字节（及可选 4 字节前缀）
+     * 后取 Int32 relationOid；T 读 I32 表数 + 选项字节后的 oid 数组；M 无 oid 跳过。偏移与
+     * describeData 同源（协议线格式见 spec 附录）。
      */
-    private void appendSpillIndex(TxBuffer bucket, long index) {
-        if (lastSpillAppender == bucket) {
-            bucket.spillSegments.peekLast()[1] = index;     // 同桶相邻：顺延当前段
+    private void collectOids(TxBuffer bucket, byte[] raw) {
+        int base = currentStream != null ? 5 : 1;
+        switch (raw[0]) {
+            case 'I', 'U', 'D' -> bucket.oidSet.add(RawPeeks.intAt(raw, base));
+            case 'T' -> {
+                int n = RawPeeks.intAt(raw, base);
+                for (int i = 0; i < n; i++) {
+                    bucket.oidSet.add(RawPeeks.intAt(raw, base + 5 + 4 * i));
+                }
+            }
+            default -> { /* 'M' 无 oid */ }
+        }
+    }
+
+    /**
+     * 把数据单元的 CQ index 记入桶的连续段（原 appendSpillIndex 规则扩展）：上一次全局 append 的
+     * owner 是本桶才顺延当前段，否则新开段 [index,index]——控制消息的 append 会把 owner 置 null，
+     * 天然断段。firstIndex/lastIndex 维护全局端点。只在 reader 线程调用。
+     */
+    private void appendIndex(TxBuffer bucket, long index) {
+        if (lastAppendOwner == bucket && !bucket.segments.isEmpty()) {
+            bucket.segments.peekLast()[1] = index;
         } else {
-            bucket.spillSegments.addLast(new long[]{index, index});   // 他人插队：起新段
+            bucket.segments.addLast(new long[]{index, index});
         }
         if (bucket.firstIndex < 0) {
             bucket.firstIndex = index;
         }
         bucket.lastIndex = index;
-        lastSpillAppender = bucket;
+        lastAppendOwner = bucket;
     }
 
     /**
@@ -386,18 +336,18 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private String describeData(byte[] raw) {
         int base = currentStream != null ? 5 : 1;   // 类型字节 + 可选 Int32 前缀之后
         return switch (raw[0]) {
-            case 'I' -> "Insert relationOid=" + intAt(raw, base);
-            case 'U' -> "Update relationOid=" + intAt(raw, base);
-            case 'D' -> "Delete relationOid=" + intAt(raw, base);
+            case 'I' -> "Insert relationOid=" + RawPeeks.intAt(raw, base);
+            case 'U' -> "Update relationOid=" + RawPeeks.intAt(raw, base);
+            case 'D' -> "Delete relationOid=" + RawPeeks.intAt(raw, base);
             case 'T' -> {
-                int n = intAt(raw, base);
+                int n = RawPeeks.intAt(raw, base);
                 int[] oids = new int[n];
                 for (int i = 0; i < n; i++) {
-                    oids[i] = intAt(raw, base + 5 + 4 * i);   // I32 表数 + I8 选项位之后
+                    oids[i] = RawPeeks.intAt(raw, base + 5 + 4 * i);   // I32 表数 + I8 选项位之后
                 }
                 yield "Truncate relationOids=" + Arrays.toString(oids);
             }
-            case 'M' -> "LogicalMsg prefix=" + cstringAt(raw, base + 1 + 8);   // flags(1) + lsn(8) 之后
+            case 'M' -> "LogicalMsg prefix=" + RawPeeks.cstringAt(raw, base + 1 + 8);   // flags(1) + lsn(8) 之后
             default -> "'" + (char) raw[0] + "'";
         };
     }
@@ -407,27 +357,12 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         if (currentNormalTx != null) {
             throw new IllegalStateException("Begin 到达但普通事务未闭合: xid=" + currentNormalTx.xid);
         }
-        currentNormalTx = newBucket(m.xid());
-    }
-
-    /**
-     * 开新桶，并按全局水位决定它从哪种形态起步（spec §4.2）。
-     * spill 启用且水位已达到阈值（其它未完结的巨型桶把水位顶了上去）时，新桶直接以 SPILLED
-     * 起步——先是空区间，首个单元写入时才建立 firstIndex；否则从 MEMORY 起步。
-     * 写入侧的越限判定是严格大于（见 {@link #storeUnit}），水位恰好等于阈值时不会触发转储，
-     * 这里取 ≥ 正好接住这个边界情形；spill 关闭时永远是 MEMORY。
-     */
-    private TxBuffer newBucket(long xid) {
-        TxBuffer bucket = new TxBuffer(xid);
-        if (spill.spillEnabled() && memoryBytes >= spill.thresholdBytes()) {
-            bucket.mode = TxBuffer.Mode.SPILLED;
-        }
-        return bucket;
+        currentNormalTx = new TxBuffer(m.xid());
     }
 
     /**
      * Commit（无 xid 字段）：回放当前普通事务桶并封箱 NORMAL Transaction 回调，清空指针；
-     * 无桶即 fail-fast（异常带 commitLsn 定位）。回放完成后桶完结（记账回退 + 低水位维护）。
+     * 无桶即 fail-fast（异常带 commitLsn 定位）。回放完成后桶完结（低水位维护 + 剪枝）。
      */
     private void commit(PgOutputMessage.Commit m) {
         if (currentNormalTx == null) {
@@ -457,7 +392,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
         TxBuffer bucket;
         if (m.firstSegment()) {
-            bucket = newBucket(m.xid());
+            bucket = new TxBuffer(m.xid());
             if (streamedByXid.putIfAbsent(m.xid(), bucket) != null) {
                 throw new IllegalStateException("流式事务桶已存在: xid=" + m.xid());
             }
@@ -484,7 +419,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     /**
      * StreamCommit(xid)：顶层事务全部流段已收齐，回放桶并封箱 STREAMED Transaction 回调、移除桶；
      * 桶 miss 或仍有未闭合流块均 fail-fast（协议保证 stream_commit 必在流块外，spec B.3）。
-     * 回放完成后桶完结（记账回退 + 低水位维护）。
+     * 回放完成后桶完结（低水位维护 + 剪枝）。
      */
     private void streamCommit(PgOutputMessage.StreamCommit m) {
         if (currentStream != null) {
@@ -503,9 +438,10 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     /**
      * StreamAbort(top, sub)：已流式事务的（子）事务回滚（spec B.4）。
      *
-     * <p>top==sub（整顶层回滚，decode 层"先子后顶"的最后一条）→ 移除整个桶（存储随之丢弃）；
-     * 否则 sub 记入桶的 abortedSubxids，回放期过滤该（子）事务的单元（Message 单元前缀=顶层 xid，
-     * 天然不命中 sub，不会误剔）。桶 miss 或流块未闭合均 fail-fast（abort 必在流块外）。
+     * <p>top==sub（整顶层回滚，decode 层"先子后顶"的最后一条）→ 移除整个桶（管道里的对应条目
+     * 成为垃圾，随低水位推进被删除）；否则 sub 记入桶的 abortedSubxids，回放期过滤该（子）事务
+     * 的单元（Message 单元前缀=顶层 xid，天然不命中 sub，不会误剔）。桶 miss 或流块未闭合均
+     * fail-fast（abort 必在流块外）。
      */
     private void streamAbort(PgOutputMessage.StreamAbort m) {
         if (currentStream != null) {
@@ -528,7 +464,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         if (currentPrepareTx != null) {
             throw new IllegalStateException("BeginPrepare 到达但两阶段事务未闭合: gid=" + currentPrepareTx.gid);
         }
-        currentPrepareTx = newBucket(m.xid());
+        currentPrepareTx = new TxBuffer(m.xid());
         currentPrepareTx.gid = m.gid();
     }
 
@@ -553,7 +489,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
 
     /**
      * CommitPrepared：挂起池取桶（miss → fail-fast）回放并封箱 TWO_PHASE Transaction 回调
-     * （用户确认的输出时机）。回放完成后桶完结（记账回退 + 低水位维护）。
+     * （用户确认的输出时机）。回放完成后桶完结（低水位维护 + 剪枝）。
      */
     private void commitPrepared(PgOutputMessage.CommitPrepared m) {
         TxBuffer bucket = preparedByGid.remove(m.gid());
@@ -598,231 +534,97 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 回放一个桶的存储单元，得到 TxChange 序列（提交路径的核心；MEMORY/SPILLED 两种形态）。
+     * 提交路径回放（本任务仍单线程内联；Task 6 移交 consumer）：桶的段经管道读回，Relation 按
+     * registry asOf 直查渲染（单线程无竞争，快照交接属 Task 6）。
      *
-     * <p>SPILLED 桶先逐段经 {@link MessageSpool#readRange} 读回、{@link SpoolFrame#unframe}
-     * 还原成单元列表——段按写入顺序拼接，别的桶交错写入的条目天然不在本桶的段里；
-     * abortedSubxids 这类桶元数据不落盘，内存里原样可用。还原出的单元列表与 MEMORY 桶的
-     * units 走**同一个** {@link BucketReplayer}（aborted 过滤、按 asOf 取 Relation 版本、
-     * 解码与 observer 回调都在它那里）——两种形态的回放语义完全一致。
-     *
-     * <p>边界：SPILLED 起步但还没写过单元（firstIndex&lt;0）的桶此时单元必然为空，与 MEMORY
-     * 桶一样直接用 units。Relation 未先行到达（require 查不到）、回放中字节与协议不符时抛
-     * ISE/协议异常——回放失败意味着协议流异常，不允许输出半截事务（异常先于 listener 回调抛出）。
+     * <p>边界：Relation 未先行到达（require 查不到）、回放中字节与协议不符时抛 ISE/协议异常
+     * ——回放失败意味着协议流异常，不允许输出半截事务（异常先于 listener 回调抛出）。
      * 在 run 线程内同步执行。
      */
     private List<TxChange> replay(TxBuffer bucket) {
-        if (bucket.mode != TxBuffer.Mode.SPILLED || bucket.firstIndex < 0) {
-            return replayer.replay(bucket.units, bucket.abortedSubxids);
-        }
-        List<PayloadUnit> units = new ArrayList<>();
-        for (long[] segment : bucket.spillSegments) {
-            spool.readRange(segment[0], segment[1],
-                    (framed, ordinal) -> units.add(SpoolFrame.unframe(framed)));
-        }
-        return replayer.replay(units, bucket.abortedSubxids);
+        return replayer.replay(bucket, pipe, registry::require);
     }
 
     /**
-     * 把当前全部 MEMORY 桶整体转储为 SPILLED（水位越限的响应，一次成批处理，spec §5）。
-     *
-     * <p>步骤：先经 {@link #spool()} 建池（失败就抛，桶状态不动）→ 收集全部存活桶（普通/两阶段
-     * 活动、流式多桶、挂起池；currentStream 指向的桶已在 streamedByXid 里，不重复计）里还是
-     * MEMORY 形态的 → 逐桶逐单元帧化写入队列（一个桶的单元连续写入，正好构成该桶的一个连续段）→
-     * 置为 SPILLED、清空 units、全局水位扣回该桶的字节 → INFO 记一行（桶数/单元数/字节数）。
-     * 正在追加的桶也在转储之列，转储后它的后续写入自然走 SPILLED 分支。
-     *
-     * <p>边界：队列写失败（磁盘满/IO）以 Chronicle 运行时异常上抛，不吞不重试——此时桶集合
-     * 可能停在转储到一半的中间状态，会话线程随异常终止（溢写池是瞬态工作区，重启时整体清空，
-     * 没有一致性风险）。方法的前置条件 memoryBytes&gt;threshold 保证了至少有一个非空的 MEMORY 桶，
-     * 也就是至少会写入一个单元——"先 append 后查询 lastAppendedIndex" 的契约由此成立。
-     * 由 {@link #storeUnit} 的水位检查在 run 线程内同步调用。
-     */
-    private void spillAll() {
-        MessageSpool target = spool();
-        long bytesSpilled = memoryBytes;
-        int bucketsSpilled = 0;
-        long unitsSpilled = 0;
-        for (TxBuffer bucket : liveBuckets()) {
-            if (bucket.mode != TxBuffer.Mode.MEMORY) {
-                continue;
-            }
-            for (PayloadUnit unit : bucket.units) {
-                appendSpillIndex(bucket, target.append(SpoolFrame.frame(unit)));
-                unitsSpilled++;
-            }
-            bucket.units.clear();
-            bucket.mode = TxBuffer.Mode.SPILLED;
-            memoryBytes -= bucket.bytesTotal;
-            bucketsSpilled++;
-        }
-        LOG.info("spillAll：{} 个 MEMORY 桶（{} 单元/{}B）整体转储溢写池（threshold={}B，水位归零）",
-                bucketsSpilled, unitsSpilled, bytesSpilled, spill.thresholdBytes());
-    }
-
-    /**
-     * 惰性获取溢写池单例：首次转储时建立（INFO 留痕），之后始终复用同一实例——appender 的
-     * 单写者约束和 index 记账都依赖单例。
-     * 目录清不掉或队列建不起来时，{@link MessageSpool} 的构造异常原样上抛（fail-fast，
-     * spool 字段保持 null）。只在 spill 启用的写入路径上会被调用；spill 关闭时本方法不可达。
-     */
-    private MessageSpool spool() {
-        if (spool == null) {
-            LOG.info("首次 spill，建立溢写池：dir={} rollCycle={} threshold={}B",
-                    spill.dir(), spill.rollCycle(), spill.thresholdBytes());
-            spool = new MessageSpool(spill.dir(), spill.rollCycle());
-        }
-        return spool;
-    }
-
-    /**
-     * 桶完结（已从所有桶集合中移除）后的统一收尾：堆内水位回退 + 溢写低水位维护 + registry 剪枝。
-     *
-     * <p>MEMORY 桶把 bytesTotal 从全局水位里扣掉（SPILLED 桶的堆内没有单元，字节已在转储时扣过）；
-     * 随后 {@link #releaseSpooled} 按当前低水位触发滚动文件的删除检查；
-     * {@link #pruneRegistryVersions} 按存活桶的最老 seq 收缩 Relation 版本日志，防止长期膨胀。
-     * spool 没建立时溢写侧是空操作（registry 剪枝与 spool 无关，总会执行）。
-     * 调用时机 = 桶已经移除之后（提交回放后 / StreamAbort 整桶丢弃 / RollbackPrepared 丢弃）。
+     * 桶完结（提交/整桶丢弃，已从所有桶集合中移除）后统一收尾：解除 lastAppendOwner 引用
+     * （退役桶不再 append，连续段判定退回"起新段"）→ CQ 删除低水位检查（滚动文件回收）→
+     * registry 剪枝（版本日志收缩）。两个低水位的作用域差异见 1.7 设计 §3.2。
      */
     private void retireBucket(TxBuffer bucket) {
-        if (bucket.mode == TxBuffer.Mode.MEMORY) {
-            memoryBytes -= bucket.bytesTotal;
+        if (lastAppendOwner == bucket) {
+            lastAppendOwner = null;
         }
-        if (lastSpillAppender == bucket) {
-            lastSpillAppender = null;   // 退役桶不再 append，解除引用（连续段判定退回"起新段"）
-        }
-        releaseSpooled();
+        releasePiped();
         pruneRegistryVersions();
     }
 
     /**
-     * 按当前低水位 {@link #spillWatermark()} 让溢写池删除不再会被回读的过老滚动文件。
-     * spool 没建立（从未转储或 spill 关闭）就直接返回；单个文件删除失败由 spool 内部 WARN
-     * 吸收不上抛——残留文件只是占磁盘，不影响正确性，下次水位推进会重试。
+     * 按当前低水位 {@link #pipeWatermark()} 让管道删除不再会被回读的过老滚动文件。
+     * 单个文件删除失败由 pipe 内部 WARN 吸收不上抛——残留文件只是占磁盘，不影响正确性，
+     * 下次水位推进会重试。管道恒存在（构造即建立），无需 null 守卫。
      */
-    private void releaseSpooled() {
-        if (spool != null) {
-            spool.releaseBelow(spillWatermark());
-        }
+    private void releasePiped() {
+        pipe.releaseBelow(pipeWatermark());
     }
 
     /**
-     * Relation 版本日志剪枝：以**所有存活桶的最老 seq**（取最小值）为低水位，调
-     * {@link VersionedRelationRegistry#pruneBelow}（与 {@link #releaseSpooled} 一样挂在桶完结点）。
+     * Relation 版本日志剪枝：以**所有存活桶的最老 index（firstIndex）**为低水位，调
+     * {@link VersionedRelationRegistry#pruneBelow}（与 {@link #releasePiped} 一样挂在桶完结点）。
      *
-     * <p>四路存活桶全部参与，包括 2PC 挂起池——挂起桶将来回放时仍会按它旧单元的 seq 做
-     * asOf 查询，它的 minSeq 必须继续保住对应版本。一个带单元的存活桶都没有时低水位取
+     * <p>四路存活桶全部参与，包括 2PC 挂起池——挂起桶将来回放时仍会按它旧单元的 index 做
+     * asOf 查询，它的 firstIndex 必须继续保住对应版本。一个带单元的存活桶都没有时低水位取
      * Long.MAX_VALUE：现存版本不会再有人按旧 asOf 查，可以剪到每个 oid 只剩最新一条。
      *
      * <p>正确性依据：pruneBelow 保留"低水位时刻正在生效"的那个版本（它自身的 seq 可以早于
      * 低水位——Relation 消息总是先于同表第一个 DML 到达），而存活桶的任何一次 asOf 查询都
-     * 不早于低水位，查不到被剪掉的部分。空桶（minSeq 为 Long.MAX_VALUE）不参与取最小值；
+     * 不早于低水位，查不到被剪掉的部分。空桶（firstIndex&lt;0）不参与取最小值；
      * 每个桶完结时执行一次，消息热路径上没有开销。
      */
     private void pruneRegistryVersions() {
-        long minSeq = Math.min(bucketFloor(currentNormalTx), bucketFloor(currentPrepareTx));
+        long minSeq = Math.min(floor(currentNormalTx), floor(currentPrepareTx));
         for (TxBuffer bucket : streamedByXid.values()) {
-            minSeq = Math.min(minSeq, bucketFloor(bucket));
+            minSeq = Math.min(minSeq, floor(bucket));
         }
         for (TxBuffer bucket : preparedByGid.values()) {
-            minSeq = Math.min(minSeq, bucketFloor(bucket));
+            minSeq = Math.min(minSeq, floor(bucket));
         }
         registry.pruneBelow(minSeq);
     }
 
-    /** 取一个存活桶的 registry 低水位候选（桶内最老单元的 seq）；桶为 null 或还没有单元时不参与取最小值。 */
-    private static long bucketFloor(TxBuffer bucket) {
-        return bucket == null ? Long.MAX_VALUE : bucket.minSeq;
-    }
-
     /**
-     * 计算当前溢写低水位 = min(存活 SPILLED 桶的 firstIndex, 最近写入 index+1)。
+     * 计算当前 CQ 删除低水位 = min(存活桶 firstIndex, maxAppendedIndex+1)。
      * 低于该 index 的队列条目永远不会再被回读，所在的滚动文件可以安全删除（保留哪些档位见
-     * {@link MessageSpool#releaseBelow}）；一个存活的 SPILLED 桶都没有时取"最近写入 index+1"
+     * {@link MessagePipe#releaseBelow}）；一个存活桶都没有时取"最近写入 index+1"
      * ——已落盘的内容全部是垃圾。
      *
-     * <p>边界：溢写池从未建立（没转储过或 spill 关闭）返回哨兵值 -1；SPILLED 起步但还没写过
-     * 单元的桶（firstIndex&lt;0）不参与取最小值；spool 非 null 时必有成功写入（spillAll 的前置
-     * 保证），lastAppendedIndex 不会抛异常。包私有机动：仅供同包单测断言低水位推进，不是公开 API。
+     * <p>边界：存活但还没写过单元的桶（firstIndex&lt;0）不参与取最小值（其未来单元的 index
+     * 必然大于当前全部已 append 条目，不构成约束）；管道刚建立未 append 过时
+     * maxAppendedIndex=-1，水位为 0（空队列无物可删，天然安全）。本任务（单线程）只有存活桶
+     * 维度；Task 6 加入非 DONE 交接桶维度。包私有机动：仅供同包单测/探针断言低水位推进，
+     * 不是公开 API。
      *
-     * @return 低水位 CQ index；溢写池未建立时返回 -1
+     * @return 低水位 CQ index（≥0，无 -1 哨兵——管道恒存在）
      */
-    long spillWatermark() {
-        if (spool == null) {
-            return -1L;
-        }
-        long lowest = spool.lastAppendedIndex() + 1;
-        lowest = Math.min(lowest, spilledFloor(currentNormalTx));
-        lowest = Math.min(lowest, spilledFloor(currentPrepareTx));
+    long pipeWatermark() {
+        long lowest = maxAppendedIndex + 1;
+        lowest = Math.min(lowest, floor(currentNormalTx));
+        lowest = Math.min(lowest, floor(currentPrepareTx));
         for (TxBuffer bucket : streamedByXid.values()) {
-            lowest = Math.min(lowest, spilledFloor(bucket));
+            lowest = Math.min(lowest, floor(bucket));
         }
         for (TxBuffer bucket : preparedByGid.values()) {
-            lowest = Math.min(lowest, spilledFloor(bucket));
+            lowest = Math.min(lowest, floor(bucket));
         }
         return lowest;
     }
 
-    /** 取一个存活 SPILLED 桶的区间下界（低水位候选）；桶为 null、还是 MEMORY 形态、或尚未写入任何条目时返回 Long.MAX_VALUE（不参与取最小值）。 */
-    private static long spilledFloor(TxBuffer bucket) {
-        if (bucket != null && bucket.mode == TxBuffer.Mode.SPILLED && bucket.firstIndex >= 0) {
-            return bucket.firstIndex;
-        }
-        return Long.MAX_VALUE;
+    /** 存活桶的 firstIndex 低水位候选（CQ 删除与 registry 剪枝两个低水位共用）；桶 null 或空桶返回 Long.MAX_VALUE。 */
+    private static long floor(TxBuffer bucket) {
+        return (bucket == null || bucket.firstIndex < 0) ? Long.MAX_VALUE : bucket.firstIndex;
     }
 
-    /**
-     * 收集当前存活的全部桶（普通活动、两阶段活动、流式多桶、挂起池四路）。
-     * currentStream 指向的桶就在 streamedByXid 里，不再单独加（避免重复）。只有 spillAll
-     * 遍历时用，顺序没有语义——各桶按自己的区间独立回读，跨桶 index 交错不影响正确性。
-     */
-    private List<TxBuffer> liveBuckets() {
-        List<TxBuffer> buckets = new ArrayList<>();
-        if (currentNormalTx != null) {
-            buckets.add(currentNormalTx);
-        }
-        if (currentPrepareTx != null) {
-            buckets.add(currentPrepareTx);
-        }
-        buckets.addAll(streamedByXid.values());
-        buckets.addAll(preparedByGid.values());
-        return buckets;
-    }
-
-    /** 桶存储形态的日志描述（MEMORY 显示单元数/字节数，SPILLED 显示 CQ 区间）——prepare/回滚的日志留痕用。 */
+    /** 桶存储形态的日志描述（段数 + CQ index 端点）——prepare/回滚的日志留痕用。 */
     private static String storageOf(TxBuffer bucket) {
-        return bucket.mode == TxBuffer.Mode.SPILLED
-                ? "SPILLED[" + bucket.firstIndex + ".." + bucket.lastIndex + "]"
-                : "MEMORY[" + bucket.units.size() + " units/" + bucket.bytesTotal + "B]";
-    }
-
-    /**
-     * big-endian 读 4 字节有符号整数（oid 等，仅 fail-fast 描述与窥探用）。
-     * 每字节先 &amp; 0xFF 再移位拼接——byte 是有符号类型，任一字节 ≥ 0x80 时直接 {@code |}
-     * 拼接会把符号位扩散到全部高位（Task 12 集成实测：流式前缀 xid 758 的低字节 0xF6 使
-     * {@code 512 | 0xFFFFFFF6 = 0xFFFFFFF6}，单元归属错位致 StreamAbort 剔除静默失效）。
-     */
-    private static int intAt(byte[] raw, int offset) {
-        return ((raw[offset] & 0xFF) << 24) | ((raw[offset + 1] & 0xFF) << 16)
-                | ((raw[offset + 2] & 0xFF) << 8) | (raw[offset + 3] & 0xFF);
-    }
-
-    /** big-endian 读 4 字节无符号整数入 long（流式前缀 xid；与 ByteBufferReader.readUnsignedInt 同语义）。 */
-    private static long unsignedInt(byte[] raw, int offset) {
-        return intAt(raw, offset) & 0xFFFFFFFFL;
-    }
-
-    /** big-endian 读 8 字节 long（LogicalMsg 的 lsn 窥探）。 */
-    private static long longAt(byte[] raw, int offset) {
-        return (unsignedInt(raw, offset) << 32) | unsignedInt(raw, offset + 4);
-    }
-
-    /** 读 offset 起的 null 结尾 UTF-8 字符串（LogicalMsg 的 prefix 窥探，仅异常/告警路径调用）。 */
-    private static String cstringAt(byte[] raw, int offset) {
-        int end = offset;
-        while (raw[end] != 0) {
-            end++;
-        }
-        return new String(raw, offset, end - offset, StandardCharsets.UTF_8);
+        return "PIPE[" + bucket.segments.size() + " segs " + bucket.firstIndex + ".." + bucket.lastIndex + "]";
     }
 }

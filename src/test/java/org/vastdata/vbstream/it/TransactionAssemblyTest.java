@@ -1,19 +1,17 @@
 package org.vastdata.vbstream.it;
 
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.Column;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.StreamingMode;
 import org.vastdata.vbstream.protocol.TupleValue;
 import org.vastdata.vbstream.replication.DmlKind;
+import org.vastdata.vbstream.replication.PipeConfig;
 import org.vastdata.vbstream.replication.RowChange;
-import org.vastdata.vbstream.replication.SpillConfig;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionAssembler;
 import org.vastdata.vbstream.replication.TransactionKind;
@@ -42,6 +40,10 @@ class TransactionAssemblyTest {
 
     /** 本测试类共用的复制槽名：cleanup 与各场景 newConfig 统一引用，防多处字面量拼写漂移。 */
     private static final String SLOT = "slot_assembly";
+
+    /** 每用例独立的管道目录（1.7 起组装器数据经 MessagePipe 往返，回放需要真实管道）。 */
+    @TempDir
+    Path pipeDir;
 
     /**
      * 流式场景的行载荷表达式：512 个不同 md5(random()) 拼接 = 16384 个随机十六进制字符 ≈ 16KB
@@ -72,17 +74,19 @@ class TransactionAssemblyTest {
 
     /**
      * 离线回放录制流（raw 字节驱动组装器）：全部原始字节喂新组装器（'R' 的 registry 路由在
-     * 组装器内部发生），收集输出的 Transaction。回放中组装器的 fail-fast 同样会抛（等效在线校验）。
+     * 组装器内部发生），收集输出的 Transaction；try-with-resources 收敛管道（不关会泄漏 mmap
+     * 且阻塞 @TempDir 清理）。回放中组装器的 fail-fast 同样会抛（等效在线校验）。
      * 回放模式取 PARALLEL——与 PgTestEnv.newConfig 固定的 streaming 参数一致：StreamAbort 附加
      * 字段（abort_lsn/abort_time）的有无由该模式决定，回放解码必须与录制时一致。
      */
-    private static List<Transaction> assembleRecording(List<byte[]> rawMessages) {
+    private List<Transaction> assembleRecording(List<byte[]> rawMessages) {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
         List<Transaction> out = new ArrayList<>();
-        TransactionAssembler assembler = new TransactionAssembler(out::add, StreamingMode.PARALLEL,
-                registry, new SpillConfig(0, Path.of("unused"), LegacyRollCycles.MINUTELY));
-        for (byte[] raw : rawMessages) {
-            assembler.onRaw(raw);
+        try (TransactionAssembler assembler = new TransactionAssembler(out::add, StreamingMode.PARALLEL,
+                registry, new PipeConfig(pipeDir, LegacyRollCycles.MINUTELY))) {
+            for (byte[] raw : rawMessages) {
+                assembler.onRaw(raw);
+            }
         }
         return out;
     }

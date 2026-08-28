@@ -10,9 +10,9 @@ import org.vastdata.vbstream.protocol.StreamingMode;
 import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
 import org.vastdata.vbstream.replication.DmlKind;
+import org.vastdata.vbstream.replication.PipeConfig;
+import org.vastdata.vbstream.replication.PipeWatermarkProbe;
 import org.vastdata.vbstream.replication.RowChange;
-import org.vastdata.vbstream.replication.SpillConfig;
-import org.vastdata.vbstream.replication.SpillWatermarkProbe;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionAssembler;
 import org.vastdata.vbstream.replication.TransactionKind;
@@ -32,34 +32,20 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 溢写（spill）路径集成测试四场景（assembly-spill 设计 §6 验收）：全部走 SessionHarness 的
- * raw 录制 → close → 离线回放契约——"同一条字节流"喂不同 {@link SpillConfig} 阈值的组装器，
- * 对比输出 {@link Transaction} 是否严格相等（spill 无损的确定性证明：同一字节流双配置对照，
- * 规避两次录制的数据随机性）。低水位观测经 {@link SpillWatermarkProbe}（跨包测试桥）：
- * -1 = 溢写池从未建立（spill 未发生），&gt; -1 = spill 确已发生——防"阈值配小但 spill 被短路"
- * 的假绿等价断言。容器/槽清理复用 PgTestEnv；场景表各自独立（名字带 spill 前缀），
- * setup 统一 DROP+CREATE 自愈（容器跨测试类共享，上次异常退出不留残）。harness 生命周期统一
- * try/finally 而非 try-with-resources：资源变量出块后仍可引用，保证全部断言在 close 之后读
- * 已停止增长的录制列表（"先 close 后断言"顺序契约）。
+ * 管道（MessagePipe）存储路径集成测试（1.7 起单形态——组装器纯 CQ index 段记账，原"双阈值
+ * 等价"场景已删，等价性移至 Task 6 的同步/异步对照）：全部走 SessionHarness 的 raw 录制 →
+ * close → 离线回放契约——同一条字节流回放给组装器，数据经管道 append→readRange 往返后断言
+ * 输出 {@link Transaction} 完整性（多桶交错段、事务内 DDL asOf 渲染、回滚后低水位推进删档）。
+ * 低水位观测经 {@link PipeWatermarkProbe}（跨包测试桥）：CQ 删除低水位 ≥0（无 -1 哨兵——管道
+ * 恒存在），正值即"有存活桶或已 append"。容器/槽清理复用 PgTestEnv；场景表各自独立（名字带
+ * spill 前缀，类名 Task 8 一并处理），setup 统一 DROP+CREATE 自愈（容器跨测试类共享，上次异常
+ * 退出不留残）。harness 生命周期统一 try/finally 而非 try-with-resources：资源变量出块后仍可
+ * 引用，保证全部断言在 close 之后读已停止增长的录制列表（"先 close 后断言"顺序契约）。
  */
 class AssemblySpillTest {
 
     /** 本测试类共用的复制槽名：cleanup 与各场景 newConfig 统一引用，防多处字面量拼写漂移。 */
     private static final String SLOT = "slot_spill";
-
-    /**
-     * 大阈值对照配置：64MiB（SpillConfig 默认值量级）——spill 启用但本类场景的数据量（≤240KB）
-     * 全程不会越限，作为"纯内存组装"基线；其溢写低水位应恒为 -1（溢写池从未建立）。
-     */
-    private static final long BIG_THRESHOLD = 64L * 1024 * 1024;
-
-    /**
-     * 小阈值溢写配置：32KiB——流式载荷行（约 16KB/行）累计 2~3 行即越限触发 spillAll，
-     * 保证场景内 spill 真实发生（低水位 &gt; -1 是等价性断言的前置条件）。取 32KiB 而非
-     * 64KiB 是为了与场景 1 的"服务端不驱逐"约束共存：该场景单事务约 50KB（3 行载荷），
-     * 服务端 64kB work_mem 恒不驱逐（确定性 NORMAL 路径），客户端 32KiB 仍必溢写。
-     */
-    private static final long SMALL_THRESHOLD = 32L * 1024;
 
     /**
      * 行载荷表达式：512 个不同 md5(random()) 拼接 ≈ 16KB 且不可压缩（pg_column_size 实测存满
@@ -86,119 +72,19 @@ class AssemblySpillTest {
     }
 
     /**
-     * 场景 1（核心验收）——spill 无损等价性：同一条录制字节流喂两个仅阈值不同的组装器
-     * （64MiB 恒不溢写 vs 32KiB 必溢写），输出 List&lt;Transaction&gt; 必须完全相等（record 值相等，
-     * 含 xid/LSN/时间戳/逐变更元组与 Relation 快照）。
-     * 构造手法：单连接 5 个串行 NORMAL 事务（混合 DML——事务 1：10 行 INSERT 含 3 行 16KB 不可
-     * 压缩载荷，单事务约 50KB：服务端 64kB work_mem 恒不驱逐（确定性 NORMAL 路径，流式与否不随
-     * 执行时机漂移），客户端 32KB 阈值回放中段触发 spillAll；事务 2：v_text 换 16KB 随机载荷；
-     * 事务 3：同行仅改数值列，new tuple 的 v_text 为 'u'（unchanged TOAST）；事务 4：一条语句批量
-     * UPDATE 3 行；事务 5：一条语句批量 DELETE 2 行）。
-     * 断言依据（按依赖顺序）：小阈值实例低水位 &gt; -1 且大阈值实例 == -1（双配置确实走出不同存储
-     * 路径，防"spill 被短路、两边都是纯内存"的空转等价）→ 双配置输出完全相等 → 非空转内容锚定：
-     * 恰 5 个 NORMAL 事务、变更数 [10,1,1,3,2]、各事务末条 DML [U,U,U,D]、事务 3 的 v_text 列
-     * 携带 UnchangedToast。录制超时/会话异常由 awaitTermination 抛 AssertionError；回放异常
-     * （协议错位/Relation require miss）由 onRaw 原样上抛终结用例。
-     */
-    @Test
-    void spilledAndMemoryReplayOfSameRecordingAreIdentical(@TempDir Path dir) throws Exception {
-        PgTestEnv.execSql(
-                "DROP PUBLICATION IF EXISTS pub_spill_types",
-                "DROP TABLE IF EXISTS t_spill_types",
-                "CREATE TABLE t_spill_types("
-                        + "id int PRIMARY KEY, v_text text, v_bigint bigint, v_float double precision, "
-                        + "v_numeric numeric, v_date date, v_time time, v_ts timestamp)",
-                "CREATE PUBLICATION pub_spill_types FOR TABLE t_spill_types");
-        AtomicInteger commits = new AtomicInteger();
-        SessionHarness harness = SessionHarness.start(
-                PgTestEnv.newConfig(SLOT, "pub_spill_types"),
-                msg -> msg instanceof PgOutputMessage.Commit && commits.incrementAndGet() >= 5);
-        try {
-            try (Connection c = PgTestEnv.newSqlConnection(); Statement st = c.createStatement()) {
-                c.setAutoCommit(false);
-                // 事务 1：10 行 INSERT——id 1..5 与 9..10 为类型字面量（空串/unicode/转义/极值/NULL），
-                // id 6..8 携 16KB 随机载荷（约 50KB：服务端不驱逐走 NORMAL，客户端 32KB 阈值中途溢写）
-                st.execute("INSERT INTO t_spill_types VALUES "
-                        + "(1, 'hello', 100, 3.14, 1234.5678, '2026-08-27', '09:15:00', '2026-08-27 09:15:00'), "
-                        + "(2, '世界 hello', -42, 2.718281828459045, 1.5, '2000-01-01', '23:59:59.999999', '2000-01-01 23:59:59.999999'), "
-                        + "(3, '', 0, 0, 0.0000, '1999-12-31', '00:00:00', '1999-12-31 00:00:00'), "
-                        + "(4, E'tab\\tand unicode ☃', 9223372036854775807, -1e+308, 99999999.99, '2024-02-29', '12:30:45', '2024-02-29 12:30:45'), "
-                        + "(5, 'quote''s % _ \\ back', 42, 1e-15, 0.000000000001, '1970-01-01', '06:00:00', '1970-01-01 06:00:00'), "
-                        + "(6, " + RAND_PAYLOAD + ", 1, 1.1, 1.11, '2026-01-01', '11:11:11', '2026-01-01 11:11:11'), "
-                        + "(7, " + RAND_PAYLOAD + ", NULL, NULL, NULL, '2025-06-15', NULL, '2025-06-15 14:00:00'), "
-                        + "(8, " + RAND_PAYLOAD + ", 9, 9.9, 9.99, NULL, '10:20:30', NULL), "
-                        + "(9, 'row-nine 中文🙂', -1, -2.5, -3.75, '2026-08-27', '13:45:30', '2026-08-27 13:45:30.123456'), "
-                        + "(10, 'row-ten', 10, 10.10, 10.101, '2026-10-10', '10:10:10', '2026-10-10 10:10:10')");
-                c.commit();
-                // 事务 2：text 换 16KB 随机载荷（TOAST 化）
-                st.execute("UPDATE t_spill_types SET v_text = " + RAND_PAYLOAD + " WHERE id = 2");
-                c.commit();
-                // 事务 3：同行仅改数值列——new tuple 的 v_text 预期 'u'（unchanged TOAST，大字段不重传）
-                st.execute("UPDATE t_spill_types SET v_bigint = 1234567890123, v_float = 9.87654321 WHERE id = 2");
-                c.commit();
-                // 事务 4：一条语句批量改 3 行——单事务 3 个 Update 变更（CASE 写死目标值保证可断言）
-                st.execute("UPDATE t_spill_types SET v_float = CASE id "
-                        + "WHEN 3 THEN 0.5 WHEN 4 THEN -5e+307 WHEN 5 THEN 5e-16 END "
-                        + "WHERE id IN (3, 4, 5)");
-                c.commit();
-                // 事务 5：一条语句删 2 行——before 为主键元组（replica identity 默认）
-                st.execute("DELETE FROM t_spill_types WHERE id IN (6, 7)");
-                c.commit();
-            }
-            harness.awaitTermination(Duration.ofSeconds(30));
-        } finally {
-            harness.close();
-        }
-
-        // close 后取全量录制（"先 close 后断言"顺序契约），同一条字节流喂双配置
-        List<byte[]> recording = List.copyOf(harness.rawMessages());
-        ReplayOutcome memoryOnly = replayRecording(recording, BIG_THRESHOLD, dir.resolve("spill-big"));
-        ReplayOutcome spilled = replayRecording(recording, SMALL_THRESHOLD, dir.resolve("spill-small"));
-
-        // 前置（防假绿）：小阈值确已溢写（溢写池建立）、大阈值确未溢写——两实例走出不同存储路径
-        assertTrue(spilled.finalWatermark() > -1L, () -> "小阈值应真实溢写: watermark=" + spilled.finalWatermark());
-        assertEquals(-1L, memoryOnly.finalWatermark(), () -> "大阈值不应溢写: watermark=" + memoryOnly.finalWatermark());
-
-        // 核心断言：同一字节流双配置输出完全相等（失败消息走摘要化 firstDivergence，防 16KB 载荷爆炸）
-        assertTrue(memoryOnly.transactions().equals(spilled.transactions()),
-                () -> "同字节流双配置输出应严格相等: " + firstDivergence(memoryOnly.transactions(), spilled.transactions()));
-
-        // 非空转锚定：等价不是"两边同样错"——内容与结构逐项钉死
-        List<Transaction> txns = memoryOnly.transactions();
-        assertEquals(5, txns.size(), () -> "恰 5 个事务: " + summarize(txns));
-        for (Transaction t : txns) {
-            assertEquals(TransactionKind.NORMAL, t.kind(), () -> summarize(txns));
-        }
-        assertEquals(List.of(10, 1, 1, 3, 2),
-                txns.stream().map(t -> t.changes().size()).toList(),
-                () -> "各事务变更数 [INSERT10/UPDATE1/UPDATE1/UPDATE3/DELETE2]: " + summarize(txns));
-        assertEquals(List.of(DmlKind.UPDATE, DmlKind.UPDATE, DmlKind.UPDATE, DmlKind.DELETE),
-                txns.stream().skip(1)
-                        .map(t -> ((RowChange) t.changes().get(t.changes().size() - 1)).dml()).toList(),
-                () -> "事务 2..5 末条变更的 DML 种类: " + summarize(txns));
-        RowChange first = (RowChange) txns.get(0).changes().get(0);
-        assertEquals(DmlKind.INSERT, first.dml());
-        assertEquals("t_spill_types", first.relation().table());
-        assertEquals("1", ((TupleValue.Text) first.after().orElseThrow().columns().get(0)).value());
-        // 事务 3：仅改数值列，v_text（列序 1）为 unchanged TOAST——溢写回读后 'u' 标志保真
-        RowChange numericOnly = (RowChange) txns.get(2).changes().get(0);
-        assertTrue(numericOnly.after().orElseThrow().columns().get(1) instanceof TupleValue.UnchangedToast,
-                "未动的大字段列应携带 unchanged-TOAST 标志: " + tupleShape(numericOnly.after().orElseThrow()));
-    }
-
-    /**
-     * 场景 2——流式大事务交错 + spill：双连接交错手法（参照 TransactionAssemblyTest 场景 4）+
+     * 场景 2——流式大事务交错 + 多连续段：双连接交错手法（参照 TransactionAssemblyTest 场景 4）+
      * SAVEPOINT 子事务回滚（参照其场景 2）构造"两并发 STREAMED 事务多桶交错 + StreamAbort 剔除"，
-     * 同一条录制喂 64MiB 与 32KiB 双配置回放。
+     * 同一条录制喂两个独立管道目录的组装器回放（1.7 单形态，双回放兼作确定性对照）。
      * 构造手法：A/B 两连接各自 BEGIN 后逐行交替 INSERT（各 6 行 ×16KB 不可压缩载荷，行间 150ms
      * 让驱逐发生在事务进行中）；A 再 SAVEPOINT 写 6 行（96KB 重新越过 64kB 全局水位，确保子事务
      * 变更也被流式下发）后 ROLLBACK TO（由 StreamAbort 剔除）+ 1 行尾行；先 commit A 后
      * commit B，停条件取第 2 个 StreamCommit（AtomicInteger 计数防首个即停漏录 B）。全局
-     * rb->size 超限轮番驱逐两事务，流段交错下发；小阈值客户端在两桶累计约 32KB 时 spillAll
-     * （多桶整体转储），其后 A/B 追加在共享 appender 上交错落盘（单桶多连续段的真实路径）。
+     * rb->size 超限轮番驱逐两事务，流段交错下发；客户端单 appender 管道上 A/B 的流段交错 append，
+     * 每桶按"上一次 append 归属"切成多个连续段（单桶多段回放的真实路径）。
      * 断言依据：前置录制流含 StreamAbort（未流式的子事务回滚被 PG 静默丢弃，缺此断言场景空转）→
-     * 小阈值低水位 &gt; -1、大阈值 == -1 → 双配置输出完全相等 → 内容锚定：恰 2 个 STREAMED 事务、
-     * xid 各异、A 桶 7 行（6+尾行，201..206 一条不混入）、B 桶 6 行、两桶各自行 id 无重复。
+     * 回放后低水位 &gt; 0（消息确经管道 append，非空转）→ 两次回放输出完全相等（确定性）→
+     * 内容锚定：恰 2 个 STREAMED 事务、xid 各异、A 桶 7 行（6+尾行，201..206 一条不混入）、
+     * B 桶 6 行、两桶各自行 id 无重复。
      */
     @Test
     void streamedInterleavedLargeTransactionsSpillEquivalently(@TempDir Path dir) throws Exception {
@@ -247,13 +133,14 @@ class AssemblySpillTest {
         assertTrue(hasStreamAbort(recording),
                 "子事务回滚应产生 StreamAbort（未流式的子事务被 PG 静默丢弃，场景将空转）");
 
-        ReplayOutcome memoryOnly = replayRecording(recording, BIG_THRESHOLD, dir.resolve("spill-big"));
-        ReplayOutcome spilled = replayRecording(recording, SMALL_THRESHOLD, dir.resolve("spill-small"));
+        ReplayOutcome memoryOnly = replayRecording(recording, dir.resolve("pipe-a"));
+        ReplayOutcome spilled = replayRecording(recording, dir.resolve("pipe-b"));
 
-        assertTrue(spilled.finalWatermark() > -1L, () -> "小阈值应真实溢写: watermark=" + spilled.finalWatermark());
-        assertEquals(-1L, memoryOnly.finalWatermark(), () -> "大阈值不应溢写: watermark=" + memoryOnly.finalWatermark());
+        assertTrue(spilled.finalWatermark() > 0L, () -> "回放应经管道 append（水位=maxAppended+1）: watermark="
+                + spilled.finalWatermark());
         assertTrue(memoryOnly.transactions().equals(spilled.transactions()),
-                () -> "同字节流双配置输出应严格相等: " + firstDivergence(memoryOnly.transactions(), spilled.transactions()));
+                () -> "同字节流两次回放输出应严格相等（确定性）: "
+                        + firstDivergence(memoryOnly.transactions(), spilled.transactions()));
 
         // 内容锚定（等价非空转）：2 个 STREAMED 事务，A 桶 7 行（无 201/202），B 桶 6 行
         List<Transaction> txns = memoryOnly.transactions();
@@ -285,7 +172,7 @@ class AssemblySpillTest {
     }
 
     /**
-     * 场景 3——DDL 的 asOf 版本渲染：大事务（阈值以上）内**同事务 DDL**——前段按旧列数插入、
+     * 场景 3——DDL 的 asOf 版本渲染：大事务（大体量）内**同事务 DDL**——前段按旧列数插入、
      * ALTER TABLE ADD COLUMN、后段按新列数插入，服务端在事务中段重发新版本 Relation，
      * 回放必须按单元自身 seq 取"变更时刻"的表定义（VersionedRelationRegistry asOf，设计 §4.4），
      * 旧单元按新 schema 渲染即列错位。
@@ -293,10 +180,10 @@ class AssemblySpillTest {
      * 提交之后（ADD COLUMN 取 ACCESS EXCLUSIVE，与 conn1 已持有的 ROW EXCLUSIVE 冲突），
      * "conn1 后段插入落在新 schema"在双连接手法下不可达；同事务 DDL 是同一断言意图（同一 oid
      * 前后两版 Relation + 同桶跨版本单元）在真实库上的可达构造——DDL 在自身事务内即时生效，
-     * 前段 3 行（48KB）入桶溢写后继续追加后段，单桶同时含 v1/v2 两代单元。服务端侧总记账
+     * 前段 3 行（48KB）先入管道后继续追加后段，单桶同时含 v1/v2 两代单元。服务端侧总记账
      * 48KB+2 小行 &lt; 64kB work_mem，事务走确定性 NORMAL 路径（不依赖驱逐时机）。
      * 断言依据：前置录制流中该表的 Relation 恰按 [3 列, 4 列] 两版到达（asOf 非空转：线上确有
-     * 两版）→ 小阈值（16KB）低水位 &gt; -1（3 行×16KB 必溢写）→ 恰 1 个 NORMAL 事务 5 条变更：
+     * 两版）→ 回放后低水位 &gt; 0（消息确经管道 append）→ 恰 1 个 NORMAL 事务 5 条变更：
      * 前 3 条 relation().columns() 为 3 列且末列名 v_tag、元组 3 值，后 2 条 4 列、末列名
      * ddl_probe 且元组第 4 值等于写入值——任何按"最新版本"渲染旧单元的实现都会在此错位失败。
      * 测试尾无需清理列结构：专表 t_spill_ddl + setup DROP/CREATE 自愈，不影响其他测试。
@@ -314,7 +201,7 @@ class AssemblySpillTest {
         try {
             try (Connection c = PgTestEnv.newSqlConnection(); Statement st = c.createStatement()) {
                 c.setAutoCommit(false);
-                // 前段：3 行 16KB 载荷（48KB > 客户端 16KB 阈值 → 溢写）——Relation v1（3 列）
+                // 前段：3 行 16KB 载荷（48KB 大体量，保证跨 DDL 的多单元场景）——Relation v1（3 列）
                 for (int i = 1; i <= 3; i++) {
                     st.execute("INSERT INTO t_spill_ddl VALUES (" + i + ", " + RAND_PAYLOAD + ", 'pre-" + i + "')");
                 }
@@ -337,10 +224,10 @@ class AssemblySpillTest {
                 .toList();
         assertEquals(List.of(3, 4), versions, "事务中段应重发新版本 Relation（两版各一次）");
 
-        // 客户端阈值 16KB：3 行×约 16KB 于第 2 行即越限 spillAll，前段单元先行落盘
+        // 全量录制经管道回放（1.7 单形态：前段单元与后段单元同经 append→readRange 往返）
         List<byte[]> recording = List.copyOf(harness.rawMessages());
-        ReplayOutcome spilled = replayRecording(recording, 16L * 1024, dir.resolve("spill-small"));
-        assertTrue(spilled.finalWatermark() > -1L, () -> "16KB 阈值应真实溢写: watermark=" + spilled.finalWatermark());
+        ReplayOutcome spilled = replayRecording(recording, dir.resolve("pipe-ddl"));
+        assertTrue(spilled.finalWatermark() > 0L, () -> "回放应经管道 append: watermark=" + spilled.finalWatermark());
 
         List<Transaction> txns = spilled.transactions();
         assertEquals(1, txns.size(), () -> "恰 1 个事务: " + summarize(txns));
@@ -370,17 +257,17 @@ class AssemblySpillTest {
     }
 
     /**
-     * 场景 4——大事务回滚后的溢写垃圾回收：spill 后整体 ROLLBACK 的流式大事务（StreamAbort 整桶
-     * 丢弃）+ 随后一个小事务 COMMIT，断言输出仅含小事务、无异常、溢写低水位越过被回滚桶的区间
-     * 起点——回放过程中在首个 StreamAbort 前观测到的水位即"被回滚桶的区间起点"（彼时它是唯一
-     * 存活的 SPILLED 桶，其 firstIndex 即低水位；丢弃后低水位跳到 lastAppended+1，垃圾可回收）。
-     * 构造手法：单连接显式事务逐行 8×16KB（128KB，服务端 64kB work_mem 必驱逐 → STREAMED；
-     * 客户端 32KB 阈值在约第 2 行 spillAll）→ ROLLBACK（顶层回滚 → StreamAbort(top==sub) 整桶
-     * 丢弃，已落盘单元成垃圾）→ 同连接小事务 INSERT 一行 'small-commit' 后 COMMIT（停条件取
-     * 首个 Commit——被回滚事务永不产生 Commit/StreamCommit 终结消息）。
+     * 场景 4——大事务回滚后的管道垃圾回收：整体 ROLLBACK 的流式大事务（StreamAbort 整桶
+     * 丢弃）+ 随后一个小事务 COMMIT，断言输出仅含小事务、无异常、CQ 删除低水位越过被回滚桶的
+     * 区间起点——回放过程中在首个 StreamAbort 前观测到的水位即"被回滚桶的区间起点"（彼时它是
+     * 唯一存活的带单元桶，其 firstIndex 即低水位；丢弃后低水位跳到 maxAppended+1，垃圾可回收）。
+     * 构造手法：单连接显式事务逐行 8×16KB（128KB，服务端 64kB work_mem 必驱逐 → STREAMED）→
+     * ROLLBACK（顶层回滚 → StreamAbort(top==sub) 整桶丢弃，管道里已 append 的单元成垃圾）→
+     * 同连接小事务 INSERT 一行 'small-commit' 后 COMMIT（停条件取首个 Commit——被回滚事务
+     * 永不产生 Commit/StreamCommit 终结消息）。
      * 断言依据：前置录制流含 StreamAbort（非流式回滚被 PG 静默丢弃、无单元入桶，场景空转）→
-     * 回放首个 'A' 前低水位 &gt; -1（回滚桶确已溢写且回收有物）→ 回放结束后低水位严格大于回滚前
-     * 观测值（垃圾不再挡低水位）→ 输出恰 1 个 NORMAL 事务、1 条变更且内容正确（溢写垃圾不污染
+     * 回放首个 'A' 前低水位 &gt; 0（被回滚桶存活且回收有物）→ 回放结束后低水位严格大于回滚前
+     * 观测值（垃圾不再挡低水位）→ 输出恰 1 个 NORMAL 事务、1 条变更且内容正确（管道垃圾不污染
      * 后续读回放）。回放全程无异常由 onRaw 的 fail-fast 语义隐式断言（异常原样上抛即用例失败）。
      */
     @Test
@@ -415,11 +302,11 @@ class AssemblySpillTest {
         assertTrue(hasStreamAbort(recording),
                 "流式回滚应产生 StreamAbort（非流式回滚被 PG 静默丢弃，场景将空转）");
 
-        ReplayOutcome spilled = replayRecording(recording, SMALL_THRESHOLD, dir.resolve("spill-small"));
+        ReplayOutcome spilled = replayRecording(recording, dir.resolve("pipe-rb"));
 
-        // 低水位推进：回滚前（桶存活，floor=其 firstIndex）< 回滚后（垃圾让位，跳到 lastAppended+1）
-        assertTrue(spilled.watermarkBeforeFirstAbort() > -1L,
-                () -> "首个 StreamAbort 前应已溢写（被回滚桶为存活 SPILLED 桶）: watermark="
+        // 低水位推进：回滚前（桶存活，floor=其 firstIndex）< 回滚后（垃圾让位，跳到 maxAppended+1）
+        assertTrue(spilled.watermarkBeforeFirstAbort() > 0L,
+                () -> "首个 StreamAbort 前被回滚桶应已 append 且存活（其 firstIndex 即水位）: watermark="
                         + spilled.watermarkBeforeFirstAbort());
         assertTrue(spilled.finalWatermark() > spilled.watermarkBeforeFirstAbort(),
                 () -> "回滚后低水位应越过被回滚桶区间起点（垃圾可回收）: 回滚前="
@@ -459,34 +346,33 @@ class AssemblySpillTest {
     }
 
     /**
-     * 离线回放录制流（raw 字节驱动组装器）并观测溢写低水位：全部原始字节喂**新**组装器
+     * 离线回放录制流（raw 字节驱动组装器）并观测 CQ 删除低水位：全部原始字节喂**新**组装器
      * （独立 VersionedRelationRegistry——seq/版本日志随本组装器重建，与其它回放互不共享），
      * 收集输出的 Transaction，并在（a）回放结束后、（b）首个 StreamAbort('A') 喂入前两个时点
-     * 经 {@link SpillWatermarkProbe} 快照低水位——(b) 供回滚场景断言"被回滚桶的区间起点"。
+     * 经 {@link PipeWatermarkProbe} 快照低水位——(b) 供回滚场景断言"被回滚桶的区间起点"。
      * 边界与异常：回放中组装器的 fail-fast（桶缺失/Relation require miss/协议错位）原样上抛 =
-     * 等效在线校验；finally 关闭组装器释放溢写池 mmap（否则 @TempDir 清理可能因映射未释放失败）。
+     * 等效在线校验；finally 关闭组装器释放管道 mmap（否则 @TempDir 清理可能因映射未释放失败）。
      * 回放模式取 PARALLEL——与 PgTestEnv.newConfig 固定的 streaming 参数一致（StreamAbort 附加
      * 字段的有无由该模式决定，回放解码必须与录制时一致）。
      *
-     * @param rawMessages    全量录制（close 后的确定性快照）
-     * @param thresholdBytes spill 阈值（&gt;0 启用；越大越难越限）
-     * @param spillDir       溢写池目录（MessageSpool 构造时自建并清空）
+     * @param rawMessages 全量录制（close 后的确定性快照）
+     * @param pipeDir     管道目录（MessagePipe 构造时自建并清空）
      * @return 输出事务列表 + 两个低水位观测点
      */
-    private static ReplayOutcome replayRecording(List<byte[]> rawMessages, long thresholdBytes, Path spillDir) {
+    private static ReplayOutcome replayRecording(List<byte[]> rawMessages, Path pipeDir) {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
         List<Transaction> out = new ArrayList<>();
         TransactionAssembler assembler = new TransactionAssembler(out::add, StreamingMode.PARALLEL,
-                registry, new SpillConfig(thresholdBytes, spillDir, LegacyRollCycles.MINUTELY));
+                registry, new PipeConfig(pipeDir, LegacyRollCycles.MINUTELY));
         long beforeFirstAbort = -1L;
         try {
             for (byte[] raw : rawMessages) {
                 if (raw[0] == 'A' && beforeFirstAbort < 0L) {
-                    beforeFirstAbort = SpillWatermarkProbe.of(assembler);   // 首个 StreamAbort 前快照
+                    beforeFirstAbort = PipeWatermarkProbe.of(assembler);   // 首个 StreamAbort 前快照
                 }
                 assembler.onRaw(raw);
             }
-            return new ReplayOutcome(List.copyOf(out), SpillWatermarkProbe.of(assembler), beforeFirstAbort);
+            return new ReplayOutcome(List.copyOf(out), PipeWatermarkProbe.of(assembler), beforeFirstAbort);
         } finally {
             assembler.close();
         }
@@ -495,10 +381,12 @@ class AssemblySpillTest {
     /**
      * 一次离线回放的产物与观测点。
      *
-     * @param transactions             组装器输出的全部事务（回调序，不可变）
-     * @param finalWatermark           回放结束后的溢写低水位（-1 = 溢写池从未建立，即 spill 未发生）
-     * @param watermarkBeforeFirstAbort 首个 StreamAbort('A') 喂入前的低水位快照；录制无 'A' 或其前
-     *                                  溢写未发生时为 -1（供回滚场景断言被回滚桶的区间起点）
+     * @param transactions              组装器输出的全部事务（回调序，不可变）
+     * @param finalWatermark            回放结束后的 CQ 删除低水位（≥0：无存活桶时 = maxAppended+1，
+     *                                  即全部已 append 条目数意义上的"垃圾上界"）
+     * @param watermarkBeforeFirstAbort 首个 StreamAbort('A') 喂入前的低水位快照；录制无 'A' 时为 -1
+     *                                  （供回滚场景断言被回滚桶的区间起点——彼时它是唯一存活带单元桶，
+     *                                  快照即其 firstIndex）
      */
     private record ReplayOutcome(List<Transaction> transactions, long finalWatermark,
                                  long watermarkBeforeFirstAbort) {

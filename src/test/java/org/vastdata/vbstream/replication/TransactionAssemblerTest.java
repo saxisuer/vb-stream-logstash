@@ -9,14 +9,11 @@ import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
 import org.vastdata.vbstream.protocol.UnknownMessageTypeException;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
-import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -39,10 +36,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       此形态），移植用 {@link PgWire#streamed} 加 xid 前缀保持消息序位置不变</li>
  * </ul>
  *
- * <p>夹具约定：组装器以 {@link StreamingMode#ON} 构造（非 parallel——{@link PgWire#streamAbort}
- * 只产出无附加字段的形态）；spill 阈值 0 = 纯 MEMORY 逃生门（Task 10 起为真实短路路径：spool
- * 永不创建）。文末混合模式组（Task 10）验证溢写路径的**无损性**——同一字节流以小阈值（触发
- * spillAll/SPILLED 起步/回放回读）与纯内存两种配置跑，断言 {@code List<Transaction>} 完全相等。
+ * <p>夹具约定（1.7 纯段记账）：组装器以 {@link StreamingMode#ON} 构造（非 parallel——
+ * {@link PgWire#streamAbort} 只产出无附加字段的形态）；管道目录取类级共享的静态 {@code @TempDir}
+ * （每次构造组装器 wipe-on-open 顺序清空，用例间不残留）。数据全部经 CQ 往返
+ * （append→readRange），等价基线 = 既有期望值不变——这是 1.6 → 1.7a 的无损性验收本体
+ * （1.6 的"双阈值对照"已无对照面，等价性移至 Task 6 的同步/异步对照）。
  */
 class TransactionAssemblerTest {
 
@@ -57,8 +55,15 @@ class TransactionAssemblerTest {
     private static final long SUB = 7003L;
     /** 两阶段事务全局 id 夹具值。 */
     private static final String GID = "gid-1";
-    /** 纯 MEMORY 配置（阈值 0 = 禁用 spill 的逃生门值）。 */
-    private static final SpillConfig NO_SPILL = new SpillConfig(0, Path.of("unused"), LegacyRollCycles.MINUTELY);
+
+    /** 类级共享管道目录：静态 @TempDir 全类一份，用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
+    @TempDir
+    static Path PIPE_DIR;
+
+    /** 组装器统一管道配置（目录取类级共享 @TempDir，滚动周期与生产默认同档）。 */
+    private static PipeConfig pipeCfg() {
+        return new PipeConfig(PIPE_DIR, LegacyRollCycles.MINUTELY);
+    }
 
     /** 构造默认 oid 的两列 (id, v) Relation 字节，供单表场景使用。 */
     private static byte[] relation() {
@@ -99,26 +104,12 @@ class TransactionAssemblerTest {
     /**
      * 依序把 raw 字节喂给新组装器（'R' 的 registry 路由在组装器内部发生），收集输出的 Transaction。
      * 组装器以 StreamingMode.ON 构造——与 {@link PgWire#streamAbort} 的非 parallel 形态配对。
+     * try-with-resources 收敛管道（每个组装器独占一条 CQ，不关会泄漏 mmap 且阻塞 @TempDir 清理）。
      */
     private static List<Transaction> run(byte[]... msgs) {
         List<Transaction> out = new ArrayList<>();
-        TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, new VersionedRelationRegistry(), NO_SPILL);
-        for (byte[] m : msgs) {
-            assembler.onRaw(m);
-        }
-        return out;
-    }
-
-    /**
-     * 责任：以指定 spill 配置驱动同一字节流（双配置等价性用例的对照侧驱动器）。
-     * 关键步骤：try-with-resources 构造组装器（close 收敛溢写池）→ 依序 onRaw → 返回输出列表。
-     * 边界：需要中途断言 {@code spillWatermark()} 的用例不走本夹具（须持有组装器实例逐步驱动）。
-     */
-    private static List<Transaction> run(SpillConfig spill, byte[]... msgs) {
-        List<Transaction> out = new ArrayList<>();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, new VersionedRelationRegistry(), spill)) {
+                out::add, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
             for (byte[] m : msgs) {
                 assembler.onRaw(m);
             }
@@ -426,22 +417,23 @@ class TransactionAssemblerTest {
     @Test
     void streamAbortOfWholeTopTransactionDropsBucket() {
         List<Transaction> out = new ArrayList<>();
-        TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, new VersionedRelationRegistry(), NO_SPILL);
-        byte[][] seq = {
-                relation(),
-                PgWire.streamStart(TOP_A, true),
-                streamedInsert(TOP_A, "1", "a"),
-                streamedInsert(SUB, "2", "b"),
-                PgWire.streamStop(),
-                PgWire.streamAbort(TOP_A, SUB),
-                PgWire.streamAbort(TOP_A, TOP_A)};
-        for (byte[] m : seq) {
-            assembler.onRaw(m);
+        try (TransactionAssembler assembler = new TransactionAssembler(
+                out::add, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
+            byte[][] seq = {
+                    relation(),
+                    PgWire.streamStart(TOP_A, true),
+                    streamedInsert(TOP_A, "1", "a"),
+                    streamedInsert(SUB, "2", "b"),
+                    PgWire.streamStop(),
+                    PgWire.streamAbort(TOP_A, SUB),
+                    PgWire.streamAbort(TOP_A, TOP_A)};
+            for (byte[] m : seq) {
+                assembler.onRaw(m);
+            }
+            assertEquals(0, out.size());
+            // 同一实例：桶已被移除 → 后续同 xid StreamCommit fail-fast（非静默）
+            assertThrows(IllegalStateException.class, () -> assembler.onRaw(PgWire.streamCommit(TOP_A)));
         }
-        assertEquals(0, out.size());
-        // 同一实例：桶已被移除 → 后续同 xid StreamCommit fail-fast（非静默）
-        assertThrows(IllegalStateException.class, () -> assembler.onRaw(PgWire.streamCommit(TOP_A)));
     }
 
     /** 旧例 16：StreamStart(first=false) 但顶层事务无桶 fail-fast。 */
@@ -645,322 +637,35 @@ class TransactionAssemblerTest {
         assertThrows(UnknownMessageTypeException.class, () -> run(new byte[]{'X'}));
     }
 
-    // --- Task 10：混合缓冲（spill）路径——核心验收 = 同一字节流大/小阈值双配置输出严格相等 ----------
-
-    /** 溢写阈值小值（brief Step 1）：一条块外 Insert 恰 20B（1 类型 + 4 oid + 1 标记 + 14 TupleData）。 */
-    private static final long SPILL_THRESHOLD = 100L;
-
-    /** 构造指定阈值的溢写配置（目录用 @TempDir、MINUTELY 滚动与生产默认同档）。 */
-    private static SpillConfig spillAt(long thresholdBytes, Path dir) {
-        return new SpillConfig(thresholdBytes, dir, LegacyRollCycles.MINUTELY);
-    }
-
-    /**
-     * 构造 [Relation, Begin, insert×rows, Commit] 的单普通事务字节流（行值带序号保持可区分；
-     * 每条 insert 20B，rows≥6 即可越过 {@link #SPILL_THRESHOLD}）。
-     */
-    private static byte[][] normalTx(int rows) {
-        byte[][] msgs = new byte[rows + 3][];
-        msgs[0] = relation();
-        msgs[1] = PgWire.begin(1L);
-        for (int i = 0; i < rows; i++) {
-            msgs[2 + i] = insert(Integer.toString(i), "v" + i);
-        }
-        msgs[rows + 2] = PgWire.commit();
-        return msgs;
-    }
-
-    /**
-     * 等价性 1：阈值内小事务全程 MEMORY——与纯内存（阈值 0 逃生门）跑同一字节流，输出
-     * {@code List<Transaction>} 完全相等（record 值相等深比较），且溢写池从未建立
-     * （{@code spillWatermark()} 哨兵 -1、temp 目录零文件——spool 惰性创建不被空转触发）。
-     */
-    @Test
-    void smallTransactionUnderThresholdStaysMemoryAndEqualsPureMemory(@TempDir Path dir) throws IOException {
-        byte[][] stream = {
-                relation(),
-                PgWire.begin(1L),
-                insert("1", "a"),
-                insert("2", "b"),
-                insert("3", "c"),          // 3×20B=60B，全程在 100B 阈值内
-                PgWire.commit()};
-        List<Transaction> expected = run(stream);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(SPILL_THRESHOLD, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertEquals(-1L, assembler.spillWatermark());   // 未发生 spill：spool 未创建
-        }
-        assertEquals(expected, actual);
-        try (Stream<Path> entries = Files.list(dir)) {
-            assertEquals(0, entries.count());                // spool 惰性创建：目录保持空白
-        }
-    }
-
-    /**
-     * 等价性 2（核心验收）：大事务跨阈值——第 6 条 Insert 后全局记账 120B&gt;100B 触发 spillAll
-     * （前 6 条转储落盘、桶置 SPILLED），其余 6 条直写溢写池；Commit 经 readRange 整段
-     * [firstIndex..lastIndex] 回读解帧回放，输出与纯内存跑完全相等（**spill 无损**）。
-     * {@code spillWatermark()>-1} 佐证溢写池确已建立（防阈值误算导致的空转绿）。
-     */
-    @Test
-    void bigNormalTransactionAcrossThresholdEqualsPureMemory(@TempDir Path dir) {
-        byte[][] stream = normalTx(12);                      // 12×20B=240B，第 6 条触发 spillAll
-        List<Transaction> expected = run(stream);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(SPILL_THRESHOLD, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertTrue(assembler.spillWatermark() > -1L);    // spillAll 确已发生
-        }
-        assertEquals(expected, actual);
-        assertEquals(12, actual.get(0).changes().size());    // 无丢单元（6 转储 + 6 直写）
-    }
-
-    /**
-     * 开桶即 SPILLED：TOP_A 流块内 4 条 streamed Insert（每条 24B）累计恰 == 阈值（写入侧越限判定
-     * 是严格 &gt;，恰等不触发 spillAll），随后 TOP_B 开桶时 memoryBytes&gt;=threshold → 直接
-     * SPILLED 起步（空区间，首单元 append 建立 firstIndex，不经任何 MEMORY 阶段）；两事务输出与
-     * 纯内存跑完全相等，{@code spillWatermark()>-1} 证明 TOP_B 单元确已落盘。
-     */
-    @Test
-    void newBucketStartsSpilledWhenWatermarkAtThreshold(@TempDir Path dir) {
-        long unitBytes = streamedInsert(TOP_A, "1", "a").length;   // 24B，运行期实测防布局演算失配
-        long threshold = 4L * unitBytes;                            // 4 条恰 == 阈值（96B）
-        byte[][] stream = {
-                relation(),
-                PgWire.streamStart(TOP_A, true),
-                streamedInsert(TOP_A, "1", "a"),
-                streamedInsert(TOP_A, "2", "b"),
-                streamedInsert(TOP_A, "3", "c"),
-                streamedInsert(TOP_A, "4", "d"),
-                PgWire.streamStop(),
-                PgWire.streamStart(TOP_B, true),            // 开桶点：memoryBytes(96B)>=threshold(96B)
-                streamedInsert(TOP_B, "9", "i"),            // SPILLED 起步：直写溢写池
-                streamedInsert(TOP_B, "8", "h"),
-                PgWire.streamStop(),
-                PgWire.streamCommit(TOP_A),
-                PgWire.streamCommit(TOP_B)};
-        List<Transaction> expected = run(stream);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(threshold, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertTrue(assembler.spillWatermark() > -1L);    // TOP_B 首单元 append 建立了溢写池
-        }
-        assertEquals(expected, actual);
-        assertEquals(List.of(TOP_A, TOP_B), actual.stream().map(Transaction::xid).toList());
-    }
-
-    /**
-     * 等价性 3：SPILLED 桶的 StreamAbort(sub)——abortedSubxids 存于桶元数据（与单元存储位置无关），
-     * 跨阈值转储的流式事务回滚子事务后，回放期照旧剔除 SUB 单元（解帧还原的 streamXid 命中过滤），
-     * 输出与纯内存跑完全相等。
-     */
-    @Test
-    void streamAbortSubFilteringWorksOnSpilledBucket(@TempDir Path dir) {
-        byte[][] stream = {
-                relation(),
-                PgWire.streamStart(TOP_A, true),
-                streamedInsert(TOP_A, "1", "a"),            // 24/48/72/96B：第 4 条后恰达 96B<100B
-                streamedInsert(TOP_A, "2", "b"),
-                streamedInsert(TOP_A, "3", "c"),
-                streamedInsert(TOP_A, "4", "d"),
-                streamedInsert(SUB, "5", "e"),              // 第 5 条：120B>100B → spillAll（5 单元转储）
-                streamedInsert(SUB, "6", "f"),              // 第 6 条：SPILLED 分支直写
-                PgWire.streamStop(),
-                PgWire.streamAbort(TOP_A, SUB),             // 桶元数据记 sub，不删存储
-                PgWire.streamCommit(TOP_A)};
-        List<Transaction> expected = run(stream);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(SPILL_THRESHOLD, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertTrue(assembler.spillWatermark() > -1L);
-        }
-        assertEquals(expected, actual);
-        assertEquals(4, actual.get(0).changes().size());    // SUB 两单元被回放剔除
-    }
-
-    /**
-     * 等价性 4：2PC 跨 spill——小两阶段桶（2 单元/40B，MEMORY）PREPARE 入挂起池后"跨很久"
-     * （以中间的普通事务模拟），该普通事务第 4 条 Insert 使全局 120B&gt;100B 触发 spillAll，
-     * **挂起池桶一并转储**；COMMIT PREPARED 经 readRange 回放输出与纯内存跑完全相等。
-     */
-    @Test
-    void twoPhaseBucketSpilledByLaterSpillAllStillReplaysEqually(@TempDir Path dir) {
-        byte[][] stream = {
-                relation(),
-                PgWire.beginPrepare(601L, GID),
-                insert("1", "a"),
-                insert("2", "b"),                           // 40B MEMORY 入挂起池
-                PgWire.prepare(601L, GID),
-                PgWire.begin(99L),                          // 开桶点：40B<100B → MEMORY 起步
-                insert("5", "x"),                           // 60/80/100B
-                insert("6", "y"),
-                insert("7", "z"),
-                insert("8", "w"),                           // 120B>100B → spillAll（普通桶+挂起池桶）
-                insert("9", "u"),
-                insert("0", "t"),                           // SPILLED 直写
-                PgWire.commit(),
-                PgWire.commitPrepared(601L, GID)};          // 挂起池桶回放（readRange 路径）
-        List<Transaction> expected = run(stream);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(SPILL_THRESHOLD, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertTrue(assembler.spillWatermark() > -1L);
-        }
-        assertEquals(expected, actual);
-        assertEquals(List.of(99L, 601L), actual.stream().map(Transaction::xid).toList());
-        assertEquals(6, actual.get(0).changes().size());
-        assertEquals(2, actual.get(1).changes().size());
-    }
-
-    /**
-     * spill 禁用（threshold=0 逃生门）：大事务全路径短路，spool 永不创建——{@code spillWatermark()}
-     * 恒 -1，close() 后 temp 目录无任何队列文件（.cq4/.cq4t 均无），输出与纯内存行为一致。
-     */
-    @Test
-    void disabledSpillNeverCreatesQueueFiles(@TempDir Path dir) throws IOException {
-        byte[][] stream = normalTx(12);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(0, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertEquals(-1L, assembler.spillWatermark());  // 禁用：spool 未创建
-        }
-        try (Stream<Path> entries = Files.list(dir)) {
-            assertEquals(0, entries.count());               // 无队列文件落盘
-        }
-        assertEquals(run(stream), actual);                  // 行为与纯内存一致
-    }
-
-    /**
-     * 低水位推进：巨型流式桶跨阈值转储后（watermark == 巨型桶 firstIndex），整桶 abort 丢弃
-     * （存活 SPILLED 桶清空 → watermark 跳到 lastAppended+1），随后小普通事务提交维持推进后的
-     * 水位——三段断言覆盖"转储期 < abort 后 ≤ 小桶提交后"的单调推进路径。
-     */
-    @Test
-    void spillWatermarkAdvancesAfterGiantBucketAbortAndSmallCommit(@TempDir Path dir) {
-        List<Transaction> out = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(SPILL_THRESHOLD, dir))) {
-            byte[][] giant = {
-                    relation(),
-                    PgWire.streamStart(TOP_A, true),
-                    streamedInsert(TOP_A, "1", "a"),        // 第 5 条 120B>100B → spillAll
-                    streamedInsert(TOP_A, "2", "b"),
-                    streamedInsert(TOP_A, "3", "c"),
-                    streamedInsert(TOP_A, "4", "d"),
-                    streamedInsert(TOP_A, "5", "e"),
-                    PgWire.streamStop()};
-            for (byte[] m : giant) {
-                assembler.onRaw(m);
-            }
-            long duringGiant = assembler.spillWatermark();
-            assertTrue(duringGiant > -1L);                  // == 巨型桶 firstIndex
-            assembler.onRaw(PgWire.streamAbort(TOP_A, TOP_A));   // 整桶丢弃 → 低水位候选推进
-            long afterAbort = assembler.spillWatermark();
-            assertTrue(afterAbort > duringGiant);           // 无存活 SPILLED 桶 → lastAppended+1
-            assembler.onRaw(PgWire.begin(99L));             // 小桶（memoryBytes 已归零 → MEMORY 起步）
-            assembler.onRaw(insert("5", "x"));
-            assembler.onRaw(PgWire.commit());
-            assertEquals(afterAbort, assembler.spillWatermark());   // 小桶提交不回退水位
-        }
-        assertEquals(List.of(99L), out.stream().map(Transaction::xid).toList());   // 巨型桶被 abort 不输出
-    }
-
-    /**
-     * 等价性 5（交错段）：两个并发流式事务**先后**跨阈值转储后，各自的后续流段在共享 appender 上
-     * 交错直写（A 段→B 段→A 段→B 段）——单桶条目不再整体连续，按连续段记账逐段回读。触发序列：
-     * A 第 5 条（120B&gt;100B）首次 spillAll；B 累计至第 5 条（116B&gt;100B）第二次 spillAll；
-     * 此后 A、B 各再追加一段（互在他桶 append 之间→各起新段）。输出与纯内存跑完全相等
-     * （交错不串桶、不丢不重）。
-     */
-    @Test
-    void interleavedSpilledStreamSegmentsReplayEqually(@TempDir Path dir) {
-        byte[][] stream = {
-                relation(),
-                PgWire.streamStart(TOP_A, true),
-                streamedInsert(TOP_A, "1", "a"),            // 24..96B
-                streamedInsert(TOP_A, "2", "b"),
-                streamedInsert(TOP_A, "3", "c"),
-                streamedInsert(TOP_A, "4", "d"),
-                streamedInsert(TOP_A, "5", "e"),            // 120B>100B → spillAll（A 转储 5 单元一段）
-                PgWire.streamStop(),
-                PgWire.streamStart(TOP_B, true),
-                streamedInsert(TOP_B, "9", "i"),            // B MEMORY：24B
-                PgWire.streamStop(),
-                PgWire.streamStart(TOP_A, false),
-                streamedInsert(TOP_A, "6", "f"),            // A 已 SPILLED：直写（顺延 A 的段）
-                PgWire.streamStop(),
-                PgWire.streamStart(TOP_B, false),
-                streamedInsert(TOP_B, "8", "h"),            // B MEMORY 累计：48/72/96B
-                streamedInsert(TOP_B, "7", "g"),
-                streamedInsert(TOP_B, "6", "f"),
-                streamedInsert(TOP_B, "5", "e"),            // 120B>100B → spillAll（B 转储 5 单元一段）
-                PgWire.streamStop(),
-                PgWire.streamStart(TOP_A, false),
-                streamedInsert(TOP_A, "7", "g"),            // B 插队过 → A 起新段
-                PgWire.streamStop(),
-                PgWire.streamStart(TOP_B, false),
-                streamedInsert(TOP_B, "4", "d"),            // A 插队过 → B 起新段
-                PgWire.streamStop(),
-                PgWire.streamCommit(TOP_A),
-                PgWire.streamCommit(TOP_B)};
-        List<Transaction> expected = run(stream);
-        List<Transaction> actual = new ArrayList<>();
-        try (TransactionAssembler assembler = new TransactionAssembler(
-                actual::add, StreamingMode.ON, new VersionedRelationRegistry(), spillAt(SPILL_THRESHOLD, dir))) {
-            for (byte[] m : stream) {
-                assembler.onRaw(m);
-            }
-            assertTrue(assembler.spillWatermark() > -1L);
-        }
-        assertEquals(expected, actual);
-        assertEquals(7, actual.get(0).changes().size());    // A：5 转储 + 1 直写 + 1 新段
-        assertEquals(6, actual.get(1).changes().size());    // B：5 转储 + 1 新段
-        assertEquals(List.of("1", "2", "3", "4", "5", "6", "7"), idsOf(actual.get(0)));
-        assertEquals(List.of("9", "8", "7", "6", "5", "4"), idsOf(actual.get(1)));
-    }
-
     // --- 终审 Fix B：registry 版本日志剪枝接线（桶完结点驱动，同 oid 多版本场景） ---------------
 
     /**
      * 桶完结驱动 registry 剪枝：无存活桶时低水位取"无穷"——被新版本取代的旧版本在下一个桶完结点
      * 被剪掉（旧 asOf 查询 ISE 证明确实剪了，非空转），后续事务仍按新版本正确渲染。
-     * 消息序（seq 从 1 起、每条 onRaw 一次）：R(t_v1)=1、B=2、I=3、C=4（完结点①：仅 v1 在册，
-     * floor 保留）；R(t_v2)=5、B=6、I=7、C=8（完结点②：无存活桶 → v1 剪除）；
-     * B=9、I=10、C=11（按 v2 渲染）。同一 registry 实例贯穿全程（剪枝副作用可观测的前提）。
+     * 消息序（1.7 起 seq ≡ CQ index，绝对值随建队列时刻漂移、不可字面断言）：R(t_v1)、B、I、C
+     * （完结点①：仅 v1 在册，floor 保留）；R(t_v2)、B、I、C（完结点②：无存活桶 → v1 剪除）；
+     * B、I、C（按 v2 渲染）。同一 registry 实例贯穿全程（剪枝副作用可观测的前提）。
+     * asOf 锚点取法：完结点①后无存活桶，{@code pipeWatermark()} = 最近 append index + 1——减一
+     * 即 v1 时代的最后一条消息 index，先证其可解析（v1 在册），再在完结点②后断言同 asOf 抛 ISE
+     * （剪枝确已发生，而非 asAt 值本身无效的空转）。
      */
     @Test
     void retiredBucketPrunesSupersededRegistryVersions() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
         List<Transaction> out = new ArrayList<>();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, registry, NO_SPILL)) {
+                out::add, StreamingMode.ON, registry, pipeCfg())) {
             assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
             assembler.onRaw(PgWire.begin(1L));
             assembler.onRaw(insert("1", "a"));
             assembler.onRaw(PgWire.commit());
+            long v1EraSeq = assembler.pipeWatermark() - 1L;   // == 完结点①前最近 append（首条 Commit）的 index
+            assertEquals("t_v1", registry.require(OID, v1EraSeq).table());   // 剪枝前该 asOf 可解析
             assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"));
             assembler.onRaw(PgWire.begin(2L));
             assembler.onRaw(insert("2", "b"));
             assembler.onRaw(PgWire.commit());
-            assertThrows(IllegalStateException.class, () -> registry.require(OID, 4));   // v1 已剪
+            assertThrows(IllegalStateException.class, () -> registry.require(OID, v1EraSeq));   // v1 已剪
             assertEquals("t_v2", registry.require(OID).table());                        // 最新视图仍可答
             assembler.onRaw(PgWire.begin(3L));
             assembler.onRaw(insert("3", "c"));
@@ -973,20 +678,22 @@ class TransactionAssemblerTest {
     }
 
     /**
-     * 2PC 挂起桶算存活（剪枝低水位候选）：挂起桶的旧单元依赖 v1——其 seq(1) 早于桶 minSeq(3)
-     * （'R' 恒先于同表 DML 到达），其间他桶（普通事务 99）完结触发的剪枝必须保住 v1
-     * （floor 语义）；挂起桶最终 CommitPrepared 仍按 v1 正确渲染，其完结后 v1 才被剪。
-     * 这是"以存活桶 minSeq 为低水位"接线正确性的钉子用例（若按"丢弃 seq &lt; 低水位"的
+     * 2PC 挂起桶算存活（剪枝低水位候选）：挂起桶的旧单元依赖 v1——其 seq（R(t_v1) 的 index）
+     * 早于桶 firstIndex（'R' 恒先于同表 DML 到达），其间他桶（普通事务 99）完结触发的剪枝必须
+     * 保住 v1（floor 语义）；挂起桶最终 CommitPrepared 仍按 v1 正确渲染，其完结后 v1 才被剪。
+     * 这是"以存活桶 firstIndex 为低水位"接线正确性的钉子用例（若按"丢弃 seq &lt; 低水位"的
      * 字面实现，v1 会在事务 99 的完结点被误剪，CommitPrepared 回放 ISE 崩溃）。
-     * 消息序：R(t_v1)=1、b=2、I=3（挂起桶 minSeq）、P=4、R(t_v2)=5、B=6、I=7、C=8（剪枝点：
-     * 低水位 = 挂起桶 minSeq(3)）、K=9（挂起桶按 v1 回放，完结后 v1 剪除）。
+     * 消息序（1.7 起 seq ≡ CQ index）：R(t_v1)、b、I（挂起桶 firstIndex）、P、R(t_v2)、B、I、C
+     * （剪枝点：低水位 = 挂起桶 firstIndex）、K（挂起桶按 v1 回放，完结后 v1 剪除）。
+     * 挂起桶单元 seq 取法：剪枝点后挂起桶是唯一带单元的存活桶，{@code pipeWatermark()} 恰等于
+     * 其 firstIndex（min 语义），即旧单元自身的 asOf。
      */
     @Test
     void pendingTwoPhaseBucketKeepsItsAsOfVersionAliveAcrossPruning() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
         List<Transaction> out = new ArrayList<>();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, registry, NO_SPILL)) {
+                out::add, StreamingMode.ON, registry, pipeCfg())) {
             assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
             assembler.onRaw(PgWire.beginPrepare(601L, GID));
             assembler.onRaw(insert("1", "a"));
@@ -995,9 +702,10 @@ class TransactionAssemblerTest {
             assembler.onRaw(PgWire.begin(99L));
             assembler.onRaw(insert("9", "x"));
             assembler.onRaw(PgWire.commit());                                    // 剪枝点：v1 必须存活
-            assertEquals("t_v1", registry.require(OID, 3).table());              // 挂起桶依赖版本可答
+            long pendingSeq = assembler.pipeWatermark();   // == 挂起桶 firstIndex（唯一带单元存活桶的 min）
+            assertEquals("t_v1", registry.require(OID, pendingSeq).table());     // 挂起桶依赖版本可答
             assembler.onRaw(PgWire.commitPrepared(601L, GID));                   // 挂起桶回放：按 v1 渲染
-            assertThrows(IllegalStateException.class, () -> registry.require(OID, 4));   // 完结后 v1 已剪
+            assertThrows(IllegalStateException.class, () -> registry.require(OID, pendingSeq));   // 完结后 v1 已剪
         }
         assertEquals(List.of(99L, 601L), out.stream().map(Transaction::xid).toList());
         assertEquals("t_v2", ((RowChange) out.get(0).changes().get(0)).relation().table());
