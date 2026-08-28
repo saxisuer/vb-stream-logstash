@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * oid → Relation 的版本日志：为每个 oid 维护一条按 seq 升序的版本序列，支持按 asOfSeq 二分取
@@ -25,6 +26,8 @@ import java.util.Optional;
  *       asOf=minSeq 时刻**正在生效**的那个版本（它自身的 seq 可以早于 minSeq，因为 Relation 总是
  *       先于同表第一个 DML 到达）及其之后的全部，更早的丢弃；minSeq 之后一个版本都没有时整列
  *       保留（"每个 oid 至少留最新一条"由这一规则自然保证，永远不会剪空）</li>
+ *   <li>{@link #snapshot(Set, long)}：把指定 oid 集合在 maxSeq 时刻已生效的版本前缀拷成不可变
+ *       {@link RelationSnapshot}，供桶交接给 consumer 线程回放渲染（1.7 设计 §4.3）</li>
  *   <li>继承下来的 {@link #accept(PgOutputMessage)} / {@link #find(int)} / {@link #require(int)}
  *       一律取最新版本，旧接缝的行为不变</li>
  * </ul>
@@ -162,6 +165,37 @@ public class VersionedRelationRegistry extends RelationRegistry {
                 list.subList(0, keepFrom).clear();
             }
         }
+    }
+
+    /**
+     * 责任：把指定 oid 集合在 maxSeq 时刻已生效的版本前缀拷成不可变快照（1.7 设计 §4.3）。
+     * 关键步骤：逐 oid 二分找 ≤ maxSeq 的最新版本下标，把 [0..idx] 的 (seq, Relation) 拷入新列表；
+     * 拷贝是浅拷（Relation record 不可变，引用可安全共享）。oid 无版本或全部版本晚于 maxSeq 时省略——
+     * 回放期 RelationSnapshot.require 会以"未先行到达"fail-fast，报错时机与 1.6 直查 registry 一致。
+     * 边界：oids 为 null 抛 NPE；maxSeq ≤ 0 时所有 oid 都省略（空桶无渲染需求）。单写者（reader）调用。
+     *
+     * @param oids  需要快照的表 oid 集合（通常是桶内出现过的全部 oid）
+     * @param maxSeq 快照截止序号（该时刻之后到达的版本不进快照）
+     * @return 各 oid 版本前缀的不可变快照（省略的 oid 不含 key）
+     */
+    public RelationSnapshot snapshot(Set<Integer> oids, long maxSeq) {
+        Map<Integer, List<RelationSnapshot.Entry>> out = new HashMap<>();
+        for (Integer oid : oids) {
+            List<Version> list = versions.get(oid);
+            if (list == null) {
+                continue;
+            }
+            int idx = floorIndex(list, maxSeq);
+            if (idx < 0) {
+                continue;
+            }
+            List<RelationSnapshot.Entry> copied = new ArrayList<>(idx + 1);
+            for (int i = 0; i <= idx; i++) {
+                copied.add(new RelationSnapshot.Entry(list.get(i).seq(), list.get(i).rel()));
+            }
+            out.put(oid, List.copyOf(copied));
+        }
+        return new RelationSnapshot(out);
     }
 
     /**

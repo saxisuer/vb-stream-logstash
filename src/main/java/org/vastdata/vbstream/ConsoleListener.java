@@ -7,7 +7,7 @@ import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
 import org.vastdata.vbstream.replication.MsgChange;
 import org.vastdata.vbstream.replication.PgOutputListener;
-import org.vastdata.vbstream.replication.RelationRegistry;
+import org.vastdata.vbstream.replication.RelationLookup;
 import org.vastdata.vbstream.replication.RowChange;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionListener;
@@ -42,12 +42,12 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
      * 控制消息（Begin/Commit/流式与两阶段信号）与 Relation('R') 到达即 live 解码、按到达序回调；
      * 数据消息（I/U/D/T/M）live 期以原始字节入桶不解码，在提交回放期解码回调——每条恰好一次
      * （被 StreamAbort 过滤的子事务单元不回调；'Y'/'O' 组装器直接丢弃，不产生回调）。
-     * 渲染用的 registry 为版本日志的最新版视图（闭包持同一实例引用，随 'R' 到达演进——逐消息
-     * 渲染按最新 schema 展示即可；提交块的 asOf 精确渲染由组装器回放出的 TxChange 内嵌快照承担，
-     * 见 {@link #onTransaction}，不经本方法）。
+     * 渲染用的 Relation 视图参型为 {@link RelationLookup}（1.7 设计 §4.3）：Main 装配下闭包持
+     * 版本日志 registry（最新版视图，随 'R' 到达演进——逐消息渲染按最新 schema 展示即可）；提交块的
+     * asOf 精确渲染由组装器回放出的 TxChange 内嵌快照承担，见 {@link #onTransaction}，不经本方法。
      */
     @Override
-    public void onMessage(PgOutputMessage message, RelationRegistry registry) {
+    public void onMessage(PgOutputMessage message, RelationLookup registry) {
         if (isTxLifecycle(message)) {
             if (CDC.isInfoEnabled()) {
                 CDC.info("{}", render(message, registry));
@@ -118,7 +118,7 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
         return relation.schema() + "." + relation.table();
     }
 
-    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationRegistry)} 同规则：列名取快照、越界退化为 "#i"，值渲染规则见 {@link #renderValue}）。 */
+    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationLookup)} 同规则：列名取快照、越界退化为 "#i"，值渲染规则见 {@link #renderValue}）。 */
     private static String tupleOf(TupleData tuple, PgOutputMessage.Relation relation) {
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < tuple.columns().size(); i++) {
@@ -151,7 +151,7 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
      * DML 的表名/列名经 registry 解析。未知消息类型抛 {@link IllegalStateException}（fail-fast）。
      */
     // 注：record pattern switch 是 Java 21 正式特性，本项目约束 Java 17，故用 instanceof 链
-    private String render(PgOutputMessage msg, RelationRegistry registry) {
+    private String render(PgOutputMessage msg, RelationLookup registry) {
         if (msg instanceof PgOutputMessage.Begin m) {
             return "BEGIN             xid=%d finalLsn=0x%s".formatted(m.xid(), Long.toHexString(m.finalLsn()));
         }
@@ -228,14 +228,14 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
     }
 
     /** 表名渲染（registry 版）：命中返回 schema.table，miss（DML 先于 Relation，协议流异常）退化为 "oid:N"。 */
-    private static String tableOf(int oid, RelationRegistry registry) {
+    private static String tableOf(int oid, RelationLookup registry) {
         return registry.find(oid)
                 .map(rel -> rel.schema() + "." + rel.table())
                 .orElse("oid:" + oid);
     }
 
     /** 列名=值 打印；列名经 registry 解析（miss 或越界退化为 "#i"），值渲染规则见 {@link #renderValue}。 */
-    private static String tupleOf(int oid, TupleData tuple, RelationRegistry registry) {
+    private static String tupleOf(int oid, TupleData tuple, RelationLookup registry) {
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < tuple.columns().size(); i++) {
             final int idx = i; // lambda 引用要求实际 final
