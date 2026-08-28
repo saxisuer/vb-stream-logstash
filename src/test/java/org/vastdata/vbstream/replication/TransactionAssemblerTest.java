@@ -372,6 +372,54 @@ class TransactionAssemblerTest {
     }
 
     /**
+     * intAt 掩码钉子（Task 12 评审补例，防 7b263c5 修复回退）：流式前缀 xid 的 4 字节中
+     * **任一字节 ≥ 0x80** 时（byte 有符号，Java 对负 byte 做 {@code |} 会符号位扩散到全部高位），
+     * 组装器侧 {@code unsignedInt(raw,1)} 读出的单元 streamXid 错值 → abortedSubxids 过滤
+     * 永不命中 → 子事务回滚剔除静默失效。既有夹具 xid（7001/7003…）恰好每字节 &lt;0x80，
+     * 本例专取覆盖四个字节位的高字节形态钉死回归：
+     * TOP=0xABCD1234（首字节 0xAB）、SUB_A=0x8F1234（第 3 字节 0x8F）、SUB_B=758=0x2F6
+     * （末字节 0xF6，Task 12 集成实测踩中的真实形态）、SUB_C=0x90AB（第 2 字节 0x90）。
+     * 关键步骤：TOP 写 2 行（保留），SUB_A/SUB_B 各写 1 行后双双 abort（剔除），第二流块
+     * SUB_C 写 1 行后 abort（剔除）再补 TOP 尾行（保留），StreamCommit 收束。
+     * 断言依据：恰 1 个 STREAMED 事务、存活 2 行恰为 TOP 的首尾两行（id 序列逐值钉死）、
+     * 逐变更 streamXid 精确等于 TOP。回退到未掩码的 intAt 时 SUB 单元因前缀错值
+     * （如 0x2F6 读成 0xFFFFFFF6）全部漏剔，变更数断言必红（已实测复核）。
+     */
+    @Test
+    void streamAbortFiltersHighByteXidPrefixesExactly() {
+        final long top = 0xABCD1234L;    // 首字节 0xAB
+        final long subA = 0x8F1234L;     // 第 3 字节 0x8F
+        final long subB = 758L;          // 末字节 0xF6（Task 12 集成实测形态）
+        final long subC = 0x90ABL;       // 第 2 字节 0x90
+        List<Transaction> out = run(
+                relation(),
+                PgWire.streamStart(top, true),
+                streamedInsert(top, "1", "a"),
+                streamedInsert(subA, "201", "b"),
+                streamedInsert(subB, "202", "c"),
+                PgWire.streamStop(),
+                PgWire.streamAbort(top, subA),
+                PgWire.streamAbort(top, subB),
+                PgWire.streamStart(top, false),
+                streamedInsert(subC, "203", "d"),
+                PgWire.streamStop(),
+                PgWire.streamAbort(top, subC),
+                PgWire.streamStart(top, false),
+                streamedInsert(top, "999", "tail"),
+                PgWire.streamStop(),
+                PgWire.streamCommit(top));
+        assertEquals(1, out.size());
+        Transaction t = out.get(0);
+        assertEquals(TransactionKind.STREAMED, t.kind());
+        assertEquals(top, t.xid());
+        // 仅 TOP 的三行存活：三个高字节子事务的单元被按正确 streamXid 精确剔除
+        assertEquals(List.of("1", "999"), idsOf(t));
+        for (TxChange change : t.changes()) {
+            assertEquals(OptionalLong.of(top), change.streamXid());
+        }
+    }
+
+    /**
      * 旧例 15：整顶层回滚（decode 层先逐子后顶，最后一条 top==sub，spec B.4）——桶整体移除，
      * StreamCommit 无从回调。同一实例驱动（不走 run 夹具）：验证的是"桶被移除"而非"桶从未存在"。
      */
