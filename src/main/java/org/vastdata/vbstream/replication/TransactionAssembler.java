@@ -7,18 +7,26 @@ import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
 import java.nio.ByteBuffer;
+import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.Consumer;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 /**
  * pgoutput 事务组装状态机：消费原始字节，把同一事务的变更以 **纯 CQ index 段记账** 攒进桶里
- * （1.7 设计 §2/§4.1），收到提交信号后同步内联回放成完整的 {@link Transaction} 交给监听器
- * （spec §4 / assembly-spill 设计 §2-§5 的 1.7a 形态）。
+ * （1.7 设计 §2/§4.1），收到提交信号后**交接冻结桶**（快照随行）给消费侧
+ * （{@link TransactionConsumer}——同步形态在调用线程直调、异步形态经交接队列由 consumer 线程
+ * 取走）回放成完整的 {@link Transaction} 交给监听器（spec §4 / assembly-spill 设计 §2-§5 的
+ * 1.7 解耦形态）。
  *
  * <p>与消息驱动旧版的核心区别：**数据消息先不解码**。Insert/Update/Delete/Truncate/Message
  * 五类消息的原始字节只在 {@link #onRaw} 首行追加一次管道（{@link MessagePipe}），桶里只记
@@ -27,11 +35,14 @@ import java.util.function.Supplier;
  *
  * <p>seq ≡ CQ index（1.7 设计 §2）：**每条消息（含控制消息与 'R'）先 append 取 index 作 seq，
  * 再做记账路由**——数据单元与 'R' 版本天然同序。Relation 以到达时的 seq 记入
- * {@link VersionedRelationRegistry} 版本日志；回放时按单元自己的 seq（即其 CQ index）取
- * "变更那一刻"的表定义——事务中途若有并发 DDL，前后段的行仍按各自的表结构解释（设计 §4.4）。
- * 版本日志在每次桶完结时按存活桶的最老 index 剪枝（2PC 挂起桶算存活），防止长期膨胀。
+ * {@link VersionedRelationRegistry} 版本日志；交接时按桶的 oidSet 圈定、截止 lastIndex 拷出
+ * {@link RelationSnapshot} 随桶冻结，回放按单元自己的 seq（即其 CQ index）取"变更那一刻"的
+ * 表定义——事务中途若有并发 DDL，前后段的行仍按各自的表结构解释（设计 §4.4）。版本日志在
+ * 每次桶完结点按存活桶的最老 index 剪枝（2PC 挂起桶算存活；**不含**已交接桶——快照自足，
+ * 设计 §3.2），防止长期膨胀。
  *
- * <p>桶模型（语义与 1.6 逐条等价，等价基线 = 移植后的既有单测期望值不变）：
+ * <p>桶模型（语义与 1.6 逐条等价，等价基线 = 移植后的既有单测期望值不变 + 解耦等价验收
+ * {@code DecoupledEquivalenceTest}）：
  * <ul>
  *   <li>普通事务：单指针 {@code currentNormalTx}。Commit 消息不带 xid，且 walsender 按 LSN 序
  *       串行输出 Begin..Commit——同一时刻至多一个活动普通事务</li>
@@ -44,32 +55,46 @@ import java.util.function.Supplier;
  * </ul>
  *
  * <p>低水位（1.7 设计 §3.2，两个作用域）：CQ 删除低水位
- * {@link #pipeWatermark()} = min(存活桶 firstIndex, maxAppendedIndex+1)，交
- * {@link MessagePipe#releaseBelow} 删除过老的滚动文件；registry 剪枝低水位 = 全部存活桶
- * firstIndex 的最小值，驱动 {@link VersionedRelationRegistry#pruneBelow}。两者都挂在桶完结点。
+ * {@link #pipeWatermark()} = min(存活桶 firstIndex, 非 DONE 交接桶 firstIndex,
+ * maxAppendedIndex+1)，交 {@link MessagePipe#releaseBelow} 删除过老的滚动文件；registry 剪枝
+ * 低水位 = 全部存活桶 firstIndex 的最小值，驱动 {@link VersionedRelationRegistry#pruneBelow}。
+ * 两者都挂在桶完结点（交接/整桶丢弃）。
  *
  * <p>注意"内存有界"只覆盖组装期：提交回放仍会把整桶单元从管道读回堆（原始字节 + 解码出的
- * TxChange 双份瞬态并存，峰值 O(事务大小)），流式输出属里程碑 2 范畴。
+ * TxChange 双份瞬态并存，峰值 O(事务大小)），流式输出属里程碑 2 范畴——1.7 的解耦只把这段
+ * 瞬态从 reader 路径移到 consumer 线程，不改变其量级。
  *
- * <p>线程约束：非线程安全。全部方法设计为由 run 循环的单一线程调用（decoder 的流块状态与
- * 全部桶指针都要求单写者）；本任务（1.7a）回放也内联在同一线程，Task 6 起移交 consumer 线程。
- * 产出的 Transaction 不可变，可跨线程传递。
+ * <p>线程约束（1.7 双线程形态）：**reader 侧**（onRaw 及其全部私有路由/记账/registry/入队）
+ * 设计为由 run 循环的单一线程调用（decoder 的流块状态与全部桶指针都要求单写者）——提交期回放
+ * 已不在 reader 路径上；**consumer 侧**（readRange、冻结桶回放、listener 回调、前沿累加、
+ * 桶状态后两态）由 {@link TransactionConsumer} 在 consumer 线程（同步形态即调用线程）执行。
+ * 跨线程共享仅有：交接队列（并发安全）、{@code TxBuffer.state}（volatile）与 outputFrontier
+ * （AtomicLong）。产出的 Transaction 不可变，可跨线程传递。
  */
 public final class TransactionAssembler implements RawMessageListener, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(TransactionAssembler.class);
 
-    private final TransactionListener listener;
     /** live 解码器（只用于控制消息与 'R'）：维护流块状态 inStream，与 currentStream 指针同步变化。 */
     private final PgOutputDecoder decoder;
-    /** Relation 版本日志：'R' 到达即记入（带 seq），回放时按单元 seq 取当时的版本。 */
+    /** Relation 版本日志：'R' 到达即记入（带 seq），交接时按桶 oidSet 拷出快照随行。 */
     private final VersionedRelationRegistry registry;
     /** 主缓冲管道（构造时急切建立——管道是地基，构造即 wipe 目录）：每条消息 append 一次，回放按段读回。 */
     private final MessagePipe pipe;
-    /** 每个解码点（控制消息、'R'、回放单元）回调一次——ConsoleListener 逐消息 DEBUG 挂在这里。 */
-    private final Consumer<PgOutputMessage> decodedObserver;
-    /** 桶回放器：提交路径把桶单元渲染为 TxChange（自带独立 decoder，不影响本类的 live 解码状态）。 */
-    private final BucketReplayer replayer;
+    /** 每个解码点（控制消息、'R'、回放单元）回调一次——ConsoleListener 逐消息 DEBUG 挂在这里；
+     *  第二参是渲染视图（RelationLookup）：live 解码点传 registry（最新版），回放点传桶快照。 */
+    private final BiConsumer<PgOutputMessage, RelationLookup> decodedObserver;
+    /** 事务消费器：交接桶的回放输出半程（冻结桶 + readRange + 回调 + 前沿），同步/异步两形态共用。
+     *  listener 与 outputFrontier 在构造时交它持有（组装器自身不再触碰回调与前沿）。 */
+    private final TransactionConsumer consumer;
+    /** consumer 线程（异步形态非 null，名 transaction-consumer 非守护）；同步形态为 null——handoff 直调 processBucket。 */
+    private final Thread consumerThread;
+    /** 交接队列（reader 投入 → consumer 取出）：无界 LinkedBlockingQueue，FIFO 保证交接序即提交序。 */
+    private final BlockingQueue<TxBuffer> handoffQueue = new LinkedBlockingQueue<>();
+    /** 已交接桶的 reader 侧记账（冻结后引用仍要保住 CQ 删除低水位，DONE 后由完结点惰性清理）。 */
+    private final ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
+    /** reader 侧存活桶计数（LIVE 状态桶数，交接/整桶丢弃时递减）——consumer 周期统计展示用。 */
+    private final AtomicInteger liveCount = new AtomicInteger();
 
     /** 最近一次 append 的 index（reader 记账，替代 pipe.lastAppendedIndex()——空队列时后者会抛；
      *  未 append 过为 -1）。watermark 的"已落盘内容全是垃圾"上界由此 +1 派生。 */
@@ -90,30 +115,47 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private final Map<String, TxBuffer> preparedByGid = new HashMap<>();
 
     /**
-     * 构造组装器（急切建立管道——{@link MessagePipe} 构造即清空目录建队列，失败原样上抛
-     * fail-fast：管道是地基，建不起来就没有可运行形态）。
+     * 构造**异步形态**组装器（Main 用，1.7 解耦本体）：建管道与消费器之外，另起
+     * {@code transaction-consumer} 线程（非守护——未排干的交接桶在 JVM 退出前必须有机会输出）
+     * 立即开始消费交接队列。close() 走毒丸排干协议（见其 javadoc）。
+     *
+     * @param listener        完整事务到达时的回调（consumer 线程同步调用）
+     * @param mode            流式模式（仅影响 decoder 对 StreamAbort 附加字段的解析，须与
+     *                        START_REPLICATION 的 streaming 参数一致，否则 abort 解析错位 fail-fast）
+     * @param registry        Relation 版本日志（'R' 路由与交接快照共用，本组装器独占写入）
+     * @param pipeConfig      管道配置（目录/滚动周期；目录是瞬态工作区，打开即整体清空）
+     * @param decodedObserver 每个解码点回调（控制消息 + 'R' + 回放单元；Y/O 不解码不回调）
+     * @param outputFrontier  输出前沿载体（调用方持有以便反馈封顶；本实例只做单调 max 累加）
+     * @param onFailure       consumer 回放失败的逃生回调（consumer 线程调用，如通知会话停机）
+     */
+    public TransactionAssembler(TransactionListener listener, StreamingMode mode,
+            VersionedRelationRegistry registry, PipeConfig pipeConfig,
+            BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+            AtomicLong outputFrontier, Runnable onFailure) {
+        this(listener, mode, registry, pipeConfig, decodedObserver, outputFrontier, onFailure, true);
+    }
+
+    /**
+     * 构造**同步形态**组装器（既有单测锚定 1.6 期望的驱动形态）：不开 consumer 线程，handoff
+     * 在调用线程直调 {@link TransactionConsumer#processBucket}——回放与回调对 onRaw 同步可见、
+     * fail-fast 异常直传调用方。急切建立管道——{@link MessagePipe} 构造即清空目录建队列，
+     * 失败原样上抛 fail-fast：管道是地基，建不起来就没有可运行形态。
      *
      * @param listener        完整事务到达时的回调（同步调用，调用线程与本组装器的调用线程一致）
      * @param mode            流式模式（仅影响 decoder 对 StreamAbort 附加字段的解析，须与
      *                        START_REPLICATION 的 streaming 参数一致，否则 abort 解析错位 fail-fast）
-     * @param registry        Relation 版本日志（'R' 路由与回放渲染共用，本组装器独占写入）
+     * @param registry        Relation 版本日志（'R' 路由与交接快照共用，本组装器独占写入）
      * @param pipeConfig      管道配置（目录/滚动周期；目录是瞬态工作区，打开即整体清空）
      * @param decodedObserver 每个解码点回调（控制消息 + 'R' + 回放单元；Y/O 不解码不回调）
      */
     public TransactionAssembler(TransactionListener listener, StreamingMode mode,
             VersionedRelationRegistry registry, PipeConfig pipeConfig,
-            Consumer<PgOutputMessage> decodedObserver) {
-        this.listener = Objects.requireNonNull(listener, "listener");
-        this.decoder = new PgOutputDecoder(Objects.requireNonNull(mode, "mode"));
-        this.registry = Objects.requireNonNull(registry, "registry");
-        Objects.requireNonNull(pipeConfig, "pipeConfig");
-        this.pipe = new MessagePipe(pipeConfig.dir(), pipeConfig.rollCycle());
-        this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
-        this.replayer = new BucketReplayer(mode, this.decodedObserver);
+            BiConsumer<PgOutputMessage, RelationLookup> decodedObserver) {
+        this(listener, mode, registry, pipeConfig, decodedObserver, new AtomicLong(), () -> { }, false);
     }
 
     /**
-     * 便捷构造：解码观察者置为空消费（不需要逐消息透出的场景）。
+     * 便捷构造：解码观察者置为空消费（不需要逐消息透出的场景），同步形态。
      *
      * @param listener    完整事务到达时的回调
      * @param mode        流式模式
@@ -122,7 +164,32 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      */
     public TransactionAssembler(TransactionListener listener, StreamingMode mode,
             VersionedRelationRegistry registry, PipeConfig pipeConfig) {
-        this(listener, mode, registry, pipeConfig, msg -> { });
+        this(listener, mode, registry, pipeConfig, (msg, view) -> { });
+    }
+
+    /**
+     * 全量构造（两形态公共初始化）：字段赋值 + 建管道 + 建消费器；async=true 时另起并启动
+     * consumer 线程。管道建立失败原样上抛（fail-fast，同上）。
+     */
+    private TransactionAssembler(TransactionListener listener, StreamingMode mode,
+            VersionedRelationRegistry registry, PipeConfig pipeConfig,
+            BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+            AtomicLong outputFrontier, Runnable onFailure, boolean async) {
+        this.decoder = new PgOutputDecoder(Objects.requireNonNull(mode, "mode"));
+        this.registry = Objects.requireNonNull(registry, "registry");
+        Objects.requireNonNull(pipeConfig, "pipeConfig");
+        this.pipe = new MessagePipe(pipeConfig.dir(), pipeConfig.rollCycle());
+        this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
+        this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
+                this.pipe, handoffQueue, Objects.requireNonNull(outputFrontier, "outputFrontier"),
+                liveCount, Objects.requireNonNull(onFailure, "onFailure"), this.decodedObserver);
+        if (async) {
+            this.consumerThread = new Thread(consumer, "transaction-consumer");
+            this.consumerThread.setDaemon(false);
+            this.consumerThread.start();
+        } else {
+            this.consumerThread = null;
+        }
     }
 
     /**
@@ -192,14 +259,30 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 关闭管道。
+     * 关闭组装器：**排干协议**（异步形态）——毒丸入队 → 等 consumer 线程退出（join 60s 超时
+     * WARN——防回调卡死拖住停机，超时后放弃等待继续关管道）→ 关管道。毒丸排在队列尾，FIFO
+     * 保证 consumer 先排干此前交接的全部冻结桶再见到毒丸——**已提交未输出的事务不丢**
+     * （这是排干语义的核心承诺）。同步形态无 consumer 线程，跳过前两步直接关管道（回放本就
+     * 同步内联完成，无未排干存量）。
      *
      * <p>{@link MessagePipe#close} 内部已逐资源 WARN 吸收，这里只兜住意外逃逸的异常——
      * close 不应掩盖业务异常（最坏代价是句柄延迟回收）。在 run 线程收尾或调用方线程调用一次，
-     * 不可与 onRaw 并发。
+     * 不可与 onRaw 并发。join 被中断时恢复中断标志并放弃等待（不重试——停机路径不应被阻塞）。
      */
     @Override
     public void close() {
+        if (consumerThread != null) {
+            handoffQueue.add(TxBuffer.POISON);
+            try {
+                consumerThread.join(60_000L);
+                if (consumerThread.isAlive()) {
+                    LOG.warn("consumer 线程 60s 内未退出（可能卡在 listener 回调），放弃等待直接关管道");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.warn("等待 consumer 退出被中断，放弃等待直接关管道");
+            }
+        }
         try {
             pipe.close();
         } catch (RuntimeException e) {
@@ -207,10 +290,14 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
     }
 
-    /** 当场解码一条消息并回调 decodedObserver（所有 live 解码点的统一出口）；协议不符由 decoder 抛异常，不捕获。 */
+    /**
+     * 当场解码一条消息并回调 decodedObserver（所有 live 解码点的统一出口；第二参传 registry——
+     * live 视角的 RelationLookup，最新版视图）；协议不符由 decoder 抛异常，不捕获。
+     * 只在 reader 线程调用（decoder 的流块状态单写者）。
+     */
     private PgOutputMessage decode(byte[] raw) {
         PgOutputMessage msg = decoder.decode(ByteBuffer.wrap(raw));
-        decodedObserver.accept(msg);
+        decodedObserver.accept(msg, registry);
         return msg;
     }
 
@@ -231,8 +318,9 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * 事务性消息必须落在活动桶里（没有桶就 fail-fast，与 DML 相同）；非事务性消息有桶就随桶走
      * （将来 abort 剔除按 streamXid 判断，语义安全），没有桶则 WARN 后丢弃——协议允许它游离在
      * 任何事务之外，不算异常。flags 偏移由 currentStream 是否在流块内决定，与 decoder 的
-     * inStream 状态同步变化。丢弃路径同样要断开连续段：这条消息的 append 已进管道但不属任何桶，
-     * 不断开会让"下一次同桶追加"把它的 index 误并入段（回放读回错位）。
+     * inStream 状态同步变化。丢弃路径的 owner 置空属**防御性**（当前控制消息路径已统一置空；
+     * 此路径到达时无任何活动桶，owner 至多指向已退役/已交接的桶——它们不会再成为追加目标，
+     * 置空与否不影响段判定）。
      */
     private void routeLogicalMsg(byte[] raw, long seq) {
         int flagsOffset = currentStream != null ? 5 : 1;   // 流内前缀 4 字节在前
@@ -242,7 +330,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
             appendUnit(bucket, raw, seq);
             return;
         }
-        lastAppendOwner = null;   // 游离消息的 append 不属任何桶：断段
+        lastAppendOwner = null;   // 防御性置空（当前控制消息路径已统一置空；此路径到达时无活动桶，owner 至多指向已退役桶，置空与否不影响段判定）
         LOG.warn("非事务性消息游离于任何事务之外，丢弃: prefix={} lsn=0x{}",
                 RawPeeks.cstringAt(raw, flagsOffset + 1 + 8), Long.toHexString(RawPeeks.longAt(raw, flagsOffset + 1)));
     }
@@ -357,12 +445,12 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         if (currentNormalTx != null) {
             throw new IllegalStateException("Begin 到达但普通事务未闭合: xid=" + currentNormalTx.xid);
         }
-        currentNormalTx = new TxBuffer(m.xid());
+        currentNormalTx = newBucket(m.xid());
     }
 
     /**
-     * Commit（无 xid 字段）：回放当前普通事务桶并封箱 NORMAL Transaction 回调，清空指针；
-     * 无桶即 fail-fast（异常带 commitLsn 定位）。回放完成后桶完结（低水位维护 + 剪枝）。
+     * Commit（无 xid 字段）：当前普通事务桶交接封箱 NORMAL 输出，清空指针；无桶即 fail-fast
+     * （异常带 commitLsn 定位）。交接后桶完结（低水位维护 + 剪枝）。
      */
     private void commit(PgOutputMessage.Commit m) {
         if (currentNormalTx == null) {
@@ -371,10 +459,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
         TxBuffer bucket = currentNormalTx;
         currentNormalTx = null;
-        List<TxChange> changes = replay(bucket);
-        retireBucket(bucket);
-        listener.onTransaction(new Transaction(bucket.xid, TransactionKind.NORMAL, null,
-                m.commitLsn(), m.endLsn(), m.commitTimestamp(), changes));
+        handoff(bucket, TransactionKind.NORMAL, m.commitLsn(), m.endLsn(), m.commitTimestamp());
     }
 
     /**
@@ -392,7 +477,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
         TxBuffer bucket;
         if (m.firstSegment()) {
-            bucket = new TxBuffer(m.xid());
+            bucket = newBucket(m.xid());
             if (streamedByXid.putIfAbsent(m.xid(), bucket) != null) {
                 throw new IllegalStateException("流式事务桶已存在: xid=" + m.xid());
             }
@@ -417,9 +502,9 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * StreamCommit(xid)：顶层事务全部流段已收齐，回放桶并封箱 STREAMED Transaction 回调、移除桶；
+     * StreamCommit(xid)：顶层事务全部流段已收齐，桶交接封箱 STREAMED 输出、移除桶；
      * 桶 miss 或仍有未闭合流块均 fail-fast（协议保证 stream_commit 必在流块外，spec B.3）。
-     * 回放完成后桶完结（低水位维护 + 剪枝）。
+     * 交接后桶完结（低水位维护 + 剪枝）。
      */
     private void streamCommit(PgOutputMessage.StreamCommit m) {
         if (currentStream != null) {
@@ -429,10 +514,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         if (bucket == null) {
             throw new IllegalStateException("StreamCommit 对应流式事务桶不存在: xid=" + m.xid());
         }
-        List<TxChange> changes = replay(bucket);
-        retireBucket(bucket);
-        listener.onTransaction(new Transaction(m.xid(), TransactionKind.STREAMED, null,
-                m.commitLsn(), m.endLsn(), m.commitTimestamp(), changes));
+        handoff(bucket, TransactionKind.STREAMED, m.commitLsn(), m.endLsn(), m.commitTimestamp());
     }
 
     /**
@@ -453,7 +535,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
         if (m.xid() == m.subxid()) {
             streamedByXid.remove(m.xid());
-            retireBucket(bucket);       // 整桶丢弃：低水位候选推进（释放检查）
+            liveCount.decrementAndGet();   // 整桶丢弃：退出 LIVE 记账
+            maintainWatermarks();          // 整桶丢弃：低水位候选推进（释放检查）
         } else {
             bucket.abortedSubxids.add(m.subxid());
         }
@@ -464,7 +547,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         if (currentPrepareTx != null) {
             throw new IllegalStateException("BeginPrepare 到达但两阶段事务未闭合: gid=" + currentPrepareTx.gid);
         }
-        currentPrepareTx = new TxBuffer(m.xid());
+        currentPrepareTx = newBucket(m.xid());
         currentPrepareTx.gid = m.gid();
     }
 
@@ -488,18 +571,15 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * CommitPrepared：挂起池取桶（miss → fail-fast）回放并封箱 TWO_PHASE Transaction 回调
-     * （用户确认的输出时机）。回放完成后桶完结（低水位维护 + 剪枝）。
+     * CommitPrepared：挂起池取桶（miss → fail-fast）交接封箱 TWO_PHASE 输出（gid 随桶冻结；
+     * 用户确认的输出时机）。交接后桶完结（低水位维护 + 剪枝）。
      */
     private void commitPrepared(PgOutputMessage.CommitPrepared m) {
         TxBuffer bucket = preparedByGid.remove(m.gid());
         if (bucket == null) {
             throw new IllegalStateException("CommitPrepared 对应 gid 不存在: " + m.gid());
         }
-        List<TxChange> changes = replay(bucket);
-        retireBucket(bucket);
-        listener.onTransaction(new Transaction(bucket.xid, TransactionKind.TWO_PHASE, bucket.gid,
-                m.commitLsn(), m.endLsn(), m.commitTimestamp(), changes));
+        handoff(bucket, TransactionKind.TWO_PHASE, m.commitLsn(), m.endLsn(), m.commitTimestamp());
     }
 
     /** RollbackPrepared：挂起池取桶（miss → fail-fast）静默丢弃，不回调（用户确认的回滚语义）；丢弃后低水位候选推进。 */
@@ -510,7 +590,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
         LOG.warn("两阶段事务回滚，丢弃已缓冲变更: gid={} xid={} storage={}",
                 m.gid(), bucket.xid, storageOf(bucket));
-        retireBucket(bucket);
+        liveCount.decrementAndGet();   // 整桶丢弃：退出 LIVE 记账
+        maintainWatermarks();
     }
 
     /**
@@ -534,28 +615,58 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 提交路径回放（本任务仍单线程内联；Task 6 移交 consumer）：桶的段经管道读回，Relation 按
-     * registry asOf 直查渲染（单线程无竞争，快照交接属 Task 6）。
-     *
-     * <p>边界：Relation 未先行到达（require 查不到）、回放中字节与协议不符时抛 ISE/协议异常
-     * ——回放失败意味着协议流异常，不允许输出半截事务（异常先于 listener 回调抛出）。
-     * 在 run 线程内同步执行。
+     * 交接（1.7 设计 §4.4）：拷快照（oidSet 圈定，截止 lastIndex）→ 捕获封箱元数据 → state=HANDED_OFF
+     * → 入 handedOff 记账 → 入队（同步模式直调 processBucket）→ 维护低水位。立即返回——reader 路径
+     * 从此不含回放。只在 reader 线程调用。
      */
-    private List<TxChange> replay(TxBuffer bucket) {
-        return replayer.replay(bucket, pipe, registry::require);
+    private void handoff(TxBuffer bucket, TransactionKind kind, long commitLsn, long endLsn,
+            Instant commitTimestamp) {
+        bucket.kind = kind;
+        bucket.commitLsn = commitLsn;
+        bucket.endLsn = endLsn;
+        bucket.commitTimestamp = commitTimestamp;
+        bucket.relationSnapshot = registry.snapshot(bucket.oidSet, bucket.lastIndex);
+        bucket.state = BucketState.HANDED_OFF;
+        bucket.handoffNanos = System.nanoTime();
+        handedOff.add(bucket);
+        liveCount.decrementAndGet();
+        if (consumerThread == null) {
+            consumer.processBucket(bucket);        // 同步消费（测试锚定路径）：回放与回调在调用线程内联完成
+        } else {
+            handoffQueue.add(bucket);
+        }
+        maintainWatermarks();
     }
 
     /**
-     * 桶完结（提交/整桶丢弃，已从所有桶集合中移除）后统一收尾：解除 lastAppendOwner 引用
-     * （退役桶不再 append，连续段判定退回"起新段"）→ CQ 删除低水位检查（滚动文件回收）→
-     * registry 剪枝（版本日志收缩）。两个低水位的作用域差异见 1.7 设计 §3.2。
+     * 桶完结点统一收尾（交接/整桶丢弃时调用，1.7 设计 §3.2）：先从交接记账里清掉已 DONE 的桶
+     * （consumer 写 state、reader 清引用——reader 只读 state 的 volatile 值，清理是惰性的，
+     * 恰好发生在下一个完结点）→ CQ 删除低水位检查（滚动文件回收，非 DONE 交接桶参与钉住）→
+     * registry 剪枝（版本日志收缩，**不含**交接桶——快照自足，交接桶回放不再查 registry）。
+     * 只在 reader 线程调用。
      */
-    private void retireBucket(TxBuffer bucket) {
-        if (lastAppendOwner == bucket) {
-            lastAppendOwner = null;
-        }
+    private void maintainWatermarks() {
+        handedOff.removeIf(b -> b.state == BucketState.DONE);
         releasePiped();
         pruneRegistryVersions();
+    }
+
+    /**
+     * 开新桶并计入 LIVE 记账（begin/streamStart 首段/beginPrepare 共用）。
+     * 只在 reader 线程调用。
+     */
+    private TxBuffer newBucket(long xid) {
+        liveCount.incrementAndGet();
+        return new TxBuffer(xid);
+    }
+
+    /**
+     * 已交接桶的记账快照（测试面）：包私有机动，仅供同包单测断言状态机保护（如 firstIndex 钉住
+     * 低水位）——handedOff 是 reader 私有结构，DONE 惰性清理发生在完结点，本方法返回调用时刻
+     * 的浅拷贝快照（List.copyOf），先例同 {@link #pipeWatermark()}。只在 reader（测试）线程调用。
+     */
+    List<TxBuffer> handedOffForTest() {
+        return List.copyOf(handedOff);
     }
 
     /**
@@ -571,13 +682,15 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * Relation 版本日志剪枝：以**所有存活桶的最老 index（firstIndex）**为低水位，调
      * {@link VersionedRelationRegistry#pruneBelow}（与 {@link #releasePiped} 一样挂在桶完结点）。
      *
-     * <p>四路存活桶全部参与，包括 2PC 挂起池——挂起桶将来回放时仍会按它旧单元的 index 做
-     * asOf 查询，它的 firstIndex 必须继续保住对应版本。一个带单元的存活桶都没有时低水位取
+     * <p>四路存活桶全部参与，包括 2PC 挂起池——挂起桶将来**交接时拷快照**仍会按它旧单元的
+     * index 圈定版本，它的 firstIndex 必须继续保住对应版本。一个带单元的存活桶都没有时低水位取
      * Long.MAX_VALUE：现存版本不会再有人按旧 asOf 查，可以剪到每个 oid 只剩最新一条。
+     * **已交接桶不参与**（spec §3.2）：它的回放走桶内快照，registry 的任何剪枝都不影响已冻结
+     * 的渲染输入——这是"快照随行"换来的解耦红利。
      *
      * <p>正确性依据：pruneBelow 保留"低水位时刻正在生效"的那个版本（它自身的 seq 可以早于
-     * 低水位——Relation 消息总是先于同表第一个 DML 到达），而存活桶的任何一次 asOf 查询都
-     * 不早于低水位，查不到被剪掉的部分。空桶（firstIndex&lt;0）不参与取最小值；
+     * 低水位——Relation 消息总是先于同表第一个 DML 到达），而存活桶的任何一次快照圈定/回放
+     * 查询都不早于低水位，查不到被剪掉的部分。空桶（firstIndex&lt;0）不参与取最小值；
      * 每个桶完结时执行一次，消息热路径上没有开销。
      */
     private void pruneRegistryVersions() {
@@ -592,16 +705,17 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 计算当前 CQ 删除低水位 = min(存活桶 firstIndex, maxAppendedIndex+1)。
-     * 低于该 index 的队列条目永远不会再被回读，所在的滚动文件可以安全删除（保留哪些档位见
-     * {@link MessagePipe#releaseBelow}）；一个存活桶都没有时取"最近写入 index+1"
-     * ——已落盘的内容全部是垃圾。
+     * 计算当前 CQ 删除低水位 = min(存活桶 firstIndex, 非 DONE 交接桶 firstIndex,
+     * maxAppendedIndex+1)。低于该 index 的队列条目永远不会再被回读，所在的滚动文件可以安全
+     * 删除（保留哪些档位见 {@link MessagePipe#releaseBelow}）；一个带段的桶都没有时取
+     * "最近写入 index+1"——已落盘的内容全部是垃圾。
      *
      * <p>边界：存活但还没写过单元的桶（firstIndex&lt;0）不参与取最小值（其未来单元的 index
-     * 必然大于当前全部已 append 条目，不构成约束）；管道刚建立未 append 过时
-     * maxAppendedIndex=-1，水位为 0（空队列无物可删，天然安全）。本任务（单线程）只有存活桶
-     * 维度；Task 6 加入非 DONE 交接桶维度。包私有机动：仅供同包单测/探针断言低水位推进，
-     * 不是公开 API。
+     * 必然大于当前全部已 append 条目，不构成约束）；交接桶按 state 过滤——DONE（consumer 已
+     * 输出完成）不再约束，HANDED_OFF/OUTPUTTING 仍会被 readRange 读回必须钉住（state 是
+     * volatile，本方法在 reader 线程读到的是 consumer 写入的即时值，语义即"此刻仍在途"）；
+     * 管道刚建立未 append 过时 maxAppendedIndex=-1，水位为 0（空队列无物可删，天然安全）。
+     * 包私有机动：仅供同包单测/探针断言低水位推进，不是公开 API。只在 reader 线程调用。
      *
      * @return 低水位 CQ index（≥0，无 -1 哨兵——管道恒存在）
      */
@@ -614,6 +728,11 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         }
         for (TxBuffer bucket : preparedByGid.values()) {
             lowest = Math.min(lowest, floor(bucket));
+        }
+        for (TxBuffer bucket : handedOff) {
+            if (bucket.state != BucketState.DONE && bucket.firstIndex >= 0) {
+                lowest = Math.min(lowest, bucket.firstIndex);
+            }
         }
         return lowest;
     }

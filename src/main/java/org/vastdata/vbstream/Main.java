@@ -47,13 +47,14 @@ public final class Main {
             session.ensureSlot();
             session.start();
             ConsoleListener console = new ConsoleListener();
-            // 组装器独享的 Relation 版本日志：'R' live 解码入版本序列（seq 戳），回放按单元 seq 取
-            // asOf 版本；console 逐消息渲染经同一实例的 find 走最新版视图（闭包持引用，随 'R' 到达演进）。
+            // 组装器独享的 Relation 版本日志：'R' live 解码入版本序列（seq 戳），交接时按桶圈定拷快照；
+            // console 逐消息渲染的第二参（RelationLookup）由组装器分流——live 解码点传 registry
+            // （最新版视图），回放解码点传桶快照（Task 6 起，1.7 设计 §4.3）。
             VersionedRelationRegistry registry = new VersionedRelationRegistry();
             Thread worker = new Thread(() -> {
                 // 组装器随会话生命周期关闭：会话 close → run 经 isClosed 守卫退出 → 此处收尾管道。
                 try (TransactionAssembler assembler = new TransactionAssembler(console, config.streamingMode(),
-                        registry, pipeConfig, msg -> console.onMessage(msg, registry))) {
+                        registry, pipeConfig, console::onMessage)) {
                     session.run(assembler);
                 } catch (Exception e) {
                     LOG.error("复制流中断: {}（槽 {} 已保留，重启续传）", e.toString(), config.slotName(), e);

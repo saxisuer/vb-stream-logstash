@@ -14,6 +14,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -710,5 +713,50 @@ class TransactionAssemblerTest {
         assertEquals(List.of(99L, 601L), out.stream().map(Transaction::xid).toList());
         assertEquals("t_v2", ((RowChange) out.get(0).changes().get(0)).relation().table());
         assertEquals("t_v1", ((RowChange) out.get(1).changes().get(0)).relation().table());
+    }
+
+    // --- 1.7 Task 6：桶状态机 + 交接（HANDED_OFF 桶对 CQ 删除低水位的保护，spec §9.2） ------------------
+
+    /**
+     * 1.7：在途交接桶约束 CQ 删除低水位。构造：异步组装器 + 阻塞 listener 定格第一个桶在
+     * OUTPUTTING；随后交接第二个事务，断言 pipeWatermark() 不越过被阻塞桶的 firstIndex（两个桶
+     * 都非 DONE，低水位被钉住）；放行后排干、close 退出，两事务均已输出。
+     * 关键步骤：commit 触发第一次交接 → inCallback latch 确认 consumer 已进入回调并阻塞 →
+     * 读 handedOff 记账首桶 firstIndex → 第二个事务交接（排队，同样非 DONE）→ 断言水位 ≤ 钉住值。
+     * 边界：try/finally 而非 try-with-resources——latch 必须先放行再 close，否则 close 的
+     * join(60s) 会被阻塞回调拖满超时；若水位保护失效（DONE 误判/维度缺失），断言消息带双值定位。
+     * 线程约束：喂流与水位断言在测试线程（reader 角色）；consumer 线程定格在 listener 回调内，
+     * 断言时刻不可能把任何一桶推到 DONE。
+     */
+    @Test
+    void handedOffBucketConstrainsPipeWatermark() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch inCallback = new CountDownLatch(1);
+        AtomicLong frontier = new AtomicLong();
+        TransactionAssembler assembler = new TransactionAssembler(t -> {
+            inCallback.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg(),
+                (msg, view) -> { }, frontier, () -> { });
+        try {
+            assembler.onRaw(relation());
+            assembler.onRaw(PgWire.begin(101));
+            assembler.onRaw(insert("1", "a"));
+            assembler.onRaw(PgWire.commit());   // 第一个桶交接，consumer 进入回调并阻塞
+            assertTrue(inCallback.await(5, TimeUnit.SECONDS));
+            long blockedFirst = assembler.handedOffForTest().get(0).firstIndex;
+            assembler.onRaw(PgWire.begin(102));
+            assembler.onRaw(insert("2", "b"));
+            assembler.onRaw(PgWire.commit());   // 第二个桶交接（排队，同样非 DONE）
+            assertTrue(assembler.pipeWatermark() <= blockedFirst,
+                    "在途桶应钉住删除低水位: wm=" + assembler.pipeWatermark() + " blockedFirst=" + blockedFirst);
+        } finally {
+            release.countDown();
+            assembler.close();                  // 排干并退出（try/finally 而非 try-with-resources：latch 要先放行）
+        }
     }
 }

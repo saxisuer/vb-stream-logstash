@@ -25,11 +25,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 快照嵌入、aborted 子事务过滤（被剔单元不解码不回调）、同 oid 多版本下按单元 seq 的 asOf 渲染
  * （DDL 中途换版不串位）、非数据消息类型的 fail-fast、空桶回放产出空列表（空桶提交路径）。
  *
- * <p>夹具约定（1.7 起回放契约 = 桶段 × 管道）：单元 payload 字节全部经 {@link PgWire} 构造
+ * <p>夹具约定（1.7 起回放契约 = 冻结桶段 × 管道）：单元 payload 字节全部经 {@link PgWire} 构造
  * （流式桶的单元用 {@link PgWire#streamed} 加 Int32 xid 前缀——回放按桶级 hasPrefix 重窥前缀作
  * streamXid），逐单元 {@code pipe.append} 后以返回 index 给桶记一段 [index,index]（index 即单元
  * seq，作 asOf 查询入参）；registry 预置版本用 Relation record 直接构造，版本的 accept seq 取自
- * 相关单元的实际 index（1.7 起 seq ≡ CQ index，绝对值随建队列时刻漂移，不可字面硬编码）。
+ * 相关单元的实际 index（1.7 起 seq ≡ CQ index，绝对值随建队列时刻漂移，不可字面硬编码），随后经
+ * {@link #freeze} 以 oidSet 圈定、截止 lastIndex 拷出快照冻结进桶（组装器 handoff 的同款语义）——
+ * 回放器自 Task 6 起不收 resolver，Relation 解析只走桶内快照。
  * 前缀不变量按桶组织：流式单元与块外单元分属两个桶（混现是组装器的 fail-fast 路径，不在此测）。
  * registry 样本沿 {@link VersionedRelationRegistryTest} 的模式，表名区分版本；回放器以
  * {@link StreamingMode#ON} 构造（decodeSingle 对白名单类型不分支于模式档位，仅保持与既有测试
@@ -95,6 +97,16 @@ class BucketReplayerTest {
     }
 
     /**
+     * 交接辅助（测试面，按组装器 handoff 的冻结语义）：圈定 oidSet（本夹具全部单元指向 OID）
+     * 后以截止 lastIndex 从 registry 拷出 RelationSnapshot 冻结进桶——1.7 起回放契约要求桶
+     * 已交接（快照随行），直接驱动回放器必须补上这一步。纯函数，测试线程调用。
+     */
+    private static void freeze(TxBuffer bucket, VersionedRelationRegistry registry) {
+        bucket.oidSet.add(OID);
+        bucket.relationSnapshot = registry.snapshot(bucket.oidSet, bucket.lastIndex);
+    }
+
+    /**
      * 正常 I/U/D 三单元回放：产出三条 RowChange（顺序与单元一致），before/after 按 DML 语义
      * （INSERT 仅 after、UPDATE 无旧镜像时 before 空、DELETE 仅 before），Relation 为 registry
      * 命中版本的原样 record（assertSame 证快照嵌入），decodedObserver 逐单元回调且顺序一致。
@@ -111,9 +123,10 @@ class BucketReplayerTest {
             appendUnit(pipe, bucket, PgWire.delete(OID, 'O', PgWire.tuple("1", "b")));
             VersionedRelationRegistry registry = new VersionedRelationRegistry();
             registry.accept(i0 - 10L, rel);
-            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, observed::add);
+            freeze(bucket, registry);
+            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> observed.add(m));
 
-            List<TxChange> changes = replayer.replay(bucket, pipe, registry::require);
+            List<TxChange> changes = replayer.replay(bucket, pipe);
 
             assertEquals(3, changes.size());
             RowChange c0 = (RowChange) changes.get(0);
@@ -157,12 +170,14 @@ class BucketReplayerTest {
             VersionedRelationRegistry registry = new VersionedRelationRegistry();
             PgOutputMessage.Relation rel = rel("t");
             registry.accept(streamed.firstIndex - 10L, rel);
-            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, observed::add);
+            freeze(streamed, registry);
+            freeze(plain, registry);
+            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> observed.add(m));
 
-            List<TxChange> streamedChanges = replayer.replay(streamed, pipe, registry::require);
+            List<TxChange> streamedChanges = replayer.replay(streamed, pipe);
             assertEquals(1, streamedChanges.size());
             assertEquals(OptionalLong.of(TOP), streamedChanges.get(0).streamXid());
-            List<TxChange> plainChanges = replayer.replay(plain, pipe, registry::require);
+            List<TxChange> plainChanges = replayer.replay(plain, pipe);
             assertEquals(1, plainChanges.size());
             assertTrue(plainChanges.get(0).streamXid().isEmpty());
             assertEquals(2, observed.size());              // 两条 SUB 单元被跳过，未发生解码
@@ -186,9 +201,10 @@ class BucketReplayerTest {
             VersionedRelationRegistry registry = new VersionedRelationRegistry();
             registry.accept(u1, rel("t_v1"));
             registry.accept(r2, rel("t_v2"));
-            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, m -> { });
+            freeze(bucket, registry);
+            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> { });
 
-            List<TxChange> changes = replayer.replay(bucket, pipe, registry::require);
+            List<TxChange> changes = replayer.replay(bucket, pipe);
 
             assertEquals(List.of("t_v1", "t_v2"),
                     changes.stream().map(c -> ((RowChange) c).relation().table()).toList());
@@ -201,10 +217,10 @@ class BucketReplayerTest {
         try (MessagePipe pipe = new MessagePipe(pipeDir, LegacyRollCycles.MINUTELY)) {
             TxBuffer bucket = plainBucket(1L);
             appendUnit(pipe, bucket, PgWire.begin(1L));
-            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, m -> { });
+            freeze(bucket, new VersionedRelationRegistry());
+            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> { });
 
-            assertThrows(IllegalStateException.class,
-                    () -> replayer.replay(bucket, pipe, new VersionedRelationRegistry()::require));
+            assertThrows(IllegalStateException.class, () -> replayer.replay(bucket, pipe));
         }
     }
 
@@ -212,10 +228,11 @@ class BucketReplayerTest {
     @Test
     void emptyUnitListReplaysToEmptyChanges() {
         try (MessagePipe pipe = new MessagePipe(pipeDir, LegacyRollCycles.MINUTELY)) {
-            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, m -> { });
+            TxBuffer bucket = new TxBuffer(1L);
+            freeze(bucket, new VersionedRelationRegistry());
+            BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> { });
 
-            assertTrue(replayer.replay(new TxBuffer(1L), pipe,
-                    new VersionedRelationRegistry()::require).isEmpty());
+            assertTrue(replayer.replay(bucket, pipe).isEmpty());
         }
     }
 }

@@ -1,5 +1,6 @@
 package org.vastdata.vbstream.replication;
 
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.Set;
@@ -17,7 +18,13 @@ import java.util.Set;
  * 块外（无前缀）；追加期校验，混现即 ISE fail-fast（协议不允许，防御）。回放据此决定 decodeSingle
  * 的 inStream 实参并重窥前缀值作 streamXid（子事务过滤用）。
  *
- * <p>线程约束：LIVE 期间仅 reader 线程触碰（单写者）。
+ * <p>冻结语义（1.7 设计 §3.1）：桶在 LIVE 期间由 reader 记账；交接（handoff）瞬间 reader 把封箱
+ * 元数据与 Relation 版本快照写入冻结字段、state 推进到 HANDED_OFF，此后除 {@link #state} 外的
+ * 全部字段终生不变——consumer 线程只读消费。state 是唯一跨线程可变字段（volatile）：
+ * reader 写 LIVE→HANDED_OFF，consumer 写 HANDED_OFF→OUTPUTTING→DONE。
+ *
+ * <p>线程约束：LIVE 期间仅 reader 线程触碰（单写者）；交接后冻结字段任意线程只读，
+ * {@link #state} 按 volatile 单写者分段（reader 前段、consumer 后段）。
  */
 final class TxBuffer {
 
@@ -31,6 +38,24 @@ final class TxBuffer {
     boolean hasPrefix;
     boolean prefixKnown = false;
     final Set<Long> abortedSubxids = new HashSet<>();
+
+    /** 桶生命周期状态（1.7 设计 §3.1）。写侧归属：reader 写到 HANDED_OFF（交接即冻结），consumer 写后两态。唯一跨线程可变字段。 */
+    volatile BucketState state = BucketState.LIVE;
+    /** 交接时捕获的封箱元数据（来自提交控制消息 live 解码）。冻结字段。 */
+    TransactionKind kind;
+    /** 交接时捕获的提交记录 LSN（Commit/StreamCommit/CommitPrepared 对应字段）。冻结字段。 */
+    long commitLsn;
+    /** 交接时捕获的提交结束 LSN（前沿累加用）。冻结字段。 */
+    long endLsn;
+    /** 交接时捕获的提交时间戳。冻结字段。 */
+    Instant commitTimestamp;
+    /** 交接时从 registry 拷出的版本快照（oidSet 圈定，截止 lastIndex）。冻结字段；空桶为空快照。 */
+    RelationSnapshot relationSnapshot;
+    /** 交接时刻（nanoTime）——consumer 统计最老滞留用。冻结字段。 */
+    long handoffNanos;
+
+    /** 毒丸哨兵：consumer 循环见到即退出（close 排干协议）。xid=-1 与真实 xid（无符号 Int32 值域）区分。 */
+    static final TxBuffer POISON = new TxBuffer(-1L);
 
     TxBuffer(long xid) {
         this.xid = xid;
