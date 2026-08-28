@@ -28,7 +28,7 @@ class RelationSnapshotTest {
         return new PgOutputMessage.Relation(OptionalLong.empty(), oid, "public", table, 'd', List.of());
     }
 
-    /** 快照只含 ≤ maxSeq 的版本前缀：maxSeq=20 截去 v3；快照内 asOf 二分按 ≤ asOfSeq 取版（15→v1、20→v2）。 */
+    /** 快照只含 ≤ maxSeq 的版本前缀：maxSeq=20 截去 v3；快照内 asOf 二分按 ≤ asOfSeq 取版（15→v1、20→v2），find 亦只见截止后的最新版。 */
     @Test
     void snapshotCutsVersionsAboveMaxSeq() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
@@ -38,6 +38,7 @@ class RelationSnapshotTest {
         RelationSnapshot snap = registry.snapshot(Set.of(1), 20L);
         assertEquals("v2", snap.require(1, 20L).table());   // ≤20 的最新版
         assertEquals("v1", snap.require(1, 15L).table());
+        assertEquals(Optional.of("v2"), snap.find(1).map(PgOutputMessage.Relation::table));   // 未截断的全量拷入会得 v3
     }
 
     /** oid 无任何版本时被快照省略：require 以"未先行到达"fail-fast，find 走宽松视图返回 empty。 */

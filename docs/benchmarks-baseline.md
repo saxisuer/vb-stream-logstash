@@ -138,7 +138,7 @@ MEMORY 对照，unframe 亦随帧退役）。
   单元配比漂移，实际单元数以基准 Setup 产物为准（`BenchPipeBridge.PipedBucket#unitCount`
   可自检）。aborted 过滤对基准桶恒空集（该基准不测子事务剔除，属正确性测试的范畴，见
   `DecoupledPipelineTest`）。
-- `appendOneMessage` 用 21B 最小真实消息（压磁盘增速），测的是 append 机制吞吐；16KB 大帧的
-  吞吐可用 `-p` 扩参或改用桶转储场景（`replayBucket` 的 Setup 即 8400 条混合帧顺写）另行测量。
+- `appendOneMessage` 用 21B 最小真实消息（压磁盘增速），测的是 append 机制吞吐；16KB 大消息的
+  吞吐可用 `-p` 扩参或改用桶转储场景（`replayBucket` 的 Setup 即 8400 条混合消息顺写）另行测量。
 - `AssembleMemoryBenchmark` 为同步形态（reader 记账 + 回放合一单线程计量）——线上异步形态把
   两半程拆到双线程，端到端总量不变，线程拆分本身的开销（交接队列/原子前沿）不在本基准面。

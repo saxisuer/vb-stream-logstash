@@ -80,7 +80,7 @@ class DecoupledPipelineTest {
     }
 
     /**
-     * 场景 2——流式大事务交错 + 多连续段：双连接交错手法（参照 TransactionAssemblyTest 场景 4）+
+     * ①——流式大事务交错 + 多连续段：双连接交错手法（参照 TransactionAssemblyTest 场景 4）+
      * SAVEPOINT 子事务回滚（参照其场景 2）构造"两并发 STREAMED 事务多桶交错 + StreamAbort 剔除"，
      * 同一条录制先后喂两个独立管道目录的**异步**组装器回放（双回放兼作确定性对照——同步/异步
      * 的形态等价另由 DecoupledEquivalenceTest 单测锚定，此处验证异步管道在真实字节流上的确定性）。
@@ -181,7 +181,7 @@ class DecoupledPipelineTest {
     }
 
     /**
-     * 场景 3——DDL 的 asOf 版本渲染：大事务（大体量）内**同事务 DDL**——前段按旧列数插入、
+     * ②——DDL 的 asOf 版本渲染：大事务（大体量）内**同事务 DDL**——前段按旧列数插入、
      * ALTER TABLE ADD COLUMN、后段按新列数插入，服务端在事务中段重发新版本 Relation，
      * 回放必须按单元自身 seq 取"变更时刻"的表定义（VersionedRelationRegistry asOf，设计 §4.4），
      * 旧单元按新 schema 渲染即列错位。
@@ -267,7 +267,7 @@ class DecoupledPipelineTest {
     }
 
     /**
-     * 场景 4——大事务回滚后的管道垃圾回收：整体 ROLLBACK 的流式大事务（StreamAbort 整桶
+     * ③——大事务回滚后的管道垃圾回收：整体 ROLLBACK 的流式大事务（StreamAbort 整桶
      * 丢弃）+ 随后一个小事务 COMMIT，断言输出仅含小事务、无异常、CQ 删除低水位越过被回滚桶的
      * 区间起点——回放过程中在首个 StreamAbort 前观测到的水位即"被回滚桶的区间起点"（彼时它是
      * 唯一存活的带单元桶，其 firstIndex 即低水位；丢弃后低水位跳到 maxAppended+1，垃圾可回收）。
@@ -518,7 +518,7 @@ class DecoupledPipelineTest {
     }
 
     /**
-     * 单事务全部变更的轻量摘要（场景 3 列错位诊断）：逐变更取 dml + Relation 列名序列 + 元组
+     * 单事务全部变更的轻量摘要（②列错位诊断）：逐变更取 dml + Relation 列名序列 + 元组
      * 形态拼接为单行（载荷 16KB 也不展开内容）。
      */
     private static String changeDigest(Transaction t) {

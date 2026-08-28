@@ -1,6 +1,5 @@
 package org.vastdata.vbstream.replication;
 
-import net.openhft.chronicle.queue.RollCycle;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
 

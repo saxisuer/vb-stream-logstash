@@ -11,10 +11,12 @@ import java.util.Set;
 
 /**
  * oid → Relation 的版本日志：为每个 oid 维护一条按 seq 升序的版本序列，支持按 asOfSeq 二分取
- * "某个时刻正在生效"的表定义（seq 是组装器给原始流分配的单调序号，从 1 起）。
+ * "某个时刻正在生效"的表定义（seq 是消息的 CQ index，1.7 起 ≡ Chronicle Queue index，
+ * 起点随建队列时刻漂移，勿硬编码）。
  *
- * <p>为什么需要它：DDL 会让服务端在流里重发 Relation（同一个 oid 换了新定义）。溢写回放旧单元
- * 时必须按"当时"的版本渲染，如果取最新版，旧行会被按新表结构错误解释。
+ * <p>为什么需要它：DDL 会让服务端在流里重发 Relation（同一个 oid 换了新定义）。回放旧单元
+ * 时必须按"当时"的版本渲染，如果取最新版，旧行会被按新表结构错误解释——1.7 起回放在 consumer
+ * 线程以桶内不可变快照（RelationSnapshot）渲染，快照内容仍是本类按 seq 记的版本时间线。
  *
  * <p>语义要点：
  * <ul>
@@ -32,9 +34,10 @@ import java.util.Set;
  *       一律取最新版本，旧接缝的行为不变</li>
  * </ul>
  *
- * <p>线程约束：非线程安全——单写者假设，所有方法都由同一个组装器（run 循环）线程串行调用
- * （溢写回放也发生在这个线程里），所以用 HashMap 而不是父类的 ConcurrentHashMap；需要跨线程
- * 查询的场景请改用父类 {@link RelationRegistry}。另外注意：旧接缝
+ * <p>线程约束：非线程安全——单写者假设：1.7 起回放在 consumer 线程用桶内不可变快照
+ * （RelationSnapshot）渲染、不查本类，本类全部方法仍仅由 reader 线程（跑组装器 run 循环的
+ * 线程）串行调用，所以用 HashMap 而不是父类的 ConcurrentHashMap；需要跨线程查询的场景请改用
+ * 父类 {@link RelationRegistry}。另外注意：旧接缝
  * {@link #accept(PgOutputMessage)} 没有 seq 可用，会用内部水位合成一个递增 seq 记到时间线末尾，
  * 只为维持"最新视图 = 最后到达"这个语义；带 seq 的接缝与旧接缝不应混用（合成 seq 可能与真实
  * 流序号冲突，冲突时后到的会被幂等跳过）。
@@ -44,7 +47,8 @@ public class VersionedRelationRegistry extends RelationRegistry {
     /**
      * 单个版本条目。
      *
-     * @param seq 该 Relation 到达时所处的消息序号（组装器按原始流顺序分配，单调递增、从 1 起）
+     * @param seq 该 Relation 到达时所处的消息序号（1.7 起 ≡ 消息的 Chronicle Queue index，
+     *            起点随建队列时刻漂移，勿硬编码）
      * @param rel 该时刻的表元数据（不可变 record，同一引用可在多版本间安全复用）
      */
     private record Version(long seq, PgOutputMessage.Relation rel) {}
@@ -127,7 +131,8 @@ public class VersionedRelationRegistry extends RelationRegistry {
      * 步骤：查该 oid 版本序列 → 手写二分求 floor（seq ≤ asOfSeq 的最大下标）→ 返回命中版本的 rel。
      * 边界：oid 完全无版本、或全部版本都晚于 asOfSeq（含已被 pruneBelow 剪掉的更早区间）→
      * {@link IllegalStateException}，"Relation 未先行到达"语义（消息附 oid 与 asOf 便于定位）。
-     * 线程：单写者调用（溢出回放渲染发生在组装器线程内）。
+     * 线程：单写者调用（1.7 起回放在 consumer 线程用桶内不可变快照 RelationSnapshot 渲染、不查
+     * 本类，本方法仍仅由 reader 线程调用）。
      *
      * @param relationOid 表 oid
      * @param asOfSeq     查询时刻的消息序号（取该时刻已到达的最新版本）
@@ -154,7 +159,7 @@ public class VersionedRelationRegistry extends RelationRegistry {
      * <p>边界：找不到这条生效版本（该 oid 的所有版本都晚于 minSeq，未来的查询还用得着）时整列
      * 保留；生效版本就是要保留区间的第一个元素，所以"每个 oid 至少保留最新一条"自然成立——
      * minSeq 超过全部版本 seq 时它就是末位，只剩最新；空序列什么都不做。
-     * 由组装器在桶完结点调用（见 TransactionAssembler.retireBucket），单写者。
+     * 由组装器在桶完结点调用（见 TransactionAssembler.maintainWatermarks），单写者。
      *
      * @param minSeq 最低仍需可查询的消息序号（比它更早的 asOf 查询不会再发生）
      */

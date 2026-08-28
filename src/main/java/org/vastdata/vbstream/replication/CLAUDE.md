@@ -16,7 +16,7 @@ reader 线程（pgoutput-reader，沿用 1.6 名）
 Chronicle Queue（MessagePipe：一条记录 = 一条完整消息，wipe-on-open）
   ▼
 consumer 线程（transaction-consumer，TransactionAssembler 内部创建）
-  TransactionConsumer：交接队列 take 桶 → 逐段 readRange → BucketReplayer（桶内快照渲染）
+  TransactionConsumer：交接队列取桶（poll 1s，采样统计服务）→ 逐段 readRange → BucketReplayer（桶内快照渲染）
   → 封箱 Transaction → listener.onTransaction → 前沿 AtomicLong ← endLsn → state=DONE
 ```
 
@@ -175,7 +175,7 @@ raw 字节窥探辅助：`intAt`（big-endian 有符号 I32，oid 窥探——�
 
 ## 线程模型小结（1.7 双线程形态）
 
-**reader 线程（pgoutput-reader）**：session.run 循环 → 组装器 onRaw 全部路由/记账 → registry（单写者）→ pipe append/releaseBelow → 交接入队 → 反馈封顶读取前沿。**consumer 线程（transaction-consumer，异步形态）**：交接队列 take → pipe.readRange（tailer）→ 冻结桶回放（快照渲染）→ listener 回调 → 前沿累加 → 桶状态后两态。
+**reader 线程（pgoutput-reader）**：session.run 循环 → 组装器 onRaw 全部路由/记账 → registry（单写者）→ pipe append/releaseBelow → 交接入队 → 反馈封顶读取前沿。**consumer 线程（transaction-consumer，异步形态）**：交接队列取桶（poll 1s，采样统计服务）→ pipe.readRange（tailer）→ 冻结桶回放（快照渲染）→ listener 回调 → 前沿累加 → 桶状态后两态。
 
 **跨线程共享面精确枚举**（除此之外各线程私有）：
 
