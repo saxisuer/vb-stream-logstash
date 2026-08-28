@@ -19,7 +19,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 
 ```
 PostgreSQL 18（walsender 逻辑解码：pgoutput v4 + streaming + two_phase）
-  │ CopyBoth 消息（pgjdbc 已剥复制协议头）
+  │ CopyData/'w' WAL 帧（pgjdbc 已剥复制协议封装）
   ▼
 PgReplicationSession.run()  ←100ms readPending 非阻塞轮询；周期回传 LSN 确认
   │ RawMessageListener.onRaw(byte[])：单条完整消息的独占数组（类型字节 + 流式块内可选 xid 前缀）
@@ -97,7 +97,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 - **spill 的内存有界性只覆盖组装期**（终审修正）：阈值约束的是进行中事务的桶缓冲；提交期回放把整桶单元物化回堆——SPILLED 桶逐段回读的原始字节与回放解码出的 TxChange 双份瞬态并存，峰值 O(事务大小)；流式输出（边回放边吐出）属里程碑 2 范畴。仍随事务/会话增长的堆结构：`abortedSubxids`（每回滚子事务一个 Long，随桶完结释放）、`preparedByGid` 挂起池（未决 2PC 数，协议固有）、registry 版本日志（随新表/DDL 线性；组装器在桶完结点按存活桶 minSeq 低水位 `pruneBelow` 剪枝——floor 语义，保留低水位时刻生效的版本，2PC 挂起桶算存活；剪枝后仅随不同表 oid 数线性）
 - **源码结构**（各源码根一行；包内细节见各模块级 CLAUDE.md，层间关系见上文“架构总览”）：
     - `src/main/java`：`protocol`（协议解析，纯函数）、`replication`（会话 + raw 接缝 + 事务组装与溢写）、顶层 `Main`/`ConsoleListener`
-    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）、`it` 包集成测试 9 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
+    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleListenerTest`、`it` 包集成测试 9 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
     - `src/jmh/java`：四基准（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖，见其 CLAUDE.md）
 - 集成测试（`org.vastdata.vbstream.it`，9 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。溢写专项 `AssemblySpillTest` 四场景：①同录制字节流喂 64MiB/32KiB 双阈值组装器，输出 `Transaction` 全等（spill 无损核心验收）②双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除 ③大事务内同事务 DDL，前后段按 asOf 版本渲染 ④流式大事务回滚后低水位推进触发删档；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
 - JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 自带，详见该文档；基线数字在档作回归对照，不进 CI）
