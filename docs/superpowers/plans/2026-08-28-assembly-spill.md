@@ -62,7 +62,7 @@ git push
 - Test: `src/test/java/org/vastdata/vbstream/replication/SpillConfigTest.java`
 
 **Interfaces:**
-- Produces: `record SpillConfig(long thresholdBytes, Path dir, RollCycle rollCycle)`；`static SpillConfig fromSystemProperties()`（`vb.spill.thresholdBytes` 默认 67108864、`vb.spill.dir` 默认 `spill-queue`、`vb.spill.rollCycle` 默认 `RollCycles.MINUTELY`，枚举名大小写宽容）；`boolean spillEnabled()`（thresholdBytes > 0）
+- Produces: `record SpillConfig(long thresholdBytes, Path dir, RollCycle rollCycle)`；`static SpillConfig fromSystemProperties()`（`vb.spill.thresholdBytes` 默认 67108864、`vb.spill.dir` 默认 `spill-queue`、`vb.spill.rollCycle` 默认 `LegacyLegacyRollCycles.MINUTELY`，枚举名大小写宽容）；`boolean spillEnabled()`（thresholdBytes > 0）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -72,7 +72,7 @@ void defaultsMatchSpec() {
     SpillConfig c = SpillConfig.fromSystemProperties();
     assertEquals(64L * 1024 * 1024, c.thresholdBytes());
     assertEquals(Path.of("spill-queue"), c.dir());
-    assertEquals(RollCycles.MINUTELY, c.rollCycle());
+    assertEquals(LegacyLegacyRollCycles.MINUTELY, c.rollCycle());
     assertTrue(c.spillEnabled());
 }
 
@@ -83,7 +83,7 @@ void overridesAndDisabled() {
     System.setProperty("vb.spill.rollCycle", "hourly");
     SpillConfig c = SpillConfig.fromSystemProperties();
     assertFalse(c.spillEnabled());          // ≤0 = 纯内存逃生门
-    assertEquals(RollCycles.HOURLY, c.rollCycle());  // 大小写宽容
+    assertEquals(LegacyLegacyRollCycles.HOURLY, c.rollCycle());  // 大小写宽容
     // 测试尾清理 System.clearProperty(...)（@AfterEach）
 }
 
@@ -234,7 +234,7 @@ void inheritedLatestViewForLegacyContract() {
 ```java
 @Test
 void appendReadRangeRoundTrip(@TempDir Path dir) {
-    try (MessageSpool spool = new MessageSpool(dir, RollCycles.MINUTELY)) {
+    try (MessageSpool spool = new MessageSpool(dir, LegacyLegacyRollCycles.MINUTELY)) {
         long a = spool.append(new byte[]{1});
         long b = spool.append(new byte[]{2});
         long c = spool.append(new byte[]{3});
@@ -247,8 +247,8 @@ void appendReadRangeRoundTrip(@TempDir Path dir) {
 
 @Test
 void reopenWipesStaleContent(@TempDir Path dir) {
-    try (MessageSpool s1 = new MessageSpool(dir, RollCycles.MINUTELY)) { s1.append(new byte[]{9}); }
-    try (MessageSpool s2 = new MessageSpool(dir, RollCycles.MINUTELY)) {
+    try (MessageSpool s1 = new MessageSpool(dir, LegacyLegacyRollCycles.MINUTELY)) { s1.append(new byte[]{9}); }
+    try (MessageSpool s2 = new MessageSpool(dir, LegacyLegacyRollCycles.MINUTELY)) {
         List<byte[]> got = new ArrayList<>();
         s2.readRange(0, 100, (f, i) -> got.add(f));   // 旧内容不存在：0 起步读不到即空
         assertTrue(got.isEmpty());
@@ -262,13 +262,13 @@ void releaseBelowNeverTouchesRecentCycles(@TempDir Path dir) throws IOException 
     Files.writeString(dir.resolve("20260101-0001.cq4"), "x");
     Files.writeString(dir.resolve("20260101-0002.cq4"), "x");
     // neededCycle=2（20260101-0002 的 cycle 号）→ 只删 cycle 0 一档（保留 needed 与 needed-1）
-    List<Path> doomed = MessageSpool.deletableFiles(RollCycles.MINUTELY, dir, 2);
+    List<Path> doomed = MessageSpool.deletableFiles(LegacyLegacyRollCycles.MINUTELY, dir, 2);
     assertEquals(List.of(dir.resolve("20260101-0000.cq4")), doomed);
 }
 
 @Test
 void liveReleaseBelowEndToEnd(@TempDir Path dir) throws IOException {
-    try (MessageSpool spool = new MessageSpool(dir, RollCycles.MINUTELY)) {
+    try (MessageSpool spool = new MessageSpool(dir, LegacyLegacyRollCycles.MINUTELY)) {
         spool.append(new byte[]{1});
         assertEquals(0, spool.releaseBelow(spool.lastAppendedIndex())); // 当前 cycle，无文件可删
     }

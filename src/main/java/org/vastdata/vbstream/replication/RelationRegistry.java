@@ -9,8 +9,10 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * oid → Relation 元数据缓存。Relation 消息（含流式块内重复下发）统一入缓存；DML 前必有 Relation。
  * 写入方为 run 循环单线程，但 listener 可能查询，保守起见用 ConcurrentHashMap 保证线程安全。
+ * 可继承用于版本化扩展（如 {@link VersionedRelationRegistry} 按 seq 保留多版本、支持 asOf 查询；
+ * 注意子类自行接管全部读写，不再复用本类的并发缓存）。
  */
-public final class RelationRegistry {
+public class RelationRegistry {
 
     private final Map<Integer, PgOutputMessage.Relation> relations = new ConcurrentHashMap<>();
 
