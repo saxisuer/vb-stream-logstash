@@ -747,9 +747,15 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
                 : "MEMORY[" + bucket.units.size() + " units/" + bucket.bytesTotal + "B]";
     }
 
-    /** big-endian 读 4 字节有符号整数（oid 等，仅 fail-fast 描述与窥探用）。 */
+    /**
+     * big-endian 读 4 字节有符号整数（oid 等，仅 fail-fast 描述与窥探用）。
+     * 每字节先 &amp; 0xFF 再移位拼接——byte 是有符号类型，任一字节 ≥ 0x80 时直接 {@code |}
+     * 拼接会把符号位扩散到全部高位（Task 12 集成实测：流式前缀 xid 758 的低字节 0xF6 使
+     * {@code 512 | 0xFFFFFFF6 = 0xFFFFFFF6}，单元归属错位致 StreamAbort 剔除静默失效）。
+     */
     private static int intAt(byte[] raw, int offset) {
-        return (raw[offset] << 24) | (raw[offset + 1] << 16) | (raw[offset + 2] << 8) | raw[offset + 3];
+        return ((raw[offset] & 0xFF) << 24) | ((raw[offset + 1] & 0xFF) << 16)
+                | ((raw[offset + 2] & 0xFF) << 8) | (raw[offset + 3] & 0xFF);
     }
 
     /** big-endian 读 4 字节无符号整数入 long（流式前缀 xid；与 ByteBufferReader.readUnsignedInt 同语义）。 */
