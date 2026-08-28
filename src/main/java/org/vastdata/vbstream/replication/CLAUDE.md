@@ -66,14 +66,14 @@
 
 ## 事务模型 record 族（输出侧，组装器的回调产物）
 
-提交路径回放出的不可变值对象族：`Transaction` 是对外的原子单元，`TxChange` sealed 族是其内容。全部 record + 紧凑构造器归一（无 null 组件、集合防御性拷贝），可跨线程传递。各类完整 javadoc 见源文件。
+提交路径回放出的不可变值对象族：`Transaction` 是对外的原子单元，`TxChange` sealed 族是其内容。全部为值语义 record：集合组件经紧凑构造器防御性拷贝（null 或含 null 元素抛 NPE）、Optional 组件 null 归一 empty。两个例外：`Transaction.gid` 非 TWO_PHASE 时刻意为 null；`MsgChange` 无紧凑构造器（content 为解码器独占新建数组、共享引用不复制——同 PayloadUnit 的"构造后不得改写"约定）。不可变、可跨线程传递。各类完整 javadoc 见源文件。
 
 - **`TransactionListener.onTransaction(Transaction)`**：事务消费契约（@FunctionalInterface）。调用线程 = run 循环线程（同步执行，回调耗时直接拖慢消息循环与 LSN 反馈，实现方应快速返回或转交）；ROLLBACK 路径不回调
 - **`Transaction(xid, kind, gid, commitLsn, endLsn, commitTimestamp, changes)`**：一个已确认提交的完整事务。xid 来源随 kind 而定（NORMAL←Begin、STREAMED←StreamStart、TWO_PHASE←BeginPrepare/StreamPrepare）；gid 非 null **当且仅当** kind=TWO_PHASE；changes 按协议到达顺序，紧凑构造器 `List.copyOf` 防御性拷贝（null 或含 null 元素抛 NPE）
 - **`TransactionKind`**（枚举）：NORMAL（变更整体缓冲，Commit 后一次输出）/ STREAMED（越过 logical_decoding_work_mem 被驱逐流式，StreamCommit 后一次输出）/ TWO_PHASE（PREPARE 后挂起，COMMIT PREPARED 才输出，ROLLBACK PREPARED 丢弃）
-- **`TxChange`（sealed interface，permits RowChange/TruncateChange/MsgChange）**：事务内一条变更的基接口。公共组件 `streamXid`（OptionalLong）：流式块内非空——DML/Truncate 的 xid 前缀 = 产生变更的**（子）事务** xid、Message 的前缀 = 顶层 xid；非流式块内恒 empty。供 StreamAbort(sub) 按子事务剔除与下游追溯归属
+- **`TxChange`（sealed interface，permits RowChange/TruncateChange/MsgChange）**：事务内一条变更的基接口。公共组件 `streamXid`（OptionalLong）：流式块内非空——DML/Truncate 的 xid 前缀 = 产生变更的**（子）事务** xid、Message 的前缀 = 顶层 xid；非流式块内恒 empty。供回放期按子事务剔除（同一值在 PayloadUnit 上判定）与下游追溯归属
 - **`RowChange(dml, relation, before, after, streamXid)`**：行变更。`relation` 是**变更时刻的 Relation 快照嵌入**（非 registry 引用——下游自包含，DDL 后旧行不按新 schema 错解）；before/after 统一 Optional：INSERT 仅 after、DELETE 仅 before、UPDATE 的 before 取决于 replica identity（紧凑构造器把 null 归一为 empty）
-- **`TruncateChange(relations, options, streamXid)`**：一条 TRUNCATE 语句可截多表——一次变更携带全部受影响表的快照（顺序与协议 relationOids 一致）；options 经 Set.copyOf 不可变化
+- **`TruncateChange(relations, options, streamXid)`**：一条 TRUNCATE 语句可截多表——一次变更携带全部受影响表的快照（顺序与协议 relationOids 一致）；relations/options 均经 List.copyOf/Set.copyOf 防御性拷贝
 - **`MsgChange(transactional, prefix, content, streamXid)`**：`pg_logical_emit_message` 的事务内逻辑消息（非事务性即时消息在组装器 WARN 丢弃，不入 Transaction）；content 为 byte[] 组件，显式 override equals/hashCode 为**值相等**（record 默认对数组退化为引用相等）
 - **`DmlKind`**（枚举）：INSERT/UPDATE/DELETE，与 RowChange 的 before/after 语义一一对应
 
