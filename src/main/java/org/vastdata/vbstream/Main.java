@@ -27,9 +27,13 @@ public final class Main {
      * 累加前沿，crash 时未输出事务必然被重发（1.7 设计 §5）→ 主线程 await 停机信号（Ctrl+C 触发
      * shutdown hook）。关闭次序：会话 → 组装器（排干）→ 管道——会话 close 使 run 经 isClosed 守卫
      * 退出，组装器 try-with-resources 收尾走毒丸排干协议（已提交未输出的事务不丢），管道随组装器
-     * close 内部释放。consumer 回放失败经 onFailure（stop::countDown）触发停机（fail-fast，等价
-     * 1.6"异常上抛终止会话"）。配置缺失 exit 2，启动失败 exit 1，复制流中断保持槽位并倒计时停机
-     * （重启续传）。
+     * close 内部释放。**信号停机的排干闸门**（spec §4.6）：JVM 在 shutdown hook 完成后才 halt、
+     * 不等 non-daemon 线程，故 hook 除 countDown 外还 join pgoutput-reader（上限 60s，对齐组装器
+     * close 的 consumer join；超时 WARN 放行防卡死兜底，正常路径远快于此）——hook 与 main 并行
+     * 推进、无互相等待（worker 退出依赖的 session.close 由 main 醒来后在 try-with-resources
+     * 执行，worker 的组装器 close 内部自会 join consumer），Ctrl+C 的排干承诺由此成立。
+     * consumer 回放失败经 onFailure（stop::countDown）触发停机（fail-fast，等价 1.6"异常上抛
+     * 终止会话"）。配置缺失 exit 2，启动失败 exit 1，复制流中断保持槽位并倒计时停机（重启续传）。
      */
     public static void main(String[] args) throws Exception {
         ReplicationConfig config = ReplicationConfig.fromSystemProperties();
@@ -45,7 +49,6 @@ public final class Main {
         LOG.info("pipe 配置: dir={} rollCycle={}", pipe.dir(), pipe.rollCycle());
 
         CountDownLatch stop = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(stop::countDown, "shutdown-hook"));
         // 输出前沿（consumer 已输出事务的最大 endLsn，跨线程 AtomicLong）：consumer 线程单调累加、
         // reader 线程的 run 循环每轮读取并对 LSN 确认做 min 封顶——确认锚定输出进度而非读取进度。
         AtomicLong outputFrontier = new AtomicLong();
@@ -73,6 +76,24 @@ public final class Main {
                 }
             }, "pgoutput-reader");
             worker.start();
+            // 信号停机的排干闸门（spec §4.6，须在 worker 建好并启动后注册）：SIGINT/SIGTERM 下
+            // JVM 跑完 shutdown hook 即 halt、不等 non-daemon 线程——hook 必须亲自等 worker 走完
+            // "run 退出 → 组装器 close（毒丸排干 consumer）"，已提交未输出的事务才不丢。join
+            // 上限 60s 对齐组装器 close 的 consumer join；超时/被中断 WARN 放行（防关闭序列卡死
+            // 拖住停机的兜底）。无死锁链：hook 等 worker；worker 的退出依赖 session.close——由
+            // main 线程 countDown 醒来后在 try-with-resources 收尾执行，与 hook 并行不互等。
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                stop.countDown();
+                try {
+                    worker.join(60_000L);
+                    if (worker.isAlive()) {
+                        LOG.warn("pgoutput-reader 60s 内未退出（关闭序列卡死），放弃等待交还 JVM halt");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    LOG.warn("等待 pgoutput-reader 退出被中断，放弃等待交还 JVM halt");
+                }
+            }, "shutdown-hook"));
             stop.await();
             LOG.info("正在关闭复制流...");
         } catch (Exception e) {
