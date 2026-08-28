@@ -18,6 +18,8 @@
         <junit-jupiter.version>6.1.3</junit-jupiter.version>
         <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
         <testcontainers.version>2.0.5</testcontainers.version>
+        <jmh.version>1.37</jmh.version>
+        <maven-build-helper-plugin.version>3.6.0</maven-build-helper-plugin.version>
     </properties>
 
     <dependencies>
@@ -74,5 +76,69 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- JMH 基准档（Task 13）：-Pjmh 激活。基准源码放独立根 src/jmh/java（经 build-helper 挂为
+             test 源码目录），默认构建完全不引入 JMH 依赖与基准编译——`mvn clean test` 不受影响；
+             `-Pjmh test-compile` 才把四类 *Benchmark 与 JMH 生成的基准桩编进 target/test-classes。
+             annprocess 以 compiler 的 annotationProcessorPaths 显式接入（不依赖 classpath 隐式发现，
+             新版 JDK 已默认禁用隐式注解处理）；桩类由 Surefire 默认命名规则排除（*Benchmark 非 *Test），
+             `mvn -Pjmh test` 也不会误跑基准。运行方法见 docs/benchmarks-baseline.md。 -->
+        <profile>
+            <id>jmh</id>
+            <dependencies>
+                <!-- JMH 核心：基准注解 + 运行器（org.openjdk.jmh.Main 入口在测试 classpath 上） -->
+                <dependency>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-core</artifactId>
+                    <version>${jmh.version}</version>
+                    <scope>test</scope>
+                </dependency>
+                <!-- JMH 注解处理器：把 @Benchmark 方法生成为可被 Main 发现的基准桩类 -->
+                <dependency>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-generator-annprocess</artifactId>
+                    <version>${jmh.version}</version>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>${maven-build-helper-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>add-jmh-test-source</id>
+                                <phase>generate-test-sources</phase>
+                                <goals>
+                                    <goal>add-test-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/jmh/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-compiler-plugin</artifactId>
+                        <configuration>
+                            <annotationProcessorPaths>
+                                <path>
+                                    <groupId>org.openjdk.jmh</groupId>
+                                    <artifactId>jmh-generator-annprocess</artifactId>
+                                    <version>${jmh.version}</version>
+                                </path>
+                            </annotationProcessorPaths>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
 </project>

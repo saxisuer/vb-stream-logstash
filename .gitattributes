@@ -6,3 +6,5 @@
 src/docker/initdb.d/* text eol=lf
 # SQL 喂给容器内 psql：字面量若被 checkout 成 CRLF，\r 会混进字符串数据（如 E'...\n' 多行文本），故同样强制 LF
 *.sql text eol=lf
+# JMH 基准语料是长度前缀的二进制消息流，禁止任何行尾/编码改写（src/test/resources/bench-corpus/corpus.bin）
+*.bin binary
