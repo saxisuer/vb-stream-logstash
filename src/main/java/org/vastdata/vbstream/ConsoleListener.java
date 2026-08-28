@@ -24,9 +24,10 @@ import java.util.OptionalLong;
  * 事务生命周期控制消息（流式分段边界 + 两阶段信号）走 CDC logger INFO；行级数据与元数据等逐消息细节
  * 降为 DEBUG（默认关闭），仅供排障时开启。INFO 级保证任何事务形态至少留一行痕迹，不吞噬事务信息。
  *
- * <p>同一实例承担双角色：事务回调（{@link #onTransaction}，组装器提交路径）与逐消息渲染
- * （{@link #onMessage}，Main 装配下挂在组装器的解码点 observer——控制消息/Relation live 解码与
- * 提交回放期 payload 解码，见其 javadoc）。
+ * <p>同一实例承担双角色：事务回调（{@link #onTransaction}，consumer 线程）与逐消息渲染
+ * （{@link #onMessage}，Main 装配下挂在组装器的解码点 observer——reader 线程的 live 解码与
+ * consumer 线程的回放解码**两处**调用，见其 javadoc）。本类无状态且 slf4j 线程安全，双线程
+ * 并发调用无共享可变状态。
  */
 public final class ConsoleListener implements PgOutputListener, TransactionListener {
 
@@ -42,9 +43,11 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
      * 控制消息（Begin/Commit/流式与两阶段信号）与 Relation('R') 到达即 live 解码、按到达序回调；
      * 数据消息（I/U/D/T/M）live 期以原始字节入桶不解码，在提交回放期解码回调——每条恰好一次
      * （被 StreamAbort 过滤的子事务单元不回调；'Y'/'O' 组装器直接丢弃，不产生回调）。
-     * 渲染用的 Relation 视图参型为 {@link RelationLookup}（1.7 设计 §4.3）：Main 装配下闭包持
-     * 版本日志 registry（最新版视图，随 'R' 到达演进——逐消息渲染按最新 schema 展示即可）；提交块的
-     * asOf 精确渲染由组装器回放出的 TxChange 内嵌快照承担，见 {@link #onTransaction}，不经本方法。
+     * 调用线程自 1.7 起为**两处**：reader 线程（控制消息/'R' 的 live 解码点）与 consumer 线程
+     * （提交回放期的数据解码点）——渲染视图第二参 {@link RelationLookup} 由组装器按调用点分流
+     * （1.7 设计 §4.3）：live 点传版本日志 registry（最新版视图，逐消息渲染按最新 schema 展示即可），
+     * 回放点传该桶冻结时随行的 RelationSnapshot（asOf 变更时刻版本）。提交块的 asOf 精确渲染由
+     * 组装器回放出的 TxChange 内嵌快照承担，见 {@link #onTransaction}，不经本方法。
      */
     @Override
     public void onMessage(PgOutputMessage message, RelationLookup registry) {
@@ -79,7 +82,9 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
 
     /**
      * 事务块输出：头/尾各一行 INFO（CDC logger），变更行逐条基于内嵌 Relation 快照渲染（不依赖 registry）。
-     * 调用线程 = run 循环线程（与 onMessage 同约束，同步执行应快速返回）。
+     * 调用线程 = consumer 线程（异步装配 1.7 起——Main 形态为 transaction-consumer 线程；同步测试
+     * 形态为调用方线程）——回调耗时不再拖慢读取路径，但仍应快速返回（拖长会积压交接队列、
+     * 推迟输出前沿与 LSN 反馈推进）。
      */
     @Override
     public void onTransaction(Transaction transaction) {
