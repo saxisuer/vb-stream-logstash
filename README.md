@@ -4,7 +4,7 @@
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
-- 状态：里程碑 1.6 完成——协议层 19 种消息全量解析、复制会话、事务组装器（MEMORY/SPILLED 混合缓冲 + Chronicle Queue 溢写 + Relation 版本日志（DDL 后旧行按变更时刻表结构渲染）），151 个测试全绿（单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`）
+- 状态：里程碑 1.6 完成——协议层 19 种消息全量解析、复制会话、事务组装器（MEMORY/SPILLED 混合缓冲 + Chronicle Queue 溢写 + Relation 版本日志——DDL 后旧行按变更时刻表结构渲染），151 个测试全绿（单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`）
 
 ## PostgreSQL 18 前置要求
 
@@ -79,9 +79,9 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 2026-08-27 02:40:07.064 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - STREAM-STOP
 2026-08-27 02:40:07.065 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - STREAM-COMMIT     xid=769 commitLsn=0x3a21c60
 2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - TXN-BEGIN xid=769 kind=STREAMED gid=null commitLsn=0x3a21c60 commitTs=2026-08-27T02:40:07Z changes=3
-2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [1] INSERT public.t_stream_test BEFORE=- AFTER=[id=1404, payload=logback-smoke-1]
-2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [2] INSERT public.t_stream_test BEFORE=- AFTER=[id=1405, payload=logback-smoke-2]
-2026-08-27 02:40:07.069 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [3] INSERT public.t_stream_test BEFORE=- AFTER=[id=1406, payload=logback-smoke-3]
+2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [1] INSERT public.t_stream_test BEFORE=- AFTER=[id=1404, payload=logback-smoke-1] [streamed xid=769]
+2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [2] INSERT public.t_stream_test BEFORE=- AFTER=[id=1405, payload=logback-smoke-2] [streamed xid=769]
+2026-08-27 02:40:07.069 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [3] INSERT public.t_stream_test BEFORE=- AFTER=[id=1406, payload=logback-smoke-3] [streamed xid=769]
 2026-08-27 02:40:07.069 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - TXN-END   xid=769
 ```
 
