@@ -44,9 +44,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class AssemblySpillTest {
 
-    private static final org.slf4j.Logger LOG =
-            org.slf4j.LoggerFactory.getLogger(AssemblySpillTest.class);
-
     /** 本测试类共用的复制槽名：cleanup 与各场景 newConfig 统一引用，防多处字面量拼写漂移。 */
     private static final String SLOT = "slot_spill";
 
