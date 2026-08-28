@@ -1,10 +1,10 @@
 # vb-stream-logstash
 
-适配 PostgreSQL 逻辑解码 **stream 模式**的 CDC 采集器：基于 pgjdbc `ReplicationConnection` 直连复制流，自研 pgoutput 协议解码器，实时解析普通事务、流式大事务（`streaming=parallel`）、两阶段提交（`two_phase`）与 Truncate，并把原始字节流组装为**原子事务块**输出（组装缓冲越限自动溢写 Chronicle Queue，内存有界）。
+适配 PostgreSQL 逻辑解码 **stream 模式**的 CDC 采集器：基于 pgjdbc `ReplicationConnection` 直连复制流，自研 pgoutput 协议解码器，实时解析普通事务、流式大事务（`streaming=parallel`）、两阶段提交（`two_phase`）与 Truncate，并把原始字节流组装为**原子事务块**输出（组装缓冲越限自动溢写 Chronicle Queue，组装期内存有界）。
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
-- 状态：里程碑 1.6 完成——协议层 19 种消息全量解析、复制会话（raw 字节接缝）、事务组装器（MEMORY/SPILLED 混合缓冲 + Chronicle Queue 溢写 + Relation 版本日志），151 个测试全绿（单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`）
+- 状态：里程碑 1.6 完成——协议层 19 种消息全量解析、复制会话、事务组装器（MEMORY/SPILLED 混合缓冲 + Chronicle Queue 溢写 + Relation 版本日志（DDL 后旧行按变更时刻表结构渲染）），151 个测试全绿（单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`）
 
 ## PostgreSQL 18 前置要求
 
@@ -41,7 +41,9 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
      -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
 ```
 
-`--add-opens` 清单必带：组装缓冲越过溢写阈值时建 Chronicle Queue，其 mmap 在 Java 17 需开放内部包（与 pom 的 surefire argLine 同源）。
+`--add-opens` 清单必带：组装缓冲越过溢写阈值时建 Chronicle Queue，其 mmap 在 Java 17 需开放内部包。
+
+> 注：命令为 bash 形态；Windows 下 classpath 分隔符是 `;` 而非 `:`
 
 ### 配置（系统属性，均有默认值对准 src/docker 环境）
 
@@ -68,14 +70,18 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 ### 输出
 
 - **事务块**（`TXN-BEGIN`/`TXN-END` 头尾 + 逐变更行）与**事务生命周期控制消息**（流式 Stream-Start/Stop/Commit/Abort/Prepare + 两阶段信号，共 9 种）：走 CDC 专用 logger `org.vastdata.vbstream.cdc`，INFO——任何事务形态（含回滚、无数据消息的事务）在 INFO 级至少留一行痕迹
-- 行级数据与元数据的逐消息细节：同 logger **DEBUG 默认关闭**（大事务防刷屏），排障时在 `src/main/resources/logback.xml` 调级
+- 行级数据与元数据的逐消息细节：同 logger **DEBUG 默认关闭**（大事务防刷屏），排障时在 `src/main/resources/logback.xml` 加 `<logger name="org.vastdata.vbstream.cdc" level="DEBUG"/>`
 - 诊断日志：会话生命周期 INFO（连接/建槽/开流/关闭）
 
 ```
 2026-08-27 02:40:04.661 [main] INFO  o.v.v.r.PgReplicationSession - 复制流已启动: 槽=vb_cdc_slot ...
 2026-08-27 02:40:07.060 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - STREAM-START      xid=769 firstSegment=true
-2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - TXN-BEGIN xid=769 kind=STREAMED gid=null commitLsn=0x0/3A21C60 commitTs=2026-08-27T02:40:07Z changes=3
-2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [1] INSERT public.t_stream_test BEFORE=- AFTER=[id=1404, payload=logback-smoke]
+2026-08-27 02:40:07.064 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - STREAM-STOP
+2026-08-27 02:40:07.065 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - STREAM-COMMIT     xid=769 commitLsn=0x3a21c60
+2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - TXN-BEGIN xid=769 kind=STREAMED gid=null commitLsn=0x3a21c60 commitTs=2026-08-27T02:40:07Z changes=3
+2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [1] INSERT public.t_stream_test BEFORE=- AFTER=[id=1404, payload=logback-smoke-1]
+2026-08-27 02:40:07.068 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [2] INSERT public.t_stream_test BEFORE=- AFTER=[id=1405, payload=logback-smoke-2]
+2026-08-27 02:40:07.069 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc -   [3] INSERT public.t_stream_test BEFORE=- AFTER=[id=1406, payload=logback-smoke-3]
 2026-08-27 02:40:07.069 [pgoutput-reader] INFO  o.vastdata.vbstream.cdc - TXN-END   xid=769
 ```
 
@@ -96,7 +102,7 @@ mvn test                # 全部：协议/组装单元测试 + Testcontainers �
 mvn test -Dtest=StreamedTransactionTest    # 单类
 ```
 
-集成测试（`org.vastdata.vbstream.it`，9 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器：场景脚本或建表 DDL 变化（SHA-256 指纹失配）才起容器重录并改写语料（产物提交回库），常规 `mvn test` 秒级通过。
+集成测试（`org.vastdata.vbstream.it`，9 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
 
 JMH 基准在独立源码根 `src/jmh`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）；运行方式与基线数字见 `docs/benchmarks-baseline.md`。
 
