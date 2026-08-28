@@ -5,8 +5,6 @@ import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.vastdata.vbstream.protocol.PgOutputDecoder;
-import org.vastdata.vbstream.protocol.PgOutputMessage;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -100,20 +98,21 @@ public final class PgReplicationSession implements AutoCloseable {
     private static final long POLL_INTERVAL_MILLIS = 100;
 
     /**
-     * 消息循环：readPending 非阻塞轮询 → 解码 → 缓存 Relation → 回调；按周期 forceUpdateStatus 反馈 LSN。
+     * 消息循环：readPending 非阻塞轮询 → 拷贝单条消息完整字节 → 回调 listener；按周期
+     * forceUpdateStatus 反馈 LSN。会话只做字节交付（解码与 Relation 缓存移交给上层，
+     * 如 {@link DecodedMessageBridge}），自身不再触碰协议层。
      * 用轮询而非阻塞 read()：实测（pgjdbc 42.7.13 + PG 18）阻塞 read 在空闲期不按 statusInterval 醒来，
      * status 依赖服务端 keepalive（约 wal_sender_timeout/2，默认 ~30s）才被触发；轮询使 status 周期
      * 独立于消息到达（反馈间隔 = feedbackIntervalSeconds，运维可从 pg_stat_replication.flush_lsn 及时
      * 看到客户端进度），且断连感知更快（isClosed 检查每轮执行）。
+     * 边界：非 null 但 remaining()==0 的载荷（pgjdbc 实际不产生，防御性跳过）不回调。
      *
      * 关于 confirmed_flush_lsn 的服务端行为（Diag 实证，勿再当 bug 排查）：standby status 到达后
      * 服务端先采纳进 pg_stat_replication.flush_lsn；槽的 confirmed_flush_lsn 由 walsender 在
      * 解码推进时（candidate 机制）落库——空闲期不推进，但确认不丢失：下一次任何 WAL 活动会使其
      * 一步跳到客户端已确认的最新位点。
      */
-    public void run(PgOutputListener listener) throws SQLException, IOException {
-        PgOutputDecoder decoder = new PgOutputDecoder(config.streamingMode());
-        RelationRegistry registry = new RelationRegistry();
+    public void run(RawMessageListener listener) throws SQLException, IOException {
         long feedbackIntervalNanos = config.feedbackIntervalSeconds() * 1_000_000_000L;
         long lastFeedbackNanos = System.nanoTime();
         while (true) {
@@ -121,10 +120,10 @@ public final class PgReplicationSession implements AutoCloseable {
                 throw new SQLException("复制流已结束（连接断开）");
             }
             ByteBuffer payload = stream.readPending(); // 非阻塞；无消息返回 null 属正常
-            if (payload != null) {
-                PgOutputMessage message = decoder.decode(payload);
-                registry.accept(message);
-                listener.onMessage(message, registry);
+            if (payload != null && payload.remaining() > 0) {
+                byte[] raw = new byte[payload.remaining()];
+                payload.get(raw);
+                listener.onRaw(raw);
             }
             LogSequenceNumber last = stream.getLastReceiveLSN();
             stream.setAppliedLSN(last);
