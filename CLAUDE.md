@@ -13,6 +13,40 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
     - `net.openhft:chronicle-queue`（持久化低延迟队列；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
 
+## 架构总览
+
+端到端数据流（raw 接缝，里程碑 1.6 形态）——各组件机制详见对应包内 CLAUDE.md：
+
+```
+PostgreSQL 18（walsender 逻辑解码：pgoutput v4 + streaming + two_phase）
+  │ CopyBoth 消息（pgjdbc 已剥复制协议头）
+  ▼
+PgReplicationSession.run()  ←100ms readPending 非阻塞轮询；周期回传 LSN 确认
+  │ RawMessageListener.onRaw(byte[])：单条完整消息的独占数组（类型字节 + 流式块内可选 xid 前缀）
+  ▼
+TransactionAssembler  ←全局 seq 分配 → 按类型字节路由：控制消息与 'R' live 解码；
+  │                   I/U/D/T/M 只窥 xid 前缀构造 PayloadUnit 入桶（解码推迟到提交期）
+  ├─ MEMORY 桶（默认）──字节和越 vb.spill.thresholdBytes──▶ spillAll() 全量转储
+  │                                                        └▶ MessageSpool（Chronicle Queue 溢写池）
+  ├─ VersionedRelationRegistry：oid → (seq, Relation) 版本日志（DDL 重发同 oid 新版即追加）
+  ▼ 提交期（Commit / StreamCommit / CommitPrepared）
+BucketReplayer  ←aborted 子事务过滤 → decodeSingle → 按单元 seq 取 asOf 版本 Relation 渲染
+  │ TransactionListener.onTransaction(Transaction)：不可变原子事务块
+  ▼
+ConsoleListener（CDC 专用 logger org.vastdata.vbstream.cdc，INFO）
+```
+
+三层模块职责：
+
+| 层 | 位置 | 职责 | 细节文档 |
+|---|---|---|---|
+| 协议解析 | `org.vastdata.vbstream.protocol` | pgoutput 消息字节 → 强类型 record，纯函数无 IO | `src/main/java/.../protocol/CLAUDE.md` |
+| 会话与组装 | `org.vastdata.vbstream.replication` | 双 JDBC 连接、raw 字节交付接缝、事务组装（MEMORY/SPILLED 混合桶 + 溢写） | `src/main/java/.../replication/CLAUDE.md` |
+| 入口与输出 | `org.vastdata.vbstream`（顶层） | `Main` 装配、`ConsoleListener` 控制台输出 | 本节 |
+
+- **`Main`**：冒烟入口。校验配置（缺失 exit 2 打用法）→ session open/ensureSlot/start → reader 线程（`pgoutput-reader`）内 try-with-resources 建组装器（独享 `VersionedRelationRegistry` 与 `SpillConfig`；`ConsoleListener` 一个实例兼任事务回调与解码点 observer——组装器是唯一解码者）→ 主线程 await 停机信号（Ctrl+C 触发 shutdown hook）→ 会话关闭使 run 退出、组装器随之收尾 spill 池。启动失败 exit 1；复制流中断保留槽位并倒计时停机（重启续传）
+- **`ConsoleListener`**：双角色 listener。`onTransaction`：TXN-BEGIN/END 头尾 + 逐变更行，基于 `TxChange` 内嵌 Relation 快照渲染（不依赖 registry），INFO；`onMessage`：9 种事务生命周期控制消息（流式 5 + 两阶段 4）升 INFO，行级/元数据 DEBUG（默认关闭）——INFO 级保证任何事务形态至少留一行痕迹。值渲染：text 截 64 字符、binary 十六进制、TOAST 未变显式标注
+
 ## 常用命令
 
 ```bash
@@ -61,7 +95,10 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 
 - **spill 队列目录重启自动清空属预期行为**：溢写池是瞬态工作区——真源是复制槽，重启后 PG 从槽确认位点重发未完事务，`MessageSpool` 构造时先整体清空目录再建队列（残留旧数据的有害陈旧 index 会让回读错位）。不要往该目录放任何需要保留的东西
 - **spill 的内存有界性只覆盖组装期**（终审修正）：阈值约束的是进行中事务的桶缓冲；提交期回放把整桶单元物化回堆——SPILLED 桶逐段回读的原始字节与回放解码出的 TxChange 双份瞬态并存，峰值 O(事务大小)；流式输出（边回放边吐出）属里程碑 2 范畴。仍随事务/会话增长的堆结构：`abortedSubxids`（每回滚子事务一个 Long，随桶完结释放）、`preparedByGid` 挂起池（未决 2PC 数，协议固有）、registry 版本日志（随新表/DDL 线性；组装器在桶完结点按存活桶 minSeq 低水位 `pruneBelow` 剪枝——floor 语义，保留低水位时刻生效的版本，2PC 挂起桶算存活；剪枝后仅随不同表 oid 数线性）
-- 源码结构：`org.vastdata.vbstream.protocol`（协议解析，纯函数）、`org.vastdata.vbstream.replication`（会话 + raw 接缝 + 事务组装与溢写，详见包内模块级 CLAUDE.md）、`Main`/`ConsoleListener`；JMH 基准在独立源码根 `src/jmh/java`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）
+- **源码结构**（各源码根一行；包内细节见各模块级 CLAUDE.md，层间关系见上文“架构总览”）：
+    - `src/main/java`：`protocol`（协议解析，纯函数）、`replication`（会话 + raw 接缝 + 事务组装与溢写）、顶层 `Main`/`ConsoleListener`
+    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）、`it` 包集成测试 9 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
+    - `src/jmh/java`：四基准（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖，见其 CLAUDE.md）
 - 集成测试（`org.vastdata.vbstream.it`，9 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。溢写专项 `AssemblySpillTest` 四场景：①同录制字节流喂 64MiB/32KiB 双阈值组装器，输出 `Transaction` 全等（spill 无损核心验收）②双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除 ③大事务内同事务 DDL，前后段按 asOf 版本渲染 ④流式大事务回滚后低水位推进触发删档；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
 - JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 自带，详见该文档；基线数字在档作回归对照，不进 CI）
 - src/docker 的 postgresql.conf 已含冒烟所需 `max_prepared_transactions=16` 与 `logical_decoding_work_mem=64kB`（改 conf 后 `docker compose restart postgres`）。注意：walsender 已追平时，单语句 `INSERT..SELECT` 批量写入的大事务不触发流式（整段于提交后回放）；构造流式场景需事务内分批/跨秒写入
