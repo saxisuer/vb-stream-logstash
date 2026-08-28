@@ -15,6 +15,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 /**
  * pgoutput 复制会话：两条连接（普通 SQL + replication=database），
@@ -97,22 +98,33 @@ public final class PgReplicationSession implements AutoCloseable {
     /** 轮询间隔：readPending 非阻塞，空转 sleep 控 CPU，消息到达延迟上界即此值。 */
     private static final long POLL_INTERVAL_MILLIS = 100;
 
+    /** 兼容重载：无输出前沿（不封顶，等价 1.6 行为）。消息循环细节见 {@link #run(RawMessageListener, LongSupplier)}。 */
+    public void run(RawMessageListener listener) throws SQLException, IOException {
+        run(listener, () -> 0L);
+    }
+
     /**
      * 消息循环：readPending 非阻塞轮询 → 拷贝单条消息完整字节 → 回调 listener；按周期
-     * forceUpdateStatus 反馈 LSN。会话只做字节交付（解码与 Relation 缓存移交给上层，
-     * 如 {@link DecodedMessageBridge}），自身不再触碰协议层。
+     * forceUpdateStatus 反馈 LSN，确认值经 {@link #capFeedback} 按输出前沿封顶。会话只做字节交付
+     * （解码与 Relation 缓存移交给上层，如 {@link DecodedMessageBridge}），自身不再触碰协议层。
      * 用轮询而非阻塞 read()：实测（pgjdbc 42.7.13 + PG 18）阻塞 read 在空闲期不按 statusInterval 醒来，
      * status 依赖服务端 keepalive（约 wal_sender_timeout/2，默认 ~30s）才被触发；轮询使 status 周期
      * 独立于消息到达（反馈间隔 = feedbackIntervalSeconds，运维可从 pg_stat_replication.flush_lsn 及时
      * 看到客户端进度），且断连感知更快（isClosed 检查每轮执行）。
      * 边界：非 null 但 remaining()==0 的载荷（pgjdbc 实际不产生，防御性跳过）不回调。
      *
+     * outputFrontier 语义：consumer 已输出事务的最大 endLsn——LSN 确认锚定输出前沿，crash 时未输出
+     * 事务必然被重发（1.7 设计 §5）；0 = 无 cap（首个事务输出前与 1.6 行为一致）。status 包照常按
+     * 反馈周期发送，前沿不前进只影响确认值不影响心跳——不会触发 wal_sender_timeout 断连。
+     * 线程约束：循环体由调用方线程执行；outputFrontier 每轮在本线程内 getAsLong 读取一次，
+     * 实现应为廉价、无副作用的读。
+     *
      * 关于 confirmed_flush_lsn 的服务端行为（Diag 实证，勿再当 bug 排查）：standby status 到达后
      * 服务端先采纳进 pg_stat_replication.flush_lsn；槽的 confirmed_flush_lsn 由 walsender 在
      * 解码推进时（candidate 机制）落库——空闲期不推进，但确认不丢失：下一次任何 WAL 活动会使其
      * 一步跳到客户端已确认的最新位点。
      */
-    public void run(RawMessageListener listener) throws SQLException, IOException {
+    public void run(RawMessageListener listener, LongSupplier outputFrontier) throws SQLException, IOException {
         long feedbackIntervalNanos = config.feedbackIntervalSeconds() * 1_000_000_000L;
         long lastFeedbackNanos = System.nanoTime();
         while (true) {
@@ -125,7 +137,8 @@ public final class PgReplicationSession implements AutoCloseable {
                 payload.get(raw);
                 listener.onRaw(raw);
             }
-            LogSequenceNumber last = stream.getLastReceiveLSN();
+            long confirmed = capFeedback(stream.getLastReceiveLSN().asLong(), outputFrontier.getAsLong());
+            LogSequenceNumber last = LogSequenceNumber.valueOf(confirmed);
             stream.setAppliedLSN(last);
             stream.setFlushedLSN(last);
             if (System.nanoTime() - lastFeedbackNanos >= feedbackIntervalNanos) {
@@ -140,6 +153,15 @@ public final class PgReplicationSession implements AutoCloseable {
                 throw new SQLException("复制循环被中断", e);
             }
         }
+    }
+
+    /**
+     * 责任：反馈位点封顶纯函数（1.7 设计 §5）——LSN 确认锚定输出前沿，crash 时未输出事务必然被重发。
+     * 关键步骤：前沿 ≤0（尚未有任何事务输出）视为无 cap，反馈已收到值；否则取 min（前沿不会超过
+     * 已收到，防御性钳制）。纯函数无副作用，供 run 循环每轮调用与单测直接驱动。
+     */
+    static long capFeedback(long received, long outputFrontier) {
+        return outputFrontier <= 0L ? received : Math.min(received, outputFrontier);
     }
 
     /** 供上层在异常退出时打印续传位点；流未启动时返回 INVALID_LSN。 */
