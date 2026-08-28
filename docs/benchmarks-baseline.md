@@ -23,9 +23,12 @@ java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" \
 
 注意：
 
+- **两条命令都须在模块根目录（pom.xml 所在目录）运行**——classpath 与 `target/cp.txt` 均为相对
+  路径，换目录执行会静默拼错 classpath（找不到主类或语料）。
 - **`-jvmArgsAppend` 必带**（等号单 token 形式）。JMH 每个 fork 是全新 JVM，不继承启动器的
   `--add-opens`；Chronicle Queue 的 mmap 走反射调 `sun.nio.ch`，缺开包会在 fork 内直接失败。
-  该清单与 pom 的 surefire argLine 同源（`jdk.internal.misc` 项在 JDK 17 为 no-op，略去）。
+  该清单与 pom 的 surefire argLine 同源（pom 中 `jdk.unsupported/sun.misc` 项在 JDK 17
+  默认已开放、为 no-op，此处略去）。
 - 正式基线建议去掉冒烟档参数跑默认档（5×2s 预热 + 5×2s 测量，1 fork），命令行控制，类上不硬编码。
 - `mvn clean test`（无 profile）不编译基准不依赖 JMH；`-Pjmh test` 下基准桩类名虽匹配
   `*Test` 模式，但无 JUnit 注解，Surefire/JUnit Platform 发现零测试，不会误跑。
@@ -67,7 +70,7 @@ Azul Zulu JDK 17.0.11 · Maven 3.9.4 · chronicle-queue 2026.6 · JMH 1.37 · Do
 | 基准 | (path) | 模式 | 得分 ±99.9% CI | 换算 |
 |---|---|---|---|---|
 | DecodeBenchmark.decodeOne | — | avgt | **1.004 ± 0.113 µs/条** | ≈4.0 GB/s（avg 4,149 B/条） |
-| RoutePeekBenchmark.peekRoute | — | avgt | **7.771 ± 0.342 ns/条** | ≈128 GB/s |
+| RoutePeekBenchmark.peekRoute | — | avgt | **7.771 ± 0.342 ns/条** | peek/decode ≈ 0.77% |
 | AssembleMemoryBenchmark.assembleWholeCorpus | — | avgt | **0.081 ± 0.030 ms/轮** | 84 条/轮 ≈ 0.96 µs/条 |
 | SpillPathBenchmark.replayBucket | MEMORY | avgt | **3.683 ± 0.160 ms/桶** | 2000 单元 ≈ 1.84 µs/单元 ≈ 4.3 GB/s |
 | SpillPathBenchmark.replayBucket | SPILLED | avgt | **9.185 ± 0.233 ms/桶** | 2000 单元 ≈ 4.59 µs/单元 ≈ 1.7 GB/s |

@@ -10,7 +10,7 @@ import org.vastdata.vbstream.replication.VersionedRelationRegistry;
 
 import java.util.concurrent.CountDownLatch;
 
-/** 里程碑 1 入口：连上复制流，把 pgoutput 消息组装为事务块打印到控制台，Ctrl+C 优雅退出。 */
+/** 冒烟入口：连上复制流，把 pgoutput 原始字节经 raw 驱动的 TransactionAssembler（MEMORY/SPILLED 混合缓冲，阈值后溢写 Chronicle Queue）组装为原子事务块打印到控制台，Ctrl+C 优雅退出。 */
 public final class Main {
 
     private static final Logger LOG = LoggerFactory.getLogger(Main.class);

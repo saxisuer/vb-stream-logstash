@@ -8,7 +8,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态；artifactId 暗示最终会以某种形式与 Logstash 集成，集成方式尚未确定）
 - 工具链：Java 17 + Maven
-- 当前状态：**里程碑 1 已完成**（pgoutput 流式解码器：19 种协议消息解析 + 复制会话 + `Main`/`ConsoleListener` + 4 组 Testcontainers 集成用例，`mvn test` 全绿）。核心依赖（版本以 pom 的 `<properties>` 为准）：
+- 当前状态：**里程碑 1.6 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）与事务组装之上，组装缓冲溢写 Chronicle Queue：`TransactionAssembler` 的 MEMORY/SPILLED 混合桶 + `MessageSpool` 溢写池 + `VersionedRelationRegistry` 版本日志 + JMH 基线（`docs/benchmarks-baseline.md`），`mvn test` 147 用例全绿）。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
     - `net.openhft:chronicle-queue`（持久化低延迟队列；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
@@ -35,17 +35,34 @@ mvn dependency:tree                  # 查看依赖树
   - 说清**职责**（做什么）、**关键步骤**（分支/循环/算法的意图，复杂逻辑分步）、**边界与异常语义**（null/失败/越界时的行为）、**线程约束**（非线程安全需注明单写者假设，参照 `PgOutputDecoder` 的写法）
   - record 组件、常量、枚举值同样注明语义；协议相关代码需指向依据（如"格式见 spec 附录 A"），现状范例参照 `protocol/` 包
 
-## 运行 Main（里程碑 1）
+## 运行 Main
 
 ```bash
 cd src/docker && docker compose up -d && cd ../..     # 起本地 PG
 mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
-java -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
+java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
+     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
+     --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED \
+     --add-opens java.base/sun.nio.fs=ALL-UNNAMED \
+     --add-opens java.base/java.lang.reflect=ALL-UNNAMED \
+     -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
 # 可选覆盖：-Dvb.pg.slot=... -Dvb.pg.publication=... -Dvb.pg.streaming=on|parallel|off
+#           -Dvb.spill.thresholdBytes=... -Dvb.spill.dir=... -Dvb.spill.rollCycle=...
 ```
 
-- 源码结构：`org.vastdata.vbstream.protocol`（协议解析，纯函数）、`org.vastdata.vbstream.replication`（会话）、`Main`/`ConsoleListener`
-- 集成测试（`org.vastdata.vbstream.it`）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部
+- **`--add-opens` 清单必带**：Main 装配的 `TransactionAssembler` 越过 spill 阈值时会建 Chronicle Queue 溢写池，chronicle-core 的 mmap 在 Java 17 需开放内部包（反射调 `sun.nio.ch.FileChannelImpl.map0`，官方支持说明 https://chronicle.software/chronicle-support-java-17）；清单与 pom 的 surefire argLine 同源
+- **spill 参数（`-Dvb.spill.*`，`SpillConfig`，默认值即下表）**：
+
+| 属性 | 默认 | 语义 |
+|---|---|---|
+| `vb.spill.thresholdBytes` | 67108864（64MiB） | 全局 MEMORY 桶字节和阈值，越限即整体转储溢写池；**≤0 = 禁用 spill**（纯内存逃生门，回退里程碑 1.5 行为） |
+| `vb.spill.dir` | `spill-queue` | 溢写队列目录（相对工作目录） |
+| `vb.spill.rollCycle` | `MINUTELY` | 滚动周期（`LegacyRollCycles` 枚举名，大小写宽容） |
+
+- **spill 队列目录重启自动清空属预期行为**：溢写池是瞬态工作区——真源是复制槽，重启后 PG 从槽确认位点重发未完事务，`MessageSpool` 构造时先整体清空目录再建队列（残留旧数据的有害陈旧 index 会让回读错位）。不要往该目录放任何需要保留的东西
+- 源码结构：`org.vastdata.vbstream.protocol`（协议解析，纯函数）、`org.vastdata.vbstream.replication`（会话 + raw 接缝 + 事务组装与溢写，详见包内模块级 CLAUDE.md）、`Main`/`ConsoleListener`；JMH 基准在独立源码根 `src/jmh/java`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）
+- 集成测试（`org.vastdata.vbstream.it`，9 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。溢写专项 `AssemblySpillTest` 四场景：①同录制字节流喂 64MiB/32KiB 双阈值组装器，输出 `Transaction` 全等（spill 无损核心验收）②双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除 ③大事务内同事务 DDL，前后段按 asOf 版本渲染 ④流式大事务回滚后低水位推进触发删档；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
+- JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 自带，详见该文档；基线数字在档作回归对照，不进 CI）
 - src/docker 的 postgresql.conf 已含冒烟所需 `max_prepared_transactions=16` 与 `logical_decoding_work_mem=64kB`（改 conf 后 `docker compose restart postgres`）。注意：walsender 已追平时，单语句 `INSERT..SELECT` 批量写入的大事务不触发流式（整段于提交后回放）；构造流式场景需事务内分批/跨秒写入
 - **流式驱逐的内存记账按 TOAST 压缩后大小（实测，构造流式测试数据必读）**：reorder buffer 的 `rb->size` 按变更元组 TOAST 压缩后的实际字节数记账，不是 SQL 文本长度。规则图案载荷（`repeat('x',8192)`、`repeat(md5,N)`）被 pglz 压到百字节级——少量行永远越不过 `logical_decoding_work_mem=64kB`，事务整体走 Begin..Commit 的 NORMAL 路径（事务组装 Task 8 首版实测踩坑）。要少量行即触发流式，用不可压缩载荷：`(SELECT string_agg(md5(random()::text),'') FROM generate_series(1,512))` ≈16KB（`pg_column_size` 实测存满 16384）；数百行可压缩载荷靠总量也能触发（`StreamedTransactionTest` 的 500 行方案）。另注意阈值是**全局** `rb->size`（所有进行中事务合计），双连接并发大事务会轮番驱逐、流段交错下发（`TransactionAssemblyTest` 场景 4 即此构造）
 

@@ -31,7 +31,8 @@ public final class SessionHarness implements AutoCloseable {
      * 私有构造：绑定会话与停止条件，启动守护读取线程双轨录制。
      * 接线：session 交付 raw（先录 rawMessages）→ 桥解码（decoder/registry 归桥所有）→
      * target 录 decoded 并测停止条件。raw 先于 decoded 入列表，录制中途两列表条数可能
-     * 相差正在解码的一条，close 后必然一致。
+     * 相差正在解码的一条；无解码异常时 close 后两列表等长——解码抛异常的那条 raw 已入列
+     * 而对位 decoded 缺席（异常随即成为 failure 终止读取线程），等长性从此不成立。
      * 线程内命中停止条件或会话抛异常都只 countDown latch——异常记入 failure，
      * 由 awaitTermination 统一上抛，不在本方法同步暴露。
      */
@@ -91,7 +92,8 @@ public final class SessionHarness implements AutoCloseable {
     /**
      * 已录制 raw 消息字节的实时视图，与 {@link #messages()} 同序一一对应（每条 raw 恰好
      * 是对位解码消息的完整字节）。
-     * 契约：同 messages()——确定性全量断言必须先 close() 再读，且 close 后与 messages() 等长。
+     * 契约：同 messages()——确定性全量断言必须先 close() 再读，且 close 后无解码异常时
+     * 与 messages() 等长（解码异常会使 raw 侧多出最后一条未解码字节，见构造方法说明）。
      */
     public List<byte[]> rawMessages() {
         return rawMessages;
