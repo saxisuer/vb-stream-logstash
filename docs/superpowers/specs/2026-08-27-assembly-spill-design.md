@@ -4,7 +4,7 @@
 
 里程碑 1.5 的 `TransactionAssembler` 把事务变更缓冲为堆内 `TxChange` 对象列表。流式大事务（PG 侧 reorder buffer 驱逐后逐段下发）的变更量没有上限——组装器堆占用随事务大小线性增长，一个 100GB 事务就能拖垮进程。
 
-**目标：组装缓冲内存有界化。** 小事务纯内存组装（快路径零额外成本）；大事务越过阈值后溢写（spill）到 Chronicle Queue（CQ），堆里只留记账元数据；两种模式输出严格等价。
+**目标：组装期缓冲内存有界化**（提交期回放仍 O(事务大小)，见 §3.1）。小事务纯内存组装（快路径零额外成本）；大事务越过阈值后溢写（spill）到 Chronicle Queue（CQ），堆里只留记账元数据；两种模式输出严格等价。
 
 ### 1.1 调研结论：不需要 protostuff（或任何新序列化组件）
 
@@ -54,7 +54,17 @@
 | `RelationRegistry` 改造 | 升级为**版本日志**：oid → 按到达序号的 `(seq, Relation)` 列表；`lookup(oid, asOfSeq)` 二分取"当时版本"；低于全局最低未决序号可剪枝（DDL 稀少，日志极短） |
 | `TransactionAssembler` 改造 | **payload 路由窥探内置于组装器**（非独立组件）：只读类型字节 + 流块内 Int32 xid 前缀即可选桶，不完整解码；inStream 上下文由 live 解码的 StreamStart/StreamStop 驱动，不需独立状态机。桶改持 `List<PayloadUnit>`（MEMORY）或落盘连续段列表（SPILLED，见 §5）+ 字节记账；新增全局水位与 spillAll 触发；提交路径改为"遍历单元 → 滤 abortedSubxids → `decodeSingle` → 组 TxChange → 封箱"（回放不路由） |
 
-内存侧每桶只剩：xid、gid（2PC）、kind、mode、`List<PayloadUnit>`（MEMORY）或落盘连续段（SPILLED）、abortedSubxids 集合、字节计数——几十字节到 KB 级；SPILLED 后逐单元元数据只存在于 CQ 信封帧，堆内为零。100GB 事务的堆占用也是平的。
+内存侧每桶只剩：xid、gid（2PC）、kind、mode、`List<PayloadUnit>`（MEMORY）或落盘连续段（SPILLED）、abortedSubxids 集合、字节计数——几十字节到 KB 级；SPILLED 后逐单元元数据只存在于 CQ 信封帧，堆内为零。100GB 事务的**组装期**堆占用也是平的——但仅限组装期：提交期回放仍 O(事务大小)（原始字节 + TxChange 双份瞬态，见 §3.1），流式输出（边回放边吐出、不整桶物化）属里程碑 2 范畴。
+
+### 3.1 有界性的准确范围（终审修正）
+
+"内存有界"仅在**组装期**成立：桶缓冲（MEMORY 单元或 SPILLED 连续段记账）受阈值约束。**提交期回放把整桶单元物化回堆**——SPILLED 桶逐段回读解帧为 `List<PayloadUnit>`（原始字节），回放器再逐单元解码构造 TxChange，两份表示并存直至事务封箱，峰值 O(事务大小)。流式输出（回放一个吐一个、消费确认后释放）属里程碑 2 的输出队列范畴。
+
+仍随事务或会话增长的堆结构清单（终审盘点）：
+
+- **`abortedSubxids`**：每桶一个集合，每个被回滚的流式子事务记一个 `Long`——单桶内 O(该事务子事务数)，随桶完结释放（不做会话级累积）
+- **`preparedByGid` 挂起池**：每个未决 2PC 事务一个桶引用（协议固有——PREPARE 至 COMMIT/ROLLBACK PREPARED 可能长期挂起；挂起桶若为 MEMORY 形态，其单元字节也仍在堆）
+- **registry 版本日志**：随会话内出现的新表（oid 数）与 DDL（同 oid 多版本）线性增长；组装器已在桶完结点以存活桶 minSeq 低水位调 `pruneBelow` 剪枝（终审修复波接线，floor 语义——保留低水位时刻生效的版本），剪枝后仍随不同表 oid 数线性（每 oid 至少保留最新一条）
 
 ## 4. 线上不变量与路由
 

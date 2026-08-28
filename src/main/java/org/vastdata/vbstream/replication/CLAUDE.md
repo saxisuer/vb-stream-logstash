@@ -43,7 +43,7 @@
 - **`VersionedRelationRegistry`**（子类，组装器用）：oid → `(seq, Relation)` **版本日志**——存在动机：DDL 会让服务端在流中重发同 oid 新版 Relation，溢写回放旧单元必须按"变更时刻"版本渲染，取最新版会把旧行按新 schema 错解。要点：
   - `accept(seq, rel)`：按 oid 追加版本、维持 seq 升序；同 seq 重复投递幂等跳过
   - `require(oid, asOfSeq)`：**二分取 ≤ asOfSeq 的最新版**；无版本或全部晚于 asOfSeq 抛 ISE（沿用"Relation 未先行到达"fail-fast）
-  - `pruneBelow(minSeq)`：丢弃 seq < minSeq 的旧版本且每 oid 至少保留最新一条（防掏空）
+  - `pruneBelow(minSeq)`：以"最低仍会被查询的 seq"为低水位剪枝——各 oid 保留 asOf=minSeq 时刻**生效**的版本（floor，其自身 seq 可早于 minSeq：'R' 恒先于首个 DML，存活桶旧单元会解析到低水位之前记入的版本——字面"丢弃 seq < minSeq"实现会在并发 DDL 流形下误剪崩回放）及其后全部；minSeq 之后无任何版本时整列保留（每 oid 至少留最新一条由此自然成立）。**已接线非死代码**：组装器在桶完结点（`retireBucket`）以全部存活桶 minSeq 的最小值调用（2PC 挂起桶算存活），版本日志低水位剪枝后有界
   - 继承的 `accept(PgOutputMessage)`/`find`/`require(oid)` 委托最新版本（旧接缝行为不变；旧接缝以合成 seq 记入时间线末尾，与带 seq 接缝不应混用）
   - **线程约束不同于父类**：单写者假设（组装器 run 线程串行调用全部方法），用 HashMap 而非 ConcurrentHashMap；跨线程查询场景请用父类
 
@@ -58,7 +58,8 @@
 - **桶模型**：普通事务单指针 `currentNormalTx`（Begin..Commit 串行不嵌套）；流式多桶 `streamedByXid`（key=StreamStart 顶层 xid）+ 流块上下文 `currentStream`（段间交错、流块不嵌套）；两阶段 `currentPrepareTx` 活动 + `preparedByGid` 挂起池（PREPARE 至 COMMIT/ROLLBACK PREPARED，可能长期挂起）。**StreamAbort**：top==sub 整桶丢弃（存储随之释放）；否则记入桶的 `abortedSubxids`，**回放期过滤**（数据保留到提交期一次性甄别）。桶缺失/重复/流块状态异常一律 ISE fail-fast
 - **混合缓冲**：桶存储双形态 `Mode`——**MEMORY** 持内存 `List<PayloadUnit>`；**SPILLED** 持溢写池 CQ index **连续段**（单元经 `SpoolFrame` 信封帧落盘，堆内零逐单元元数据；并发桶 append 在共享 appender 上交错——同桶相邻 append 顺延当前段、他人插队起新段，回放逐段 readRange）。全局记账 `memoryBytes` = Σ 存活 MEMORY 桶 bytesTotal：任一 MEMORY 写入后越限（> threshold）即 **`spillAll()`** 把所有 MEMORY 桶逐单元转储（正在追加的桶也在列，INFO 留痕）；开桶时水位已达阈值（>= threshold）直接 SPILLED 起步。`spillEnabled()==false`（thresholdBytes ≤ 0）时全路径短路——纯内存逃生门，spool 永不创建
 - **提交路径**：Commit/StreamCommit/CommitPrepared → `replay(bucket)`：SPILLED 桶先逐段 `MessageSpool.readRange` + `SpoolFrame.unframe` 复原单元，随后与 MEMORY 走**同一** `BucketReplayer`（两种形态输出严格相等，spill 无损）→ 封箱 Transaction 回调 → 桶完结收尾（`retireBucket`：记账回退 + 低水位维护）。回滚路径（RollbackPrepared/StreamAbort 整桶）丢弃不回调
-- **低水位**：`spillWatermark()` = min(存活 SPILLED 桶 firstIndex, lastAppended+1)，交 `MessageSpool.releaseBelow` 删除过老滚动文件（spool 未建立返回 -1 哨兵）
+- **低水位**：`spillWatermark()` = min(存活 SPILLED 桶 firstIndex, lastAppended+1)，交 `MessageSpool.releaseBelow` 删除过老滚动文件（spool 未建立返回 -1 哨兵）；同一完结点并行维护 **registry 剪枝低水位** = 全部存活桶 minSeq（桶内最老单元 seq，MEMORY/SPILLED 两路都在 storeUnit 记账）的最小值，驱动 `VersionedRelationRegistry.pruneBelow`（终审 Fix B 接线）
+- **有界性范围（终审修正）**："内存有界"仅指**组装期**桶缓冲——提交期回放把整桶单元物化回堆（SPILLED 回读的原始字节 + 解码出的 TxChange 双份瞬态并存，峰值 O(事务大小)），流式输出属里程碑 2；仍随事务/会话增长的堆结构：`abortedSubxids`（每回滚子事务一个 Long，随桶完结释放）、`preparedByGid`（未决 2PC 数，协议固有）、registry 版本日志（随新表/DDL 线性——低水位剪枝后仅随不同表 oid 数线性）
 - **close()**：收敛溢写池（曾建立过时）；失败仅 WARN
 - **线程约束**：非线程安全——单写者假设，全部在 run 循环线程内（decoder inStream、桶指针、appender 均要求）；输出 Transaction 不可变可跨线程
 - 日志：spillAll 转储与首次建池 INFO；非事务性 M 丢弃、RollbackPrepared 丢弃 WARN；Y/O 丢弃与 PREPARE 入挂起池 DEBUG

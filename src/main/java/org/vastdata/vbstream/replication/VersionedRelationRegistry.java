@@ -19,8 +19,10 @@ import java.util.Optional;
  *   <li>{@link #accept(long, PgOutputMessage.Relation)}：按 oid 追加版本并维持 seq 升序；同 seq 重复接受幂等跳过</li>
  *   <li>{@link #require(int, long)}：二分取 ≤ asOfSeq 的最新版；oid 完全无版本或全部版本晚于 asOfSeq 时
  *       抛 {@link IllegalStateException}（沿用父类"Relation 未先行到达"的 fail-fast 语义）</li>
- *   <li>{@link #pruneBelow(long)}：各 oid 丢弃 seq &lt; minSeq 的版本（恰好 == minSeq 的保留），
- *       且每个 oid 至少保留最新一条，防止过度剪枝掏空</li>
+ *   <li>{@link #pruneBelow(long)}：以"最低仍会被查询的 seq"为低水位——各 oid 保留 asOf=minSeq
+ *       时刻**生效**的版本（floor，其自身 seq 可能早于 minSeq——'R' 恒先于首个 DML 到达）与其后
+ *       全部，仅丢弃更早版本；minSeq 之后无任何版本时整列保留（每 oid 至少保留最新一条由此
+ *       自然成立，永不掏空）</li>
  *   <li>继承的 {@link #accept(PgOutputMessage)} / {@link #find(int)} / {@link #require(int)} 委托最新版本，
  *       旧接缝（渲染路径）行为不变</li>
  * </ul>
@@ -135,22 +137,21 @@ public class VersionedRelationRegistry extends RelationRegistry {
 
     /**
      * 责任：按"最低仍会被查询的 seq"收缩各 oid 的版本日志（防长期运行内存膨胀）。
-     * 步骤：对每个 oid 从序列头部推进游标，越过所有 seq &lt; minSeq 的旧版本，随后一次性删除该前缀
-     * （子视图 clear 避免逐个 remove 的 O(n²)）；恰好 == minSeq 的版本不在删除范围。
-     * 边界：游标至多推进到 size-1——每个 oid 至少保留最新一条，minSeq 超过全部版本 seq 时也不掏空
-     * （保留的最新版对任意更大 asOf 仍可作答）；空序列与"头部版本 seq 已 ≥ minSeq"均为无操作。
-     * 线程：单写者调用。
+     * 步骤：对每个 oid 二分定位 asOf=minSeq 时刻**生效**的版本（floor——seq ≤ minSeq 的最新一条，
+     * 其自身 seq 允许早于 minSeq：'R' 恒先于同表首个 DML 到达，存活桶的旧单元会解析到低水位之前
+     * 记入的版本），随后一次性删除该版本之前的全部前缀（子视图 clear 避免逐个 remove 的 O(n²)）。
+     * 边界：floor 不存在（该 oid 全部版本都晚于 minSeq——未来查询仍需它们）时整列保留；
+     * floor 恒为保留区间首元素，"每 oid 至少保留最新一条"自然成立（minSeq 超过全部版本 seq 时
+     * floor 即末位，只留最新）；空序列为无操作。
+     * 线程：单写者调用（组装器在桶完结点驱动，见 TransactionAssembler.retireBucket）。
      *
      * @param minSeq 最低仍需可查询的消息序号（此前的 asOf 查询不再发生）
      */
     public void pruneBelow(long minSeq) {
         for (List<Version> list : versions.values()) {
-            int drop = 0;
-            while (drop < list.size() - 1 && list.get(drop).seq() < minSeq) {
-                drop++;
-            }
-            if (drop > 0) {
-                list.subList(0, drop).clear();
+            int keepFrom = floorIndex(list, minSeq);
+            if (keepFrom > 0) {
+                list.subList(0, keepFrom).clear();
             }
         }
     }

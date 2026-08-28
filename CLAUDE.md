@@ -8,7 +8,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态；artifactId 暗示最终会以某种形式与 Logstash 集成，集成方式尚未确定）
 - 工具链：Java 17 + Maven
-- 当前状态：**里程碑 1.6 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）与事务组装之上，组装缓冲溢写 Chronicle Queue：`TransactionAssembler` 的 MEMORY/SPILLED 混合桶 + `MessageSpool` 溢写池 + `VersionedRelationRegistry` 版本日志 + JMH 基线（`docs/benchmarks-baseline.md`），`mvn test` 147 用例全绿）。核心依赖（版本以 pom 的 `<properties>` 为准）：
+- 当前状态：**里程碑 1.6 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）与事务组装之上，组装缓冲溢写 Chronicle Queue：`TransactionAssembler` 的 MEMORY/SPILLED 混合桶 + `MessageSpool` 溢写池 + `VersionedRelationRegistry` 版本日志 + JMH 基线（`docs/benchmarks-baseline.md`），`mvn test` 151 用例全绿）。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
     - `net.openhft:chronicle-queue`（持久化低延迟队列；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
@@ -60,6 +60,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 | `vb.spill.rollCycle` | `MINUTELY` | 滚动周期（`LegacyRollCycles` 枚举名，大小写宽容） |
 
 - **spill 队列目录重启自动清空属预期行为**：溢写池是瞬态工作区——真源是复制槽，重启后 PG 从槽确认位点重发未完事务，`MessageSpool` 构造时先整体清空目录再建队列（残留旧数据的有害陈旧 index 会让回读错位）。不要往该目录放任何需要保留的东西
+- **spill 的内存有界性只覆盖组装期**（终审修正）：阈值约束的是进行中事务的桶缓冲；提交期回放把整桶单元物化回堆——SPILLED 桶逐段回读的原始字节与回放解码出的 TxChange 双份瞬态并存，峰值 O(事务大小)；流式输出（边回放边吐出）属里程碑 2 范畴。仍随事务/会话增长的堆结构：`abortedSubxids`（每回滚子事务一个 Long，随桶完结释放）、`preparedByGid` 挂起池（未决 2PC 数，协议固有）、registry 版本日志（随新表/DDL 线性；组装器在桶完结点按存活桶 minSeq 低水位 `pruneBelow` 剪枝——floor 语义，保留低水位时刻生效的版本，2PC 挂起桶算存活；剪枝后仅随不同表 oid 数线性）
 - 源码结构：`org.vastdata.vbstream.protocol`（协议解析，纯函数）、`org.vastdata.vbstream.replication`（会话 + raw 接缝 + 事务组装与溢写，详见包内模块级 CLAUDE.md）、`Main`/`ConsoleListener`；JMH 基准在独立源码根 `src/jmh/java`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）
 - 集成测试（`org.vastdata.vbstream.it`，9 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。溢写专项 `AssemblySpillTest` 四场景：①同录制字节流喂 64MiB/32KiB 双阈值组装器，输出 `Transaction` 全等（spill 无损核心验收）②双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除 ③大事务内同事务 DDL，前后段按 asOf 版本渲染 ④流式大事务回滚后低水位推进触发删档；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
 - JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 自带，详见该文档；基线数字在档作回归对照，不进 CI）

@@ -488,6 +488,18 @@ class TransactionAssemblerTest {
                 PgWire.streamAbort(TOP_A, TOP_A)));
     }
 
+    /**
+     * 终审 Fix C：流块嵌套违规——S..S 不夹 E（上一流块未闭合又来 StreamStart）fail-fast，
+     * 与 'c'/'A'/'p'/'E' 处理器的"流块未闭合"守卫对齐（此前该形态会静默改写 currentStream，
+     * 丢失原桶的流块上下文）。
+     */
+    @Test
+    void rejectsStreamStartWithOpenStreamBlock() {
+        assertThrows(IllegalStateException.class, () -> run(
+                PgWire.streamStart(TOP_A, true),
+                PgWire.streamStart(TOP_B, true)));   // 未闭合 TOP_A 流块又开新流块
+    }
+
     /** 旧例 22：StreamAbort 对应顶层事务桶不存在 fail-fast。 */
     @Test
     void rejectsStreamAbortForUnknownTopXid() {
@@ -923,5 +935,72 @@ class TransactionAssemblerTest {
         assertEquals(6, actual.get(1).changes().size());    // B：5 转储 + 1 新段
         assertEquals(List.of("1", "2", "3", "4", "5", "6", "7"), idsOf(actual.get(0)));
         assertEquals(List.of("9", "8", "7", "6", "5", "4"), idsOf(actual.get(1)));
+    }
+
+    // --- 终审 Fix B：registry 版本日志剪枝接线（桶完结点驱动，同 oid 多版本场景） ---------------
+
+    /**
+     * 桶完结驱动 registry 剪枝：无存活桶时低水位取"无穷"——被新版本取代的旧版本在下一个桶完结点
+     * 被剪掉（旧 asOf 查询 ISE 证明确实剪了，非空转），后续事务仍按新版本正确渲染。
+     * 消息序（seq 从 1 起、每条 onRaw 一次）：R(t_v1)=1、B=2、I=3、C=4（完结点①：仅 v1 在册，
+     * floor 保留）；R(t_v2)=5、B=6、I=7、C=8（完结点②：无存活桶 → v1 剪除）；
+     * B=9、I=10、C=11（按 v2 渲染）。同一 registry 实例贯穿全程（剪枝副作用可观测的前提）。
+     */
+    @Test
+    void retiredBucketPrunesSupersededRegistryVersions() {
+        VersionedRelationRegistry registry = new VersionedRelationRegistry();
+        List<Transaction> out = new ArrayList<>();
+        try (TransactionAssembler assembler = new TransactionAssembler(
+                out::add, StreamingMode.ON, registry, NO_SPILL)) {
+            assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
+            assembler.onRaw(PgWire.begin(1L));
+            assembler.onRaw(insert("1", "a"));
+            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"));
+            assembler.onRaw(PgWire.begin(2L));
+            assembler.onRaw(insert("2", "b"));
+            assembler.onRaw(PgWire.commit());
+            assertThrows(IllegalStateException.class, () -> registry.require(OID, 4));   // v1 已剪
+            assertEquals("t_v2", registry.require(OID).table());                        // 最新视图仍可答
+            assembler.onRaw(PgWire.begin(3L));
+            assembler.onRaw(insert("3", "c"));
+            assembler.onRaw(PgWire.commit());                                           // 剪枝后新查询仍正确
+        }
+        assertEquals(3, out.size());
+        assertEquals("t_v1", ((RowChange) out.get(0).changes().get(0)).relation().table());
+        assertEquals("t_v2", ((RowChange) out.get(1).changes().get(0)).relation().table());
+        assertEquals("t_v2", ((RowChange) out.get(2).changes().get(0)).relation().table());
+    }
+
+    /**
+     * 2PC 挂起桶算存活（剪枝低水位候选）：挂起桶的旧单元依赖 v1——其 seq(1) 早于桶 minSeq(3)
+     * （'R' 恒先于同表 DML 到达），其间他桶（普通事务 99）完结触发的剪枝必须保住 v1
+     * （floor 语义）；挂起桶最终 CommitPrepared 仍按 v1 正确渲染，其完结后 v1 才被剪。
+     * 这是"以存活桶 minSeq 为低水位"接线正确性的钉子用例（若按"丢弃 seq &lt; 低水位"的
+     * 字面实现，v1 会在事务 99 的完结点被误剪，CommitPrepared 回放 ISE 崩溃）。
+     * 消息序：R(t_v1)=1、b=2、I=3（挂起桶 minSeq）、P=4、R(t_v2)=5、B=6、I=7、C=8（剪枝点：
+     * 低水位 = 挂起桶 minSeq(3)）、K=9（挂起桶按 v1 回放，完结后 v1 剪除）。
+     */
+    @Test
+    void pendingTwoPhaseBucketKeepsItsAsOfVersionAliveAcrossPruning() {
+        VersionedRelationRegistry registry = new VersionedRelationRegistry();
+        List<Transaction> out = new ArrayList<>();
+        try (TransactionAssembler assembler = new TransactionAssembler(
+                out::add, StreamingMode.ON, registry, NO_SPILL)) {
+            assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
+            assembler.onRaw(PgWire.beginPrepare(601L, GID));
+            assembler.onRaw(insert("1", "a"));
+            assembler.onRaw(PgWire.prepare(601L, GID));
+            assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"));
+            assembler.onRaw(PgWire.begin(99L));
+            assembler.onRaw(insert("9", "x"));
+            assembler.onRaw(PgWire.commit());                                    // 剪枝点：v1 必须存活
+            assertEquals("t_v1", registry.require(OID, 3).table());              // 挂起桶依赖版本可答
+            assembler.onRaw(PgWire.commitPrepared(601L, GID));                   // 挂起桶回放：按 v1 渲染
+            assertThrows(IllegalStateException.class, () -> registry.require(OID, 4));   // 完结后 v1 已剪
+        }
+        assertEquals(List.of(99L, 601L), out.stream().map(Transaction::xid).toList());
+        assertEquals("t_v2", ((RowChange) out.get(0).changes().get(0)).relation().table());
+        assertEquals("t_v1", ((RowChange) out.get(1).changes().get(0)).relation().table());
     }
 }

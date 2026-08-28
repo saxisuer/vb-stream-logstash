@@ -13,7 +13,8 @@ import java.util.OptionalLong;
  * @param payload   完整单条消息字节：含类型字节与（流式块内时）其后的 Int32 xid 前缀。消费契约——
  *                  无前缀单元 {@code decodeSingle(ByteBuffer.wrap(payload), false)}；有前缀单元
  *                  {@code decodeSingle(ByteBuffer.wrap(payload), true)} 且解析出的前缀值 == streamXid
- * @param seq       MessageSpool 分配的全局单调序号，供 Relation 版本日志 asOf 取"变更时刻"版本
+ * @param seq       组装器 nextSeq 分配的全局单调序号（每条 onRaw 一次，含控制消息与 'R'），供
+ *                  Relation 版本日志 asOf 取"变更时刻"版本
  * @param streamXid 所属（子）事务 xid：有值即"流式块内"（payload 带 4 字节前缀）、empty 即"块外"；
  *                  值域为无符号 Int32（0..4294967295），超出会被 {@link SpoolFrame#frame} fail-fast
  */

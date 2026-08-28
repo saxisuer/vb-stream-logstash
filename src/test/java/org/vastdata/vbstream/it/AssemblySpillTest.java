@@ -87,7 +87,7 @@ class AssemblySpillTest {
 
     /**
      * 场景 1（核心验收）——spill 无损等价性：同一条录制字节流喂两个仅阈值不同的组装器
-     * （64MiB 恒不溢写 vs 64KiB 必溢写），输出 List&lt;Transaction&gt; 必须完全相等（record 值相等，
+     * （64MiB 恒不溢写 vs 32KiB 必溢写），输出 List&lt;Transaction&gt; 必须完全相等（record 值相等，
      * 含 xid/LSN/时间戳/逐变更元组与 Relation 快照）。
      * 构造手法：单连接 5 个串行 NORMAL 事务（混合 DML——事务 1：10 行 INSERT 含 3 行 16KB 不可
      * 压缩载荷，单事务约 50KB：服务端 64kB work_mem 恒不驱逐（确定性 NORMAL 路径，流式与否不随
@@ -189,7 +189,7 @@ class AssemblySpillTest {
     /**
      * 场景 2——流式大事务交错 + spill：双连接交错手法（参照 TransactionAssemblyTest 场景 4）+
      * SAVEPOINT 子事务回滚（参照其场景 2）构造"两并发 STREAMED 事务多桶交错 + StreamAbort 剔除"，
-     * 同一条录制喂 64MiB 与 64KiB 双配置回放。
+     * 同一条录制喂 64MiB 与 32KiB 双配置回放。
      * 构造手法：A/B 两连接各自 BEGIN 后逐行交替 INSERT（各 6 行 ×16KB 不可压缩载荷，行间 150ms
      * 让驱逐发生在事务进行中）；A 再 SAVEPOINT 写 6 行（96KB 重新越过 64kB 全局水位，确保子事务
      * 变更也被流式下发）后 ROLLBACK TO（由 StreamAbort 剔除）+ 1 行尾行；先 commit A 后

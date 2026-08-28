@@ -38,7 +38,7 @@ class SpillConfigTest {
 
     /**
      * 覆盖路径：thresholdBytes=0 时 spillEnabled() 必须为 false（纯内存逃生门），
-     * rollCycle 属性 "hourly" 以小写形式解析为 RollCycles.HOURLY（枚举名大小写宽容）。
+     * rollCycle 属性 "hourly" 以小写形式解析为 LegacyRollCycles.HOURLY（枚举名大小写宽容）。
      */
     @Test
     void overridesAndDisabled() {

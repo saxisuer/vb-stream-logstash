@@ -56,6 +56,26 @@ class VersionedRelationRegistryTest {
         assertEquals("v2", reg.require(1, 10_001).table());
     }
 
+    /**
+     * 剪枝保留"低水位时刻生效"的版本（floor），而非"seq ≥ 低水位"的版本（终审 Fix B 语义钉子）：
+     * 低水位 30 落在 v1 生效期内——v1 自身 seq(10) 虽早于 30，仍是被存活桶旧单元（asOf ∈ [10,49)）
+     * 解析的目标，不得剪。若按"丢弃 seq &lt; 30"实现，require(1,29) 会误抛 ISE，组装器在
+     * "R(v1) → 开桶 → DDL 重发 R(v2) → 他桶完结触发剪枝"的并发 DDL 流形下回放必崩。
+     */
+    @Test
+    void pruneKeepsVersionInEffectAtWatermarkEvenIfItsSeqIsOlder() {
+        reg.accept(10, rel(1, "v1")); reg.accept(50, rel(1, "v2"));
+        reg.pruneBelow(30);                            // 低水位落在 v1 生效期内
+        assertEquals("v1", reg.require(1, 29).table());   // v1 仍可答（未误剪）
+        assertEquals("v1", reg.require(1, 30).table());
+        assertEquals("v2", reg.require(1, 50).table());
+        reg.pruneBelow(31);                            // 低水位仍在 v1 生效期内：同上，v1 保留
+        assertEquals("v1", reg.require(1, 30).table());
+        reg.pruneBelow(50);                            // 越过 v2 切换点：v1 才可安全剪掉
+        assertThrows(IllegalStateException.class, () -> reg.require(1, 49));
+        assertEquals("v2", reg.require(1, 50).table());
+    }
+
     @Test
     void inheritedLatestViewForLegacyContract() {
         reg.accept(10, rel(1, "v1")); reg.accept(50, rel(1, "v2"));

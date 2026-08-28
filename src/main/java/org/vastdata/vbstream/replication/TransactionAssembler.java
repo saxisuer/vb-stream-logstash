@@ -45,7 +45,9 @@ import java.util.function.Supplier;
  * <p>seq 分配：每条 onRaw（含控制消息与 'R'）取一次 {@code nextSeq++}（单调，从 1 起）；
  * 'R' 以到达时的 seq 记入 {@link VersionedRelationRegistry} 版本日志，数据单元回放时经
  * {@code registry.require(oid, unit.seq())} 取"变更时刻"的表定义（DDL 并发下的 asOf 正确性，
- * assembly-spill 设计 §4.4）。
+ * assembly-spill 设计 §4.4）。版本日志在桶完结点以全部存活桶 minSeq 的最小值剪枝
+ * （{@link VersionedRelationRegistry#pruneBelow}，2PC 挂起桶算存活——低水位剪枝后有界，
+ * 防随新表/DDL 线性膨胀）。
  *
  * <p>混合缓冲（assembly-spill 设计 §2/§5）：桶存储双形态 {@link TxBuffer.Mode}——MEMORY 持内存
  * {@code List<PayloadUnit>}，SPILLED 持溢写池 CQ index 连续段（单元经 {@link SpoolFrame} 信封帧
@@ -109,7 +111,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * 追加与 B 的 spillAll 条目相邻交错），故每遇"他人插队"起新段、回放逐段 readRange——堆内
      * 仍零逐单元元数据（每段仅一个 long[2]，段数 = 交错次数，非单元数）。firstIndex/lastIndex 为
      * 全部落盘条目的全局端点（水印与日志用）。abortedSubxids 收集被回滚子事务的 xid
-     * （桶元数据，与存储形态无关，回放期过滤）。
+     * （桶元数据，与存储形态无关，回放期过滤）。minSeq 记桶内最老单元的 seq（存储无关，
+     * registry 剪枝低水位候选——桶完结时与全部存活桶取 min 驱动 {@link VersionedRelationRegistry#pruneBelow}）。
      * 非线程安全（仅 run 线程触碰）。
      */
     private static final class TxBuffer {
@@ -128,6 +131,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         /** SPILLED 落盘条目的全局端点（CQ index，含端点）；firstIndex&lt;0 表示尚无条目落盘（MEMORY 桶或空溢写桶）。 */
         long firstIndex = -1L;
         long lastIndex = -1L;
+        /** 桶内最老单元的 seq（MEMORY/SPILLED 两路都在 storeUnit 记账；无单元时 Long.MAX_VALUE 不参与低水位 min）。 */
+        long minSeq = Long.MAX_VALUE;
         /** SPILLED 的连续段列表（[first,last] 闭区间，追加序）；MEMORY 桶恒空。 */
         final ArrayDeque<long[]> spillSegments = new ArrayDeque<>();
         final List<PayloadUnit> units = new ArrayList<>();
@@ -295,7 +300,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
 
     /**
      * 责任：单元入桶的**统一存储入口**——按桶当前形态分流写入（spec §4.2）。
-     * 关键步骤：MEMORY → units.add + 桶/全局字节记账，随后越限检查（严格 &gt;，spill 启用时）
+     * 关键步骤：先记桶低水位候选 minSeq（两形态共用：取 min，供桶完结点的 registry 剪枝，与
+     * 存储位置无关）→ MEMORY → units.add + 桶/全局字节记账，随后越限检查（严格 &gt;，spill 启用时）
      * 触发 {@link #spillAll}（当前正在追加的桶也在转储之列，转储后本桶后续写入走 SPILLED 分支）；
      * SPILLED → 信封帧化后 {@code spool.append} 落盘，index 经 {@link #appendSpillIndex} 记入
      * 桶的连续段（首个 append 建立 firstIndex）。
@@ -304,6 +310,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * 线程：run 线程内（单写者，无并发）。
      */
     private void storeUnit(TxBuffer bucket, PayloadUnit unit) {
+        bucket.minSeq = Math.min(bucket.minSeq, unit.seq());
         if (bucket.mode == TxBuffer.Mode.MEMORY) {
             bucket.units.add(unit);
             bucket.bytesTotal += unit.payload().length;
@@ -430,10 +437,15 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * StreamStart(xid, firstSegment)：xid 恒为顶层 xid（spec B.3——ReorderBufferStreamTXN 断言 toptxn，
      * firstSegment=!rbtxn_is_streamed(txn)）。
      *
-     * <p>firstSegment=true（该顶层事务首段）→ 新建桶入 streamedByXid（已存在同 xid → fail-fast）；
-     * false（后续段）→ 桶必须已存在（miss → fail-fast）。两种情况都切换 currentStream 到该桶。
+     * <p>currentStream 非 null（上一流块未闭合，缺 'E'）→ fail-fast（流块不嵌套，与 'c'/'A'/'p'/'E'
+     * 处理器的守卫对齐——终审 Fix C 防御性 parity）。firstSegment=true（该顶层事务首段）→ 新建桶入
+     * streamedByXid（已存在同 xid → fail-fast）；false（后续段）→ 桶必须已存在（miss → fail-fast）。
+     * 两种情况都切换 currentStream 到该桶。
      */
     private void streamStart(PgOutputMessage.StreamStart m) {
+        if (currentStream != null) {
+            throw new IllegalStateException("StreamStart 到达但流块未闭合: xid=" + currentStream.xid);
+        }
         TxBuffer bucket;
         if (m.firstSegment()) {
             bucket = newBucket(m.xid());
@@ -654,11 +666,12 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 责任：桶完结（移除出全部桶集合）后的统一收尾——MEMORY 记账回退 + 低水位维护。
+     * 责任：桶完结（移除出全部桶集合）后的统一收尾——MEMORY 记账回退 + 溢写低水位维护 + registry 剪枝。
      * 关键步骤：MEMORY 桶把 bytesTotal 从全局 memoryBytes 扣除（SPILLED 桶堆内无单元、不占记账，
-     * bytesTotal 已在转储时回退过）→ {@link #releaseSpooled} 按当前低水位触发滚动文件删除检查。
-     * 边界：spool 未建立时低水位维护为空操作；调用时机 = 桶已从对应集合并移除之后
-     * （提交回放后 / StreamAbort 整桶丢弃 / RollbackPrepared 丢弃）。
+     * bytesTotal 已在转储时回退过）→ {@link #releaseSpooled} 按当前低水位触发滚动文件删除检查 →
+     * {@link #pruneRegistryVersions} 以存活桶 minSeq 最小值收缩 Relation 版本日志（防长期膨胀）。
+     * 边界：spool 未建立时溢写低水位维护为空操作（registry 剪枝与 spool 无关、恒执行）；调用时机 =
+     * 桶已从对应集合并移除之后（提交回放后 / StreamAbort 整桶丢弃 / RollbackPrepared 丢弃）。
      * 线程：run 线程内。
      */
     private void retireBucket(TxBuffer bucket) {
@@ -669,6 +682,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
             lastSpillAppender = null;   // 退役桶不再 append，解除引用（连续段判定退回"起新段"）
         }
         releaseSpooled();
+        pruneRegistryVersions();
     }
 
     /**
@@ -681,6 +695,36 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         if (spool != null) {
             spool.releaseBelow(spillWatermark());
         }
+    }
+
+    /**
+     * 责任：registry 版本日志剪枝——以**所有存活桶 minSeq 的最小值**为低水位调
+     * {@link VersionedRelationRegistry#pruneBelow}（与 {@link #releaseSpooled} 同在桶完结点维护，
+     * 终审 Fix B 接线）。四路存活桶全参与（含 2PC 挂起池——挂起桶回放时仍会按其旧单元 seq 做
+     * asOf 查询，其 minSeq 必须继续保活对应版本）；无任何带单元的存活桶时取 Long.MAX_VALUE
+     * （现存版本皆无人再按旧 asOf 查询，剪到每 oid 仅剩最新——未来单元 seq 更大，仍可作答）。
+     * 正确性依据：pruneBelow 保留 asOf=低水位时刻**生效**的版本（floor 自身 seq 可早于低水位，
+     * 'R' 恒先于同表首个 DML 到达），存活桶的任意 asOf ≥ 低水位不会解析到被剪版本。
+     * 边界：空桶（minSeq=Long.MAX_VALUE）不参与 min；每桶完结点一次，消息热路径零开销。
+     * 线程：run 线程内。
+     */
+    private void pruneRegistryVersions() {
+        long minSeq = Math.min(bucketFloor(currentNormalTx), bucketFloor(currentPrepareTx));
+        for (TxBuffer bucket : streamedByXid.values()) {
+            minSeq = Math.min(minSeq, bucketFloor(bucket));
+        }
+        for (TxBuffer bucket : preparedByGid.values()) {
+            minSeq = Math.min(minSeq, bucketFloor(bucket));
+        }
+        registry.pruneBelow(minSeq);
+    }
+
+    /**
+     * 责任：取一个存活桶的 registry 低水位候选（桶内最老单元 seq）。
+     * 边界：桶为 null 或尚无单元（minSeq 未记过，Long.MAX_VALUE）时不参与 min。
+     */
+    private static long bucketFloor(TxBuffer bucket) {
+        return bucket == null ? Long.MAX_VALUE : bucket.minSeq;
     }
 
     /**

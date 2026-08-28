@@ -42,6 +42,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>录制流内容（6 脚本叠加）：类型边界值 INSERT/UPDATE/DELETE、TOAST 未变标志、
  * REPLICA IDENTITY FULL 的全列 old tuple 与 Relation 重发、流式大事务提交（StreamStart/Stop/
  * StreamCommit 分段）与流式回滚（StreamAbort）——覆盖基准所需的全部消息形态。
+ *
+ * <p><b>生成器性质告警</b>：本用例在指纹失配（脚本/DDL 变化）或语料缺失时会**改写源码树**
+ * （重录并覆盖 {@code src/test/resources/bench-corpus/} 下的语料与指纹边车），且该路径需要
+ * Docker——只读 checkout 或无 Docker 环境下会失败，属预期行为（产物应提交回库，而非本地缓存）。
  */
 class BenchCorpusRecordTest {
 
