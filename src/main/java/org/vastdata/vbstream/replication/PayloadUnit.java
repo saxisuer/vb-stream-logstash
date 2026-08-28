@@ -5,25 +5,28 @@ import java.util.Objects;
 import java.util.OptionalLong;
 
 /**
- * 事务组装桶的存储单元（spec §4）：一条**可直接回放**的 pgoutput 原始消息字节 + 定位元数据。
- * 整个混合内存/溢写设计的支点——桶里存的不是解码后的 TxChange 对象，而是原始字节，
- * 使 MEMORY→SPILLED 切换成为纯字节转储（加 {@link SpoolFrame} 信封帧直写 Chronicle Queue），
- * 自始至终只有一种存储表示。
+ * 事务组装桶的存储单元（spec §4）：一条**可直接回放**的 pgoutput 原始消息字节，外加定位元数据。
  *
- * @param payload   完整单条消息字节：含类型字节与（流式块内时）其后的 Int32 xid 前缀。消费契约——
- *                  无前缀单元 {@code decodeSingle(ByteBuffer.wrap(payload), false)}；有前缀单元
- *                  {@code decodeSingle(ByteBuffer.wrap(payload), true)} 且解析出的前缀值 == streamXid
- * @param seq       组装器 nextSeq 分配的全局单调序号（每条 onRaw 一次，含控制消息与 'R'），供
- *                  Relation 版本日志 asOf 取"变更时刻"版本
- * @param streamXid 所属（子）事务 xid：有值即"流式块内"（payload 带 4 字节前缀）、empty 即"块外"；
- *                  值域为无符号 Int32（0..4294967295），超出会被 {@link SpoolFrame#frame} fail-fast
+ * <p>它是整个混合内存/溢写设计的支点——桶里存的不是解码后的 TxChange 对象，而是原始字节。
+ * 这样 MEMORY 切到 SPILLED 就只是纯字节转储（加 {@link SpoolFrame} 信封帧直接写进
+ * Chronicle Queue），自始至终只有一种存储表示。
+ *
+ * @param payload   完整的单条消息字节：含类型字节，流式块内的消息还带 Int32 xid 前缀。
+ *                  消费契约：无前缀的单元用 {@code decodeSingle(wrap(payload), false)} 解码；
+ *                  有前缀的用 {@code decodeSingle(wrap(payload), true)}，且解析出的前缀值
+ *                  必须等于 streamXid
+ * @param seq       组装器分配的全局单调序号（每条消息一个，控制消息与 Relation 也占号），
+ *                  供 Relation 版本日志按 asOf 取"变更时刻"的版本
+ * @param streamXid 所属（子）事务的 xid：有值表示这条消息在流式块内（payload 带 4 字节前缀），
+ *                  为空表示在块外；取值范围是无符号 Int32（0..4294967295），超出会被
+ *                  {@link SpoolFrame#frame} 拒绝
  */
 public record PayloadUnit(byte[] payload, long seq, OptionalLong streamXid) {
 
     /**
-     * 归一与 fail-fast：payload 为 null 直接 NPE（帧层无从表示空引用）；streamXid 为 null 归一为
-     * empty（组装器可能传 null，与 RowChange 的 null 宽容约定一致）。payload 数组按引用共享不复制
-     * （溢写热路径避免双倍拷贝），调用方构造后不得再改写该数组。
+     * 构造时的归一与校验：payload 为 null 直接 NPE；streamXid 为 null 归一成 empty（组装器可能
+     * 传 null，与 RowChange 的宽容约定一致）。payload 数组按引用共享、不做拷贝（溢写热路径要
+     * 避免双倍拷贝），所以调用方构造之后不得再改写这个数组。
      */
     public PayloadUnit {
         Objects.requireNonNull(payload, "payload 不能为 null");

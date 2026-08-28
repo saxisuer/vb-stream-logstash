@@ -42,16 +42,17 @@ public final class PgOutputDecoder {
     }
 
     /**
-     * 按显式指定的 inStream 解码**单条**消息，供回放场景使用——回放侧已知每条消息是否处于
-     * 流式块内，无需用 'S'/'E' 包裹重建上下文。
-     * 关键步骤：读类型字节 → 白名单校验（仅允许可带 xid 前缀的 7 类 M/R/Y/I/U/D/T，其余一律
-     * {@link IllegalArgumentException}，含 'S'/'E' 与两阶段控制类型——它们没有可复用的前缀语义）
-     * → 以**入参**（而非实例字段）作为 inStream 分发解析 → 出口与 {@link #decode} 共用剩余字节
-     * 检查与日志。
-     * 边界与异常语义：完全不读写实例的 {@code inStream} 字段，调用前后 decode 的流块状态不受影响；
-     * 剩余字节非 0 抛 {@link ProtocolMisalignmentException}；前缀假设与字节布局不符时经由各 parser
-     * 的 fail-fast 异常暴露。
-     * 线程约束：同 decode，单一线程调用。
+     * 按显式指定的 inStream 解码**单条**消息，供回放场景使用——回放侧本来就知道每条消息在不在
+     * 流式块内，不需要拿 'S'/'E' 把流块上下文重新包一遍。
+     *
+     * <p>步骤：读类型字节 → 白名单校验（只允许可带 xid 前缀的 7 类 M/R/Y/I/U/D/T，其余一律
+     * {@link IllegalArgumentException}，包括 'S'/'E' 和两阶段控制类型——它们没有可复用的前缀
+     * 语义）→ 用**入参**（而不是实例字段）作为 inStream 分发解析 → 出口与 {@link #decode}
+     * 共用剩余字节检查和日志。
+     *
+     * <p>边界：完全不读写实例的 {@code inStream} 字段，调用它不会影响 decode 的流块状态；
+     * 剩余字节非 0 抛 {@link ProtocolMisalignmentException}；前缀假设与字节布局不符时由各
+     * parser 的 fail-fast 异常暴露。线程约束同 decode：单一线程调用。
      */
     public PgOutputMessage decodeSingle(ByteBuffer payload, boolean inStream) {
         ByteBufferReader r = new ByteBufferReader(payload);
