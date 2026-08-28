@@ -15,7 +15,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -25,9 +24,10 @@ import java.util.function.Supplier;
  * pgoutput **原始字节驱动**的事务组装状态机（spec §4 / assembly-spill 设计 §2-§4，MEMORY-only
  * 第一阶段）：实现 {@link RawMessageListener}，按"轻窥路由 + 控制消息 live 解码"分流——数据消息
  * （I/U/D/T/M）不做完整解码，直接以 {@link PayloadUnit}（原始字节 + seq + 可选流式 xid）入桶；
- * 控制消息与 'R' 现场解码驱动桶状态机。收到提交信号（Commit/StreamCommit/CommitPrepared）后
- * **回放**桶内单元（decodeSingle + 按 asOf 版本渲染 Relation）封箱为不可变 {@link Transaction}
- * 回调；回滚路径（RollbackPrepared/StreamAbort）丢弃或记账后不回调。
+ * 控制消息与 'R' 现场解码驱动桶状态机。收到提交信号（Commit/StreamCommit/CommitPrepared）后经
+ * {@link BucketReplayer} **回放**桶内单元（decodeSingle + 按 asOf 版本渲染 Relation + aborted
+ * 子事务过滤）封箱为不可变 {@link Transaction} 回调；回滚路径（RollbackPrepared/StreamAbort）
+ * 丢弃或记账后不回调。
  *
  * <p>桶模型（与消息驱动版逐语义等价，等价基线 = 既有 33 例单测的移植）：
  * <ul>
@@ -65,6 +65,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private final SpillConfig spill;
     /** 每个解码点（控制消息、'R'、回放单元）回调——ConsoleListener 逐消息 DEBUG 的新挂点。 */
     private final Consumer<PgOutputMessage> decodedObserver;
+    /** 桶回放器：提交路径把桶单元渲染为 TxChange（自持独立 decoder，decodeSingle 不触碰 inStream 实例状态）。 */
+    private final BucketReplayer replayer;
 
     /** 下一个分配的消息序号（单调，从 1 起；每条 onRaw 消耗一次）。 */
     private long nextSeq = 1L;
@@ -115,6 +117,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         this.registry = Objects.requireNonNull(registry, "registry");
         this.spill = Objects.requireNonNull(spill, "spill");
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
+        this.replayer = new BucketReplayer(mode, this.registry, this.decodedObserver);
     }
 
     /**
@@ -449,60 +452,15 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     }
 
     /**
-     * 责任：回放一个桶的存储单元为 TxChange 序列（提交路径的核心，MEMORY 形态）。
-     * 关键步骤：按入桶序遍历 units → streamXid 命中 abortedSubxids 的单元跳过（子事务回滚剔除）
-     * → 其余经 {@link #replayUnit} 解码渲染 → 汇集为列表（空桶产出空列表，协议合法）。
+     * 责任：回放一个桶的存储单元为 TxChange 序列（提交路径的核心，MEMORY 形态）——把桶的
+     * （units, abortedSubxids）二元组交给 {@link BucketReplayer}，回放语义（aborted 过滤、
+     * asOf 版本渲染、decodeSingle + observer）全部由其承担。
      * 边界与异常语义：Relation 未先行到达（require(oid, seq) miss）或字节与协议不符时抛
      * ISE/协议异常 fail-fast——回放失败即协议流异常，不允许半截事务输出（异常先于 listener 回调抛出）。
      * 线程：run 线程内同步执行。
      */
     private List<TxChange> replay(TxBuffer bucket) {
-        List<TxChange> changes = new ArrayList<>(bucket.units.size());
-        for (PayloadUnit unit : bucket.units) {
-            if (unit.streamXid().isPresent() && bucket.abortedSubxids.contains(unit.streamXid().getAsLong())) {
-                continue;
-            }
-            changes.add(replayUnit(unit));
-        }
-        return changes;
-    }
-
-    /**
-     * 责任：回放单个存储单元——decodeSingle 解码（inStream 由单元自身 streamXid 有无显式给定，
-     * 免 S/E 包裹）后按消息类型构造 TxChange，Relation 一律 {@code registry.require(oid, unit.seq())}
-     * 取变更时刻版本。
-     * 关键步骤：解码并回调 decodedObserver → instanceof 链分发（Java 17 约束，不用 record pattern）
-     * → I/U/D 构造 RowChange（before/after 按 DML 语义）、T 构造 TruncateChange（逐 oid 快照）、
-     * M 构造 MsgChange。
-     * 边界与异常语义：桶内只可能有 I/U/D/T/M（路由保证 'R'/'Y'/'O' 不入桶），其余类型到达即
-     * ISE（防御性，正常不可达）。
-     */
-    private TxChange replayUnit(PayloadUnit unit) {
-        PgOutputMessage msg = decoder.decodeSingle(
-                ByteBuffer.wrap(unit.payload()), unit.streamXid().isPresent());
-        decodedObserver.accept(msg);
-        if (msg instanceof PgOutputMessage.Insert m) {
-            return new RowChange(DmlKind.INSERT, registry.require(m.relationOid(), unit.seq()),
-                    Optional.empty(), Optional.of(m.newTuple()), m.streamXid());
-        }
-        if (msg instanceof PgOutputMessage.Update m) {
-            return new RowChange(DmlKind.UPDATE, registry.require(m.relationOid(), unit.seq()),
-                    m.oldTuple(), Optional.of(m.newTuple()), m.streamXid());
-        }
-        if (msg instanceof PgOutputMessage.Delete m) {
-            return new RowChange(DmlKind.DELETE, registry.require(m.relationOid(), unit.seq()),
-                    Optional.of(m.oldTuple()), Optional.empty(), m.streamXid());
-        }
-        if (msg instanceof PgOutputMessage.Truncate m) {
-            List<PgOutputMessage.Relation> snapshots = Arrays.stream(m.relationOids())
-                    .mapToObj(oid -> registry.require(oid, unit.seq()))
-                    .toList();
-            return new TruncateChange(snapshots, m.options(), m.streamXid());
-        }
-        if (msg instanceof PgOutputMessage.LogicalMsg m) {
-            return new MsgChange(m.transactional(), m.prefix(), m.content(), m.streamXid());
-        }
-        throw new IllegalStateException("桶内出现不可回放的消息类型: " + msg.getClass().getSimpleName());
+        return replayer.replay(bucket.units, bucket.abortedSubxids);
     }
 
     /** big-endian 读 4 字节有符号整数（oid 等，仅 fail-fast 描述与窥探用）。 */
