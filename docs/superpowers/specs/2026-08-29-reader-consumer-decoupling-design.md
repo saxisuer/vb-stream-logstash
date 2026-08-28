@@ -88,7 +88,8 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部）
 | `segments`（`long[2]` 列表） | 追加期连续段记账 | readRange 端点 |
 | `firstIndex` / `lastIndex` | 首末单元 CQ index | 删除低水位 / 快照截止（maxSeq） |
 | `abortedSubxids`（Set\<Long\>） | StreamAbort 记账 | 回放期子事务过滤 |
-| `oidSet`（Set\<Long\>） | 追加期窥 I/U/D/T 的 relation oid（T 为多 oid） | 交接时圈定快照范围 |
+| `oidSet`（Set\<Integer\>） | 追加期窥 I/U/D/T 的 relation oid（T 为多 oid） | 交接时圈定快照范围 |
+| `hasPrefix`（boolean，桶级不变量） | 首单元追加时按流块上下文判定；后续单元混现即 ISE fail-fast | 回放 `decodeSingle` 的 inStream 实参与 streamXid 重窥——前缀**有无**无法从裸 payload 判定（协议上流式桶恒在块内收单元、普通/两阶段桶恒在块外），**值**则回放时重窥 raw[1..4] |
 | `relationSnapshot` | **交接时**由 reader 从 registry 拷贝 | consumer 渲染（§4.3） |
 
 **seq ≡ CQ index**：每条消息（含控制消息）append 后拿到的 index 就是它的 seq。数据单元与 'R' 版本天然同序，asOf 二分查找的正确性由构造保证；`firstIndex` 兼任 1.6 的 `minSeq`。`nextSeq` 计数器退役。
@@ -98,7 +99,7 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部）
 ### 4.2 MessagePipe（原 MessageSpool 改名）
 
 - `append(byte[] payload) → index`（**reader 线程**）；`readRange(first, last, BiConsumer<Long, byte[]>)`（**consumer 线程**）——签名改为携带每条自己的 index（作 seq，asOf 用）。信封帧全删（`SpoolFrame` 退役），一条 CQ 记录 = 一条完整消息，回读时重窥类型字节/流式前缀恢复 streamXid（1.6 `BucketReplayer` 消费契约本就如此）
-- 结构不变：单 appender + 单 tailer（tailer 仅被 consumer 的 readRange 用，`moveToIndex` 定位）；**跨线程分工变更**：append 与 readRange 分属两线程——CQ 官方支持（appender/tailer 各自单线程使用即可），类 javadoc 重写线程约束
+- 结构不变：单 appender + 单 tailer（tailer 仅被 consumer 的 readRange 用，`moveToIndex` 定位）；**跨线程分工变更**：append 与 readRange 分属两线程——CQ 官方支持（appender/tailer 各自单线程使用即可），类 javadoc 重写线程约束。信封帧删除后"帧头携带 seq/streamXid"的信息由两处承接：seq ≡ CQ index（readRange 逐条回调真实 index），streamXid 的**有无**走桶级 `hasPrefix` 不变量、**值**回放重窥（§4.1）
 - `wipe-on-open`（真源是复制槽）、`releaseBelow` 保守删档、`lastAppendedIndex`、close 顺序（tailer → appender → queue）原样保留；readRange 起点错位 ISE 保留——状态机低水位失效时的最后防线
 
 ### 4.3 RelationSnapshot（新，不可变值对象）
@@ -121,7 +122,7 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部）
 - assembler 负责装配默认线程形态（内部创建 `transaction-consumer` 线程）；`close()`（reader 在 try-with-resources 调）：投毒丸 → consumer 排干余下桶（全部到 DONE）→ join → `pipe.close()`。**停机时已提交未输出的事务不丢**
 - 线程约束重写：`onRaw`/`close` 单写者（reader）；consumer 只触碰冻结桶 + 交接队列 + pipe tailer + 前沿 AtomicLong——共享面精确枚举
 
-`decodedObserver`（ConsoleListener 逐消息挂点）变为两线程调用（reader 的控制消息 live 解码 + consumer 的回放解码）——ConsoleListener 是无状态 slf4j 日志，线程安全，javadoc 注明即可。
+`decodedObserver`（ConsoleListener 逐消息挂点）变为两线程调用（reader 的控制消息 live 解码 + consumer 的回放解码）。**渲染视图随之分流（计划期补强）**：ConsoleListener 对 DML 的逐消息渲染要按 oid 查 Relation（`find` 语义，miss 降级 "oid:N"）——若回放侧仍闭包引用 reader 的 HashMap registry 即构成数据竞争。解法：新增公共接口 `RelationLookup { Optional<Relation> find(int oid) }`（`RelationRegistry` 天然实现），`PgOutputListener.onMessage`/`ConsoleListener.onMessage` 的 registry 参型放宽为它；observer 签名升级为 `BiConsumer<PgOutputMessage, RelationLookup>`——live 解码点（reader 线程）传版本日志视图，回放解码点（consumer 线程）传桶内不可变快照（`RelationSnapshot` 实现 `RelationLookup`）。ConsoleListener 自身无状态且 slf4j 线程安全。
 
 ### 4.5 PgReplicationSession（最小改动）
 
