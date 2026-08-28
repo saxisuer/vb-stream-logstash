@@ -23,6 +23,10 @@ import java.util.OptionalLong;
  * 控制台打印 listener（Main 默认事务形态，spec §5）：事务块（TXN-BEGIN/TXN-END 头尾 + 逐变更行）与
  * 事务生命周期控制消息（流式分段边界 + 两阶段信号）走 CDC logger INFO；行级数据与元数据等逐消息细节
  * 降为 DEBUG（默认关闭），仅供排障时开启。INFO 级保证任何事务形态至少留一行痕迹，不吞噬事务信息。
+ *
+ * <p>同一实例承担双角色：事务回调（{@link #onTransaction}，组装器提交路径）与逐消息渲染
+ * （{@link #onMessage}，Main 装配下挂在组装器的解码点 observer——控制消息/Relation live 解码与
+ * 提交回放期 payload 解码，见其 javadoc）。
  */
 public final class ConsoleListener implements PgOutputListener, TransactionListener {
 
@@ -33,6 +37,14 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
      * 逐消息渲染出口，按消息类别分流级别（spec §5）：事务生命周期控制消息升 INFO
      * （低量高信号，且 StreamAbort/RollbackPrepared 不产生组装后事务块，降 DEBUG 会吞掉唯一事务级线索），
      * 其余（行级数据/元数据）维持 DEBUG 默认不发射。级别守卫避免关闭时的无谓渲染开销——render 是实参、急切求值。
+     *
+     * <p>调用时点（Main 装配）= {@code TransactionAssembler} 的解码点 observer，组装器是唯一解码者：
+     * 控制消息（Begin/Commit/流式与两阶段信号）与 Relation('R') 到达即 live 解码、按到达序回调；
+     * 数据消息（I/U/D/T/M）live 期以原始字节入桶不解码，在提交回放期解码回调——每条恰好一次
+     * （被 StreamAbort 过滤的子事务单元不回调；'Y'/'O' 组装器直接丢弃，不产生回调）。
+     * 渲染用的 registry 为版本日志的最新版视图（闭包持同一实例引用，随 'R' 到达演进——逐消息
+     * 渲染按最新 schema 展示即可；提交块的 asOf 精确渲染由组装器回放出的 TxChange 内嵌快照承担，
+     * 见 {@link #onTransaction}，不经本方法）。
      */
     @Override
     public void onMessage(PgOutputMessage message, RelationRegistry registry) {
