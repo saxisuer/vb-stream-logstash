@@ -5,12 +5,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** MessagePipe 单测：append/readRange 往返、index 暴露、wipe-on-open、错位 fail-fast。夹具：@TempDir 独立目录，每用例新建管道。 */
 class MessagePipeTest {
@@ -100,6 +102,56 @@ class MessagePipeTest {
             pipe.append(new byte[]{'C'});
             assertThrows(IllegalStateException.class,
                     () -> pipe.readRange(first - 1, first + 1, (idx, p) -> { }));
+        }
+    }
+
+    /**
+     * releaseBelow 节流（1.7.1 Task 3 修复）：needed cycle 档位未推进时跳过目录扫描——同档位内
+     * 可删集不可能变化（滚动文件只随 append 前沿出现在当前/未来档位，不回填旧档名），删档检查
+     * 延后到下一次档位推进，删除语义仍为惰性（残留只占磁盘不影响正确性）。
+     * 关键步骤：建管道 append 一条取真实 index，锚定当前档位 c = toCycle(index) → 注入陈旧档名
+     * （2020-01-01）文件 → releaseBelow(档 c) 首调即扫并删除 → 再注入一个陈旧文件 → 同档 c
+     * 二调被节流跳过（文件仍在，删档延后）→ 档 c+1 三调补扫（文件被删）。
+     * 边界：c+1 的入参 index 用 {@code toIndex(c+1, 0)} 构造（{@code toCycle(toIndex(c,0)) == c}
+     * 恒等还原档号，不假设 index 的位布局）；真实数据文件（档 c）全程保留——c 不满足
+     * {@code < (c+1)-1}，证明节流没有变成"就近清空"。
+     */
+    @Test
+    void releaseBelowSkipsScanUntilNeededCycleAdvances() throws IOException {
+        LegacyRollCycles cycle = LegacyRollCycles.MINUTELY;
+        try (MessagePipe pipe = new MessagePipe(dir, cycle)) {
+            long realIndex = pipe.append(new byte[]{'B'});
+            int needed = cycle.toCycle(realIndex);
+            Path stale = dir.resolve("20200101-0000.cq4");
+            Files.createFile(stale);
+            pipe.releaseBelow(realIndex);                 // 首调即扫：陈旧档删除
+            assertEquals(1, countRollFiles(dir),
+                    () -> "首调应删除唯一陈旧文件、只留真实数据文件: " + dir);
+            Files.createFile(stale);                      // 同档位内再次出现陈旧文件
+            pipe.releaseBelow(realIndex);                 // 同档二调：节流跳过，删档延后
+            assertTrue(Files.exists(stale),
+                    () -> "needed cycle 未推进时应跳过扫描（删档延后）: " + stale);
+            pipe.releaseBelow(cycle.toIndex(needed + 1, 0L));   // 档位推进：补扫补删
+            assertTrue(Files.notExists(stale),
+                    () -> "档位推进后应补删同档位期间出现的陈旧文件: " + stale);
+            assertTrue(countRollFiles(dir) >= 1,
+                    () -> "队列真实数据滚动文件应全程保留: " + dir);
+        }
+    }
+
+    /**
+     * 统计管道目录下的滚动数据文件数（.cq4 后缀；metadata.cq4t 后缀不同天然排除）——
+     * 节流用例的两面断言辅助：删除精确落在低水位之下，真实数据文件不计入"被删"。
+     *
+     * @param pipeDir 管道目录
+     * @return 滚动数据文件（.cq4）个数
+     */
+    private static int countRollFiles(Path pipeDir) throws IOException {
+        try (java.util.stream.Stream<Path> entries = Files.list(pipeDir)) {
+            return (int) entries
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().endsWith(".cq4"))
+                    .count();
         }
     }
 }

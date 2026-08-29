@@ -223,6 +223,61 @@ opendir/stat/readdir 合计=15.7%、msync（chronicle 后台释放线程）=6.0%
    可能落空（spec §4 已预告）；⑦ 回放半程报 17.1%（上界口径）但线上跑在 consumer 线程、不占
    reader 关键路径，且不在修复菜单内；①+②+⑨ 低于阈值，④⑤⑥ 为零头，不动。
 
+### 1.7.1 Task 3 修复决策门与实施（2026-08-29，⑧ 隔离收窄 + 出路 B 修复 + A/B 对照）
+
+Task 2 审查约束"⑧ 的 6~16% 区间不得直接翻修复决策，须先补隔离口径收窄"——本节即该口径与
+后续门判定。**已入档归因表各行数字保持原样**，本节是收窄后的判定读数与修复对照。
+
+**⑧ 隔离口径**：新增 `AssemblyAttributionBenchmark.deletableFilesScan`（`BenchPipeBridge.deletableFiles`
+同包桥透出 `MessagePipe` 包私有纯函数）——Setup 把整份语料经真实管道落盘一轮（目录内容与组装器
+实跑同形：`metadata.cq4t` + 当前 cycle 的 `.cq4`），neededCycle 取当前追加前沿所在档位 → 删集
+恒空、只扫不删，与 `assembleWholeCorpus` 每轮 13 个桶完结点上 `releaseBelow` 的真实形态一致。
+
+**收窄结果**（3 fork 档 `-f 3 -wi 5 -i 5 -w 2s -r 2s`；冒烟档 40.909 ± 17.255 µs/次同量级）：
+
+| 口径 | 得分 ±99.9% CI |
+|---|---|
+| `deletableFilesScan` 单次扫描（修复前） | **38.303 ± 2.303 µs/次** |
+| 栈剖析（`-prof stack`，RUNNABLE 内占比） | opendir0 = 22.6%、stat（isRegularFile+isDirectory 两处）= 14.6%、readdir = 8.2%、closedir = 1.2%——syscall 合计 ≈18 µs 是**下限**；`DateTimeFormatter.ofPattern` 新建 ≈1% |
+
+原区间下界建立在"opendir/readdir/stat 各 ≈1 µs"的假设上，实测 macOS 单次 opendir 即 4~9 µs 级
+——假设不成立，区间整体上移。
+
+**门判定（准则：单项 ≥15% 且不动架构）**：
+
+- **⑧ → 出路 B（达标且可修）**：13 完结点/轮 × 38.303 µs = 497.9 µs/轮，占基线 1,395 µs/轮
+  **≈35.7%**（远超 15%；即便按 syscall 下限 18 µs/次折算 234 µs/轮 ≈16.8% 也过线）。
+- **③ 缺页 46.8% → 出路 C（架构固有）**：顺序写新页的固有代价，修复菜单内的预触碰只是把
+  缺页挪到 append 之前、不减总量，其余选项必动 CQ 或架构——判定"架构固有，不修"，作为 1.7.2
+  初稿"不值得开混合存储"的加权论据（初稿结论维持）。
+- ⑦ 17.1% 在 consumer 线程、不占 reader 关键路径（不在修复菜单）；①②⑨④⑤⑥ <15% 或零头，不动。
+
+**修复内容（`MessagePipe`，零架构改动）**：
+
+1. **`releaseBelow` 按档位节流**：needed cycle 与上次实际扫描相同即跳过目录扫描（同档位内可删集
+   不可能变化——滚动文件只随 append 前沿出现在当前/未来档位，不回填旧档名）。删档检查延后到
+   档位推进，删除惰性化语义不变（水位计算不变；删除失败的重试同样顺延到下次档位推进，残留只占
+   磁盘）。节流字段只在 reader 线程读写（单写者），无并发问题。
+2. **`DateTimeFormatter` 按周期格式进程级记忆化**（`FORMATTER_BY_PATTERN`）：原每次扫描
+   `ofPattern` 新建解析器；解析器不可变线程安全，按模式串缓存后语义不变。
+
+**修复前后对照**（同会话同档 3 fork `-f 3 -wi 5 -i 5 -w 2s -r 2s`；修复前经 `git stash` 单独
+还原 `MessagePipe` 后重建复跑，其余源码相同）：
+
+| 基准 | 修复前 | 修复后 | Δ |
+|---|---|---|---|
+| `AssembleMemoryBenchmark.assembleWholeCorpus` | 1.234 ± 0.151 ms/轮 | **0.761 ± 0.107 ms/轮** | **−0.473 ms（−38.3%，CI 分离）** |
+| `AssemblyAttributionBenchmark.deletableFilesScan`（纯函数口径，节流不作用于它） | 38.303 ± 2.303 µs/次 | 35.950 ± 0.642 µs/次 | −2.35 µs（≈−6%，CI 轻微重叠——memo 只省 ofPattern） |
+
+- A/B 差分与隔离口径**互证**：Δ473 µs/轮 ÷ 13 次/轮 ≈ 36 µs/次，与隔离口径 38.3 µs/次吻合
+  ——腿 1 采样的"opendir/stat/readdir = 15.7% RUNNABLE"系**低估**（native 停留欠采样，与对账段
+  方向 (a) 同类）；⑧ 修复前的真实占比即 ≈35%（对照本会话修复前 1.234 ms/轮）。
+- 修复后 `assembleWholeCorpus` ≈0.761 ms/轮 ≈ **9.1 µs/条**（84 条/轮）；⑧ 的稳态残余 ≈ 每档位
+  推进一次扫描（MINUTELY 下 ≥60 s 一次，摊到每轮 ≈0），单次成本仍是 ≈36 µs（扫描本身未变）。
+- 回归护栏：`MessagePipeTest` 既有 4 用例零改动全绿 + 新增节流用例
+  `releaseBelowSkipsScanUntilNeededCycleAdvances`（同档跳过/档位推进补删/真实数据文件保留）；
+  `mvn clean test` 144 用例全绿（143 + 新增 1）。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/

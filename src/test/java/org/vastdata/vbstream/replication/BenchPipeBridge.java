@@ -170,6 +170,22 @@ public final class BenchPipeBridge {
     }
 
     /**
+     * 责任：透出 {@link MessagePipe#deletableFiles}（包私有纯函数）供 JMH 隔离计量
+     * （1.7.1 Task 3 归因表 ⑧ 的收窄口径）：组装器每个桶完结点都经
+     * {@code releaseBelow → deletableFiles} 做一次全目录扫描，该项在归因表中只有
+     * 6~16% 的采样区间——本桥让基准能在真实管道目录上单次计时该函数，把区间收窄成点估计。
+     * 边界与异常语义：与被透出函数完全一致（目录不存在/列举失败返回空列表，本身不删除任何文件）。
+     *
+     * @param rc          滚动周期（提供文件名格式与 cycle 换算参数）
+     * @param dir         滚动文件所在目录（真实管道目录）
+     * @param neededCycle 仍需保留的 cycle 号（它本身和减一档都保留）
+     * @return 可删除文件的列表（可能为空，顺序不保证）
+     */
+    public static List<Path> deletableFiles(RollCycle rc, Path dir, long neededCycle) {
+        return MessagePipe.deletableFiles(rc, dir, neededCycle);
+    }
+
+    /**
      * 责任：窥数据消息的 relation oid 记入桶的 oidSet（快照圈定用），逻辑与
      * {@code TransactionAssembler#collectOids} 同构：I/U/D 在类型字节（及可选 4 字节前缀）后取
      * Int32 relationOid；T 读 I32 表数 + 选项字节后的 oid 数组；M 无 oid 跳过。

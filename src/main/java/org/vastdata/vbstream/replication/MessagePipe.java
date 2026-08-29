@@ -23,6 +23,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 
@@ -50,11 +52,25 @@ final class MessagePipe implements AutoCloseable {
     /** 滚动数据文件后缀（binary WireType 约定 {@code .cq4}；队列元数据表文件为 {@code .cq4t}，后缀不同天然排除）。 */
     private static final String ROLL_FILE_SUFFIX = ".cq4";
 
+    /**
+     * 滚动周期格式 → 解析器的进程级缓存（1.7.1 Task 3 修复：原每次 {@link #deletableFiles} 调用
+     * 都 {@code DateTimeFormatter.ofPattern} 新建解析器）。{@link DateTimeFormatter} 不可变且线程
+     * 安全，按模式串记忆化后语义不变；周期格式是有限枚举（RollCycle 实现集合），缓存有界。
+     */
+    private static final ConcurrentMap<String, DateTimeFormatter> FORMATTER_BY_PATTERN = new ConcurrentHashMap<>();
+
     private final Path dir;
     private final RollCycle rollCycle;
     private final ChronicleQueue queue;
     private final ExcerptAppender appender;
     private final ExcerptTailer tailer;
+
+    /**
+     * 上次 {@link #releaseBelow} 实际扫描过的 needed cycle 档位（{@link Long#MIN_VALUE} = 从未
+     * 扫过）：节流状态（1.7.1 Task 3 修复——组装器每个桶完结点都调 releaseBelow，而滚动周期
+     * MINUTELY 下档位极少推进，同档位重复扫描是纯浪费）。只在 reader 线程读写，无并发问题。
+     */
+    private long lastScannedCycle = Long.MIN_VALUE;
 
     /**
      * 建管道：先清空目录内容，再按指定滚动周期建一个 Chronicle Queue，并预先创建 appender/tailer。
@@ -152,16 +168,25 @@ final class MessagePipe implements AutoCloseable {
      * 低水位释放：删除比"低水位所在 cycle 再往前一档"还老的滚动文件（needed 档与 needed-1 档
      * 都保留——上一档里可能还有低水位之前的在途条目，删除永远保守）。
      *
-     * <p>步骤：由 lowestNeededIndex 反算出 needed cycle → 用纯函数 {@link #deletableFiles} 算出
-     * 可删集合 → 逐个删除，每删一个记 WARN 留下文件名；单个文件删不掉只 WARN 不上抛（残留文件
-     * 只是占磁盘，不影响正确性，下次再删）→ 返回实际删除数。目录列举失败按"没有可删的"处理，
-     * 返回 0。
+     * <p>步骤：由 lowestNeededIndex 反算出 needed cycle → <b>节流检查</b>（1.7.1 Task 3）：档位
+     * 与上次实际扫描相同就直接返回 0——同档位内可删集不可能变化（滚动文件只随 append 前沿出现
+     * 在当前/未来档位，不回填旧档名），删档检查延后到下一次档位推进，删除语义仍为惰性 → 用纯函数
+     * {@link #deletableFiles} 算出可删集合 → 逐个删除，每删一个记 WARN 留下文件名；单个文件删不
+     * 掉只 WARN 不上抛（残留文件只是占磁盘，不影响正确性，下次档位推进的扫描再删）→ 返回实际
+     * 删除数。目录列举失败按"没有可删的"处理，返回 0。
+     *
+     * <p>边界：节流按"档位未变"判等而非"未减小"——水位回退（理论不可能，见调用方
+     * {@code TransactionAssembler#pipeWatermark} 的单调性）时宁可多扫一次也不漏删。
      *
      * @param lowestNeededIndex 仍被需要的最低 index（它所在的 cycle 和上一档 cycle 都保留）
-     * @return 实际删除的滚动文件数
+     * @return 实际删除的滚动文件数（节流命中时恒 0）
      */
     long releaseBelow(long lowestNeededIndex) {
         long neededCycle = rollCycle.toCycle(lowestNeededIndex);
+        if (neededCycle == lastScannedCycle) {
+            return 0L;      // 同档位已扫过：可删集不可能变化，删档检查延后到档位推进
+        }
+        lastScannedCycle = neededCycle;
         long deleted = 0;
         for (Path doomed : deletableFiles(rollCycle, dir, neededCycle)) {
             try {
@@ -170,7 +195,7 @@ final class MessagePipe implements AutoCloseable {
                     deleted++;
                 }
             } catch (IOException e) {
-                LOG.warn("MessagePipe 删除滚动文件 {} 失败（下次释放重试）", doomed, e);
+                LOG.warn("MessagePipe 删除滚动文件 {} 失败（下次档位推进的扫描重试）", doomed, e);
             }
         }
         return deleted;
@@ -215,8 +240,10 @@ final class MessagePipe implements AutoCloseable {
      * （needed 与 needed-1 两档保留），本身不做任何删除 IO——单测可以注入假文件名来验证删除规则。
      *
      * <p>步骤：目录不存在或列举失败返回空列表（保守起见当作无可删）→ 挑出以 {@code .cq4} 结尾的
-     * 常规文件 → 去掉后缀，按 {@code rc.format()} 的模式解析成 UTC 时间戳，再换算成 cycle 号
-     * （换算公式与 {@code rc.toCycle} 同一基准）→ cycle 号小于 {@code neededCycle - 1} 的入选。
+     * 常规文件 → 去掉后缀，按 {@code rc.format()} 的模式解析成 UTC 时间戳（解析器经
+     * {@link #FORMATTER_BY_PATTERN} 按模式串记忆化，1.7.1 Task 3 前每次调用新建），再换算成
+     * cycle 号（换算公式与 {@code rc.toCycle} 同一基准）→ cycle 号小于 {@code neededCycle - 1}
+     * 的入选。
      *
      * <p>边界：文件名去掉后缀后解析不出时间戳（不匹配滚动周期的命名模式）就跳过并 WARN——
      * 外来文件宁可漏删也不可错删；队列元数据文件 {@code metadata.cq4t} 后缀不同，天然不在候选内。
@@ -231,7 +258,7 @@ final class MessagePipe implements AutoCloseable {
         if (!Files.isDirectory(dir)) {
             return List.of();
         }
-        DateTimeFormatter format = DateTimeFormatter.ofPattern(rc.format(), Locale.ROOT);
+        DateTimeFormatter format = formatterFor(rc.format());
         try (Stream<Path> entries = Files.list(dir)) {
             return entries
                     .filter(Files::isRegularFile)
@@ -245,6 +272,18 @@ final class MessagePipe implements AutoCloseable {
             LOG.warn("MessagePipe 列举滚动目录 {} 失败，本次不删除", dir, e);
             return List.of();
         }
+    }
+
+    /**
+     * 取滚动周期格式对应的解析器（进程级记忆化）：{@code DateTimeFormatter.ofPattern} 构造成本
+     * 为 µs 级且格式串来自有限枚举的 {@link RollCycle} 实现——按模式串缓存后重复调用零构造成本。
+     * 线程安全（CHM + 不可变 value；竞争窗口内最坏重复构造一次，无害）。
+     *
+     * @param pattern 滚动周期的文件名格式模式串（{@code RollCycle.format()}）
+     * @return 该模式串的解析器（不可变，可共享）
+     */
+    private static DateTimeFormatter formatterFor(String pattern) {
+        return FORMATTER_BY_PATTERN.computeIfAbsent(pattern, p -> DateTimeFormatter.ofPattern(p, Locale.ROOT));
     }
 
     /**

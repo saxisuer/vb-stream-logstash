@@ -80,7 +80,7 @@ reader 与 consumer 之间的**主缓冲**（1.7 设计 §4.2，原 `MessageSpoo
 
 - `append(byte[] payload) → index`（**reader 线程**）：原样落盘并返回该条 CQ index（单调递增，即该消息的 seq，可作回读区间端点与低水位入参）；写失败以 CQ 运行时异常上抛（不吞不重试——磁盘满 = 全局停机信号，fail-fast 是设计行为）
 - `readRange(firstIndex, lastIndex, BiConsumer<Long, byte[]>)`（**consumer 线程**）：按 index 升序回读闭区间逐条回调——回调参数携带该条**自己的真实 CQ index**（作 seq，asOf 用）与队列内存不共享的字节副本；区间起点错位（已被误删/从未存在）抛 ISE fail-fast；区间不存在且无后续条目时空手而归不抛
-- `releaseBelow(lowestNeededIndex)`：删除严格低于 needed cycle - 1 的滚动文件（保留 needed 与 needed-1 档，保守删除）；每删一个 WARN 留痕、单文件失败 WARN 重试（残留只占磁盘不影响正确性）；候选集计算 `deletableFiles` 纯函数化（供单测注入文件名）
+- `releaseBelow(lowestNeededIndex)`：删除严格低于 needed cycle - 1 的滚动文件（保留 needed 与 needed-1 档，保守删除）；**按档位节流（1.7.1 Task 3）**——needed cycle 与上次实际扫描相同即跳过目录扫描（同档位内可删集不可能变化，删档检查延后到档位推进，删除惰性化语义不变；节流字段 reader 单写者无并发问题）；每删一个 WARN 留痕、单文件失败 WARN 重试（残留只占磁盘不影响正确性，下次档位推进补删）；候选集计算 `deletableFiles` 纯函数化（供单测注入文件名，解析器按周期格式进程级记忆化）
 - `lastAppendedIndex()` / `close()`（tailer → appender → queue 逆序，失败 WARN 吸收）
 - **wipe-on-open（真源是复制槽）**：构造时先递归清空目录内容再建 `SingleChronicleQueue`——重启后 PG 从确认位点重发，残留旧管道数据有害（陈旧 index 会让回读错位），**重启自动清空属预期行为**；推论：管道目录在进程内独占，同 JVM 第二实例指向同一目录会清掉前者的队列文件
 - **线程约束（跨线程分工，CQ 官方支持的用法）**：append/lastAppendedIndex/releaseBelow/close 由 reader 线程调用，readRange 由 consumer 线程调用；appender 与 tailer 均为构造时创建的单实例资源，各自单线程使用，不得交叉线程调用

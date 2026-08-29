@@ -21,9 +21,9 @@ it.BenchCorpusRecordTest（真库录制，src/test）
 | `RoutePeekBenchmark` | 组装器**路由窥探**两口径：`peekRoute` 只读类型字节 + 流式块内 Int32 xid 前缀（1.6 沿用，与 onRaw 路由同构）；`peekRouteWithOid` 另窥数据消息 relation oid（与 1.7 追加期 `collectOids` 同构——oidSet 供交接快照圈定） | ns/条——与 Decode 相除得窥探占解码的比值 |
 | `AssembleMemoryBenchmark` | **整语料一轮完整组装**（**同步形态**组装器：pipe.append + 路由/oid 窥探 + 桶段记账 + 交接快照 + 回放解码渲染，listener/observer 均 no-op；类名沿用 1.6 保持基线序列） | ms/轮 |
 | `PipePathBenchmark` | **管道三口径**：`replayBucket` 预构造 2000 单元冻结桶（语料回卷 100 轮、捕获流式块内单元 ≈32.8MB，经 `BenchPipeBridge` 走组装器 reader 侧同构 append 记账落盘）逐段 readRange + decodeSingle + 快照 asOf 渲染——即 `TransactionConsumer.processBucket` 的回放半程；`appendOneMessage` 裸消息追加吞吐（无帧化，一条 CQ 记录即一条完整消息，21B 热页）；`appendOneLargeMessage` 追加 ≈16KB 大消息（1.7.1 新增冷页口径——每条跨入约 4 个新 mmap 页，与 21B 口径差分换算每缺页成本） | ms/桶；两 append 均为 thrpt ops/s |
-| `AssemblyAttributionBenchmark` | **每次交接级开销**两口径：`snapshotCopyPerHandoff` 交接快照拷贝（registry.snapshot）、`handoffQueueOfferPoll` 交接队列 add+poll 一对——归因排除法数据源 | ns/次、ns/对 |
+| `AssemblyAttributionBenchmark` | **每次交接级开销**两口径：`snapshotCopyPerHandoff` 交接快照拷贝（registry.snapshot）、`handoffQueueOfferPoll` 交接队列 add+poll 一对——归因排除法数据源；**三口径（1.7.1 Task 3 增）**：`deletableFilesScan` 在真实管道目录（整语料落盘一轮）上单次计时 `deletableFiles` 目录扫描（opendir/readdir/stat + 名字解析）——归因表 ⑧ 的隔离收窄口径 | ns/次、ns/对；扫描为 µs/次 |
 
-口径间关系：Decode 是 RoutePeek 两口径的对照上限；AssembleMemory 与 PipePathBenchmark.replayBucket 对照可见回放半程在组装总成本中的占比；AssembleMemory 与 Decode 对照可见组装开销中解码的占比。1.7.1 归因把 assembleWholeCorpus 总成本沿"窥探 / append（21B 热页与 16KB 冷页两口径）/ 每次交接级开销"逐项分解——RoutePeek + PipePath 两 append 口径 + AssemblyAttribution 合成该分解视图。
+口径间关系：Decode 是 RoutePeek 两口径的对照上限；AssembleMemory 与 PipePathBenchmark.replayBucket 对照可见回放半程在组装总成本中的占比；AssembleMemory 与 Decode 对照可见组装开销中解码的占比。1.7.1 归因把 assembleWholeCorpus 总成本沿"窥探 / append（21B 热页与 16KB 冷页两口径）/ 每次交接级开销"逐项分解——RoutePeek + PipePath 两 append 口径 + AssemblyAttribution 合成该分解视图（⑧ 目录扫描经 `deletableFilesScan` 收窄，`BenchPipeBridge.deletableFiles` 同包桥透出包私有纯函数）。
 
 ## BenchPipeBridge（src/test，跨包桥）
 
