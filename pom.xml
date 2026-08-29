@@ -30,11 +30,21 @@
             <version>${postgresql.version}</version>
         </dependency>
 
-        <!-- Chronicle Queue：持久化低延迟消息队列，用于缓存/回放 CDC 事件 -->
+        <!-- Chronicle Queue：持久化低延迟消息队列，用于缓存/回放 CDC 事件。
+             排除 chronicle-analytics（chronicle-core 传递引入的用量遥测，HTTP 打点上报）：
+             core 的 AnalyticsFacade 对其反射加载、缺类即回落 MuteAnalytics 空实现，排除是官方
+             DISCLAIMER 认可的关闭方式；对 classpath 全局生效（Main/测试/JMH），启动横幅
+             "Chronicle Queue reports usage statistics" 随之消失 -->
         <dependency>
             <groupId>net.openhft</groupId>
             <artifactId>chronicle-queue</artifactId>
             <version>${chronicle-queue.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>net.openhft</groupId>
+                    <artifactId>chronicle-analytics</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- logback：slf4j 绑定（chronicle 传递引入 slf4j-api，缺实现时 NOP 静默） -->

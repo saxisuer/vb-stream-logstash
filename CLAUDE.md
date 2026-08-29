@@ -10,7 +10,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 - 工具链：Java 17 + Maven
 - 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`TransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `BlockOutputAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 158 用例全绿；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
-    - `net.openhft:chronicle-queue`（持久化低延迟队列——1.7 起是 reader 与 consumer 之间的**主缓冲管道**；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`）
+    - `net.openhft:chronicle-queue`（持久化低延迟队列——1.7 起是 reader 与 consumer 之间的**主缓冲管道**；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`；其传递的 `chronicle-analytics` 遥测打点已在 pom 排除——core 反射缺类回落 MuteAnalytics 空实现，官方 DISCLAIMER 认可的关闭方式，启动横幅与上报一并消失）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
 
 ## 架构总览
