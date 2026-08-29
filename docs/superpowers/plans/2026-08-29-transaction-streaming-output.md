@@ -121,23 +121,30 @@ git push
 
 ### Task 2: 契约换血（listener/consumer/replayer/ConsoleListener/收集器/测试夹具，断言零改动）
 
-> 原子换血任务：中途不可编译属预期，以全量绿收口。Main 零改动（ConsoleListener 仍是 TransactionListener 实现者）。
+> 原子换血任务：中途不可编译属预期，以全量绿收口。Main 按 `vb.output.mode` 接线（见 Step 3 末尾）。
 
 **Files:**
-- Modify: `src/main/java/org/vastdata/vbstream/replication/TransactionListener.java`（onEvent 重定义）
+- Modify: `src/main/java/org/vastdata/vbstream/replication/TransactionListener.java`（onEvent 重定义，流式主契约）
+- Create: `src/main/java/org/vastdata/vbstream/replication/BlockTransactionListener.java`（1.7 契约保留改名：`onTransaction(Transaction)`）
+- Create: `src/main/java/org/vastdata/vbstream/replication/BlockOutputAdapter.java`（流式→整块边界适配器）
+- Create: `src/main/java/org/vastdata/vbstream/replication/OutputMode.java`（枚举 + `vb.output.mode` 解析）
 - Create: `src/main/java/org/vastdata/vbstream/replication/TransactionCollector.java`
 - Modify: `src/main/java/org/vastdata/vbstream/replication/TransactionConsumer.java`（processBucket 流式化）
 - Modify: `src/main/java/org/vastdata/vbstream/replication/BucketReplayer.java`（replay 改 sink 签名）
 - Modify: `src/main/java/org/vastdata/vbstream/replication/TxBuffer.java`（+unitCount）与 `TransactionAssembler.java`（appendUnit 自增）
-- Modify: `src/main/java/org/vastdata/vbstream/replication/Transaction.java`（javadoc 换角色"重组值对象"）
-- Modify: `src/main/java/org/vastdata/vbstream/ConsoleListener.java`（onTransaction → onEvent 三段）
-- Modify: `src/test/java/org/vastdata/vbstream/replication/TransactionAssemblerTest.java`（run 夹具换收集器）、`BucketReplayerTest.java`（sink 驱动）、`TransactionModelTest.java`（如有 listener 引用）、`ConsoleListenerTest.java`（onEvent 断言）、`BenchPipeBridge.java`（replay 内部收集适配）
-- Test: `src/test/java/org/vastdata/vbstream/replication/TransactionCollectorTest.java`（新建）
+- Modify: `src/main/java/org/vastdata/vbstream/replication/Transaction.java`（javadoc 换角色"block 交付单元 + 重组值对象"）
+- Modify: `src/main/java/org/vastdata/vbstream/ConsoleListener.java`（**双实现**：onEvent 流式渲染 + onTransaction 1.7 渲染保留，共享 renderChange）
+- Modify: `src/main/java/org/vastdata/vbstream/Main.java`（按 `vb.output.mode` 接线：STREAMING→console 直传；BLOCK→`new BlockOutputAdapter(console)`）
+- Modify: `src/test/java/org/vastdata/vbstream/replication/TransactionAssemblerTest.java`（run 夹具换收集器）、`BucketReplayerTest.java`（sink 驱动）、`TransactionModelTest.java`（如有 listener 引用）、`ConsoleListenerTest.java`（onEvent 断言 + onTransaction 保留断言）、`BenchPipeBridge.java`（replay 内部收集适配）
+- Test: `src/test/java/org/vastdata/vbstream/replication/TransactionCollectorTest.java`、`BlockOutputAdapterTest.java`、`OutputModeTest.java`（新建）
 
 **Interfaces:**
 - Consumes: Task 1 事件族
 - Produces（Task 3/4/5 消费）:
-  - `TransactionListener { void onEvent(TransactionEvent event); }`
+  - `TransactionListener { void onEvent(TransactionEvent event); }`（流式主契约）
+  - `BlockTransactionListener { void onTransaction(Transaction transaction); }`（1.7 契约保留改名，block 模式消费 API）
+  - `BlockOutputAdapter implements TransactionListener`（构造收 `BlockTransactionListener`；Begin 攒、End 封箱转发后丢弃）
+  - `OutputMode { STREAMING, BLOCK }` + `static OutputMode fromSystemProperties()`（默认 STREAMING；未知值 IAE 附可用值）
   - `TransactionCollector implements TransactionListener`：`void onEvent(...)` + `List<Transaction> transactions()`
   - `BucketReplayer.replay(TxBuffer, MessagePipe, java.util.function.Consumer<TxChange> sink) → long`（交付数）
   - `TxBuffer.unitCount`（long，reader 追加期自增，交接后只读）
@@ -209,10 +216,70 @@ class TransactionCollectorTest {
 
 （RowChange 构造夹具以 record 实际组件对齐；最后一个用例的抛出时机按实现定——设计允许在 End 处理时对账抛出，测试写法随之固定为对应形态。）
 
+**Step 1b: 写 BlockOutputAdapter/OutputMode 失败测试**
+
+`OutputModeTest.java`：
+
+```java
+/** OutputMode 解析单测：默认 STREAMING、合法值大小写宽容、未知值 fail-fast 附可用值（风格同 rollCycle 解析）。属性用例 finally 恢复原值。 */
+class OutputModeTest {
+    @Test
+    void defaultsToStreaming() {
+        System.clearProperty("vb.output.mode");
+        assertEquals(OutputMode.STREAMING, OutputMode.fromSystemProperties());
+    }
+
+    @Test
+    void parsesBlockCaseInsensitively() {
+        System.setProperty("vb.output.mode", "block");
+        try {
+            assertEquals(OutputMode.BLOCK, OutputMode.fromSystemProperties());
+        } finally {
+            System.clearProperty("vb.output.mode");
+        }
+    }
+
+    @Test
+    void unknownValueFailsFast() {
+        System.setProperty("vb.output.mode", "NOPE");
+        try {
+            assertThrows(IllegalArgumentException.class, OutputMode.fromSystemProperties());
+        } finally {
+            System.clearProperty("vb.output.mode");
+        }
+    }
+}
+```
+
+`BlockOutputAdapterTest.java`：
+
+```java
+/** BlockOutputAdapter 单测：同一事件流经适配器与 TransactionCollector 的整块产物全等（block 模式等价验收）；流不合法时（End 无 Begin）原样 ISE 不转发。夹具 Begin/TxChange 构造照 TransactionCollectorTest。 */
+class BlockOutputAdapterTest {
+
+    @Test
+    void adapterForwardsSameTransactionsAsCollectorReassembles() {
+        List<Transaction> viaAdapter = new ArrayList<>();
+        BlockOutputAdapter adapter = new BlockOutputAdapter(viaAdapter::add);
+        TransactionCollector collector = new TransactionCollector();
+        // 同一事件序列分别喂 adapter 与 collector：Begin(3)+2×TxChange（emitted<expected 合法）+End(2)
+        // 断言 viaAdapter 与 collector.transactions() 全等（List.equals）
+    }
+
+    @Test
+    void illegalStreamPropagatesWithoutForwarding() {
+        List<Transaction> out = new ArrayList<>();
+        BlockOutputAdapter adapter = new BlockOutputAdapter(out::add);
+        assertThrows(IllegalStateException.class, () -> adapter.onEvent(new TransactionEvent.End(1L, 0L)));
+        assertEquals(List.of(), out);       // 零转发——block 模式原子性
+    }
+}
+```
+
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `mvn test -Dtest=TransactionCollectorTest`
-Expected: 编译失败（TransactionCollector 不存在）。
+Run: `mvn test -Dtest='TransactionCollectorTest,BlockOutputAdapterTest,OutputModeTest'`
+Expected: 编译失败（三个新类不存在）。
 
 - [ ] **Step 3: 实现换血（全部主代码）**
 
@@ -223,6 +290,76 @@ Expected: 编译失败（TransactionCollector 不存在）。
 public interface TransactionListener {
     /** 收到一个事务输出事件（头 Begin / 逐变更 TxChange / 尾 End），按序流式回调。 */
     void onEvent(TransactionEvent event);
+}
+```
+
+`BlockTransactionListener.java`（1.7 契约保留改名，javadoc：2.0 起为非默认形态——block 模式经 `BlockOutputAdapter` 重组整块后回调；原子性在 block 模式下保留——适配器攒齐才转发，中途失败下游零输出）：
+
+```java
+/** 整块事务消费契约（1.7 契约保留，2.0 起非默认——vb.output.mode=block 时经 {@link BlockOutputAdapter} 启用）。 */
+@FunctionalInterface
+public interface BlockTransactionListener {
+    /** 收到一个已确认提交的完整事务（BLOCK 模式：适配器 End 重组后转发；ROLLBACK 路径不回调）。 */
+    void onTransaction(Transaction transaction);
+}
+```
+
+`BlockOutputAdapter.java`（javadoc：非线程安全——consumer 线程；事务级转发后丢弃，不累积历史）：
+
+```java
+/** 流式→整块输出边界适配器（2.0 spec §2）：Begin 开桶攒 TxChange，End 封箱转发目标后丢弃；
+ * 中途异常攒的内容随失败丢弃，目标零输出（block 模式恢复 1.7 原子交付语义）。 */
+public final class BlockOutputAdapter implements TransactionListener {
+
+    private final BlockTransactionListener target;
+    private TransactionEvent.Begin open;
+    private final List<TxChange> changes = new ArrayList<>();
+
+    public BlockOutputAdapter(BlockTransactionListener target) {
+        this.target = Objects.requireNonNull(target, "target");
+    }
+
+    @Override
+    public void onEvent(TransactionEvent event) {
+        if (event instanceof TransactionEvent.Begin b) {
+            if (open != null) {
+                throw new IllegalStateException("Begin 内嵌 Begin: xid=" + b.xid());
+            }
+            open = b;
+            changes.clear();
+        } else if (event instanceof TransactionEvent.End e) {
+            if (open == null || e.xid() != open.xid()) {
+                throw new IllegalStateException("End 无匹配 Begin: xid=" + e.xid());
+            }
+            target.onTransaction(new Transaction(open.xid(), open.kind(), open.gid(),
+                    open.commitLsn(), open.endLsn(), open.commitTimestamp(), List.copyOf(changes)));
+            open = null;
+            changes.clear();
+        } else if (event instanceof TxChange c) {
+            if (open == null) {
+                throw new IllegalStateException("变更先于 Begin 到达");
+            }
+            changes.add(c);
+        }
+    }
+}
+```
+
+`OutputMode.java`（枚举 + 解析；javadoc 注明两模式语义差异：streaming=O(单条) 堆/半截可能输出；block=O(事务) 堆/原子交付——vb.output.mode 逃生门回到 1.7 语义）：
+
+```java
+/** 输出形态（2.0 spec §1.1）：STREAMING=流式事件交付（默认，回放期堆 O(单条)）；
+ * BLOCK=边界适配器重组整块（1.7 语义逃生门，堆 O(事务)、原子交付）。 */
+public enum OutputMode {
+    STREAMING, BLOCK;
+
+    /** 读 vb.output.mode（默认 STREAMING，大小写宽容；未知值 IAE 附可用值——风格同 PipeConfig.parseRollCycle）。 */
+    public static OutputMode fromSystemProperties() {
+        String v = System.getProperty("vb.output.mode", "streaming").trim();
+        return Arrays.stream(values()).filter(m -> m.name().equalsIgnoreCase(v)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "unknown vb.output.mode '%s', usable values: %s".formatted(v, Arrays.toString(values()))));
+    }
 }
 ```
 
@@ -324,8 +461,8 @@ long replay(TxBuffer bucket, MessagePipe pipe, Consumer<TxChange> sink) {
 
 `TxBuffer` 增字段（javadoc：reader 追加期自增、交接后只读、 Begin.expectedChanges 来源）：`long unitCount;`
 `TransactionAssembler.appendUnit`（或 collectOids/appendIndex 调用处）加 `bucket.unitCount++;`
-`Transaction.java` javadoc 换角色（"2.0 起由 TransactionCollector 重组产出，不再是 consumer 直接交付物"），record 定义零改动。
-`ConsoleListener`：`onTransaction` 删除，新增实例字段 `private int rowSeq;`（javadoc 注明：事务内行号，Begin 清零，线程限定 consumer——实例从无状态变轻状态）与：
+`Transaction.java` javadoc 换角色（"2.0 起为 block 模式交付单元 + 流式重组值对象"），record 定义零改动。
+`ConsoleListener`：实现 **`TransactionListener` 与 `BlockTransactionListener` 双契约**——既有 `onTransaction(Transaction)` 渲染**原样保留**（签名加 `implements BlockTransactionListener`；`changes=N` 取 `transaction.changes().size()`，1.7 行为不变）；新增实例字段 `private int rowSeq;`（javadoc 注明：事务内行号，Begin 清零，线程限定 consumer——流式渲染路径从无状态变轻状态）与流式 `onEvent`：
 
 ```java
 @Override
@@ -343,13 +480,26 @@ public void onEvent(TransactionEvent event) {
 }
 ```
 
-（`renderChange` 零改动；类 javadoc 双角色段同步。）
+（`renderChange` 两路径共享零改动；类 javadoc 改述：双契约实现者——流式直渲染 / block 经适配器走 onTransaction；流式头行 `changes=N` 为 expected（aborted 过滤前）、block 为实际条数，仅含子事务回滚的事务两模式头行有差异，javadoc 注明。）
+
+`Main.java` 接线（替换原 listener 直传处）：
+
+```java
+OutputMode mode = OutputMode.fromSystemProperties();
+LOG.info("输出形态: mode={}", mode);
+TransactionListener output = mode == OutputMode.BLOCK
+        ? new BlockOutputAdapter(console)   // 1.7 语义逃生门：原子交付、O(事务) 堆
+        : console;                          // 流式直渲染：O(单条) 堆
+// 组装器构造的第一参传 output
+```
+
+（javadoc 与启动日志同步两模式语义；配置缺失/非法启动期 fail-fast 沿 OutputMode 解析。）
 
 - [ ] **Step 4: 测试侧迁移（断言零改动）**
 
 - `TransactionAssemblerTest` 两个 `run(...)` 夹具：`out::add` 换 `TransactionCollector`（返回 `collector.transactions()`）；`handedOffBucketConstrainsPipeWatermark` 的阻塞 listener `t -> {...}` 换 `e -> { inCallback.countDown(); await... }`（阻塞点任意事件即可）
 - `BucketReplayerTest`：驱动处 `List<TxChange> changes = new ArrayList<>(); replayer.replay(bucket, pipe, changes::add)`——既有断言对着该列表，零改动
-- `ConsoleListenerTest`：onTransaction 用例改经 onEvent 序列断言（构造 Begin/变更/End 事件喂入，捕获 CDC 日志断言与现有格式字符串逐字节一致——`changes=N` 取 Begin.expectedChanges）
+- `ConsoleListenerTest`：既有 onTransaction 断言**原样保留**（block 渲染路径回归）；新增 onEvent 序列断言（构造 Begin/变更/End 事件喂入，捕获 CDC 日志断言与现有格式字符串一致——流式头行 `changes=N` 取 Begin.expectedChanges，无 aborted 过滤时与 block 输出逐字节一致）
 - `DecoupledEquivalenceTest`：两侧 listener 换 `TransactionCollector`，`assertEquals(syncOut, asyncOut)` 断言零改动（Task 3 再升级为事件流全等）
 - `BenchPipeBridge.replay()`：内部 `List<TxChange> out = new ArrayList<>(); replayer.replay(bucket, pipe, out::add); return out;`（编译适配；Task 5 改计数口径）
 - 其余引用 `onTransaction` 的测试按编译器指引逐一迁移（原则：**断言值零改动**，只换驱动形态）
@@ -415,9 +565,10 @@ class StreamingDeliveryTest {
 
 （`awaitForever` = latch await 带超时的私有辅助；骨架按注释展开为完整实现，断言三件套：变更已出、End 未出、事务未完成。）
 
-- [ ] **Step 2: DecoupledEquivalenceTest 升级事件流全等**
+- [ ] **Step 2: DecoupledEquivalenceTest 升级事件流全等 + block 模式等价**
 
 两侧 listener 改为 `List<TransactionEvent> events = new ArrayList<>(); event -> events.add(event)`（收集完整事件流含头尾），断言 `assertEquals(syncEvents, asyncEvents)`——比 List\<Transaction\> 更严（头尾元数据进断言）。原 Transaction 收集器断言保留为第二断言（双保险）。
+**block 模式等价（spec §5.1）**：同一字节流再跑一异步组装器，listener = `new BlockOutputAdapter(blockOut::add)`，断言 `blockOut` 与收集器重组结果全等——两模式输出语义一致性入验收。
 
 - [ ] **Step 3: 跑测 + 全量 + 提交**
 
@@ -464,7 +615,7 @@ git add -A && git commit -m "test(it): 三组 IT 迁移事件契约（阻塞点=
 - [ ] **Step 1: 基准口径迁移**——`BenchPipeBridge` 增 `long replayCounting()`（`replayer.replay(bucket, pipe, c -> {})` 返回条数；原 `replay()` 保留或删除以实际引用定）；`PipePathBenchmark.replayBucket` 计时体改 `return state.piped.replayCounting();`（返回 long 防死码）；`AssembleMemoryBenchmark` 的 `tx -> { }` listener 形态随编译器指引迁移。
 - [ ] **Step 2: 换血后 gc 对照**——Task 1 Step 5 同命令重跑 `replayBucket -prof gc`，`/tmp/m20-gc-after.txt`；两侧 `gc.alloc.rate.norm` 差值入档（如实标注口径：列表累积与 List.copyOf 的分配消失；"堆峰 O(单条)"的结构论证单独一段，不与该数字混同）。
 - [ ] **Step 3: baseline 2.0 段**——契约变更说明 + replayBucket 前后（含 gc.norm）+ AssembleMemory 复测 + 口径注记（jmh/CLAUDE.md 四/五基准表同步）。
-- [ ] **Step 4: 文档同步**——根 CLAUDE.md（里程碑状态 2.0：流式输出契约/输出格式不变/frontier 锚 End/TxBuffer.unitCount；`mvn test` 用例数更新）；replication/CLAUDE.md（TransactionListener/TransactionCollector/TransactionEvent 节 + TransactionConsumer/BucketReplayer 2.0 形态 + ConsoleListener 轻状态注记）；README（若引用输出格式/契约则同步）。
+- [ ] **Step 4: 文档同步**——根 CLAUDE.md（里程碑状态 2.0：流式输出契约/双形态 vb.output.mode 配置/frontier 锚 End/TxBuffer.unitCount；运行 Main 段补 `-Dvb.output.mode=streaming|block`；`mvn test` 用例数更新）；replication/CLAUDE.md（TransactionListener/BlockTransactionListener/BlockOutputAdapter/OutputMode/TransactionCollector/TransactionEvent 节 + TransactionConsumer/BucketReplayer 2.0 形态 + ConsoleListener 双契约与轻状态注记）；README（若引用输出格式/契约则同步）。
 - [ ] **Step 5: 全量 + 提交**
 
 Run: `mvn clean test`（Docker 在位含 IT）

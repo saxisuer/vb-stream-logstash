@@ -4,7 +4,7 @@
 
 1.7 完成读取与组装输出解耦后，回放期的堆峰值仍是 **O(事务大小)** 的无界角落：`BucketReplayer.replay` 虽逐条回读 CQ（原始字节任何时刻只有一条在堆），但解码产物累积进 `List<TxChange>`，攒齐整事务才封箱 `Transaction` 一次性回调 `onTransaction`——解码形态比原始字节膨胀 2~4×，1GB 流式事务的回放瞬间堆峰 2~4GB。原因不在 CQ 读法，在**输出契约**：整块不可变事务 + "不允许输出半截事务"的构造保证。
 
-**目标：把输出契约改为流式事件交付（事务头 → 逐变更 → 事务尾），回放期堆峰值从 O(事务) 降到 O(单条)。** 交付机制变、输出格式不变（`TXN-BEGIN`/逐行/`TXN-END` 逐字节一致）；reader 侧唯一改动是桶单元计数一个 long。
+**目标：把输出契约改为流式事件交付（事务头 → 逐变更 → 事务尾），回放期堆峰值从 O(事务) 降到 O(单条）；流式/整块双形态经 `vb.output.mode` 配置切换**——内部回放路径恒流式（单实现），block 形态是输出边界的重组适配器（恢复 1.7 的原子交付与 O(事务) 堆语义，作为逃生门保留）。交付机制变、输出格式不变（`TXN-BEGIN`/逐行/`TXN-END` 逐字节一致）；reader 侧唯一改动是桶单元计数一个 long。
 
 **完成判据**：既有全部用例经 `TransactionCollector` 断言零改动通过；同步/异步**完整事件流**全等；流式时序用例证明输出先于回放完成；JMH `-prof gc` 前后对照（replayBucket 口径分配率显著下降）入档 baseline；`mvn clean test` 全绿。
 
@@ -13,7 +13,7 @@
 | 决策点 | 结论 | 备注 |
 |---|---|---|
 | 契约形状 | **sealed 事件单回调**（`TransactionEvent` permits Begin/End/TxChange，`onEvent(TransactionEvent)`） | 与 `TxChange` 既有 sealed 习惯同构；单回调=单一背压点；未来 Logstash 下游拿一种事件类型 |
-| 兼容策略 | 破坏性替换 + 测试收集器 | 仓库内一次迁移；`Transaction` record 保留换角色为"重组值对象" |
+| 兼容策略 | **双形态配置切换**：内部回放恒流式，`vb.output.mode=streaming\|block`（默认 streaming）切换输出边界 | block = `BlockOutputAdapter` 在边界重组整块转发 `BlockTransactionListener.onTransaction`（1.7 契约保留改名）——完整恢复 1.7 可观测语义（原子交付、半截事务零输出、O(事务) 堆）；仓库内一次迁移到流式主契约，测试等价币用收集器 |
 | 中途失败 | **fail-fast 截断** | 已输出条数进 ERROR 日志；frontier 不推进（End 未达）→ 重启整事务重发（at-least-once，下游可能见重复头行，文档化）；为未来非 fail-fast 下游预留 onAbort 属后续里程碑（YAGNI） |
 | 事务条数 | reader 桶记账恢复单元计数 | `TxBuffer.unitCount`（每单元 long 自增）→ `Begin.expectedChanges`——`TXN-BEGIN` 保持 `changes=N` 格式 |
 
@@ -33,8 +33,11 @@ public sealed interface TransactionEvent permits TransactionEvent.Begin, Transac
 ```
 
 - **`TxChange` 直接 `implements TransactionEvent`**（permits 列它，不包 Change 壳）——逐条零额外分配；`TxChange` 自身仍是 sealed（RowChange/TruncateChange/MsgChange），两层 sealed 叠加合法且同构于既有习惯
-- `TransactionListener` 重定义：`void onEvent(TransactionEvent event)`（仍 @FunctionalInterface）；旧 `onTransaction(Transaction)` 删除
-- **`Transaction` record 保留、换角色**：不再由 consumer 产出；javadoc 改述为"事件流的重组值对象（测试等价币/未来需要整块的下游用）"
+- `TransactionListener` 重定义：`void onEvent(TransactionEvent event)`（仍 @FunctionalInterface，流式主契约）
+- **`BlockTransactionListener`（新命名，保留 1.7 契约）**：`void onTransaction(Transaction transaction)`——block 模式下整块消费者的 API；javadoc 注明 2.0 起为非默认形态
+- **`BlockOutputAdapter implements TransactionListener`（新，主代码）**：Begin 开桶攒 TxChange、End 封箱转发 `BlockTransactionListener.onTransaction` 后丢弃（事务级转发，不累积历史——区别于测试收集器）；中途异常时攒的内容随适配器失败丢弃，下游零输出（1.7 原子性由此恢复）
+- **`OutputMode`（新枚举，主代码）**：`STREAMING`/`BLOCK`；`fromSystemProperties()` 读 `vb.output.mode`（默认 STREAMING；未知值抛 IllegalArgumentException 附可用值，风格同 rollCycle 解析）
+- **`Transaction` record 保留、换角色**：block 模式的交付单元 + 流式形态的重组值对象；javadoc 双角色改述
 - 新增公开 **`TransactionCollector implements TransactionListener`**（replication 包）：Begin 开桶、逐 TxChange 攒入、End 封箱 `Transaction` 并 expose `List<Transaction> transactions()`；流合法性校验 fail-fast——End 无 Begin、Begin 内嵌 Begin、End 的 xid 与开启的 Begin 不匹配、`emitted > expected` 抛 ISE（**emitted < expected 合法**——aborted 子事务过滤的正常结果；每个用它的测试免费获得事件流形状检查）
 
 ## 3. 组件与数据流
@@ -51,7 +54,8 @@ processBucket（consumer 线程）：
 - **`TxBuffer`** 增 `long unitCount`（reader 追加期 `appendUnit` 内自增；非冻结面——LIVE 期写、交接后只读）
 - **`BucketReplayer.replay`**：签名改 `(TxBuffer, MessagePipe, Consumer<TxChange> sink) → long emitted`——不再构造 List；aborted 过滤、decodeSingle、快照 asOf 渲染逐条原样；返回值为过滤后交付数
 - **`TransactionConsumer`**：如上伪码；sink 包装为 `c -> { emitted++; listener.onEvent(c); }` 使已输出计数在异常路径存活（ERROR 日志标注 xid 与已输出条数）；空桶产出 Begin + End(0)（对应现在的空 changes 事务，合法）
-- **`ConsoleListener`**：实现 `onEvent` 三段渲染——Begin 打现格式 `TXN-BEGIN xid= kind= gid= commitLsn= commitTs= changes=N`（N=expected）；TxChange 打 `  [i] ...`（行号 `i` 为实例字段，Begin 时清零——ConsoleListener 从无状态变轻状态，线程限定 consumer 线程，javadoc 注明）；End 打现格式 `TXN-END   xid=`。**输出格式与 1.7 逐字节一致**
+- **`ConsoleListener` 双实现**：`onEvent` 三段渲染（流式）+ `onTransaction`（1.7 渲染原样保留），共享 `renderChange`——Begin 打现格式 `TXN-BEGIN ... changes=N`；TxChange 打 `  [i] ...`（行号 `i` 为实例字段，Begin 时清零——流式渲染下 ConsoleListener 从无状态变轻状态，线程限定 consumer 线程，javadoc 注明）；End 打现格式 `TXN-END   xid=`。**输出格式与 1.7 逐字节一致，一处注记例外**：流式头行的 N 是 expectedChanges（aborted 过滤前），block 的 N 是实际条数——仅含子事务回滚的事务两模式有差异，如实入档
+- **`Main` 装配按模式接线**：`OutputMode mode = OutputMode.fromSystemProperties()`；STREAMING → listener 直传 console（onEvent）；BLOCK → `new BlockOutputAdapter(console)`。`TransactionConsumer`/replayer 对模式无感知（内部恒流式）。frontier 两模式同规则：End 事件处理完毕即推进（block 的 End 处理 = 适配器转发 + onTransaction 返回）
 - **frontier 契约注记**：End 返回 = 下游确认完整消费（下游必须在 End 返回前完成落盘/投递）；End 未达（异常/阻塞）则该事务不推进前沿
 - reader 侧唯一改动 = `unitCount`；MessagePipe/桶状态机/两个低水位/节流/交接协议零触碰
 
@@ -61,7 +65,7 @@ processBucket（consumer 线程）：
 
 ## 5. 测试与验收
 
-1. **等价面**：既有全部组装器/回放器用例经 `TransactionCollector` 断言零改动（夹具内部 `out::add` 换收集器）；`DecoupledEquivalenceTest` 升级为完整事件流全等（同步 vs 异步，头尾进断言——比 List\<Transaction\> 更严）
+1. **等价面**：既有全部组装器/回放器用例经 `TransactionCollector` 断言零改动（夹具内部 `out::add` 换收集器）；`DecoupledEquivalenceTest` 升级为完整事件流全等（同步 vs 异步，头尾进断言——比 List\<Transaction\> 更严）；**block 模式等价**：`BlockOutputAdapter` 的转发序列与 `TransactionCollector` 重组结果全等（同一事件流两边界产物一致），`OutputMode` 解析用例（默认/合法值/未知值 fail-fast）
 2. **流式时序证明**（新用例）：listener 在第一条 TxChange 后 countDown latch，主线程断言此刻 `processBucket` 尚未返回（Future 未完成）——直接证明"边回放边输出"
 3. **堆峰验收**：结构论证（消费路径无累积容器）+ JMH `-prof gc` 前后对照（replayBucket 口径分配率下降）入档 baseline 2.0 段
 4. **IT**：DecoupledPipelineTest 三场景经收集器全等断言；ReaderUnblockedTest/FrontierCapTest 的阻塞 listener 迁移到 `onEvent`（阻塞点选 Begin 后首条 TxChange 或 End，语义等价——frontier 在 End 后，FrontierCap 阻塞 End 更贴切）
@@ -76,7 +80,7 @@ processBucket（consumer 线程）：
 
 ## 7. 交付物
 
-- `replication` 包：`TransactionEvent`（新）、`TransactionCollector`（新）、`TransactionListener` 重定义、`TxChange implements TransactionEvent`、`TxBuffer.unitCount`、`BucketReplayer.replay` 签名改造、`TransactionConsumer` 流式化、`Transaction` javadoc 换角色
-- `ConsoleListener.onEvent` 三段渲染（格式不变）；`Main` 装配（listener 直传 console）
+- `replication` 包：`TransactionEvent`（新）、`TransactionCollector`（新）、`BlockTransactionListener`（1.7 契约保留改名）、`BlockOutputAdapter`（新）、`OutputMode`（新）、`TransactionListener` 重定义、`TxChange implements TransactionEvent`、`TxBuffer.unitCount`、`BucketReplayer.replay` 签名改造、`TransactionConsumer` 流式化、`Transaction` javadoc 换角色
+- `ConsoleListener` 双实现（onEvent 流式渲染 + onTransaction 1.7 渲染保留）；`Main` 按 `vb.output.mode` 接线
 - 测试迁移 + 新增（流式时序/事件流等价/收集器校验）+ 基准迁移 + baseline 2.0 段
 - 文档：根/replication CLAUDE.md、jmh/CLAUDE.md、README 同步
