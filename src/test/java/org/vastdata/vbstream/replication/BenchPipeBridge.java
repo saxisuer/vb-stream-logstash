@@ -7,7 +7,6 @@ import org.vastdata.vbstream.protocol.StreamingMode;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -22,8 +21,9 @@ import java.util.Objects;
  *
  * <p>回放语义与 {@code TransactionConsumer#processBucket} 的**回放半程**同构：逐段
  * {@code readRange}（携带 index 作 seq）→ aborted 过滤（基准桶恒空集）→ decodeSingle →
- * 按桶内 {@link RelationSnapshot} 的 asOf 渲染；封箱 {@code Transaction}、listener 回调与
- * 前沿累加不在基准面（它们是消费循环的输出侧，非回放成本）。{@link #dump} 的记账循环则与
+ * 按桶内 {@link RelationSnapshot} 的 asOf 渲染为 TxChange 交 sink（2.0 流式交付形态，
+ * 桥侧 {@code replayCounting()} 以零分配 sink 计数交付条数）；Begin/End 头尾事件、listener
+ * 回调与前沿累加不在基准面（它们是消费循环的输出侧，非回放成本）。{@link #dump} 的记账循环则与
  * {@code TransactionAssembler#onRaw} 的 reader 侧同构：每条消息先 append 取 index 作 seq、
  * 'R' 以到达 seq 记入版本日志、数据单元窥 oid 后把 index 记入连续段——差异仅一处：真实组装器
  * 按事务边界分桶，本桥把全部匹配捕获条件的单元记进**单个基准桶**（协议的桶级 hasPrefix 不变量
@@ -53,22 +53,21 @@ public final class BenchPipeBridge {
         }
 
         /**
-         * 责任：回放本桶（管道回放口径的计时体，与 {@code TransactionConsumer#processBucket}
-         * 的回放半程同构）。
+         * 责任：回放本桶并返回交付条数（管道回放口径的计时体，与
+         * {@code TransactionConsumer#processBucket} 的回放半程同构——2.0 sink 形态）。
          * 关键步骤：逐段 readRange 回读副本（index 随行作 seq）→ aborted 过滤（基准桶恒空集，
-         * 不触发）→ decodeSingle → 按桶内 RelationSnapshot 的 asOf 渲染为 TxChange。
-         * 边界与异常语义：空桶（未捕获任何单元）返回空列表；readRange 起点错位 / Relation
+         * 不触发）→ decodeSingle → 按桶内 RelationSnapshot 的 asOf 渲染为 TxChange 交 sink。
+         * 计时体零分配 sink（{@code c -> {}}）：TxChange 的逐条分配仍是回放路径的真实成本
+         * （sink 收到即弃，JIT 可逃逸分析），消失的只是基准旧口径里消费器不再做的整桶 List
+         * 攒集——这正是 2.0 前后 gc 对照的口径差（docs/benchmarks-baseline.md 2.0 段）。
+         * 边界与异常语义：空桶（未捕获任何单元）返回 0；readRange 起点错位 / Relation
          * miss / 协议错位按底层 fail-fast 上抛；快照在 dump 尾部预构（registry.snapshot），
-         * 本方法零 registry 访问。2.0 起底层 replay 为 sink 交付——本桥内部以列表收件攒回
-         * List（编译适配的过渡形态，把消费器不再做的"整桶物化"留在这里，Task 5 随基准口径
-         * 一并改造）。
+         * 本方法零 registry 访问。
          *
-         * @return 回放产物（与捕获单元一一对应、按段序保序）
+         * @return 交付条数（aborted 过滤后；基准桶与捕获单元数一致）
          */
-        public List<TxChange> replay() {
-            List<TxChange> out = new ArrayList<>();
-            replayer.replay(bucket, pipe, out::add);
-            return out;
+        public long replayCounting() {
+            return replayer.replay(bucket, pipe, c -> { });
         }
 
         /**

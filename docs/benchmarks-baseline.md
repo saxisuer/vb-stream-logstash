@@ -1,4 +1,4 @@
-# JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段）
+# JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段，2.0 Task 5 增输出契约换血对照段）
 
 五个 JMH 基准（`src/jmh/java/org/vastdata/vbstream/bench/`，`-Pjmh` 档才参与编译）以**真实录制语料**
 离线回放，度量 pgoutput 解码、路由窥探、组装总成本与管道路径（`MessagePipe` append / 冻结桶回放）
@@ -50,15 +50,15 @@ java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" \
 | 类型分布 | B=11, C=11, I=30, U=9, D=5, R=4, S=6, E=6, c=1, A=1（10 种） |
 | 场景覆盖 | 类型边界值 INSERT/UPDATE/DELETE、TOAST 'u' 标志、REPLICA IDENTITY FULL 全列 old tuple 与 Relation 重发、流式大事务提交（StreamStart/Stop/StreamCommit 分段）与流式回滚（StreamAbort） |
 
-## 基准口径（1.7 形态）
+## 基准口径（2.0 形态；Decode/RoutePeek/两 append/归因口径自 1.7 沿用未变）
 
 | 基准 | 计时体 | 模式/单位 |
 |---|---|---|
 | `DecodeBenchmark.decodeOne` | 顺序态 `PgOutputDecoder`（PARALLEL）按序推整语料，一条消息完整解码 | avgt，µs/条 |
 | `RoutePeekBenchmark.peekRoute` | 同语料同游标，仅类型字节 + 流式块内 Int32 xid 前缀窥探（1.6 沿用口径，与 `TransactionAssembler.onRaw` 路由窥探同构） | avgt，ns/条 |
 | `RoutePeekBenchmark.peekRouteWithOid` | 同上另窥数据消息 relation oid（I/U/D 单 Int32、T 数组、M 无——与 1.7 追加期 `collectOids` 同构，oidSet 供交接快照圈定） | avgt，ns/条 |
-| `AssembleMemoryBenchmark.assembleWholeCorpus` | **同步形态** `TransactionAssembler`（不开 consumer 线程）逐条吃整份语料一轮（append + 路由/oid 窥探 + 桶段记账 + 交接快照 + 回放解码渲染；listener/observer no-op；类名沿用 1.6 保持序列对照） | avgt，ms/轮 |
-| `PipePathBenchmark.replayBucket` | 预构造 2000 单元冻结桶（语料回卷 100 轮、捕获流式块内单元，≈32.8MB；经 `BenchPipeBridge` 走组装器 reader 侧同构的 append 记账落盘），逐段 readRange + decodeSingle + 快照 asOf 渲染（`TransactionConsumer.processBucket` 的回放半程） | avgt，ms/桶 |
+| `AssembleMemoryBenchmark.assembleWholeCorpus` | **同步形态** `TransactionAssembler`（不开 consumer 线程）逐条吃整份语料一轮（append + 路由/oid 窥探 + 桶段记账 + 交接快照 + 回放解码渲染；listener 为 2.0 流式契约 `onEvent` 的 no-op 形态、observer 亦 no-op；类名沿用 1.6 保持序列对照） | avgt，ms/轮 |
+| `PipePathBenchmark.replayBucket` | 预构造 2000 单元冻结桶（语料回卷 100 轮、捕获流式块内单元，≈32.8MB；经 `BenchPipeBridge` 走组装器 reader 侧同构的 append 记账落盘），逐段 readRange + decodeSingle + 快照 asOf 渲染交**零分配 sink 计数**（`TransactionConsumer.processBucket` 的回放半程，2.0 流式交付形态——不攒整桶 List，返回交付条数） | avgt，ms/桶 |
 | `PipePathBenchmark.appendOneMessage` | 向管道追加一条裸消息字节（21B 最小真实数据消息，无帧化——一条 CQ 记录即一条完整消息；计时体只剩 writeBytes + index 取回） | thrpt，ops/s |
 
 ## 结果表
@@ -127,6 +127,7 @@ MEMORY 对照，unframe 亦随帧退役）。
 | RoutePeekBenchmark.peekRouteWithOid | avgt | ns/条 | 较 peekRoute + ___ ns |
 | AssembleMemoryBenchmark.assembleWholeCorpus | avgt | ms/轮 | µs/条 |
 | PipePathBenchmark.replayBucket | avgt | ms/桶 | µs/单元；GB/s |
+| PipePathBenchmark.replayBucket:gc.alloc.rate.norm（`-prof gc` 档） | avgt | B/op | 2.0 前后对照入档（见 2.0 段） |
 | PipePathBenchmark.appendOneMessage | thrpt | ops/s | MB/s（×21B/条） |
 
 ### 1.7.1 组装成本归因（2026-08-29，三腿互证）
@@ -285,6 +286,51 @@ Task 2 审查约束"⑧ 的 6~16% 区间不得直接翻修复决策，须先补�
 - 回归护栏：`MessagePipeTest` 既有 4 用例零改动全绿 + 新增节流用例
   `releaseBelowSkipsScanUntilNeededCycleAdvances`（同档跳过/档位推进补删/真实数据文件保留）；
   `mvn clean test` 144 用例全绿（143 + 新增 1）。
+
+### 2.0 输出契约换血对照（2026-08-29，Task 5；存证 `gc-before.txt` / `gc-after.txt` / `assemble-after.txt`，SDD 目录）
+
+**契约变更**（设计 `docs/superpowers/specs/2026-08-29-transaction-streaming-output-design.md`）：输出契约从
+`onTransaction(Transaction)` 整块交付换为 `onEvent(TransactionEvent)` 流式交付
+（`Begin → TxChange* → End`，单回调单背压点，End 返回 = 完整消费确认、前沿随之推进）；
+`BucketReplayer.replay` 改 sink 签名（逐条交付不再攒 List，返回交付条数）；block 形态
+（`vb.output.mode=block`）经 `BlockOutputAdapter` 在输出边界攒回整块（恢复 1.7 原子交付与
+O(事务) 堆语义的逃生门）。基准面随之迁移：`BenchPipeBridge.replay()`（内部攒 List 的编译过渡
+形态）→ **`replayCounting()`**（零分配 sink `c -> {}`，返回交付条数防死码）；
+`AssembleMemoryBenchmark` 的 no-op listener 迁到 2.0 契约零操作形态（`event -> {}`）。
+Decode / RoutePeek / 两 append / AssemblyAttribution 不触碰输出契约（路径零改动），未复测。
+
+**replayBucket 前后对照**（gc 档 `-f 1 -w 3s -r 5s -prof gc`，5 个 `--add-opens` 等号单 token
+形式自带；前 = 换血前 1.7 整块回放形态，后 = 2.0 sink 计数形态；同机同 JDK 同日）：
+
+| 指标 | 换血前（1.7 整块回放） | 换血后（2.0 sink 计数） | Δ |
+|---|---|---|---|
+| avgt | 11.858 ± 0.559 ms/op | 12.690 ± 0.506 ms/op | 99.9% CI 重叠（[11.298, 12.417] vs [12.184, 13.196]），无统计显著变化 |
+| **gc.alloc.rate.norm** | **99,889,660.223 ± 440.242 B/op**（≈95.27 MB/op） | **99,856,145.687 ± 505.797 B/op**（≈95.23 MB/op） | **−33,514.536 B/op（≈32.7 KiB/op，≈0.034%）** |
+| gc.alloc.rate | 8033.671 ± 382.906 MB/sec | 7503.527 ± 292.533 MB/sec | — |
+| gc.count / gc.time | 204 counts / 437 ms | 345 counts / 251 ms | 同量分配总量下 young GC 切分差异（分配微降使触发点分布变化），非语义信号 |
+
+**口径注记（如实入档，勿过度解读）**：
+
+- Δ≈32.7 KiB/op 恰为旧口径回放器内部 **2000 元素 ArrayList 攒集**的量级（backing array 增长
+  拷贝与废弃数组合计）——这是**本基准面上消失的全部份额**，与"逐条 TxChange + 解码元组"的
+  大头（≈47.5 KB/单元）相比可忽略，故降幅百分比极小属预期而非异常。
+- `List.copyOf` 与 `Transaction` 封箱分配**从未在本基准面**（1.7 计时体只测回放半程，封箱在
+  consumer 的封箱步）——线上 streaming 形态相对 1.7 实际免除的分配 = 回放期 List 攒集 +
+  封箱 `List.copyOf` + `Transaction` 包装，其中基准可测的只有第一项；block 形态经
+  `BlockOutputAdapter` 仍全额支付（攒集 + `List.copyOf` + 封箱，且攒集 List 有 ArrayList
+  高水位保留——clear 不缩容）。
+- **gc.alloc.rate.norm 度量分配速率，不是存活堆峰**：readRange 载荷副本（≈16.4 KB/单元）与
+  解码元组/record/字符串在两形态都在——这是"逐条交付"本身的成本（TxChange 仍逐条构造，
+  streaming 下 sink 收到即弃、成为即死对象，young GC 回收代价极低）。**"回放期堆峰
+  O(单条)"是结构性结论，不依赖也不由该数字证明**：2.0 消费路径无任何跨单元累积容器
+  （`processBucket` 逐条经 sink 交付、桶元数据只有 index 段与两个事件对象，TxChange 与
+  载荷副本在下一单元回放时即不可达）；1.7 形态的回放期堆峰则为 O(事务)（`List<TxChange>`
+  攒齐 + 封箱 `Transaction` 同刻存活，解码形态较原始字节膨胀 2~4×）。
+
+**assembleWholeCorpus 复测**（冒烟档 `-f 1 -w 1s -r 2s`，与 1.7 基线行同档）：
+**0.925 ± 0.331 ms/轮**（≈11.0 µs/条）——与 1.7 基线 1.395 ± 0.153、1.7.1 修复后
+0.761 ± 0.107 均 CI 重叠、同量级：2.0 契约换血对组装主路径成本无统计可见影响（每桶新增的
+Begin/End 事件对象为每轮 12 组 record，量级可忽略；no-op listener 交付零成本）。
 
 ## 已知口径限制
 

@@ -26,7 +26,8 @@ import java.util.concurrent.TimeUnit;
  * **同步** {@link TransactionAssembler}（不开 consumer 线程——交接在调用线程直调
  * processBucket）逐条吃进**整份语料**，测"一个完整语料轮次的组装总成本"（ms/轮，含
  * pipe.append、路由窥探与 oid 窥探、桶段记账、交接快照拷贝、回放解码与 Relation 快照 asOf
- * 渲染；listener/observer 均为 no-op）。与 {@link PipePathBenchmark} 的回放口径对照可见
+ * 渲染；listener/observer 均为 no-op——2.0 起 listener 契约为流式 onEvent，no-op 即零交付
+ * 成本口径）。与 {@link PipePathBenchmark} 的回放口径对照可见
  * 回放半程在总成本中的占比；与 {@link DecodeBenchmark} 对照可见组装开销中解码的占比。
  * 1.7 解耦后线上真实形态是异步（reader 记账 + consumer 回放分线程），本基准的同步形态把
  * 两半程合并在单线程计量——两边之和即端到端成本，异步拆分本身只挪线程不改总量。
@@ -53,7 +54,9 @@ public class AssembleMemoryBenchmark {
 
     /**
      * 责任：加载语料、建临时目录、组装 no-op listener/observer 的同步形态组装器（构造即建管道
-     * 并起零线程——同步形态无 consumer）。
+     * 并起零线程——同步形态无 consumer）。listener 为 2.0 流式契约 {@code onEvent} 的零操作
+     * 形态（Begin/End 头尾与逐 TxChange 全部即时丢弃——纯组装/回放成本口径；每桶的 Begin/End
+     * 事件对象分配仍在路径上，量级为每轮 12 组 record，可忽略）。
      * 边界：语料缺失按 BenchCorpus 带指引异常失败；管道建立失败（磁盘/IO）按 Chronicle 异常
      * 上抛；临时目录建失败按 IOException 上抛。
      */
@@ -61,7 +64,7 @@ public class AssembleMemoryBenchmark {
     public void setup() throws Exception {
         corpus = BenchCorpus.load();
         pipeDir = Files.createTempDirectory("bench-assemble-sync");
-        assembler = new TransactionAssembler(tx -> { }, StreamingMode.PARALLEL,
+        assembler = new TransactionAssembler(event -> { }, StreamingMode.PARALLEL,
                 new VersionedRelationRegistry(),
                 new PipeConfig(pipeDir, LegacyRollCycles.MINUTELY),
                 (msg, view) -> { });

@@ -11,7 +11,6 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.vastdata.vbstream.replication.BenchPipeBridge;
-import org.vastdata.vbstream.replication.TxChange;
 import org.vastdata.vbstream.replication.VersionedRelationRegistry;
 
 import java.io.IOException;
@@ -22,10 +21,12 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 管道路径基准（1.7 Task 9，原 SpillPathBenchmark 换口径重建）：预构造一个 N=2000 单元的
- * 冻结桶（语料回卷填充，经 {@link BenchPipeBridge} 走与组装器 reader 侧同构的 append 记账
- * 循环落盘），计时**回放**（逐段 readRange 回读副本 + decodeSingle + 快照 asOf 渲染——即
- * {@code TransactionConsumer.processBucket} 的回放半程，consumer 线程的真实工作负载）；
+ * 管道路径基准（1.7 Task 9，原 SpillPathBenchmark 换口径重建；2.0 Task 5 回放改计数口径）：
+ * 预构造一个 N=2000 单元的冻结桶（语料回卷填充，经 {@link BenchPipeBridge} 走与组装器
+ * reader 侧同构的 append 记账循环落盘），计时**回放**（逐段 readRange 回读副本 +
+ * decodeSingle + 快照 asOf 渲染为 TxChange 交零分配 sink——即
+ * {@code TransactionConsumer.processBucket} 的回放半程，consumer 线程的真实工作负载，
+ * 2.0 流式交付形态：不攒整桶 List，返回交付条数）；
  * 另附 {@code pipe.append} 裸吞吐（reader 线程每条消息的主成本之一，无帧化——一条 CQ 记录
  * 即一条完整消息，1.7 起帧头退役）。
  *
@@ -139,12 +140,14 @@ public class PipePathBenchmark {
     }
 
     /**
-     * 计时体：回放预构造的 2000 单元冻结桶（逐段 readRange + 解码 + 快照 asOf 渲染）。
-     * 返回回放产物（防死码消除；2000 条 TxChange 的分配正是回放路径的真实成本）。
+     * 计时体：回放预构造的 2000 单元冻结桶（逐段 readRange + 解码 + 快照 asOf 渲染，2.0
+     * 计数口径——零分配 sink 收条即弃，返回交付条数）。返回 long（防死码消除；逐条 TxChange
+     * 的分配与解码仍是回放路径的真实成本，消失的只是旧口径的整桶 List 攒集——2.0 前后
+     * gc 对照的口径差见 docs/benchmarks-baseline.md 2.0 段）。
      */
     @Benchmark
-    public List<TxChange> replayBucket(ReplayState state) {
-        return state.piped.replay();
+    public long replayBucket(ReplayState state) {
+        return state.piped.replayCounting();
     }
 
     /**
