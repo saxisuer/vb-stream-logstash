@@ -305,7 +305,7 @@ Decode / RoutePeek / 两 append / AssemblyAttribution 不触碰输出契约（�
 | 指标 | 换血前（1.7 整块回放） | 换血后（2.0 sink 计数） | Δ |
 |---|---|---|---|
 | avgt | 11.858 ± 0.559 ms/op | 12.690 ± 0.506 ms/op | 99.9% CI 重叠（[11.298, 12.417] vs [12.184, 13.196]），无统计显著变化 |
-| **gc.alloc.rate.norm** | **99,889,660.223 ± 440.242 B/op**（≈95.27 MB/op） | **99,856,145.687 ± 505.797 B/op**（≈95.23 MB/op） | **−33,514.536 B/op（≈32.7 KiB/op，≈0.034%）** |
+| **gc.alloc.rate.norm** | **99,889,660.223 ± 440.242 B/op**（≈95.27 MiB/op） | **99,856,145.687 ± 505.797 B/op**（≈95.23 MiB/op） | **−33,514.536 B/op（≈32.7 KiB/op，≈0.034%）** |
 | gc.alloc.rate | 8033.671 ± 382.906 MB/sec | 7503.527 ± 292.533 MB/sec | — |
 | gc.count / gc.time | 204 counts / 437 ms | 345 counts / 251 ms | 同量分配总量下 young GC 切分差异（分配微降使触发点分布变化），非语义信号 |
 
@@ -313,7 +313,7 @@ Decode / RoutePeek / 两 append / AssemblyAttribution 不触碰输出契约（�
 
 - Δ≈32.7 KiB/op 恰为旧口径回放器内部 **2000 元素 ArrayList 攒集**的量级（backing array 增长
   拷贝与废弃数组合计）——这是**本基准面上消失的全部份额**，与"逐条 TxChange + 解码元组"的
-  大头（≈47.5 KB/单元）相比可忽略，故降幅百分比极小属预期而非异常。
+  大头（≈49.9 KB/单元）相比可忽略，故降幅百分比极小属预期而非异常。
 - `List.copyOf` 与 `Transaction` 封箱分配**从未在本基准面**（1.7 计时体只测回放半程，封箱在
   consumer 的封箱步）——线上 streaming 形态相对 1.7 实际免除的分配 = 回放期 List 攒集 +
   封箱 `List.copyOf` + `Transaction` 包装，其中基准可测的只有第一项；block 形态经

@@ -58,7 +58,7 @@ public final class BenchPipeBridge {
          * 关键步骤：逐段 readRange 回读副本（index 随行作 seq）→ aborted 过滤（基准桶恒空集，
          * 不触发）→ decodeSingle → 按桶内 RelationSnapshot 的 asOf 渲染为 TxChange 交 sink。
          * 计时体零分配 sink（{@code c -> {}}）：TxChange 的逐条分配仍是回放路径的真实成本
-         * （sink 收到即弃，JIT 可逃逸分析），消失的只是基准旧口径里消费器不再做的整桶 List
+         * （实测 TxChange 分配未被逃逸分析消除），消失的只是基准旧口径里消费器不再做的整桶 List
          * 攒集——这正是 2.0 前后 gc 对照的口径差（docs/benchmarks-baseline.md 2.0 段）。
          * 边界与异常语义：空桶（未捕获任何单元）返回 0；readRange 起点错位 / Relation
          * miss / 协议错位按底层 fail-fast 上抛；快照在 dump 尾部预构（registry.snapshot），
