@@ -53,8 +53,8 @@
 ## 4. 执行方式
 
 - **IDE rename refactoring**（引用完整 + 文件名同步改），javadoc 内 `{@link}` 引用随动
-- `src/jmh/java` 若引用被改名的类（如 `TransactionRecorder`），随 rename 一并更新，保 JMH 档可编译
-- `src/test/java` 的引用随 rename 自动更新（测试代码引用改、命名风格本身不在审计范围）
+- `src/jmh/java` 对被改名四类**零引用**（已核实），JMH 档不受影响
+- `src/test/java` 的引用随 rename 自动更新（测试代码引用改、命名风格本身不在审计范围）；**以旧类名命名的测试类随之重命名**，否则 §7.3 的 grep 零残留会被类名子串误中：`ConsoleListenerTest` → `ConsoleRendererTest`、`BlockOutputAdapterTest` → `StreamingToBlockAdapterTest`、`TransactionCollectorTest` → `TransactionRecorderTest`
 - **提交分组**（跨机开发，每组 commit + push）：
   1. 输出契约族改名（§3.1 四项，一次原子提交）
   2. `ConsoleListener` → `ConsoleRenderer`（§3.2）
