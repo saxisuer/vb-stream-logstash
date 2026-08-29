@@ -107,6 +107,9 @@ public class PipePathBenchmark {
         /** 最小的真实数据消息字节（21B 主键 DELETE，Setup 一次取出，计时体复用同一数组）。 */
         private byte[] smallest;
 
+        /** 语料中最大的数据消息字节（≈16KB 级、实测为准——每次 append 跨入约 4 个新 mmap 页，冷缺页口径的载荷源）。 */
+        private byte[] largest;
+
         /** 临时管道目录（@TempDir 语义：Setup 建 / TearDown 删）。 */
         private Path dir;
 
@@ -121,6 +124,7 @@ public class PipePathBenchmark {
             pipe = BenchPipeBridge.dump(List.of(), new VersionedRelationRegistry(), true,
                     dir, LegacyRollCycles.MINUTELY);
             smallest = smallestDataMessage(BenchCorpus.load());
+            largest = largestDataMessage(BenchCorpus.load());
         }
 
         /**
@@ -158,6 +162,20 @@ public class PipePathBenchmark {
     }
 
     /**
+     * 计时体（Throughput）：向管道追加一条 ≈16KB 大消息——每次调用把 append 前沿推进约 4 个
+     * 新 mmap 页，稳态下即"每 4KB 一次软缺页 + memcpy"的真实成本（1.7.1 归因的头号嫌疑口径）。
+     * 与 appendOneMessage（21B 热页）差分换算每缺页成本，乘 assembleWholeCorpus 每轮新触页数
+     * （348KB/轮 ≈ 87 页）即得缺页对 17× 差距的预期贡献，与 -prof stack 采样对账。
+     * 返回 index 防死码消除。
+     */
+    @Benchmark
+    @BenchmarkMode(Mode.Throughput)
+    @OutputTimeUnit(TimeUnit.SECONDS)
+    public long appendOneLargeMessage(AppendState state) {
+        return state.pipe.append(state.largest);
+    }
+
+    /**
      * 责任：取语料中最小的数据消息字节（append 吞吐基准的载荷源——最小载荷把磁盘增速压到
      * 冒烟档可承受，同时仍是真实协议形态而非合成字节）。
      * 边界：无数据消息抛 IllegalStateException（录制侧健康断言保证含 I/U/D，理论不可达）。
@@ -178,5 +196,30 @@ public class PipePathBenchmark {
             throw new IllegalStateException("语料中无数据消息（I/U/D/T/M），无法构造 append 载荷");
         }
         return smallest;
+    }
+
+    /**
+     * 责任：取语料中最大的数据消息字节（冷页口径载荷源——大消息 append 每条跨入多个新 mmap 页，
+     * 稳态下每条≈每 4KB 一次软缺页，与热页小消息口径差分即得每缺页成本；不判流式性——口径
+     * 只需要大载荷，流式与否不影响缺页成本形状；当前语料实测最大者为块外 16.5KB 级 Update，
+     * 块内最大为 16.4KB 级 Insert，两者量级一致）。
+     * 边界：无数据消息抛 IllegalStateException（录制侧健康断言保证含 I/U/D）。
+     *
+     * @param corpus 语料消息字节列表
+     * @return 最大的数据消息（I/U/D/T/M 之一）原始字节
+     */
+    private static byte[] largestDataMessage(List<byte[]> corpus) {
+        byte[] largest = null;
+        for (byte[] raw : corpus) {
+            char type = (char) raw[0];
+            if ((type == 'I' || type == 'U' || type == 'D' || type == 'T' || type == 'M')
+                    && (largest == null || raw.length > largest.length)) {
+                largest = raw;
+            }
+        }
+        if (largest == null) {
+            throw new IllegalStateException("语料中无数据消息（I/U/D/T/M），冷页口径不可构造");
+        }
+        return largest;
     }
 }

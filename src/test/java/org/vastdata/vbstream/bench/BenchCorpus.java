@@ -5,7 +5,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 /**
- * 基准语料的统一取用点（Task 13）：四个 JMH 基准类共用的语料路径常量与"缺失即带指引失败"
+ * 基准语料的统一取用点（Task 13）：五个 JMH 基准类共用的语料路径常量与"缺失即带指引失败"
  * 的加载入口。语料由集成测试 {@code it.BenchCorpusRecordTest} 录制生成并提交进库
  * （路径即录制测试的落盘路径，单一事实来源）；基准 {@code @Setup} 一律经 {@link #load()}
  * 取数——文件缺失时抛带修复指引的 {@link IllegalStateException}（JMH 把 @Setup 异常视为
