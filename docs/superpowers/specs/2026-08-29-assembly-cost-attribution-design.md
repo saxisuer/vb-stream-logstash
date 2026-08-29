@@ -22,10 +22,10 @@
 **腿 2——组件微基准**（归因缺口逐个补齐）：
 - **冷页 append**（头号嫌疑）：现有 `appendOneMessage` 是**热页**口径（单管道连续写，mmap 页全热），而组装路径在真实运行中会不断触碰新 mmap 页——每 4KB 一次软缺页（µs 级）足以解释 17× 的大头。新增冷页口径：新鲜页上按页边界跨步 append
 - `BytesStore.wrap` 每消息分配 vs 复用（终审标记过的每消息分配）
-- 每交接 `RelationSnapshot` 拷贝（新 `AssemblyAttributionBenchmark`）
-- 交接队列 put/poll、段记账 + oidSet 窥探（同上，隔离口径）
+- 每交接 `RelationSnapshot` 拷贝（新 `AssemblyAttributionBenchmark`——快照 state 手工灌 2 oid × 2 版本，成本形状由 oid×版本数决定，语料 'R' 真实内容不影响量级）
+- 交接队列 put/poll（同上，隔离口径；段记账 + oidSet 窥探已被既有 `RoutePeekBenchmark.peekRouteWithOid`（≈9 ns/条）覆盖，不重复建口径）
 
-**腿 3——差分检验**：冷/热管道组装对照（`@Setup(Level.INVOCATION)` 每调用新管道——JMH 对重状态 setup 有统计局限，文档注明；对照口径之差不依赖绝对值，结论仍可靠）。
+**腿 3——差分检验**：大/小载荷 append 差分——`appendOneLargeMessage`（≈16KB 大消息，每次调用把 append 前沿推进约 4 个新 mmap 页，稳态即"每 4KB 一次软缺页 + memcpy"）对照 `appendOneMessage`（21B 热页），换算每缺页成本，乘组装一轮新触页数得预期贡献，与腿 1 采样对账。（计划期细化：曾考虑的 `@Setup(Level.INVOCATION)` 每调用新建管道方案被否——建池 ~ms 级开销会污染 1.4ms 的被测体。）
 
 ## 4. 修复菜单与启用准则
 
