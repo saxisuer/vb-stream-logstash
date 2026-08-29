@@ -123,8 +123,8 @@ final class TransactionConsumer implements Runnable {
         long[] emitted = {0L};   // 数组而非 long：lambda 递增 + 异常路径计数存活（fail-fast 截断日志用）
         try {
             replayer.replay(bucket, pipe, change -> {
+                listener.onEvent(change);   // 先交付后计数：listener 自身抛出时该条不计入"已输出"（多报 1 修复）
                 emitted[0]++;
-                listener.onEvent(change);
             });
         } catch (Throwable t) {
             LOG.error("事务流式输出中断（已输出 {}/{} 条）: xid={} firstIndex={}",
