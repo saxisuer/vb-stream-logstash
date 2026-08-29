@@ -4,8 +4,11 @@ import java.util.OptionalLong;
 
 /**
  * 事务内一条变更的密封基接口。实现自带 streamXid 组件（与接口方法同名，record 自动实现）。
+ *
+ * <p>2.0 起 {@link TransactionEvent} 直接 permits 本接口（不包 Change 壳）——逐条变更即一个交付事件、
+ * 零额外分配；自身仍是 sealed（RowChange/TruncateChange/MsgChange），两层 sealed 叠加。
  */
-public sealed interface TxChange permits RowChange, TruncateChange, MsgChange {
+public sealed interface TxChange extends TransactionEvent permits RowChange, TruncateChange, MsgChange {
 
     /**
      * 该变更所属（子）事务的 xid。
