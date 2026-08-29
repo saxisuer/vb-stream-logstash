@@ -33,6 +33,9 @@ final class TxBuffer {
     long firstIndex = -1L;
     long lastIndex = -1L;
     final ArrayDeque<long[]> segments = new ArrayDeque<>();
+    /** 追加的数据单元计数（2.0）：reader 追加期随 appendUnit 自增、交接后只读——
+     *  即 {@link TransactionEvent.Begin#expectedChanges} 的来源（aborted 过滤<b>前</b>的值）。 */
+    long unitCount;
     /** 追加期窥出的 relation oid 集合（I/U/D 单 oid、T 多 oid、M 无）——交接快照圈定范围用。 */
     final Set<Integer> oidSet = new HashSet<>();
     boolean hasPrefix;

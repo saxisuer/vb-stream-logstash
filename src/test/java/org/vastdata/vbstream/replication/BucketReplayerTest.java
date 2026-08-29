@@ -23,7 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * BucketReplayer 专项单测：**绕过组装器**直接以"MessagePipe 追加 + TxBuffer 段记账"驱动回放，
  * 逐机制验证（assembly-spill 设计 §4.4 的机制级切片）——I/U/D 三单元的 RowChange 语义与 Relation
  * 快照嵌入、aborted 子事务过滤（被剔单元不解码不回调）、同 oid 多版本下按单元 seq 的 asOf 渲染
- * （DDL 中途换版不串位）、非数据消息类型的 fail-fast、空桶回放产出空列表（空桶提交路径）。
+ * （DDL 中途换版不串位）、非数据消息类型的 fail-fast、空桶回放零交付（空桶提交路径；
+ * 2.0 起回放为 sink 交付——各用例以列表收件驱动，既有断言零改动）。
  *
  * <p>夹具约定（1.7 起回放契约 = 冻结桶段 × 管道）：单元 payload 字节全部经 {@link PgWire} 构造
  * （流式桶的单元用 {@link PgWire#streamed} 加 Int32 xid 前缀——回放按桶级 hasPrefix 重窥前缀作
@@ -126,7 +127,8 @@ class BucketReplayerTest {
             freeze(bucket, registry);
             BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> observed.add(m));
 
-            List<TxChange> changes = replayer.replay(bucket, pipe);
+            List<TxChange> changes = new ArrayList<>();          // 2.0：sink 驱动——既有断言对着该列表，零改动
+            replayer.replay(bucket, pipe, changes::add);
 
             assertEquals(3, changes.size());
             RowChange c0 = (RowChange) changes.get(0);
@@ -174,10 +176,12 @@ class BucketReplayerTest {
             freeze(plain, registry);
             BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> observed.add(m));
 
-            List<TxChange> streamedChanges = replayer.replay(streamed, pipe);
+            List<TxChange> streamedChanges = new ArrayList<>();
+            replayer.replay(streamed, pipe, streamedChanges::add);
             assertEquals(1, streamedChanges.size());
             assertEquals(OptionalLong.of(TOP), streamedChanges.get(0).streamXid());
-            List<TxChange> plainChanges = replayer.replay(plain, pipe);
+            List<TxChange> plainChanges = new ArrayList<>();
+            replayer.replay(plain, pipe, plainChanges::add);
             assertEquals(1, plainChanges.size());
             assertTrue(plainChanges.get(0).streamXid().isEmpty());
             assertEquals(2, observed.size());              // 两条 SUB 单元被跳过，未发生解码
@@ -204,7 +208,8 @@ class BucketReplayerTest {
             freeze(bucket, registry);
             BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> { });
 
-            List<TxChange> changes = replayer.replay(bucket, pipe);
+            List<TxChange> changes = new ArrayList<>();
+            replayer.replay(bucket, pipe, changes::add);
 
             assertEquals(List.of("t_v1", "t_v2"),
                     changes.stream().map(c -> ((RowChange) c).relation().table()).toList());
@@ -220,11 +225,11 @@ class BucketReplayerTest {
             freeze(bucket, new VersionedRelationRegistry());
             BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> { });
 
-            assertThrows(IllegalStateException.class, () -> replayer.replay(bucket, pipe));
+            assertThrows(IllegalStateException.class, () -> replayer.replay(bucket, pipe, c -> { }));
         }
     }
 
-    /** 无段空桶回放产出空 List（空桶提交路径：Begin 后无变更即 Commit，协议合法）。 */
+    /** 无段空桶回放零交付（空桶提交路径：Begin 后无变更即 Commit，协议合法）。 */
     @Test
     void emptyUnitListReplaysToEmptyChanges() {
         try (MessagePipe pipe = new MessagePipe(pipeDir, LegacyRollCycles.MINUTELY)) {
@@ -232,7 +237,9 @@ class BucketReplayerTest {
             freeze(bucket, new VersionedRelationRegistry());
             BucketReplayer replayer = new BucketReplayer(StreamingMode.ON, (m, v) -> { });
 
-            assertTrue(replayer.replay(bucket, pipe).isEmpty());
+            List<TxChange> delivered = new ArrayList<>();
+            assertEquals(0L, replayer.replay(bucket, pipe, delivered::add));
+            assertTrue(delivered.isEmpty());
         }
     }
 }

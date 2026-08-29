@@ -7,6 +7,7 @@ import org.vastdata.vbstream.protocol.StreamingMode;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -58,12 +59,16 @@ public final class BenchPipeBridge {
          * 不触发）→ decodeSingle → 按桶内 RelationSnapshot 的 asOf 渲染为 TxChange。
          * 边界与异常语义：空桶（未捕获任何单元）返回空列表；readRange 起点错位 / Relation
          * miss / 协议错位按底层 fail-fast 上抛；快照在 dump 尾部预构（registry.snapshot），
-         * 本方法零 registry 访问。
+         * 本方法零 registry 访问。2.0 起底层 replay 为 sink 交付——本桥内部以列表收件攒回
+         * List（编译适配的过渡形态，把消费器不再做的"整桶物化"留在这里，Task 5 随基准口径
+         * 一并改造）。
          *
          * @return 回放产物（与捕获单元一一对应、按段序保序）
          */
         public List<TxChange> replay() {
-            return replayer.replay(bucket, pipe);
+            List<TxChange> out = new ArrayList<>();
+            replayer.replay(bucket, pipe, out::add);
+            return out;
         }
 
         /**

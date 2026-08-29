@@ -2,24 +2,29 @@ package org.vastdata.vbstream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.vastdata.vbstream.replication.BlockOutputAdapter;
+import org.vastdata.vbstream.replication.OutputMode;
 import org.vastdata.vbstream.replication.PgReplicationSession;
 import org.vastdata.vbstream.replication.PipeConfig;
 import org.vastdata.vbstream.replication.ReplicationConfig;
 import org.vastdata.vbstream.replication.TransactionAssembler;
+import org.vastdata.vbstream.replication.TransactionListener;
 import org.vastdata.vbstream.replication.VersionedRelationRegistry;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** 冒烟入口（1.7 解耦形态）：reader 记账 + CQ 管道 + consumer 回放输出——连上复制流后，pgoutput 原始字节经 raw 接缝喂给异步 {@link TransactionAssembler}（数据消息 append 进管道、桶只记 CQ index 段），提交事务交接冻结桶由 transaction-consumer 线程回放成原子事务块打印到控制台；LSN 反馈按输出前沿封顶，Ctrl+C 优雅退出。 */
+/** 冒烟入口（2.0 流式输出形态）：reader 记账 + CQ 管道 + consumer 流式回放——连上复制流后，pgoutput 原始字节经 raw 接缝喂给异步 {@link TransactionAssembler}（数据消息 append 进管道、桶只记 CQ index 段），提交事务交接冻结桶由 transaction-consumer 线程回放成 {@link org.vastdata.vbstream.replication.TransactionEvent} 事件流打印到控制台（默认 STREAMING 直渲染；{@code vb.output.mode=block} 经 {@link BlockOutputAdapter} 重组 1.7 整块语义）；LSN 反馈按输出前沿封顶，Ctrl+C 优雅退出。 */
 public final class Main {
 
     private static final Logger LOG = LoggerFactory.getLogger(Main.class);
 
     /**
-     * 装配并启动复制会话（1.7 双线程形态）：ConsoleListener 一个实例双角色——组装器解码点 observer
-     * （reader 线程的控制消息/'R' live 解码 + consumer 线程的回放解码，逐消息 DEBUG/INFO）与事务回调
-     * （TXN 块 INFO，consumer 线程）。关键步骤：校验配置（含 pipe 配置解析，非法值启动期 fail-fast）
+     * 装配并启动复制会话（2.0 双线程流式形态）：ConsoleListener 一个实例三角色——组装器解码点
+     * observer（reader 线程的控制消息/'R' live 解码 + consumer 线程的回放解码，逐消息
+     * DEBUG/INFO）、流式事件渲染（STREAMING 默认，onEvent 直渲染）与整块渲染（BLOCK 经
+     * {@link BlockOutputAdapter} 回调 onTransaction）。关键步骤：校验配置（含 pipe 与输出形态
+     * 解析，非法值启动期 fail-fast）
      * → 会话 open/ensureSlot/start → reader 线程（pgoutput-reader）内 try-with-resources 建**异步**
      * 组装器（独享 {@link VersionedRelationRegistry} 与 pipe 配置；构造即建管道并起非守护的
      * transaction-consumer 线程开始消费交接队列）→ {@code session.run(assembler, outputFrontier::get)}
@@ -47,6 +52,10 @@ public final class Main {
                 config.protoVersion(), config.streamingMode(), config.twoPhase());
         PipeConfig pipe = PipeConfig.fromSystemProperties();
         LOG.info("pipe 配置: dir={} rollCycle={}", pipe.dir(), pipe.rollCycle());
+        // 输出形态解析前置（非法值启动期 fail-fast，早于连接建立）：STREAMING=流式事件直渲染
+        // （默认，回放期堆 O(单条)）；BLOCK=适配器重组整块（1.7 原子交付语义逃生门，堆 O(事务)）
+        OutputMode outputMode = OutputMode.fromSystemProperties();
+        LOG.info("输出形态: mode={}", outputMode);
 
         CountDownLatch stop = new CountDownLatch(1);
         // 输出前沿（consumer 已输出事务的最大 endLsn，跨线程 AtomicLong）：consumer 线程单调累加、
@@ -58,6 +67,12 @@ public final class Main {
             session.ensureSlot();
             session.start();
             ConsoleListener console = new ConsoleListener();
+            // vb.output.mode 接线（2.0 spec §1.1）：STREAMING（默认）——console 直接作为流式
+            // listener（onEvent 逐事件渲染，O(单条) 堆）；BLOCK——BlockOutputAdapter 把事件流攒齐
+            // 整块再回调 console.onTransaction（1.7 原子交付语义逃生门，O(事务) 堆）。
+            TransactionListener output = outputMode == OutputMode.BLOCK
+                    ? new BlockOutputAdapter(console)
+                    : console;
             // 组装器独享的 Relation 版本日志：'R' live 解码入版本序列（seq 戳），交接时按桶圈定拷快照；
             // console 逐消息渲染的第二参（RelationLookup）由组装器分流——live 解码点传 registry
             // （最新版视图），回放解码点传桶快照（Task 6 起，1.7 设计 §4.3）。
@@ -66,7 +81,7 @@ public final class Main {
                 // 组装器随会话生命周期关闭（关闭次序 session → assembler → pipe）：会话 close → run
                 // 经 isClosed 守卫退出 → 此处毒丸排干 consumer（已提交未输出的事务不丢）后关管道。
                 // consumer 回放失败经 onFailure（stop::countDown）触发停机，与复制流中断同一收敛路径。
-                try (TransactionAssembler assembler = new TransactionAssembler(console, config.streamingMode(),
+                try (TransactionAssembler assembler = new TransactionAssembler(output, config.streamingMode(),
                         registry, pipe, (msg, view) -> console.onMessage(msg, view),
                         outputFrontier, stop::countDown)) {
                     session.run(assembler, outputFrontier::get);

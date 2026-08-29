@@ -5,6 +5,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.postgresql.replication.LogSequenceNumber;
+import org.vastdata.vbstream.replication.BlockOutputAdapter;
 import org.vastdata.vbstream.replication.PgReplicationSession;
 import org.vastdata.vbstream.replication.PipeConfig;
 import org.vastdata.vbstream.replication.ReplicationConfig;
@@ -62,8 +63,10 @@ class FrontierCapTest {
 
     /**
      * 未输出事务钉住 confirmed_flush（第一段）+ 输出后越过封顶（第二段）。
-     * 关键步骤：异步组装器 + 按"输出序数 == 2 才阻塞"的 listener（T0 热身直通使前沿 &gt;0、
-     * T 阻塞、放行后的 T2 直通）→ 热身 T0 后轮询等前沿 &gt;0 → 取 before 锚点、提交 T、取 after
+     * 关键步骤：异步组装器 + 按"输出序数 == 2 才阻塞"的 listener（2.0 起组装器回调为流式事件——
+     * 序数语义是**事务**序数，经 {@link BlockOutputAdapter} 重组整块后计数阻塞，否则 Begin/
+     * TxChange/End 每事件都会使序数前移；T0 热身直通使前沿 &gt;0、T 阻塞、放行后的 T2 直通）
+     * → 热身 T0 后轮询等前沿 &gt;0 → 取 before 锚点、提交 T、取 after
      * → 等 T 到达输出回调（consumer 已阻塞）→ sleep 5s（≥2 个反馈周期，给服务端充足的采纳
      * 窗口后断言"没有推进"）断言 confirmed ≤ before → 放行，轮询等前沿越过 before（T.endLsn
      * &gt; before 恒成立，即 T 已输出完成）→ 写 T2 触发解码推进，轮询断言 confirmed &gt; before。
@@ -90,7 +93,7 @@ class FrontierCapTest {
             session.open();
             session.ensureSlot();
             session.start();
-            TransactionAssembler assembler = new TransactionAssembler(t -> {
+            TransactionAssembler assembler = new TransactionAssembler(new BlockOutputAdapter(t -> {
                 if (outputs.incrementAndGet() == TARGET_OUTPUT_ORDINAL) {   // T：目标事务，阻塞 consumer
                     targetBlocked.countDown();
                     try {
@@ -99,7 +102,7 @@ class FrontierCapTest {
                         Thread.currentThread().interrupt();
                     }
                 }   // T0（热身）与 T2（触发解码推进）直通
-            }, config.streamingMode(), new VersionedRelationRegistry(),
+            }), config.streamingMode(), new VersionedRelationRegistry(),
                     new PipeConfig(Path.of("target/frontier-cap-pipe"), LegacyRollCycles.MINUTELY),
                     (msg, view) -> { }, frontier, () -> { });
             Thread reader = new Thread(() -> {

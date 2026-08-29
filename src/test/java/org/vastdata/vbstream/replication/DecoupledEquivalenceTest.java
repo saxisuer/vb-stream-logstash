@@ -6,7 +6,6 @@ import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -68,22 +67,26 @@ class DecoupledEquivalenceTest {
      */
     @Test
     void asyncPipelineEqualsSynchronous() {
-        List<Transaction> syncOut = new ArrayList<>();
+        // 2.0 起组装器回调流式事件——两侧经 TransactionCollector 重组回整块（等价币），
+        // assertEquals(syncOut, asyncOut) 断言零改动（Task 3 再升级为事件流全等）
+        TransactionCollector syncCollector = new TransactionCollector();
         try (TransactionAssembler sync = new TransactionAssembler(
-                syncOut::add, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
+                syncCollector, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
             for (byte[] m : mixedStream()) {
                 sync.onRaw(m);
             }
         }
-        List<Transaction> asyncOut = new ArrayList<>();
+        List<Transaction> syncOut = syncCollector.transactions();
+        TransactionCollector asyncCollector = new TransactionCollector();
         AtomicLong frontier = new AtomicLong();
-        try (TransactionAssembler async = new TransactionAssembler(asyncOut::add, StreamingMode.ON,
+        try (TransactionAssembler async = new TransactionAssembler(asyncCollector, StreamingMode.ON,
                 new VersionedRelationRegistry(), pipeCfg(),
                 (msg, view) -> { }, frontier, () -> { })) {
             for (byte[] m : mixedStream()) {
                 async.onRaw(m);
             }
         }   // close：毒丸 → consumer 排干余桶 → join → pipe 关闭——排干后输出确定
+        List<Transaction> asyncOut = asyncCollector.transactions();
         assertEquals(syncOut, asyncOut);
         assertEquals(asyncOut.get(asyncOut.size() - 1).endLsn(), frontier.get());   // 前沿 = 末个输出事务 endLsn
     }

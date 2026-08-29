@@ -5,7 +5,6 @@ import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
-import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -14,9 +13,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 
 /**
- * 事务消费器（1.7 设计 §4.4）：从交接队列取冻结桶，回放渲染成 {@link Transaction} 回调输出，
+ * 事务消费器（1.7 设计 §4.4，2.0 流式输出形态）：从交接队列取冻结桶，回放逐条解码逐条以
+ * {@link TransactionEvent} 流式回调输出（Begin 头 → 逐 TxChange → End 尾，堆内 O(单条)），
  * 上报 LSN 前沿。它从组装器抽出单独成类，是为了既有单测能以"同线程消费"驱动（直接调
- * {@link #processBucket}，锚定 1.6 期望）与真实线程形态共用同一段处理逻辑。
+ * {@link #processBucket}，锚定既有期望）与真实线程形态共用同一段处理逻辑。
  *
  * <p>循环协议：{@link #queue}.poll(1s)——null（暂时无交接）做周期统计后继续；取到
  * {@link TxBuffer#POISON} 退出；否则 processBucket。失败语义：处理中抛出的任何 Throwable 记
@@ -98,8 +98,8 @@ final class TransactionConsumer implements Runnable {
             try {
                 processBucket(bucket);
             } catch (Throwable t) {
-                LOG.error("事务回放失败，consumer 终止（fail-fast）: xid={} firstIndex={}",
-                        bucket.xid, bucket.firstIndex, t);
+                // 截断细节（已输出条数/firstIndex）已在 processBucket 的 ERROR 里，此处只留 xid 与退出语义
+                LOG.error("事务输出失败，consumer 终止（fail-fast，队列不排干）: xid={}", bucket.xid, t);
                 onFailure.run();
                 return;
             }
@@ -107,16 +107,31 @@ final class TransactionConsumer implements Runnable {
     }
 
     /**
-     * 责任：处理一个冻结桶（同步/异步共用）。关键步骤：state=OUTPUTTING → 回放（快照 resolver +
-     * 快照渲染视图）→ 封箱 Transaction 回调 listener → 前沿以 endLsn 单调累加 → state=DONE。
-     * 边界：空桶产出空 changes；回放异常原样上抛（异步由 run 捕获，同步直传调用方——既有用例的
-     * fail-fast 断言路径）。线程：consumer 线程或同步测试线程。
+     * 责任：处理一个冻结桶（同步/异步共用），以三段事件流式交付。关键步骤：state=OUTPUTTING →
+     * 发 Begin 头（expectedChanges 取桶记账 unitCount，aborted 过滤前）→ 逐单元回放（快照渲染
+     * 视图）每条 TxChange 即时回调（不再构造整事务列表——堆内 O(单条)）→ 发 End 尾
+     * （emitted 为过滤后实付数）→ 前沿以 endLsn 单调累加 → state=DONE。
+     * 边界：空桶产出 Begin → End(0)（空事务合法）；回放异常在 End 发出前原样上抛并记
+     * ERROR（带已输出/预期条数——fail-fast 截断留痕），异步由 run 捕获、同步直传调用方
+     * （既有用例的 fail-fast 断言路径）；End 返回后前沿才推进（End 返回 = 下游确认完整消费）。
+     * 线程：consumer 线程或同步测试线程。
      */
     void processBucket(TxBuffer bucket) {
         bucket.state = BucketState.OUTPUTTING;
-        List<TxChange> changes = replayer.replay(bucket, pipe);
-        listener.onTransaction(new Transaction(bucket.xid, bucket.kind, bucket.gid,
-                bucket.commitLsn, bucket.endLsn, bucket.commitTimestamp, changes));
+        listener.onEvent(new TransactionEvent.Begin(bucket.xid, bucket.kind, bucket.gid,
+                bucket.commitLsn, bucket.endLsn, bucket.commitTimestamp, bucket.unitCount));
+        long[] emitted = {0L};   // 数组而非 long：lambda 递增 + 异常路径计数存活（fail-fast 截断日志用）
+        try {
+            replayer.replay(bucket, pipe, change -> {
+                emitted[0]++;
+                listener.onEvent(change);
+            });
+        } catch (Throwable t) {
+            LOG.error("事务流式输出中断（已输出 {}/{} 条）: xid={} firstIndex={}",
+                    emitted[0], bucket.unitCount, bucket.xid, bucket.firstIndex, t);
+            throw t;
+        }
+        listener.onEvent(new TransactionEvent.End(bucket.xid, emitted[0]));
         outputFrontier.accumulateAndGet(bucket.endLsn, Math::max);
         bucket.state = BucketState.DONE;
     }

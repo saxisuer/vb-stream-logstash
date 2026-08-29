@@ -15,6 +15,7 @@ import org.vastdata.vbstream.replication.PipeWatermarkProbe;
 import org.vastdata.vbstream.replication.RowChange;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionAssembler;
+import org.vastdata.vbstream.replication.TransactionCollector;
 import org.vastdata.vbstream.replication.TransactionKind;
 import org.vastdata.vbstream.replication.TxChange;
 import org.vastdata.vbstream.replication.VersionedRelationRegistry;
@@ -26,7 +27,6 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -401,10 +401,12 @@ class DecoupledPipelineTest {
      */
     private static ReplayOutcome replayAsync(List<byte[]> rawMessages, Path pipeDir, Runnable atFirstAbort) {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        List<Transaction> out = new ArrayList<>();
+        // 2.0 起组装器回调流式事件，经 TransactionCollector 重组回整块——既有断言零改动的
+        // 等价币（跨线程安全前提：close 的 join 建立读侧 happens-before，见下）
+        TransactionCollector out = new TransactionCollector();
         AtomicLong frontier = new AtomicLong();
         AtomicBoolean consumerFailed = new AtomicBoolean();
-        TransactionAssembler assembler = new TransactionAssembler(out::add, StreamingMode.PARALLEL,
+        TransactionAssembler assembler = new TransactionAssembler(out, StreamingMode.PARALLEL,
                 registry, new PipeConfig(pipeDir, LegacyRollCycles.MINUTELY),
                 (msg, view) -> { }, frontier, () -> consumerFailed.set(true));
         long beforeFirstAbort = -1L;
@@ -420,7 +422,7 @@ class DecoupledPipelineTest {
             assembler.close();   // 毒丸排干：已提交未输出的事务不丢；join 建立读侧 happens-before
         }
         assertFalse(consumerFailed.get(), "consumer 回放失败（fail-fast）——异常堆栈见 transaction-consumer 的 ERROR 日志");
-        return new ReplayOutcome(List.copyOf(out), PipeWatermarkProbe.of(assembler), beforeFirstAbort);
+        return new ReplayOutcome(List.copyOf(out.transactions()), PipeWatermarkProbe.of(assembler), beforeFirstAbort);
     }
 
     /**

@@ -4,6 +4,7 @@ import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.vastdata.vbstream.replication.BlockOutputAdapter;
 import org.vastdata.vbstream.replication.PgReplicationSession;
 import org.vastdata.vbstream.replication.PipeConfig;
 import org.vastdata.vbstream.replication.ReplicationConfig;
@@ -24,7 +25,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 1.7 解耦头名验收（设计 §9.3）：consumer 阻塞在输出回调期间，reader 持续从复制流接收消息——
  * 这是"读不被输出阻塞"这一里程碑目标本身的端到端验证。构造：**异步**组装器（真实双线程）+
- * onTransaction 内 await latch 的阻塞 listener；reader 线程（pgoutput-reader）的 raw 回调先计数
+ * onTransaction 内 await latch 的阻塞 listener（2.0 起组装器回调为流式事件——经
+ * {@link BlockOutputAdapter} 重组整块后进入阻塞块，阻塞点即 End 封箱回调，consumer 线程
+ * 同样停摆，验收语义不变）；reader 线程（pgoutput-reader）的 raw 回调先计数
  * 再喂组装器；阻塞窗口内继续写入并断言接收计数增长；放行后等 reader 追平，再按 Main 关闭次序
  * （会话 → 组装器毒丸排干）收尾，断言输出事务数 == 提交数（排干不丢不重）。
  * 夹具约定：独立槽 {@code reader_unblocked} + 前后清删（it 包习语）；专用表/publication 先于
@@ -85,7 +88,7 @@ class ReaderUnblockedTest {
             session.open();
             session.ensureSlot();
             session.start();
-            TransactionAssembler assembler = new TransactionAssembler(t -> {
+            TransactionAssembler assembler = new TransactionAssembler(new BlockOutputAdapter(t -> {
                 out.add(t);
                 firstOutput.countDown();
                 try {
@@ -93,7 +96,7 @@ class ReaderUnblockedTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-            }, config.streamingMode(), new VersionedRelationRegistry(),
+            }), config.streamingMode(), new VersionedRelationRegistry(),
                     new PipeConfig(Path.of("target/reader-unblocked-pipe"), LegacyRollCycles.MINUTELY),
                     (msg, view) -> { }, frontier, () -> { });
             Thread reader = new Thread(() -> {

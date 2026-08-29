@@ -15,6 +15,7 @@ import org.vastdata.vbstream.replication.DmlKind;
 import org.vastdata.vbstream.replication.RelationRegistry;
 import org.vastdata.vbstream.replication.RowChange;
 import org.vastdata.vbstream.replication.Transaction;
+import org.vastdata.vbstream.replication.TransactionEvent;
 import org.vastdata.vbstream.replication.TransactionKind;
 
 import java.time.Instant;
@@ -25,7 +26,7 @@ import java.util.OptionalLong;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** ConsoleListener 事务块渲染格式测试：logback ListAppender 直接挂在 CDC logger 上捕获输出行。 */
+/** ConsoleListener 事务渲染格式测试（block 路径 onTransaction + 流式路径 onEvent 双验收）：logback ListAppender 直接挂在 CDC logger 上捕获输出行。 */
 class ConsoleListenerTest {
 
     private final Logger cdc = (Logger) org.slf4j.LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
@@ -75,6 +76,63 @@ class ConsoleListenerTest {
         assertTrue(body.contains("[1] INSERT public.t_stream"), "变更行不符: " + body);
         assertTrue(body.contains("id=1"), "列渲染不符: " + body);
         assertEquals("TXN-END   xid=505", appender.list.get(2).getFormattedMessage());
+    }
+
+    /**
+     * 流式事件渲染（2.0 onEvent 主路径）：同一事务的 Begin/变更/End 事件序列喂入后，捕获的
+     * 3 行 CDC 输出与 block 路径（onTransaction，等值 Transaction）**逐字节一致**——无 aborted
+     * 子事务过滤时 Begin.expectedChanges == 实际条数，两模式头行 {@code changes=N} 相同
+     * （输出格式与 1.7 逐字节一致的核心验收，流式头行计数取 expected 见下一用例）。
+     */
+    @Test
+    void streamingEventOutputMatchesBlockOutputByteForByte() {
+        RowChange insert = new RowChange(DmlKind.INSERT, relation(),
+                Optional.empty(),
+                Optional.of(row("1", "aaa")),
+                OptionalLong.empty());
+        ConsoleListener listener = new ConsoleListener();
+
+        listener.onEvent(new TransactionEvent.Begin(505L, TransactionKind.STREAMED, null,
+                0x1BD9E70L, 0x1BD9E80L, Instant.parse("2026-08-27T08:00:00Z"), 1L));
+        listener.onEvent(insert);
+        listener.onEvent(new TransactionEvent.End(505L, 1L));
+        List<String> streamed = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage).toList();
+
+        appender.list.clear();
+        listener.onTransaction(new Transaction(505L, TransactionKind.STREAMED, null,
+                0x1BD9E70L, 0x1BD9E80L, Instant.parse("2026-08-27T08:00:00Z"), List.of(insert)));
+        List<String> blocked = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage).toList();
+
+        assertEquals(3, streamed.size(), "流式应产出头/体/尾 3 行: " + streamed);
+        assertTrue(streamed.get(0).startsWith("TXN-BEGIN xid=505 kind=STREAMED gid=null"), "流式头行不符: " + streamed.get(0));
+        assertEquals(blocked, streamed);   // expected == 实际条数（无 aborted 过滤）时两路径逐字节一致
+    }
+
+    /**
+     * 头行计数口径注记（2.0 双契约的唯二差异之一）：流式头行 {@code changes=N} 取
+     * Begin.expectedChanges（aborted 子事务过滤<b>前</b>）、block 头行取实际条数（过滤后）——
+     * expected 与实际不等（含子事务回滚的事务）时两模式头行有差异，body/footer 不受影响。
+     */
+    @Test
+    void streamingHeaderUsesExpectedWhileBlockUsesActualCount() {
+        RowChange insert = new RowChange(DmlKind.INSERT, relation(),
+                Optional.empty(), Optional.of(row("1", "aaa")), OptionalLong.empty());
+        ConsoleListener listener = new ConsoleListener();
+
+        listener.onEvent(new TransactionEvent.Begin(505L, TransactionKind.STREAMED, null,
+                1L, 2L, Instant.parse("2026-08-27T08:00:00Z"), 2L));   // expected=2（过滤前）
+        listener.onEvent(insert);
+        listener.onEvent(new TransactionEvent.End(505L, 1L));          // emitted=1（aborted 过滤后）
+        String streamedHeader = appender.list.get(0).getFormattedMessage();
+        assertTrue(streamedHeader.contains("changes=2"), "流式头行应取 expectedChanges: " + streamedHeader);
+
+        appender.list.clear();
+        listener.onTransaction(new Transaction(505L, TransactionKind.STREAMED, null,
+                1L, 2L, Instant.parse("2026-08-27T08:00:00Z"), List.of(insert)));
+        String blockedHeader = appender.list.get(0).getFormattedMessage();
+        assertTrue(blockedHeader.contains("changes=1"), "block 头行应取实际条数: " + blockedHeader);
     }
 
     /**

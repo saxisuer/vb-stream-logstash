@@ -5,11 +5,13 @@ import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
+import org.vastdata.vbstream.replication.BlockTransactionListener;
 import org.vastdata.vbstream.replication.MsgChange;
 import org.vastdata.vbstream.replication.PgOutputListener;
 import org.vastdata.vbstream.replication.RelationLookup;
 import org.vastdata.vbstream.replication.RowChange;
 import org.vastdata.vbstream.replication.Transaction;
+import org.vastdata.vbstream.replication.TransactionEvent;
 import org.vastdata.vbstream.replication.TransactionListener;
 import org.vastdata.vbstream.replication.TruncateChange;
 import org.vastdata.vbstream.replication.TxChange;
@@ -20,19 +22,30 @@ import java.util.List;
 import java.util.OptionalLong;
 
 /**
- * 控制台打印 listener（Main 默认事务形态，spec §5）：事务块（TXN-BEGIN/TXN-END 头尾 + 逐变更行）与
+ * 控制台打印 listener（spec §5）：事务块（TXN-BEGIN/TXN-END 头尾 + 逐变更行）与
  * 事务生命周期控制消息（流式分段边界 + 两阶段信号）走 CDC logger INFO；行级数据与元数据等逐消息细节
  * 降为 DEBUG（默认关闭），仅供排障时开启。INFO 级保证任何事务形态至少留一行痕迹，不吞噬事务信息。
  *
- * <p>同一实例承担双角色：事务回调（{@link #onTransaction}，consumer 线程）与逐消息渲染
- * （{@link #onMessage}，Main 装配下挂在组装器的解码点 observer——reader 线程的 live 解码与
- * consumer 线程的回放解码**两处**调用，见其 javadoc）。本类无状态且 slf4j 线程安全，双线程
- * 并发调用无共享可变状态。
+ * <p>同一实例承担三重角色（2.0 双输出契约的实现者）：流式事件渲染（{@link #onEvent}，默认——
+ * Main 以 STREAMING 形态直传本类）、整块事务渲染（{@link #onTransaction}，block 形态——Main
+ * 以 {@code vb.output.mode=block} 经 {@link org.vastdata.vbstream.replication.BlockOutputAdapter}
+ * 回调本类）与逐消息渲染（{@link #onMessage}，Main 装配下挂在组装器的解码点 observer——
+ * reader 线程的 live 解码与 consumer 线程的回放解码**两处**调用，见其 javadoc）。两个事务输出
+ * 路径共享 {@link #renderChange}，输出格式与 1.7 逐字节一致；唯一注记：流式头行
+ * {@code changes=N} 取 Begin 的 expectedChanges（aborted 子事务过滤<b>前</b>），block 头行取
+ * 实际条数（过滤后）——仅含子事务回滚的事务两模式头行有差异，无过滤时逐字节一致。
+ *
+ * <p>线程约束：本类近乎无状态，唯 {@link #rowSeq}（流式行号）为实例可变字段——线程限定
+ * consumer 线程（onEvent 的调用线程），onMessage/静态渲染不触碰；slf4j 线程安全。
  */
-public final class ConsoleListener implements PgOutputListener, TransactionListener {
+public final class ConsoleListener implements PgOutputListener, TransactionListener, BlockTransactionListener {
 
     /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
+
+    /** 流式渲染的事务内行号（{@link #onEvent} 用）：Begin 清零、逐变更自增——从无状态变轻状态，
+     *  线程限定 consumer（onEvent 调用线程），block 路径（onTransaction）自持局部序号不共用。 */
+    private int rowSeq;
 
     /**
      * 逐消息渲染出口，按消息类别分流级别（spec §5）：事务生命周期控制消息升 INFO
@@ -81,10 +94,12 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
     }
 
     /**
-     * 事务块输出：头/尾各一行 INFO（CDC logger），变更行逐条基于内嵌 Relation 快照渲染（不依赖 registry）。
-     * 调用线程 = consumer 线程（异步装配 1.7 起——Main 形态为 transaction-consumer 线程；同步测试
-     * 形态为调用方线程）——回调耗时不再拖慢读取路径，但仍应快速返回（拖长会积压交接队列、
-     * 推迟输出前沿与 LSN 反馈推进）。
+     * 事务块输出（1.7 渲染原样保留，2.0 起 block 形态路径——经 {@code BlockOutputAdapter} 重组后
+     * 回调；既有渲染断言锚定本路径）：头/尾各一行 INFO（CDC logger），变更行逐条基于内嵌 Relation
+     * 快照渲染（不依赖 registry）；头行 {@code changes=N} 取实际条数（与流式头行的 expected 差异
+     * 见类 javadoc）。调用线程 = consumer 线程（异步装配 1.7 起——Main 形态为
+     * transaction-consumer 线程；同步测试形态为调用方线程）——回调耗时不再拖慢读取路径，
+     * 但仍应快速返回（拖长会积压交接队列、推迟输出前沿与 LSN 反馈推进）。
      */
     @Override
     public void onTransaction(Transaction transaction) {
@@ -97,6 +112,27 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
             CDC.info("  [{}] {}", seq++, renderChange(change));
         }
         CDC.info("TXN-END   xid={}", transaction.xid());
+    }
+
+    /**
+     * 流式事件输出（2.0 主路径，格式与 {@link #onTransaction} 的 1.7 块输出逐字节一致）：
+     * Begin 打头行（{@code changes=N} 为 expectedChanges——aborted 过滤前，见类 javadoc 注记）
+     * 并把行号清零，TxChange 逐条以行号前缀渲染（共享 {@link #renderChange}），End 打尾行。
+     * 中途异常（End 未达）时本事务只有部分行面世——流式语义固有，End 返回即下游确认完整消费。
+     * 调用线程 = consumer 线程（同 onTransaction；rowSeq 线程限定见字段注记）。
+     */
+    @Override
+    public void onEvent(TransactionEvent event) {
+        if (event instanceof TransactionEvent.Begin b) {
+            CDC.info("TXN-BEGIN xid={} kind={} gid={} commitLsn=0x{} commitTs={} changes={}",
+                    b.xid(), b.kind(), b.gid(), Long.toHexString(b.commitLsn()), b.commitTimestamp(),
+                    b.expectedChanges());
+            rowSeq = 1;
+        } else if (event instanceof TxChange change) {
+            CDC.info("  [{}] {}", rowSeq++, renderChange(change));
+        } else if (event instanceof TransactionEvent.End e) {
+            CDC.info("TXN-END   xid={}", e.xid());
+        }
     }
 
     /** 单条变更渲染：列名取自嵌入的 Relation 快照（下游自包含，无需 registry）。 */

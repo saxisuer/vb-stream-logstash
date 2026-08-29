@@ -4,7 +4,11 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * 一个已确认提交的完整事务（不可变原子单元，回调给 {@link TransactionListener}）。
+ * 一个已确认提交的完整事务（不可变值对象）。2.0 起换角色：**block 模式的交付单元**——
+ * {@link BlockOutputAdapter}/{@link TransactionCollector} 把流式事件
+ * （{@link TransactionEvent.Begin Begin} → {@link TxChange}* → {@link TransactionEvent.End End}）
+ * 重组整块后经 {@link BlockTransactionListener} 回调（默认流式形态不构造本对象）；
+ * 组件语义与 {@link TransactionEvent.Begin} 同名组件一致。
  *
  * @param xid             事务 id：NORMAL 来自 Begin、STREAMED 来自 StreamStart、TWO_PHASE 来自 BeginPrepare/StreamPrepare
  * @param kind            事务形态

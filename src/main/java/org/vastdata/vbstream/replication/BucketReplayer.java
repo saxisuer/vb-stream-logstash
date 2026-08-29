@@ -5,13 +5,13 @@ import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 /**
  * 桶回放器（assembly-spill 设计 §2/§4.4，1.7 解耦形态）：把一个交接冻结的事务桶
@@ -40,9 +40,9 @@ import java.util.function.BiConsumer;
  * <p>边界：桶未交接（relationSnapshot 为 null）抛 {@link IllegalStateException}——回放的
  * 前置条件是快照随行，缺失即调用序编程错误；单元类型不是 I/U/D/T/M 抛 ISE——组装器的路由保证
  * 管道里只有本桶的数据单元落在桶的段内，这里是防御性的 fail-fast；Relation 未先行到达
- * （快照 require 查不到）或字节与协议不符，抛 ISE/协议异常——回放失败即协议流异常，不允许输出
- * 半截事务（异常在组装器回调 listener 之前抛出，由调用方保证）。空桶（无段）产出空列表
- * （空桶提交是合法的）。
+ * （快照 require 查不到）或字节与协议不符，抛 ISE/协议异常——回放失败即协议流异常，异常经
+ * sink 调用链原样上抛（2.0 流式语义下已交付的 TxChange 不撤回，事务尾 End 由调用方保证
+ * 永不发出）。空桶（无段）零交付（空桶提交是合法的，Begin → End(0)）。
  *
  * <p>线程约束：单线程内同步执行——由 {@link TransactionConsumer} 在 consumer 线程调用
  * （同步测试形态下即调用方线程）。自带一个独立的 {@link PgOutputDecoder}（decodeSingle 不碰
@@ -68,26 +68,30 @@ final class BucketReplayer {
     }
 
     /**
-     * 回放一个交接冻结的桶：逐段 readRange（readRange 保证段内全部是本桶单元），逐单元三步——
-     * aborted 过滤（hasPrefix 时重窥 raw[1..4] 得 streamXid，命中 abortedSubxids 跳过）→
+     * 回放一个交接冻结的桶（2.0 交付化：不再构造列表——逐条经 sink 交付，堆内 O(单条)）：
+     * 逐段 readRange（readRange 保证段内全部是本桶单元），逐单元三步——aborted 过滤
+     * （hasPrefix 时重窥 raw[1..4] 得 streamXid，命中 abortedSubxids 跳过、不交付）→
      * decodeSingle(payload, bucket.hasPrefix) → 构造 TxChange（Relation 经桶快照
-     * require(oid, index)，index 即单元 seq）。空桶产出空列表。
+     * require(oid, index)，index 即单元 seq）即交 sink。空桶零交付。
      *
-     * <p>边界：bucket/pipe 为 null 抛 NPE；桶未交接（快照缺失）抛 ISE；Relation 查不到或字节与
-     * 协议不符时抛 ISE/协议异常（在回调 listener 之前抛出，不输出半截事务）。单线程内同步执行。
+     * <p>边界：bucket/pipe/sink 为 null 抛 NPE；桶未交接（快照缺失）抛 ISE；Relation 查不到或
+     * 字节与协议不符时抛 ISE/协议异常（经 sink 调用链原样上抛，已交付条目不撤回）。
+     * 单线程内同步执行。
      *
      * @param bucket 已交接冻结的桶（段列表、abortedSubxids 与 relationSnapshot）
      * @param pipe   单元字节所在的管道（按段读回，payload 为副本）
-     * @return 回放产物（与保留的单元一一对应、按段序保序）
+     * @param sink   交付目标（每条保留单元回调一次，按段序保序；计数归调用方）
+     * @return 交付数（aborted 过滤后）
      */
-    List<TxChange> replay(TxBuffer bucket, MessagePipe pipe) {
+    long replay(TxBuffer bucket, MessagePipe pipe, Consumer<TxChange> sink) {
         Objects.requireNonNull(bucket, "bucket");
         Objects.requireNonNull(pipe, "pipe");
+        Objects.requireNonNull(sink, "sink");
         RelationSnapshot snapshot = bucket.relationSnapshot;
         if (snapshot == null) {
             throw new IllegalStateException("桶未交接（relationSnapshot 缺失），回放前置条件违反: xid=" + bucket.xid);
         }
-        List<TxChange> changes = new ArrayList<>();
+        long[] emitted = {0L};
         for (long[] segment : bucket.segments) {
             pipe.readRange(segment[0], segment[1], (index, payload) -> {
                 OptionalLong streamXid = bucket.hasPrefix
@@ -96,10 +100,11 @@ final class BucketReplayer {
                 if (streamXid.isPresent() && bucket.abortedSubxids.contains(streamXid.getAsLong())) {
                     return;
                 }
-                changes.add(replayUnit(payload, index, streamXid, snapshot));
+                sink.accept(replayUnit(payload, index, streamXid, snapshot));
+                emitted[0]++;
             });
         }
-        return changes;
+        return emitted[0];
     }
 
     /**

@@ -25,8 +25,8 @@ import java.util.function.Supplier;
  * pgoutput 事务组装状态机：消费原始字节，把同一事务的变更以 **纯 CQ index 段记账** 攒进桶里
  * （1.7 设计 §2/§4.1），收到提交信号后**交接冻结桶**（快照随行）给消费侧
  * （{@link TransactionConsumer}——同步形态在调用线程直调、异步形态经交接队列由 consumer 线程
- * 取走）回放成完整的 {@link Transaction} 交给监听器（spec §4 / assembly-spill 设计 §2-§5 的
- * 1.7 解耦形态）。
+ * 取走）回放成 {@link TransactionEvent} 事件流逐条交给监听器（2.0 流式主契约，spec §4 /
+ * assembly-spill 设计 §2-§5 的演进形态；block 形态经 {@link BlockOutputAdapter} 重组整块）。
  *
  * <p>与消息驱动旧版的核心区别：**数据消息先不解码**。Insert/Update/Delete/Truncate/Message
  * 五类消息的原始字节只在 {@link #onRaw} 首行追加一次管道（{@link MessagePipe}），桶里只记
@@ -60,9 +60,9 @@ import java.util.function.Supplier;
  * 低水位 = 全部存活桶 firstIndex 的最小值，驱动 {@link VersionedRelationRegistry#pruneBelow}。
  * 两者都挂在桶完结点（交接/整桶丢弃）。
  *
- * <p>注意"内存有界"只覆盖组装期：提交回放仍会把整桶单元从管道读回堆（原始字节 + 解码出的
- * TxChange 双份瞬态并存，峰值 O(事务大小)），流式输出属里程碑 2 范畴——1.7 的解耦只把这段
- * 瞬态从 reader 路径移到 consumer 线程，不改变其量级。
+ * <p>内存量级（2.0 起）：组装期记账恒 O(桶元数据)（段数 × long[2]）；提交回放逐单元解码
+ * 逐条交付（堆内 O(单条)）——1.7 的"回放期整事务瞬态 O(事务大小)"已随流式交付消除，
+ * block 输出形态（{@link BlockOutputAdapter}）是唯一回到 O(事务) 的路径（逃生门语义）。
  *
  * <p>线程约束（1.7 双线程形态）：**reader 侧**（onRaw 及其全部私有路由/记账/registry/入队）
  * 设计为由 run 循环的单一线程调用（decoder 的流块状态与全部桶指针都要求单写者）——提交期回放
@@ -119,7 +119,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * {@code transaction-consumer} 线程（非守护——未排干的交接桶在 JVM 退出前必须有机会输出）
      * 立即开始消费交接队列。close() 走毒丸排干协议（见其 javadoc）。
      *
-     * @param listener        完整事务到达时的回调（consumer 线程同步调用）
+     * @param listener        事务事件流回调（Begin/TxChange/End 按序流式交付，consumer 线程同步调用）
      * @param mode            流式模式（仅影响 decoder 对 StreamAbort 附加字段的解析，须与
      *                        START_REPLICATION 的 streaming 参数一致，否则 abort 解析错位 fail-fast）
      * @param registry        Relation 版本日志（'R' 路由与交接快照共用，本组装器独占写入）
@@ -141,7 +141,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * fail-fast 异常直传调用方。急切建立管道——{@link MessagePipe} 构造即清空目录建队列，
      * 失败原样上抛 fail-fast：管道是地基，建不起来就没有可运行形态。
      *
-     * @param listener        完整事务到达时的回调（同步调用，调用线程与本组装器的调用线程一致）
+     * @param listener        事务事件流回调（Begin/TxChange/End 按序流式交付，同步调用、
+     *                        调用线程与本组装器的调用线程一致）
      * @param mode            流式模式（仅影响 decoder 对 StreamAbort 附加字段的解析，须与
      *                        START_REPLICATION 的 streaming 参数一致，否则 abort 解析错位 fail-fast）
      * @param registry        Relation 版本日志（'R' 路由与交接快照共用，本组装器独占写入）
@@ -157,7 +158,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     /**
      * 便捷构造：解码观察者置为空消费（不需要逐消息透出的场景），同步形态。
      *
-     * @param listener    完整事务到达时的回调
+     * @param listener    事务事件流回调（Begin/TxChange/End 按序流式交付）
      * @param mode        流式模式
      * @param registry    Relation 版本日志
      * @param pipeConfig  管道配置
@@ -338,9 +339,10 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     /**
      * 数据消息入桶（1.7 设计 §4.1）：判定流式前缀有无（inStream）→ 校验桶级 hasPrefix 不变量
      * （首个单元定型，此后混现即 ISE fail-fast——协议不允许，防御）→ 窥 oid 入 oidSet →
-     * appendIndex 记段。字节本身已在 onRaw 首行 append 进管道（index 即 seq），此处不再写 CQ；
-     * 前缀的具体 xid 值推迟到回放期重窥（{@link BucketReplayer} 按 hasPrefix 决定 decodeSingle
-     * 的 inStream 实参并重窥作 streamXid）。只在 reader 线程调用。
+     * unitCount 自增（Begin.expectedChanges 的记账来源）→ appendIndex 记段。字节本身已在
+     * onRaw 首行 append 进管道（index 即 seq），此处不再写 CQ；前缀的具体 xid 值推迟到回放期
+     * 重窥（{@link BucketReplayer} 按 hasPrefix 决定 decodeSingle 的 inStream 实参并重窥作
+     * streamXid）。只在 reader 线程调用。
      */
     private void appendUnit(TxBuffer bucket, byte[] raw, long seq) {
         boolean inStream = currentStream != null;
@@ -352,6 +354,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
                     + " hasPrefix=" + bucket.hasPrefix + " 当前 inStream=" + inStream);
         }
         collectOids(bucket, raw);
+        bucket.unitCount++;
         appendIndex(bucket, seq);
     }
 

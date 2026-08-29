@@ -11,7 +11,6 @@ import org.vastdata.vbstream.protocol.UnknownMessageTypeException;
 
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.concurrent.CountDownLatch;
@@ -25,7 +24,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * TransactionAssembler 状态机单测（raw 字节驱动版）：全部输入经 {@link PgWire} 构造线格式
- * 字节直接喂 {@code onRaw}，覆盖轻窥路由、控制消息 live 解码与 MEMORY 回放的全路径。
+ * 字节直接喂 {@code onRaw}，覆盖轻窥路由、控制消息 live 解码与流式事件回放的全路径
+ * （2.0 起输出经 {@link TransactionCollector} 重组回整块，既有断言零改动）。
  * 每用例断言输出 Transaction 的形态/顺序/内容与 fail-fast 行为，语义与消息驱动版
  * （里程碑 1.5 的 33 例）逐用例等价——占位字段（LSN=1/2 递增、时间戳=PG 纪元）按 PgWire 约定断言。
  *
@@ -105,19 +105,21 @@ class TransactionAssemblerTest {
     }
 
     /**
-     * 依序把 raw 字节喂给新组装器（'R' 的 registry 路由在组装器内部发生），收集输出的 Transaction。
+     * 依序把 raw 字节喂给新组装器（'R' 的 registry 路由在组装器内部发生），收集输出的 Transaction
+     * （2.0 起组装器回调流式事件，经 {@link TransactionCollector} 重组回整块——既有
+     * {@code List<Transaction>} 断言零改动的等价币）。
      * 组装器以 StreamingMode.ON 构造——与 {@link PgWire#streamAbort} 的非 parallel 形态配对。
      * try-with-resources 收敛管道（每个组装器独占一条 CQ，不关会泄漏 mmap 且阻塞 @TempDir 清理）。
      */
     private static List<Transaction> run(byte[]... msgs) {
-        List<Transaction> out = new ArrayList<>();
+        TransactionCollector out = new TransactionCollector();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
+                out, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
             for (byte[] m : msgs) {
                 assembler.onRaw(m);
             }
         }
-        return out;
+        return out.transactions();
     }
 
     /** 冒烟 1（新增，正路径最小切片）：Begin→Relation→Insert→Commit 产出恰含 1 条 RowChange 的 NORMAL Transaction（轻窥路由 + live 解码 + 回放渲染全链路）。 */
@@ -419,9 +421,9 @@ class TransactionAssemblerTest {
      */
     @Test
     void streamAbortOfWholeTopTransactionDropsBucket() {
-        List<Transaction> out = new ArrayList<>();
+        TransactionCollector out = new TransactionCollector();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
+                out, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
             byte[][] seq = {
                     relation(),
                     PgWire.streamStart(TOP_A, true),
@@ -433,7 +435,7 @@ class TransactionAssemblerTest {
             for (byte[] m : seq) {
                 assembler.onRaw(m);
             }
-            assertEquals(0, out.size());
+            assertEquals(0, out.transactions().size());
             // 同一实例：桶已被移除 → 后续同 xid StreamCommit fail-fast（非静默）
             assertThrows(IllegalStateException.class, () -> assembler.onRaw(PgWire.streamCommit(TOP_A)));
         }
@@ -655,9 +657,9 @@ class TransactionAssemblerTest {
     @Test
     void retiredBucketPrunesSupersededRegistryVersions() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        List<Transaction> out = new ArrayList<>();
+        TransactionCollector collector = new TransactionCollector();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, registry, pipeCfg())) {
+                collector, StreamingMode.ON, registry, pipeCfg())) {
             assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
             assembler.onRaw(PgWire.begin(1L));
             assembler.onRaw(insert("1", "a"));
@@ -674,6 +676,7 @@ class TransactionAssemblerTest {
             assembler.onRaw(insert("3", "c"));
             assembler.onRaw(PgWire.commit());                                           // 剪枝后新查询仍正确
         }
+        List<Transaction> out = collector.transactions();
         assertEquals(3, out.size());
         assertEquals("t_v1", ((RowChange) out.get(0).changes().get(0)).relation().table());
         assertEquals("t_v2", ((RowChange) out.get(1).changes().get(0)).relation().table());
@@ -694,9 +697,9 @@ class TransactionAssemblerTest {
     @Test
     void pendingTwoPhaseBucketKeepsItsAsOfVersionAliveAcrossPruning() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        List<Transaction> out = new ArrayList<>();
+        TransactionCollector collector = new TransactionCollector();
         try (TransactionAssembler assembler = new TransactionAssembler(
-                out::add, StreamingMode.ON, registry, pipeCfg())) {
+                collector, StreamingMode.ON, registry, pipeCfg())) {
             assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
             assembler.onRaw(PgWire.beginPrepare(601L, GID));
             assembler.onRaw(insert("1", "a"));
@@ -710,6 +713,7 @@ class TransactionAssemblerTest {
             assembler.onRaw(PgWire.commitPrepared(601L, GID));                   // 挂起桶回放：按 v1 渲染
             assertThrows(IllegalStateException.class, () -> registry.require(OID, pendingSeq));   // 完结后 v1 已剪
         }
+        List<Transaction> out = collector.transactions();
         assertEquals(List.of(99L, 601L), out.stream().map(Transaction::xid).toList());
         assertEquals("t_v2", ((RowChange) out.get(0).changes().get(0)).relation().table());
         assertEquals("t_v1", ((RowChange) out.get(1).changes().get(0)).relation().table());
@@ -733,11 +737,12 @@ class TransactionAssemblerTest {
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch inCallback = new CountDownLatch(1);
         AtomicLong frontier = new AtomicLong();
-        TransactionAssembler assembler = new TransactionAssembler(t -> {
+        // 2.0 起回调面是流式事件（Begin/TxChange/End）——阻塞点任意事件即可，取首事件（Begin）
+        TransactionAssembler assembler = new TransactionAssembler(e -> {
             inCallback.countDown();
             try {
                 release.await(10, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
+            } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
             }
         }, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg(),
