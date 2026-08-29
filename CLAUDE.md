@@ -8,7 +8,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态；artifactId 暗示最终会以某种形式与 Logstash 集成，集成方式尚未确定）
 - 工具链：Java 17 + Maven
-- 当前状态：**里程碑 1.7 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）与事务组装之上，**读取与组装输出解耦**：reader 线程只做记账（数据消息全量 append 进 Chronicle Queue 主缓冲 `MessagePipe`，桶只记 CQ index 段）+ 反馈 LSN；提交事务交接冻结桶（Relation 版本快照随行）由独立 `transaction-consumer` 线程回放输出；LSN 确认按**输出前沿**封顶（crash 丢失窗口为零，at-least-once）；JMH 基线含 1.7 管道口径（`docs/benchmarks-baseline.md`），`mvn test` 143 用例全绿）。核心依赖（版本以 pom 的 `<properties>` 为准）：
+- 当前状态：**里程碑 1.7 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）与事务组装之上，**读取与组装输出解耦**：reader 线程只做记账（数据消息全量 append 进 Chronicle Queue 主缓冲 `MessagePipe`，桶只记 CQ index 段）+ 反馈 LSN；提交事务交接冻结桶（Relation 版本快照随行）由独立 `transaction-consumer` 线程回放输出；LSN 确认按**输出前沿**封顶（crash 丢失窗口为零，at-least-once）；JMH 基线含 1.7 管道口径（`docs/benchmarks-baseline.md`），`mvn test` 144 用例全绿；**1.7.1 已完成**——组装成本归因三腿互证：存储路径合计 ≈58%、其中缺页 ≈46.8% 属顺序写新页固有；⑧ deletableFiles 扫描档位节流修复使 assembleWholeCorpus −38.3% 至 ≈9.1 µs/条；1.7.2 判定**不值得开混合存储**，归因表与定稿依据见 baseline 文档 1.7.1 段）。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
     - `net.openhft:chronicle-queue`（持久化低延迟队列——1.7 起是 reader 与 consumer 之间的**主缓冲管道**；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）

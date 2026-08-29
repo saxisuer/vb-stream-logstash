@@ -318,7 +318,11 @@ class DecoupledPipelineTest {
                 "流式回滚应产生 StreamAbort（非流式回滚被 PG 静默丢弃，场景将空转）");
 
         // 注入的陈旧滚动文件：文件名按 MINUTELY 格式 yyyyMMdd-HHmm 解析出远早于当前 cycle 的档位；
-        // 内容无关（deletableFiles 只按名解析），由 replayAsync 的首个 'A' 钩子在管道建立后创建
+        // 内容无关（deletableFiles 只按名解析），由 replayAsync 的首个 'A' 钩子在管道建立后创建。
+        // 时序隐含依赖（1.7.1 MessagePipe 档位节流后）：注入必须先于管道对当前档位的首次扫描——
+        // 节流使同档位内的删档检查按 cycle 推进延迟，若首个桶完结点先于注入，陈旧文件要到下一档位
+        // 才会被扫到（MINUTELY 下分钟级），notExists 断言将难排查地红；当前录制形状首个完结点
+        // 恰是首个 'A'（其前无任何 Commit/StreamCommit），依赖成立
         Path pipeDir = dir.resolve("pipe-rb");
         Path staleRoll = pipeDir.resolve("20200101-0000.cq4");
         ReplayOutcome replayed = replayAsync(recording, pipeDir, () -> {
