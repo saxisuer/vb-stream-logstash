@@ -40,6 +40,8 @@ final class TransactionConsumer implements Runnable {
     private final AtomicLong outputFrontier;
     private final AtomicInteger liveBucketCount;
     private final Runnable onFailure;
+    /** 吞吐与分布指标（2026-08-31 设计）：输出侧三计数 + 两分布在此回填，速率/分位报告挂本类统计 tick。 */
+    private final ThroughputMetrics metrics;
 
     /**
      * 构造消费器（不启动线程——线程的创建与启动归组装器，同步形态则永远无人调 run）。
@@ -52,18 +54,22 @@ final class TransactionConsumer implements Runnable {
      * @param liveBucketCount reader 侧存活桶计数（统计展示用；并发安全）
      * @param onFailure       回放失败时的逃生回调（fail-fast 路径，如通知会话停机）
      * @param replayObserver 每个回放解码点回调（第二参为该桶的 RelationSnapshot 渲染视图）
+     * @param metrics        吞吐与分布指标（组装器创建并穿入；输出侧计数在本类回填，回放字节
+     *                      计数经 {@link BucketReplayer}，报告行挂 {@link #maybeStats} 的统计 tick）
      */
     TransactionConsumer(StreamingTransactionListener listener, StreamingMode mode, MessagePipe pipe,
                         BlockingQueue<TxBuffer> queue, AtomicLong outputFrontier,
                         AtomicInteger liveBucketCount, Runnable onFailure,
-                        BiConsumer<PgOutputMessage, RelationLookup> replayObserver) {
+                        BiConsumer<PgOutputMessage, RelationLookup> replayObserver,
+                        ThroughputMetrics metrics) {
         this.listener = Objects.requireNonNull(listener, "listener");
         this.pipe = Objects.requireNonNull(pipe, "pipe");
         this.queue = Objects.requireNonNull(queue, "queue");
         this.outputFrontier = Objects.requireNonNull(outputFrontier, "outputFrontier");
         this.liveBucketCount = Objects.requireNonNull(liveBucketCount, "liveBucketCount");
         this.onFailure = Objects.requireNonNull(onFailure, "onFailure");
-        this.replayer = new BucketReplayer(mode, replayObserver);
+        this.metrics = Objects.requireNonNull(metrics, "metrics");
+        this.replayer = new BucketReplayer(mode, replayObserver, metrics);
     }
 
     /**
@@ -107,16 +113,19 @@ final class TransactionConsumer implements Runnable {
     }
 
     /**
-     * 责任：处理一个冻结桶（同步/异步共用），以三段事件流式交付。关键步骤：state=OUTPUTTING →
-     * 发 Begin 头（expectedChanges 取桶记账 unitCount，aborted 过滤前）→ 逐单元回放（快照渲染
-     * 视图）每条 TxChange 即时回调（不再构造整事务列表——堆内 O(单条)）→ 发 End 尾
-     * （emitted 为过滤后实付数）→ 前沿以 endLsn 单调累加 → state=DONE。
+     * 责任：处理一个冻结桶（同步/异步共用），以三段事件流式交付。关键步骤：起计回放耗时 →
+     * state=OUTPUTTING → 发 Begin 头（expectedChanges 取桶记账 unitCount，aborted 过滤前）→
+     * 逐单元回放（快照渲染视图）每条 TxChange 即时回调（不再构造整事务列表——堆内 O(单条)）→
+     * 发 End 尾（emitted 为过滤后实付数）→ 前沿以 endLsn 单调累加 → state=DONE → 指标回填
+     * （输出 tx/records 计数 + 回放耗时/事务大小两分布样本——仅完整交付的事务入分布）。
      * 边界：空桶产出 Begin → End(0)（空事务合法）；回放异常在 End 发出前原样上抛并记
-     * ERROR（带已输出/预期条数——fail-fast 截断留痕），异步由 run 捕获、同步直传调用方
-     * （既有用例的 fail-fast 断言路径）；End 返回后前沿才推进（End 返回 = 下游确认完整消费）。
+     * ERROR（带已输出/预期条数——fail-fast 截断留痕，**指标不回填**——fail-fast 事务不算
+     * 完整交付），异步由 run 捕获、同步直传调用方（既有用例的 fail-fast 断言路径）；
+     * End 返回后前沿才推进（End 返回 = 下游确认完整消费）。
      * 线程：consumer 线程或同步测试线程。
      */
     void processBucket(TxBuffer bucket) {
+        long startNanos = System.nanoTime();
         bucket.state = BucketState.OUTPUTTING;
         listener.onEvent(new TransactionEvent.Begin(bucket.xid, bucket.kind, bucket.gid,
                 bucket.commitLsn, bucket.endLsn, bucket.commitTimestamp, bucket.unitCount));
@@ -134,15 +143,20 @@ final class TransactionConsumer implements Runnable {
         listener.onEvent(new TransactionEvent.End(bucket.xid, emitted[0]));
         outputFrontier.accumulateAndGet(bucket.endLsn, Math::max);
         bucket.state = BucketState.DONE;
+        metrics.onTxOutput(System.nanoTime() - startNanos, bucket.unitCount, emitted[0]);
     }
 
     /**
-     * 责任：周期统计（每 10s 一条 INFO）：LIVE 桶数（reader 侧计数）+ HANDED_OFF 桶数（队列
-     * 深度，FIFO 内全部待回放）+ OUTPUTTING（本单 consumer 是否正在处理）+ 输出前沿；最老交接
-     * 桶（队头 peek，FIFO 即最老）滞留超 60s 升 WARN（consumer 或下游回调阻塞的信号）。
-     * 关键步骤：距上次统计不足周期即原样返回旧戳；到点则取队列快照维度打 INFO，再对队头
-     * handoffNanos 做滞留判定。边界：队列为空时无滞留告警；返回本次统计时刻作下一轮基准。
-     * 线程：consumer 线程（queue 的 size/peek 并发安全，读数弱一致即可接受——统计非精确记账）。
+     * 责任：周期统计（每 10s）：①桶状态一行 INFO——LIVE 桶数（reader 侧计数）+ HANDED_OFF
+     * 桶数（队列深度，FIFO 内全部待回放）+ OUTPUTTING（本单 consumer 是否正在处理）+ 输出前沿；
+     * ②吞吐与分布两行 INFO——{@link ThroughputMetrics#reportLines}（速率窗口差分 + 分位区间，
+     * 每次调用即窗口边界）；③最老交接桶（队头 peek，FIFO 即最老）滞留超 60s 升 WARN
+     * （consumer 或下游回调阻塞的信号）。
+     * 关键步骤：距上次统计不足周期即原样返回旧戳；到点则取队列快照维度打 INFO，再让指标
+     * 生成两行并以本类 logger 打出，最后对队头 handoffNanos 做滞留判定。边界：队列为空时
+     * 无滞留告警；指标零样本窗口打 n/a；返回本次统计时刻作下一轮基准。
+     * 线程：consumer 线程（queue 的 size/peek 并发安全，读数弱一致即可接受——统计非精确记账；
+     * 指标报告与分布写入同线程，Recorder 单写者假设由此成立）。
      *
      * @param lastStats   上次统计的 nanoTime 戳
      * @param outputting  本采样窗的忙碌位（取到桶即将处理 = true；空闲轮询 = false——单 consumer 的 0/1 表达）
@@ -156,6 +170,9 @@ final class TransactionConsumer implements Runnable {
         LOG.info("consumer 统计: LIVE={} HANDED_OFF={} OUTPUTTING={} frontierLsn=0x{}",
                 liveBucketCount.get(), queue.size(), outputting ? 1 : 0,
                 Long.toHexString(outputFrontier.get()));
+        for (String line : metrics.reportLines(now)) {
+            LOG.info(line);
+        }
         TxBuffer oldest = queue.peek();
         if (oldest != null && now - oldest.handoffNanos > STALE_WARN_NANOS) {
             LOG.warn("最老交接桶滞留 {}ms 超过 {}s 阈值: xid={} firstIndex={}（consumer 或下游回调阻塞）",

@@ -95,6 +95,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private final ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
     /** reader 侧存活桶计数（LIVE 状态桶数，交接/整桶丢弃时递减）——consumer 周期统计展示用。 */
     private final AtomicInteger liveCount = new AtomicInteger();
+    /** 吞吐与分布指标（2026-08-31 设计）：组装器记 slot 读取与组装 tx，消费器/回放器记输出侧。 */
+    private final ThroughputMetrics throughputMetrics = new ThroughputMetrics();
 
     /** 最近一次 append 的 index（reader 记账，替代 pipe.lastAppendedIndex()——空队列时后者会抛；
      *  未 append 过为 -1）。watermark 的"已落盘内容全是垃圾"上界由此 +1 派生。 */
@@ -183,7 +185,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
         this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
                 this.pipe, handoffQueue, Objects.requireNonNull(outputFrontier, "outputFrontier"),
-                liveCount, Objects.requireNonNull(onFailure, "onFailure"), this.decodedObserver);
+                liveCount, Objects.requireNonNull(onFailure, "onFailure"), this.decodedObserver,
+                throughputMetrics);
         if (async) {
             this.consumerThread = new Thread(consumer, "transaction-consumer");
             this.consumerThread.setDaemon(false);
@@ -220,6 +223,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     @Override
     public void onRaw(byte[] raw) {
         Objects.requireNonNull(raw, "raw");
+        throughputMetrics.onSlotMessage(raw);   // slot 读取记账：收到即记（含控制消息与 'R'，字节=raw.length）
         long seq = pipe.append(raw);
         maxAppendedIndex = seq;
         char type = (char) raw[0];
@@ -633,6 +637,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
         bucket.handoffNanos = System.nanoTime();
         handedOff.add(bucket);
         liveCount.decrementAndGet();
+        throughputMetrics.onTxHandedOff();   // 组装完成记账：提交交接的事务才计（回滚丢弃不计）
         if (consumerThread == null) {
             consumer.processBucket(bucket);        // 同步消费（测试锚定路径）：回放与回调在调用线程内联完成
         } else {
@@ -670,6 +675,14 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      */
     List<TxBuffer> handedOffForTest() {
         return List.copyOf(handedOff);
+    }
+
+    /**
+     * 本组装器的吞吐指标实例（测试观测面）：接线测试经它断言 slot/组装侧计数与消费器回填的
+     * 输出侧计数全链路对上。包私有机动，不是公开 API。
+     */
+    ThroughputMetrics throughputMetrics() {
+        return throughputMetrics;
     }
 
     /**

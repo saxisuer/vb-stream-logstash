@@ -1,6 +1,6 @@
 # replication/ 模块——复制会话、raw 接缝与解耦事务组装（IO + 组装层）
 
-职责：管理两条 JDBC 连接（普通 SQL + 复制专用），把复制流按**原始字节**交付上层（raw 接缝，里程碑 1.6 起）；本包同时承载 raw 驱动的 `TransactionAssembler`（1.7 起 reader/consumer 双线程解耦：**reader 记账 + Chronicle Queue 主缓冲管道 + 独立消费器回放输出**；2.0 起输出契约流式化：**`onEvent(TransactionEvent)` 事件交付，回放期堆峰 O(单条)**，block 逃生门经 `StreamingToBlockAdapter` 攒回整块）。上游 `Main` 依赖 `PgReplicationSession` + `TransactionAssembler`（raw 接缝直连）；集成测试 `SessionHarness` 双轨录制（raw + 经 `DecodedMessageBridge` 的解码消息）。
+职责：管理两条 JDBC 连接（普通 SQL + 复制专用），把复制流按**原始字节**交付上层（raw 接缝，里程碑 1.6 起）；本包同时承载 raw 驱动的 `TransactionAssembler`（1.7 起 reader/consumer 双线程解耦：**reader 记账 + Chronicle Queue 主缓冲管道 + 独立消费器回放输出**；2.0 起输出契约流式化：**`onEvent(TransactionEvent)` 事件交付，回放期堆峰 O(单条)**，block 逃生门经 `StreamingToBlockAdapter` 攒回整块）；2026-08-31 起内建**吞吐与分布指标**（`ThroughputMetrics`：slot 读取/组装/输出三段速率 + 事务回放耗时与事务大小分位数，10s 周期 INFO 日志行）。上游 `Main` 依赖 `PgReplicationSession` + `TransactionAssembler`（raw 接缝直连）；集成测试 `SessionHarness` 双轨录制（raw + 经 `DecodedMessageBridge` 的解码消息）。
 
 ## 数据流（2.0 解耦 + 流式输出形态，设计文档 `docs/superpowers/specs/2026-08-29-reader-consumer-decoupling-design.md` 与 `...-transaction-streaming-output-design.md`）
 
@@ -124,12 +124,12 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 
 实现 `RawMessageListener`。核心思路：**数据消息不解码直接记账**——原始字节 append 进管道，桶只记 CQ index 段；控制消息和 Relation 当场解码驱动状态机；解码推迟到 consumer 回放（回滚的大事务从未被解码过，提交的事务也只解一次）。
 
-- **路由（每条 onRaw，reader 线程）**：先 `pipe.append(raw)` 取 seq（每条消息一个——含控制消息与 'R'），再按类型字节分流：
+- **路由（每条 onRaw，reader 线程）**：先 `throughputMetrics.onSlotMessage(raw)` 记 slot 读取（收到即记，含控制消息与 'R'），再 `pipe.append(raw)` 取 seq（每条消息一个——含控制消息与 'R'），按类型字节分流：
   - 控制消息（B/C/S/E/c/A/b/P/K/r/p）与 'R'：**live 解码**（自持 decoder 顺带维护 inStream 流块状态机，与 `currentStream` 指针同点同变）后分发到桶状态规则；'R' 以到达 seq 记入版本日志，字节不占桶（其 append 仍是 seq 时间线的一环）
   - I/U/D/T/M：**窥探不入桶不解码**——校验桶级 hasPrefix 不变量（首单元定性）、窥 relation oid 入 oidSet（I/U/D 单 oid、T 为 oid 数组、M 无）、把 index 记入当前活动桶的连续段（没有活动桶 fail-fast）；'M' 先窥 flags bit0 分事务性/非事务性（非事务性无桶 WARN 丢弃）
   - Y/O：DEBUG 记录后丢弃；未知类型经 decoder 抛 UnknownMessageTypeException（解码层 fail-fast）
 - **桶模型**：普通事务单指针 `currentNormalTx`（Begin..Commit 串行不嵌套）；流式多桶 `streamedByXid`（key=StreamStart 顶层 xid）+ 流块上下文 `currentStream`（段间交错、流块不嵌套）；两阶段 `currentPrepareTx` 活动 + `preparedByGid` 挂起池（PREPARE 至 COMMIT/ROLLBACK PREPARED，可能长期挂起）。**StreamAbort**：top==sub 整桶丢弃（管道条目成垃圾，随低水位删除）；否则记入桶的 `abortedSubxids`，**回放期过滤**。桶缺失/重复/流块状态异常一律 ISE fail-fast
-- **提交路径 = `handoff(bucket)`**（设计 §4.4）：拷快照（`registry.snapshot(oidSet, lastIndex)`）→ 捕获封箱元数据 → `state=HANDED_OFF` → 入 `handedOff` 记账（低水位钉住）→ 入交接队列（异步）或直调 `consumer.processBucket`（同步测试形态）→ 维护两个低水位 → **立即返回**。回滚路径（RollbackPrepared/StreamAbort 整桶）丢弃不回调，完结点同样维护低水位
+- **提交路径 = `handoff(bucket)`**（设计 §4.4）：拷快照（`registry.snapshot(oidSet, lastIndex)`）→ 捕获封箱元数据 → `state=HANDED_OFF` → 入 `handedOff` 记账（低水位钉住）→ `onTxHandedOff()` 记组装完成指标 → 入交接队列（异步）或直调 `consumer.processBucket`（同步测试形态）→ 维护两个低水位 → **立即返回**。回滚路径（RollbackPrepared/StreamAbort 整桶）丢弃不回调（组装指标也不计——未提交不算组装完成），完结点同样维护低水位
 - **close() = 毒丸排干协议**（异步形态）：毒丸（`TxBuffer.POISON`）入队 → join consumer（60s 超时 WARN 放行）→ 关管道。FIFO 保证 consumer 先排干此前交接的全部冻结桶再见到毒丸——**停机时已提交未输出的事务不丢**。同步形态无 consumer 线程，直接关管道
 - **线程约束（红线）**：`onRaw`/`close` 单写者（reader 线程——decoder 的流块状态、全部桶指针、registry、pipe appender 都要求）；consumer 只触碰冻结桶 + 交接队列 + pipe tailer + 前沿 AtomicLong。不可与 onRaw 并发调 close
 - 日志：非事务性 M 丢弃、RollbackPrepared 丢弃 WARN；Y/O 丢弃与 PREPARE 入挂起池 DEBUG
@@ -141,15 +141,28 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 从组装器抽出单独成类，为的是既有单测能以"同线程消费"驱动（直接调 `processBucket`，锚定 1.6 期望）与真实线程形态共用同一段处理逻辑（设计 §9）。
 
 - **循环协议（`run()`，consumer 线程）**：交接队列 `poll(1s)`——null（暂无交接）做周期统计后继续；取到毒丸退出；否则 processBucket。poll 被中断恢复中断标志退出（防御路径）
-- **processBucket（单桶处理半程，同步/异步共用，2.0 三段事件流）**：`state=OUTPUTTING` → 发 `TransactionEvent.Begin` 头（expectedChanges 取桶记账 `unitCount`，aborted 过滤前）→ `BucketReplayer.replay(bucket, pipe, sink)` 逐条交付（sink = `listener.onEvent(change)` 即时回调，**先交付后计数**——listener 自身抛出时该条不计入"已输出"；不构造整事务列表，堆 O(单条)）→ 发 `End` 尾（emitted 为过滤后实付数）→ 前沿以 endLsn 单调累加（`accumulateAndGet(max)`，**End 处理完毕后**——End 返回 = 完整消费确认，block 形态即适配器转发 + onTransaction 返回）→ `state=DONE`。空桶产出 `Begin → End(0)`；回放异常在 End 发出前原样上抛并记 ERROR（带已输出/预期条数与 firstIndex——fail-fast 截断留痕，End 永不发出、前沿不推进）——异步由 run 捕获、同步直传调用方（既有用例的 fail-fast 断言路径）
+- **processBucket（单桶处理半程，同步/异步共用，2.0 三段事件流）**：起计回放耗时 → `state=OUTPUTTING` → 发 `TransactionEvent.Begin` 头（expectedChanges 取桶记账 `unitCount`，aborted 过滤前）→ `BucketReplayer.replay(bucket, pipe, sink)` 逐条交付（sink = `listener.onEvent(change)` 即时回调，**先交付后计数**——listener 自身抛出时该条不计入"已输出"；不构造整事务列表，堆 O(单条)）→ 发 `End` 尾（emitted 为过滤后实付数）→ 前沿以 endLsn 单调累加（`accumulateAndGet(max)`，**End 处理完毕后**——End 返回 = 完整消费确认，block 形态即适配器转发 + onTransaction 返回）→ `state=DONE` → 指标回填（`onTxOutput`：输出 tx/records 计数 + 耗时/大小两分布样本——**仅完整交付的事务入分布**，fail-fast 截断的不入）。空桶产出 `Begin → End(0)`；回放异常在 End 发出前原样上抛并记 ERROR（带已输出/预期条数与 firstIndex——fail-fast 截断留痕，End 永不发出、前沿不推进、指标不回填）——异步由 run 捕获、同步直传调用方（既有用例的 fail-fast 断言路径）
 - **失败语义**：处理中抛出的任何 Throwable 记 ERROR、触发 onFailure（如 `stop::countDown`）、退出循环**不排干**（fail-fast，与 1.6"异常上抛终止会话"等价）；捕捉 Throwable 防 consumer 静默死亡导致 reader 无限追加
 - **交接队列** `LinkedBlockingQueue<TxBuffer>`（无界——元素只有元数据，真缓冲是 CQ）
-- **周期统计**（10s 固定周期，常量不做配置面）：各状态桶计数（LIVE/HANDED_OFF/OUTPUTTING）+ 输出前沿一行 INFO；最老 HANDED_OFF 桶滞留超 60s 升 WARN（consumer 或下游回调阻塞的信号）
+- **周期统计**（10s 固定周期，常量不做配置面）：①各状态桶计数（LIVE/HANDED_OFF/OUTPUTTING）+ 输出前沿一行 INFO；②吞吐与分布两行 INFO（`metrics.reportLines(now)`——**每次调用即窗口边界**，速率按窗口差分、分位按区间隔离，见 ThroughputMetrics 节）；最老 HANDED_OFF 桶滞留超 60s 升 WARN（consumer 或下游回调阻塞的信号）
 - **线程约束**：run() 仅 consumer 线程；processBucket 的触碰面 = 冻结桶 + pipe.readRange + listener 回调 + 前沿累加 + 桶状态字段——全部在 consumer 线程或并发安全结构上
 
 ## BucketReplayer（包私有，桶回放器）
 
-把一个交接冻结的桶回放渲染为 `TxChange` 序列——consumer 的核心。自 1.7 起完全走桶内快照：不持有 registry，resolver 与逐消息渲染视图都取自 `bucket.relationSnapshot`，consumer 线程与 reader 的版本日志零共享。**2.0 起 sink 交付形态**：`replay(bucket, pipe, sink)` 逐条构造逐条交 sink（不攒 List，堆 O(单条)）、返回交付条数（aborted 过滤后）——计数归调用方（消费器据此填 End 的 emitted）。逐单元三步：**aborted 过滤**（hasPrefix 时重窥 raw[1..4] 得 streamXid，命中 abortedSubxids 跳过——不解码不回调；LogicalMsg 单元前缀=顶层 xid，不会撞上子事务 subxid）→ **解码**（自持独立 decoder 的 `decodeSingle(payload, hasPrefix)`，显式给定 inStream 免 'S'/'E' 包裹重建流块上下文，不触碰实例状态——与组装器 live 解码实例互不干扰）→ **构造**（I/U/D→RowChange、T→TruncateChange、M→MsgChange；Relation 一律 `snapshot.require(oid, index)` 取**变更时刻**版本，index 即单元 seq）即交 sink。每个解码点回调 decodedObserver（第二参传桶快照作渲染视图）。空桶零交付（协议合法，`Begin → End(0)`）；非 I/U/D/T/M 单元防御性 ISE；桶未交接（快照缺失）抛 ISE——回放前置条件违反；回放失败异常经 sink 调用链原样上抛，已交付条目不撤回（事务尾 End 由调用方保证永不发出）。单线程内同步执行（consumer 线程或同步测试线程）；产出的 TxChange 不可变，可跨线程传递。
+把一个交接冻结的桶回放渲染为 `TxChange` 序列——consumer 的核心。自 1.7 起完全走桶内快照：不持有 registry，resolver 与逐消息渲染视图都取自 `bucket.relationSnapshot`，consumer 线程与 reader 的版本日志零共享。**2.0 起 sink 交付形态**：`replay(bucket, pipe, sink)` 逐条构造逐条交 sink（不攒 List，堆 O(单条)）、返回交付条数（aborted 过滤后）——计数归调用方（消费器据此填 End 的 emitted）。逐单元起手先记回读字节指标（`onReplayedUnit(payload.length)`，aborted 过滤**前**——被剔除单元的字节也确实从管道读回了，口径是"回读吞吐"），随后三步：**aborted 过滤**（hasPrefix 时重窥 raw[1..4] 得 streamXid，命中 abortedSubxids 跳过——不解码不回调；LogicalMsg 单元前缀=顶层 xid，不会撞上子事务 subxid）→ **解码**（自持独立 decoder 的 `decodeSingle(payload, hasPrefix)`，显式给定 inStream 免 'S'/'E' 包裹重建流块上下文，不触碰实例状态——与组装器 live 解码实例互不干扰）→ **构造**（I/U/D→RowChange、T→TruncateChange、M→MsgChange；Relation 一律 `snapshot.require(oid, index)` 取**变更时刻**版本，index 即单元 seq）即交 sink。每个解码点回调 decodedObserver（第二参传桶快照作渲染视图）。空桶零交付（协议合法，`Begin → End(0)`）；非 I/U/D/T/M 单元防御性 ISE；桶未交接（快照缺失）抛 ISE——回放前置条件违反；回放失败异常经 sink 调用链原样上抛，已交付条目不撤回（事务尾 End 由调用方保证永不发出）。单线程内同步执行（consumer 线程或同步测试线程）；产出的 TxChange 不可变，可跨线程传递。构造两形态：三参（mode, observer, metrics——组装器→消费器穿入共用实例）与两参便捷（metrics 自建、无人读，测试直连场景用）。
+
+## ThroughputMetrics（包私有，吞吐与分布指标）
+
+本地周期日志行观测面（2026-08-31 设计，spec `docs/superpowers/specs/2026-08-31-throughput-metrics-design.md`）：六项速率计数 + 两项分位数分布。**选型**：计数与窗口差分手写（消费通道仅日志行，Micrometer/Dropwizard 的速率算法与输出格式对本场景无净值），分位数用 HdrHistogram `SingleWriterRecorder`（零传递依赖；Micrometer `DistributionSummary` 百分位内部同源）——全部计量收在本类后面，未来接监控系统只换实现、四个埋点点位不动。
+
+- **六计数口径**（LongAdder，只增不清零）：slot bytes/messages 在组装器 `onRaw` 入口记（含控制消息与 'R'——"从槽读到什么"的诚实口径，与输出侧 records **不可对照**，bytes 才是两端口径一致的对照对）；组装 tx 在 `handoff` 记（提交交接才计，回滚丢弃不计）；输出 bytes 在回放器逐单元记（aborted 过滤**前**）；输出 tx/records 在 `processBucket` 尾经 `onTxOutput` 记（实付 TxChange 数，Begin/End 事件不计）
+- **两分布**（`SingleWriterRecorder`，2 位有效数字 ≈1% 精度）：事务回放耗时（processBucket 起止，**含下游回调**）与事务大小（`unitCount`，aborted 过滤前——事务"本相"多大，与输出 records 的差 = 被剔除的子事务量）；**仅完整交付的事务入分布**（fail-fast 截断不入）；越上界（耗时 1h / 大小 10 亿单元）钳制到上界——指标永不向热路径抛异常
+- **报告语义**（`reportLines(nowNanos)`，每次调用即窗口边界）：速率 = 六计数窗口内 delta ÷ 实际流逝秒数（nanoTime 差）；分位 = Recorder 取走的上一区间（窗口外样本不稀释当前值，返回的直方图回收复用、读后即弃）；零样本窗口分布段打 `n/a`。格式：字节 SI 十进制恒一位小数（`12.4 MB/s`）、耗时 ns→µs→ms→s 千进位（同档 ≥100 取整）、计数速率 <100 一位小数 / ≥100 整数千分位——两行样例：
+  - `吞吐: slot=12.4 MB/s (85,231 msg/s) | 组装=42 tx/s | 输出=11.8 MB/s (81,004 rec/s, 41 tx/s)`
+  - `分布: 回放耗时 p90=3.2ms p95=6.8ms max=125ms | 事务大小 p90=2,150 rec p95=5,100 rec max=48,200 rec`
+- **接线**（Main/公共 API/配置面**零改动**，指标常开）：组装器构造时创建实例 → 自用（slot/组装）→ 穿 `TransactionConsumer` 构造（输出计数 + 分布 + 报告挂 `maybeStats` 统计 tick）→ 穿 `BucketReplayer` 构造（回读字节）。同步测试形态 `run()` 不被调用 → 只计数不打印；`assembler.throughputMetrics()` 是包私有测试观测口
+- **注意**：HDR 的 Maven 坐标小写 `org.hdrhistogram`、Java 包名**大写** `org.HdrHistogram`（上游历史命名，import 别写反）；HDR 按有效数字做桶级量化，读回值可有 ±1% 偏差（3600s 记入读回 3608s 属正常），断言用容差
+- 测试：`ThroughputMetricsTest`（格式化边界/窗口差分/区间隔离/钳制）+ `ThroughputMetricsWiringTest`（同步组装器走完整业务路径，断言 4 处埋点无一漏挂）
 
 ## PipeConfig（record，不可变）
 
@@ -192,5 +205,6 @@ raw 字节窥探辅助：`intAt`（big-endian 有符号 I32，oid 窥探——�
 2. `TxBuffer.state`（volatile，写侧按状态分段：reader 前段 LIVE→HANDED_OFF、consumer 后段 OUTPUTTING/DONE；其余字段交接即冻结、任意线程只读）
 3. 输出前沿 `AtomicLong`（consumer 单调 max 累加，reader 每轮读一次做反馈封顶）
 4. `MessagePipe` 的 appender（reader 独占）与 tailer（consumer 独占）——各自单线程使用，跨线程可见性由 CQ 的单 appender/多 tailer 内存模型保证
+5. `ThroughputMetrics`：六速率计数 LongAdder（slot 侧 reader 写、输出侧 consumer 写，报告时 consumer 弱一致读——统计语义足够）+ 两 `SingleWriterRecorder`（record 与报告均在 consumer 线程，单写者假设由此成立）
 
 同步测试形态（`TransactionConsumer.processBucket` 直调）把 consumer 半程折叠回调用线程——既有组装器单测以此锚定既有期望，`DecoupledEquivalenceTest` 断言同一字节流同步/异步两形态完整事件流全等（经 `TransactionRecorder` 重组对账，Task 3 升级）。`VersionedRelationRegistry` 是 reader 侧单写者设计；`DecodedMessageBridge` 非线程安全（inStream）；`ConsoleRenderer` 近乎无状态——唯流式行号 `rowSeq` 为实例可变字段，线程限定 consumer（onEvent 调用线程；onMessage/静态渲染不触碰），slf4j 线程安全（双线程回调安全）；输出的 `TransactionEvent`/`Transaction`/`TxChange` 不可变，可跨线程传递。
