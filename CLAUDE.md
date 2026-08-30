@@ -109,7 +109,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 - **输出语义**：at-least-once——LSN 确认按输出前沿封顶，**前沿锚定 End 事件**（End 返回 = 下游确认完整消费；中途失败 fail-fast 截断、End 永不发出，前沿不推进），crash 时未输出（End 未达）事务必然被 PG 重发，console 可能重复输出已见事务的头行（不去重，文档化承诺）
 - **源码结构**（各源码根一行；包内细节见各模块级 CLAUDE.md，层间关系见上文“架构总览”）：
     - `src/main/java`：`protocol`（协议解析，纯函数）、`replication`（会话 + raw 接缝 + 解耦事务组装与管道）、顶层 `Main`/`ConsoleRenderer`
-    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleListenerTest`、`it` 包集成测试 11 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
+    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleRendererTest`、`it` 包集成测试 11 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
     - `src/jmh/java`：五基准（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖，见其 CLAUDE.md）
 - 集成测试（`org.vastdata.vbstream.it`，11 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。解耦专项三组：`DecoupledPipelineTest` 三场景（①双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除，异步管道双回放输出全等 ②大事务内同事务 DDL，前后段按 asOf 版本渲染 ③流式大事务回滚后低水位推进 + 陈旧滚动文件实际删档）、`ReaderUnblockedTest`（头名验收——consumer 阻塞期间 reader 持续接收，放行后排干不丢不重）、`FrontierCapTest`（未输出事务钉住 confirmed_flush，输出后越过封顶）；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
 - JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 等号单 token 形式自带，详见该文档；基线数字在档作回归对照——2.0 段 + 1.7 段 + 1.6 历史参照，不进 CI）
