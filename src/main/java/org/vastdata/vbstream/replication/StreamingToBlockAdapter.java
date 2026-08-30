@@ -10,7 +10,7 @@ import java.util.Objects;
  * 随失败丢弃，目标零输出（block 模式恢复 1.7 原子交付语义——堆 O(事务)、半截事务永不外泄）。
  *
  * <p>与 {@link TransactionRecorder} 的差异：本类面向**下游转发**（End 即回调目标，事务级
- * 转发后丢弃，不累积历史）；收集器面向**测试断言**（全部产物驻留列表供事后核对）。两者对
+ * 转发后丢弃，不累积历史）；录制器面向**测试断言**（全部产物驻留列表供事后核对）。两者对
  * 同一事件流的整块表达值相等（StreamingToBlockAdapterTest 的等价验收）。
  *
  * <p>边界：End 无匹配 Begin、Begin 内嵌 Begin、变更先于 Begin 均抛 {@link IllegalStateException}
