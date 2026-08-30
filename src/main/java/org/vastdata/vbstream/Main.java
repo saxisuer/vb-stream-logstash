@@ -20,7 +20,7 @@ public final class Main {
     private static final Logger LOG = LoggerFactory.getLogger(Main.class);
 
     /**
-     * 装配并启动复制会话（2.0 双线程流式形态）：ConsoleListener 一个实例三角色——组装器解码点
+     * 装配并启动复制会话（2.0 双线程流式形态）：ConsoleRenderer 一个实例三角色——组装器解码点
      * observer（reader 线程的控制消息/'R' live 解码 + consumer 线程的回放解码，逐消息
      * DEBUG/INFO）、流式事件渲染（STREAMING 默认，onEvent 直渲染）与整块渲染（BLOCK 经
      * {@link StreamingToBlockAdapter} 回调 onTransaction）。关键步骤：校验配置（含 pipe 与输出形态
@@ -66,7 +66,7 @@ public final class Main {
             session.open();
             session.ensureSlot();
             session.start();
-            ConsoleListener console = new ConsoleListener();
+            ConsoleRenderer console = new ConsoleRenderer();
             // vb.output.mode 接线（2.0 spec §1.1）：STREAMING（默认）——console 直接作为流式
             // listener（onEvent 逐事件渲染，O(单条) 堆）；BLOCK——StreamingToBlockAdapter 把事件流攒齐
             // 整块再回调 console.onTransaction（1.7 原子交付语义逃生门，O(事务) 堆）。

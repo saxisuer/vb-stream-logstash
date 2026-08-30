@@ -81,7 +81,7 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
     private final VersionedRelationRegistry registry;
     /** 主缓冲管道（构造时急切建立——管道是地基，构造即 wipe 目录）：每条消息 append 一次，回放按段读回。 */
     private final MessagePipe pipe;
-    /** 每个解码点（控制消息、'R'、回放单元）回调一次——ConsoleListener 逐消息 DEBUG 挂在这里；
+    /** 每个解码点（控制消息、'R'、回放单元）回调一次——ConsoleRenderer 逐消息 DEBUG 挂在这里；
      *  第二参是渲染视图（RelationLookup）：live 解码点传 registry（最新版），回放点传桶快照。 */
     private final BiConsumer<PgOutputMessage, RelationLookup> decodedObserver;
     /** 事务消费器：交接桶的回放输出半程（冻结桶 + readRange + 回调 + 前沿），同步/异步两形态共用。

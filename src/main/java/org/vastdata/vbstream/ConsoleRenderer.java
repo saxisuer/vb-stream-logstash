@@ -39,7 +39,7 @@ import java.util.OptionalLong;
  * <p>线程约束：本类近乎无状态，唯 {@link #rowSeq}（流式行号）为实例可变字段——线程限定
  * consumer 线程（onEvent 的调用线程），onMessage/静态渲染不触碰；slf4j 线程安全。
  */
-public final class ConsoleListener implements PgOutputListener, StreamingTransactionListener, BlockTransactionListener {
+public final class ConsoleRenderer implements PgOutputListener, StreamingTransactionListener, BlockTransactionListener {
 
     /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
@@ -146,7 +146,7 @@ public final class ConsoleListener implements PgOutputListener, StreamingTransac
         }
         if (change instanceof TruncateChange tc) {
             return "TRUNCATE %s options=%s%s".formatted(
-                    tc.relations().stream().map(ConsoleListener::tableOf).toList(),
+                    tc.relations().stream().map(ConsoleRenderer::tableOf).toList(),
                     tc.options(), suffix(tc.streamXid()));
         }
         if (change instanceof MsgChange mc) {

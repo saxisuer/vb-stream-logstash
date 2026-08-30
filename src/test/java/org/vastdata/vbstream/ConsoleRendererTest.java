@@ -26,8 +26,8 @@ import java.util.OptionalLong;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** ConsoleListener 事务渲染格式测试（block 路径 onTransaction + 流式路径 onEvent 双验收）：logback ListAppender 直接挂在 CDC logger 上捕获输出行。 */
-class ConsoleListenerTest {
+/** ConsoleRenderer 事务渲染格式测试（block 路径 onTransaction + 流式路径 onEvent 双验收）：logback ListAppender 直接挂在 CDC logger 上捕获输出行。 */
+class ConsoleRendererTest {
 
     private final Logger cdc = (Logger) org.slf4j.LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
@@ -66,7 +66,7 @@ class ConsoleListenerTest {
         Transaction txn = new Transaction(505L, TransactionKind.STREAMED, null,
                 0x1BD9E70L, 0x1BD9E80L, Instant.parse("2026-08-27T08:00:00Z"), List.of(insert));
 
-        new ConsoleListener().onTransaction(txn);
+        new ConsoleRenderer().onTransaction(txn);
 
         assertEquals(3, appender.list.size());
         String header = appender.list.get(0).getFormattedMessage();
@@ -90,7 +90,7 @@ class ConsoleListenerTest {
                 Optional.empty(),
                 Optional.of(row("1", "aaa")),
                 OptionalLong.empty());
-        ConsoleListener listener = new ConsoleListener();
+        ConsoleRenderer listener = new ConsoleRenderer();
 
         listener.onEvent(new TransactionEvent.Begin(505L, TransactionKind.STREAMED, null,
                 0x1BD9E70L, 0x1BD9E80L, Instant.parse("2026-08-27T08:00:00Z"), 1L));
@@ -119,7 +119,7 @@ class ConsoleListenerTest {
     void streamingHeaderUsesExpectedWhileBlockUsesActualCount() {
         RowChange insert = new RowChange(DmlKind.INSERT, relation(),
                 Optional.empty(), Optional.of(row("1", "aaa")), OptionalLong.empty());
-        ConsoleListener listener = new ConsoleListener();
+        ConsoleRenderer listener = new ConsoleRenderer();
 
         listener.onEvent(new TransactionEvent.Begin(505L, TransactionKind.STREAMED, null,
                 1L, 2L, Instant.parse("2026-08-27T08:00:00Z"), 2L));   // expected=2（过滤前）
@@ -143,7 +143,7 @@ class ConsoleListenerTest {
      */
     @Test
     void onMessageLogsAtDebugWhileTransactionLogsAtInfo() {
-        ConsoleListener listener = new ConsoleListener();
+        ConsoleRenderer listener = new ConsoleRenderer();
         listener.onMessage(new PgOutputMessage.Begin(1L, Instant.EPOCH, 505L), new RelationRegistry());
         assertTrue(appender.list.stream().noneMatch(e -> e.getLevel() == Level.INFO),
                 "逐消息渲染不应再以 INFO 输出: " + appender.list);
@@ -168,7 +168,7 @@ class ConsoleListenerTest {
      */
     @Test
     void transactionLifecycleMessagesEmitInfoWhileRowDataStaysDebug() {
-        ConsoleListener listener = new ConsoleListener();
+        ConsoleRenderer listener = new ConsoleRenderer();
         RelationRegistry registry = new RelationRegistry();
 
         // 流式生命周期（分段边界与终局信号）

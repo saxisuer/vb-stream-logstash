@@ -74,7 +74,7 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部创建）
 
 ## RelationLookup 与 RelationSnapshot（consumer 不共享 registry 的两块拼图，设计 §4.3）
 
-- **`RelationLookup`**（公共接口）：`Optional<Relation> find(int oid)`——宽松查询视图（miss 返回 empty，供渲染降级 "oid:N"）。存在动机：逐消息渲染的 Relation 来源随线程不同（live 解码点 = reader 线程的版本日志最新视图；回放解码点 = consumer 线程的桶内不可变快照），本接口是两者的公共形态，使 `PgOutputListener`/`ConsoleListener.onMessage` 不依赖具体 registry 实现——若回放侧闭包引用 reader 的 HashMap registry 即构成数据竞争。
+- **`RelationLookup`**（公共接口）：`Optional<Relation> find(int oid)`——宽松查询视图（miss 返回 empty，供渲染降级 "oid:N"）。存在动机：逐消息渲染的 Relation 来源随线程不同（live 解码点 = reader 线程的版本日志最新视图；回放解码点 = consumer 线程的桶内不可变快照），本接口是两者的公共形态，使 `PgOutputListener`/`ConsoleRenderer.onMessage` 不依赖具体 registry 实现——若回放侧闭包引用 reader 的 HashMap registry 即构成数据竞争。
 - **`RelationSnapshot`**（包私有，不可变）：`oid → (seq, Relation) 版本前缀` 的快照，由 reader 在交接瞬间经 `VersionedRelationRegistry.snapshot(oidSet, ≤ lastIndex)` 拷出（浅拷，Relation record 引用安全共享；通常每 oid 一版，几十字节）。`require(oid, asOfSeq)` 二分取 ≤ asOfSeq 的最新版（语义与版本日志对齐，被快照省略的 oid 以"未先行到达"fail-fast，报错时机与 1.6 直查 registry 一致）；`find` 是快照内最新版宽松视图（实现 `RelationLookup`）。**这是 consumer 不共享 reader registry 的关键**——registry 保持单写者（reader），跨线程零并发改造。
 
 ## MessagePipe（包私有，Chronicle Queue 主缓冲管道，AutoCloseable）
@@ -134,7 +134,7 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 - **线程约束（红线）**：`onRaw`/`close` 单写者（reader 线程——decoder 的流块状态、全部桶指针、registry、pipe appender 都要求）；consumer 只触碰冻结桶 + 交接队列 + pipe tailer + 前沿 AtomicLong。不可与 onRaw 并发调 close
 - 日志：非事务性 M 丢弃、RollbackPrepared 丢弃 WARN；Y/O 丢弃与 PREPARE 入挂起池 DEBUG
 
-构造两形态：**异步**（Main 用：`(listener, mode, registry, pipeConfig, decodedObserver, outputFrontier, onFailure)`——构造即建管道并起非守护 `transaction-consumer` 线程）与**同步**（测试锚定既有期望：`(listener, mode, registry, pipeConfig, decodedObserver)`——handoff 在调用线程直调 processBucket，无线程拆分；另有 observer 缺省便捷构造）。`listener` 是 `StreamingTransactionListener`（2.0 流式事件契约——Main 按 `vb.output.mode` 接线：STREAMING 直传下游、BLOCK 包 `StreamingToBlockAdapter`；组装器与消费器对模式无感知，内部恒流式）。`decodedObserver` 是 `BiConsumer<PgOutputMessage, RelationLookup>`（ConsoleListener 逐消息挂点），live 解码点（reader）传 registry、回放解码点（consumer）传桶快照。
+构造两形态：**异步**（Main 用：`(listener, mode, registry, pipeConfig, decodedObserver, outputFrontier, onFailure)`——构造即建管道并起非守护 `transaction-consumer` 线程）与**同步**（测试锚定既有期望：`(listener, mode, registry, pipeConfig, decodedObserver)`——handoff 在调用线程直调 processBucket，无线程拆分；另有 observer 缺省便捷构造）。`listener` 是 `StreamingTransactionListener`（2.0 流式事件契约——Main 按 `vb.output.mode` 接线：STREAMING 直传下游、BLOCK 包 `StreamingToBlockAdapter`；组装器与消费器对模式无感知，内部恒流式）。`decodedObserver` 是 `BiConsumer<PgOutputMessage, RelationLookup>`（ConsoleRenderer 逐消息挂点），live 解码点（reader）传 registry、回放解码点（consumer）传桶快照。
 
 ## TransactionConsumer（包私有，消费器循环）
 
@@ -193,4 +193,4 @@ raw 字节窥探辅助：`intAt`（big-endian 有符号 I32，oid 窥探——�
 3. 输出前沿 `AtomicLong`（consumer 单调 max 累加，reader 每轮读一次做反馈封顶）
 4. `MessagePipe` 的 appender（reader 独占）与 tailer（consumer 独占）——各自单线程使用，跨线程可见性由 CQ 的单 appender/多 tailer 内存模型保证
 
-同步测试形态（`TransactionConsumer.processBucket` 直调）把 consumer 半程折叠回调用线程——既有组装器单测以此锚定既有期望，`DecoupledEquivalenceTest` 断言同一字节流同步/异步两形态完整事件流全等（经 `TransactionRecorder` 重组对账，Task 3 升级）。`VersionedRelationRegistry` 是 reader 侧单写者设计；`DecodedMessageBridge` 非线程安全（inStream）；`ConsoleListener` 近乎无状态——唯流式行号 `rowSeq` 为实例可变字段，线程限定 consumer（onEvent 调用线程；onMessage/静态渲染不触碰），slf4j 线程安全（双线程回调安全）；输出的 `TransactionEvent`/`Transaction`/`TxChange` 不可变，可跨线程传递。
+同步测试形态（`TransactionConsumer.processBucket` 直调）把 consumer 半程折叠回调用线程——既有组装器单测以此锚定既有期望，`DecoupledEquivalenceTest` 断言同一字节流同步/异步两形态完整事件流全等（经 `TransactionRecorder` 重组对账，Task 3 升级）。`VersionedRelationRegistry` 是 reader 侧单写者设计；`DecodedMessageBridge` 非线程安全（inStream）；`ConsoleRenderer` 近乎无状态——唯流式行号 `rowSeq` 为实例可变字段，线程限定 consumer（onEvent 调用线程；onMessage/静态渲染不触碰），slf4j 线程安全（双线程回调安全）；输出的 `TransactionEvent`/`Transaction`/`TxChange` 不可变，可跨线程传递。
