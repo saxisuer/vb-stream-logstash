@@ -104,7 +104,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 |---|---|---|
 | `vb.output.mode` | `streaming` | `streaming`=流式事件交付（onEvent 逐事件渲染，回放期堆 O(单条)，输出格式与 block 逐字节一致）；`block`=经 `StreamingToBlockAdapter` 攒回整块再回调（1.7 原子交付语义逃生门，回放期堆 O(事务)；未知值启动期抛 IAE fail-fast） |
 
-- **管道目录重启自动清空属预期行为**：管道是瞬态工作区——真源是复制槽，重启后 PG 从确认位点（输出前沿封顶值）重发未输出事务，`MessagePipe` 构造时先整体清空目录再建队列（残留旧数据的有害陈旧 index 会让回读错位）。不要往该目录放任何需要保留的东西。同 JVM 第二个管道实例指向同一目录会清掉前者的队列文件（进程内独占）
+- **管道目录重启自动清空属预期行为**：管道是瞬态工作区——真源是复制槽，重启后 PG 从确认位点（输出前沿封顶值）重发未输出事务，`MessagePipe` 构造时先整体清空目录再建队列（残留旧数据的有害陈旧 index 会让回读错位）。不要往该目录放任何需要保留的东西（默认目录 `pipe-queue/` 已 gitignore，瞬态工作区不入库）。同 JVM 第二个管道实例指向同一目录会清掉前者的队列文件（进程内独占）
 - **内存有界性（2.0 形态）**：**组装期堆内零字节引用**——数据消息字节只在 `pipe.append` 时落盘一次，桶只记 CQ index 段（段数 × long[2]）与 oid/aborted 集合；**回放期（consumer 线程）STREAMING 形态堆峰 O(单条)**——逐单元 readRange 回读、解码、渲染、交付后即不可达（消费路径无跨单元累积容器），readRange 载荷副本与 TxChange 双份瞬态仅单单元量级；BLOCK 形态经 `StreamingToBlockAdapter` 攒回整块，恢复 1.7 的 O(事务) 回放期瞬态（攒集 ArrayList 有高水位保留——`clear` 不缩容，曾经过的大事务会留下大 backing array）。仍随事务/会话增长的堆结构：`abortedSubxids`（每回滚子事务一个 Long，随桶完结释放）、`preparedByGid` 挂起池（未决 2PC 数，协议固有）、交接队列与 `handedOff` 记账（待输出桶数 × 元数据，DONE 惰性清理）、registry 版本日志（随新表/DDL 线性——组装器在桶完结点按存活桶 firstIndex 低水位 `pruneBelow` 剪枝，floor 语义，2PC 挂起桶算存活、已交接桶不算；剪枝后仅随不同表 oid 数线性）。consumer 慢/停摆不回压 reader，代价转移到磁盘：CQ 目录与 PG 侧 WAL 保留增长（`max_slot_wal_keep_size=2GB` 兜底 + consumer 周期 WARN 告警）
 - **输出语义**：at-least-once——LSN 确认按输出前沿封顶，**前沿锚定 End 事件**（End 返回 = 下游确认完整消费；中途失败 fail-fast 截断、End 永不发出，前沿不推进），crash 时未输出（End 未达）事务必然被 PG 重发，console 可能重复输出已见事务的头行（不去重，文档化承诺）
 - **源码结构**（各源码根一行；包内细节见各模块级 CLAUDE.md，层间关系见上文“架构总览”）：
