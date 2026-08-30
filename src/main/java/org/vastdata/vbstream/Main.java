@@ -2,19 +2,19 @@ package org.vastdata.vbstream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.vastdata.vbstream.replication.BlockOutputAdapter;
+import org.vastdata.vbstream.replication.StreamingToBlockAdapter;
 import org.vastdata.vbstream.replication.OutputMode;
 import org.vastdata.vbstream.replication.PgReplicationSession;
 import org.vastdata.vbstream.replication.PipeConfig;
 import org.vastdata.vbstream.replication.ReplicationConfig;
 import org.vastdata.vbstream.replication.TransactionAssembler;
-import org.vastdata.vbstream.replication.TransactionListener;
+import org.vastdata.vbstream.replication.StreamingTransactionListener;
 import org.vastdata.vbstream.replication.VersionedRelationRegistry;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** 冒烟入口（2.0 流式输出形态）：reader 记账 + CQ 管道 + consumer 流式回放——连上复制流后，pgoutput 原始字节经 raw 接缝喂给异步 {@link TransactionAssembler}（数据消息 append 进管道、桶只记 CQ index 段），提交事务交接冻结桶由 transaction-consumer 线程回放成 {@link org.vastdata.vbstream.replication.TransactionEvent} 事件流打印到控制台（默认 STREAMING 直渲染；{@code vb.output.mode=block} 经 {@link BlockOutputAdapter} 重组 1.7 整块语义）；LSN 反馈按输出前沿封顶，Ctrl+C 优雅退出。 */
+/** 冒烟入口（2.0 流式输出形态）：reader 记账 + CQ 管道 + consumer 流式回放——连上复制流后，pgoutput 原始字节经 raw 接缝喂给异步 {@link TransactionAssembler}（数据消息 append 进管道、桶只记 CQ index 段），提交事务交接冻结桶由 transaction-consumer 线程回放成 {@link org.vastdata.vbstream.replication.TransactionEvent} 事件流打印到控制台（默认 STREAMING 直渲染；{@code vb.output.mode=block} 经 {@link StreamingToBlockAdapter} 重组 1.7 整块语义）；LSN 反馈按输出前沿封顶，Ctrl+C 优雅退出。 */
 public final class Main {
 
     private static final Logger LOG = LoggerFactory.getLogger(Main.class);
@@ -23,7 +23,7 @@ public final class Main {
      * 装配并启动复制会话（2.0 双线程流式形态）：ConsoleListener 一个实例三角色——组装器解码点
      * observer（reader 线程的控制消息/'R' live 解码 + consumer 线程的回放解码，逐消息
      * DEBUG/INFO）、流式事件渲染（STREAMING 默认，onEvent 直渲染）与整块渲染（BLOCK 经
-     * {@link BlockOutputAdapter} 回调 onTransaction）。关键步骤：校验配置（含 pipe 与输出形态
+     * {@link StreamingToBlockAdapter} 回调 onTransaction）。关键步骤：校验配置（含 pipe 与输出形态
      * 解析，非法值启动期 fail-fast）
      * → 会话 open/ensureSlot/start → reader 线程（pgoutput-reader）内 try-with-resources 建**异步**
      * 组装器（独享 {@link VersionedRelationRegistry} 与 pipe 配置；构造即建管道并起非守护的
@@ -68,10 +68,10 @@ public final class Main {
             session.start();
             ConsoleListener console = new ConsoleListener();
             // vb.output.mode 接线（2.0 spec §1.1）：STREAMING（默认）——console 直接作为流式
-            // listener（onEvent 逐事件渲染，O(单条) 堆）；BLOCK——BlockOutputAdapter 把事件流攒齐
+            // listener（onEvent 逐事件渲染，O(单条) 堆）；BLOCK——StreamingToBlockAdapter 把事件流攒齐
             // 整块再回调 console.onTransaction（1.7 原子交付语义逃生门，O(事务) 堆）。
-            TransactionListener output = outputMode == OutputMode.BLOCK
-                    ? new BlockOutputAdapter(console)
+            StreamingTransactionListener output = outputMode == OutputMode.BLOCK
+                    ? new StreamingToBlockAdapter(console)
                     : console;
             // 组装器独享的 Relation 版本日志：'R' live 解码入版本序列（seq 戳），交接时按桶圈定拷快照；
             // console 逐消息渲染的第二参（RelationLookup）由组装器分流——live 解码点传 registry

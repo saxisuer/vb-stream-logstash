@@ -10,9 +10,10 @@ import org.vastdata.vbstream.replication.MsgChange;
 import org.vastdata.vbstream.replication.PgOutputListener;
 import org.vastdata.vbstream.replication.RelationLookup;
 import org.vastdata.vbstream.replication.RowChange;
+import org.vastdata.vbstream.replication.StreamingToBlockAdapter;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionEvent;
-import org.vastdata.vbstream.replication.TransactionListener;
+import org.vastdata.vbstream.replication.StreamingTransactionListener;
 import org.vastdata.vbstream.replication.TruncateChange;
 import org.vastdata.vbstream.replication.TxChange;
 
@@ -28,7 +29,7 @@ import java.util.OptionalLong;
  *
  * <p>同一实例承担三重角色（2.0 双输出契约的实现者）：流式事件渲染（{@link #onEvent}，默认——
  * Main 以 STREAMING 形态直传本类）、整块事务渲染（{@link #onTransaction}，block 形态——Main
- * 以 {@code vb.output.mode=block} 经 {@link org.vastdata.vbstream.replication.BlockOutputAdapter}
+ * 以 {@code vb.output.mode=block} 经 {@link StreamingToBlockAdapter}
  * 回调本类）与逐消息渲染（{@link #onMessage}，Main 装配下挂在组装器的解码点 observer——
  * reader 线程的 live 解码与 consumer 线程的回放解码**两处**调用，见其 javadoc）。两个事务输出
  * 路径共享 {@link #renderChange}，输出格式与 1.7 逐字节一致；唯一注记：流式头行
@@ -38,7 +39,7 @@ import java.util.OptionalLong;
  * <p>线程约束：本类近乎无状态，唯 {@link #rowSeq}（流式行号）为实例可变字段——线程限定
  * consumer 线程（onEvent 的调用线程），onMessage/静态渲染不触碰；slf4j 线程安全。
  */
-public final class ConsoleListener implements PgOutputListener, TransactionListener, BlockTransactionListener {
+public final class ConsoleListener implements PgOutputListener, StreamingTransactionListener, BlockTransactionListener {
 
     /** CDC 数据通道专用 logger 名：生产可单独调整级别或重定向到独立 appender，与诊断日志区分流。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.cdc");
@@ -94,7 +95,7 @@ public final class ConsoleListener implements PgOutputListener, TransactionListe
     }
 
     /**
-     * 事务块输出（1.7 渲染原样保留，2.0 起 block 形态路径——经 {@code BlockOutputAdapter} 重组后
+     * 事务块输出（1.7 渲染原样保留，2.0 起 block 形态路径——经 {@code StreamingToBlockAdapter} 重组后
      * 回调；既有渲染断言锚定本路径）：头/尾各一行 INFO（CDC logger），变更行逐条基于内嵌 Relation
      * 快照渲染（不依赖 registry）；头行 {@code changes=N} 取实际条数（与流式头行的 expected 差异
      * 见类 javadoc）。调用线程 = consumer 线程（异步装配 1.7 起——Main 形态为

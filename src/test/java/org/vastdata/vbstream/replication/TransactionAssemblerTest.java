@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * TransactionAssembler 状态机单测（raw 字节驱动版）：全部输入经 {@link PgWire} 构造线格式
  * 字节直接喂 {@code onRaw}，覆盖轻窥路由、控制消息 live 解码与流式事件回放的全路径
- * （2.0 起输出经 {@link TransactionCollector} 重组回整块，既有断言零改动）。
+ * （2.0 起输出经 {@link TransactionRecorder} 重组回整块，既有断言零改动）。
  * 每用例断言输出 Transaction 的形态/顺序/内容与 fail-fast 行为，语义与消息驱动版
  * （里程碑 1.5 的 33 例）逐用例等价——占位字段（LSN=1/2 递增、时间戳=PG 纪元）按 PgWire 约定断言。
  *
@@ -106,13 +106,13 @@ class TransactionAssemblerTest {
 
     /**
      * 依序把 raw 字节喂给新组装器（'R' 的 registry 路由在组装器内部发生），收集输出的 Transaction
-     * （2.0 起组装器回调流式事件，经 {@link TransactionCollector} 重组回整块——既有
+     * （2.0 起组装器回调流式事件，经 {@link TransactionRecorder} 重组回整块——既有
      * {@code List<Transaction>} 断言零改动的等价币）。
      * 组装器以 StreamingMode.ON 构造——与 {@link PgWire#streamAbort} 的非 parallel 形态配对。
      * try-with-resources 收敛管道（每个组装器独占一条 CQ，不关会泄漏 mmap 且阻塞 @TempDir 清理）。
      */
     private static List<Transaction> run(byte[]... msgs) {
-        TransactionCollector out = new TransactionCollector();
+        TransactionRecorder out = new TransactionRecorder();
         try (TransactionAssembler assembler = new TransactionAssembler(
                 out, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
             for (byte[] m : msgs) {
@@ -421,7 +421,7 @@ class TransactionAssemblerTest {
      */
     @Test
     void streamAbortOfWholeTopTransactionDropsBucket() {
-        TransactionCollector out = new TransactionCollector();
+        TransactionRecorder out = new TransactionRecorder();
         try (TransactionAssembler assembler = new TransactionAssembler(
                 out, StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg())) {
             byte[][] seq = {
@@ -657,7 +657,7 @@ class TransactionAssemblerTest {
     @Test
     void retiredBucketPrunesSupersededRegistryVersions() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        TransactionCollector collector = new TransactionCollector();
+        TransactionRecorder collector = new TransactionRecorder();
         try (TransactionAssembler assembler = new TransactionAssembler(
                 collector, StreamingMode.ON, registry, pipeCfg())) {
             assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
@@ -697,7 +697,7 @@ class TransactionAssemblerTest {
     @Test
     void pendingTwoPhaseBucketKeepsItsAsOfVersionAliveAcrossPruning() {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        TransactionCollector collector = new TransactionCollector();
+        TransactionRecorder collector = new TransactionRecorder();
         try (TransactionAssembler assembler = new TransactionAssembler(
                 collector, StreamingMode.ON, registry, pipeCfg())) {
             assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));

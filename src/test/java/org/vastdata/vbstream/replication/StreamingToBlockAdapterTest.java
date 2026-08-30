@@ -13,11 +13,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * BlockOutputAdapter 单测：同一事件流经适配器与 TransactionCollector 的整块产物全等
+ * StreamingToBlockAdapter 单测：同一事件流经适配器与 TransactionRecorder 的整块产物全等
  * （block 模式等价验收）；流不合法时（End 无 Begin）原样 ISE 不转发（block 模式原子性——
- * 中途失败下游零输出）。夹具 Begin/TxChange 构造与 TransactionCollectorTest 同款。
+ * 中途失败下游零输出）。夹具 Begin/TxChange 构造与 TransactionRecorderTest 同款。
  */
-class BlockOutputAdapterTest {
+class StreamingToBlockAdapterTest {
 
     /** 构造 NORMAL 形态事件流头（expected=3、End emitted=2——emitted&lt;expected 合法形态）。 */
     private static TransactionEvent.Begin begin(long xid, long expected) {
@@ -39,8 +39,8 @@ class BlockOutputAdapterTest {
     @Test
     void adapterForwardsSameTransactionsAsCollectorReassembles() {
         List<Transaction> viaAdapter = new ArrayList<>();
-        BlockOutputAdapter adapter = new BlockOutputAdapter(viaAdapter::add);
-        TransactionCollector collector = new TransactionCollector();
+        StreamingToBlockAdapter adapter = new StreamingToBlockAdapter(viaAdapter::add);
+        TransactionRecorder collector = new TransactionRecorder();
         List<TransactionEvent> events = List.of(
                 begin(1L, 3L),
                 change(),
@@ -57,7 +57,7 @@ class BlockOutputAdapterTest {
     @Test
     void illegalStreamPropagatesWithoutForwarding() {
         List<Transaction> out = new ArrayList<>();
-        BlockOutputAdapter adapter = new BlockOutputAdapter(out::add);
+        StreamingToBlockAdapter adapter = new StreamingToBlockAdapter(out::add);
         assertThrows(IllegalStateException.class, () -> adapter.onEvent(new TransactionEvent.End(1L, 0L)));
         assertEquals(List.of(), out);       // 零转发——block 模式原子性
     }

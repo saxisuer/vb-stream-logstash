@@ -12,12 +12,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * TransactionCollector 单测（2.0 spec §2）：正常重组、流合法性 fail-fast、aborted 过滤下
+ * TransactionRecorder 单测（2.0 spec §2）：正常重组、流合法性 fail-fast、aborted 过滤下
  * emitted &lt; expected 的合法性（spec 自审修定的关键边界）。对账时机统一在 End 处理
  * （实现选型：emitted &gt; expected 与 emitted != 实收条数两检查都在 onEvent 的 End 分支抛出，
  * transactions() 访问器恒不抛——测试写法随之固定）。
  */
-class TransactionCollectorTest {
+class TransactionRecorderTest {
 
     /** 构造事件流头（expected 可与后续 End 的 emitted 不同——aborted 过滤形态的夹具基础）。 */
     private static TransactionEvent.Begin begin(long xid, long expected) {
@@ -32,7 +32,7 @@ class TransactionCollectorTest {
     /** 正常流：Begin(3) + 2 变更 + End(2)（aborted 过滤形态，emitted&lt;expected 合法）→ 重组出 1 个 2 变更事务。 */
     @Test
     void reassemblesTransactionAndAllowsEmittedBelowExpected() {
-        TransactionCollector c = new TransactionCollector();
+        TransactionRecorder c = new TransactionRecorder();
         RowChange r1 = new RowChange(DmlKind.INSERT, rel(),
                 Optional.empty(), Optional.empty(), OptionalLong.empty());
         RowChange r2 = new RowChange(DmlKind.DELETE, rel(),
@@ -48,14 +48,14 @@ class TransactionCollectorTest {
     /** End 无 Begin（首个事件即尾）→ ISE fail-fast。 */
     @Test
     void rejectsEndWithoutBegin() {
-        TransactionCollector c = new TransactionCollector();
+        TransactionRecorder c = new TransactionRecorder();
         assertThrows(IllegalStateException.class, () -> c.onEvent(new TransactionEvent.End(1L, 0L)));
     }
 
     /** Begin 内嵌 Begin（上一事务未封箱）→ ISE fail-fast。 */
     @Test
     void rejectsNestedBegin() {
-        TransactionCollector c = new TransactionCollector();
+        TransactionRecorder c = new TransactionRecorder();
         c.onEvent(begin(1L, 0L));
         assertThrows(IllegalStateException.class, () -> c.onEvent(begin(2L, 0L)));
     }
@@ -63,10 +63,10 @@ class TransactionCollectorTest {
     /** End 对账失败：emitted &gt; expected（记账异常）与 emitted != 实收条数（声称与实收不符）均 ISE。 */
     @Test
     void rejectsEmittedAboveExpectedAndCountMismatch() {
-        TransactionCollector c = new TransactionCollector();
+        TransactionRecorder c = new TransactionRecorder();
         c.onEvent(begin(1L, 1L));
         assertThrows(IllegalStateException.class, () -> c.onEvent(new TransactionEvent.End(1L, 2L)));
-        TransactionCollector c2 = new TransactionCollector();      // End 的 emitted 与实收条数对账
+        TransactionRecorder c2 = new TransactionRecorder();      // End 的 emitted 与实收条数对账
         c2.onEvent(begin(1L, 2L));
         assertThrows(IllegalStateException.class,
                 () -> c2.onEvent(new TransactionEvent.End(1L, 1L)));   // 声称 1 实收 0：End 处理时抛 ISE

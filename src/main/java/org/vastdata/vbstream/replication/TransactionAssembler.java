@@ -26,7 +26,7 @@ import java.util.function.Supplier;
  * （1.7 设计 §2/§4.1），收到提交信号后**交接冻结桶**（快照随行）给消费侧
  * （{@link TransactionConsumer}——同步形态在调用线程直调、异步形态经交接队列由 consumer 线程
  * 取走）回放成 {@link TransactionEvent} 事件流逐条交给监听器（2.0 流式主契约，spec §4 /
- * assembly-spill 设计 §2-§5 的演进形态；block 形态经 {@link BlockOutputAdapter} 重组整块）。
+ * assembly-spill 设计 §2-§5 的演进形态；block 形态经 {@link StreamingToBlockAdapter} 重组整块）。
  *
  * <p>与消息驱动旧版的核心区别：**数据消息先不解码**。Insert/Update/Delete/Truncate/Message
  * 五类消息的原始字节只在 {@link #onRaw} 首行追加一次管道（{@link MessagePipe}），桶里只记
@@ -62,7 +62,7 @@ import java.util.function.Supplier;
  *
  * <p>内存量级（2.0 起）：组装期记账恒 O(桶元数据)（段数 × long[2]）；提交回放逐单元解码
  * 逐条交付（堆内 O(单条)）——1.7 的"回放期整事务瞬态 O(事务大小)"已随流式交付消除，
- * block 输出形态（{@link BlockOutputAdapter}）是唯一回到 O(事务) 的路径（逃生门语义）。
+ * block 输出形态（{@link StreamingToBlockAdapter}）是唯一回到 O(事务) 的路径（逃生门语义）。
  *
  * <p>线程约束（1.7 双线程形态）：**reader 侧**（onRaw 及其全部私有路由/记账/registry/入队）
  * 设计为由 run 循环的单一线程调用（decoder 的流块状态与全部桶指针都要求单写者）——提交期回放
@@ -128,10 +128,10 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * @param outputFrontier  输出前沿载体（调用方持有以便反馈封顶；本实例只做单调 max 累加）
      * @param onFailure       consumer 回放失败的逃生回调（consumer 线程调用，如通知会话停机）
      */
-    public TransactionAssembler(TransactionListener listener, StreamingMode mode,
-            VersionedRelationRegistry registry, PipeConfig pipeConfig,
-            BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
-            AtomicLong outputFrontier, Runnable onFailure) {
+    public TransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                VersionedRelationRegistry registry, PipeConfig pipeConfig,
+                                BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                AtomicLong outputFrontier, Runnable onFailure) {
         this(listener, mode, registry, pipeConfig, decodedObserver, outputFrontier, onFailure, true);
     }
 
@@ -149,9 +149,9 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * @param pipeConfig      管道配置（目录/滚动周期；目录是瞬态工作区，打开即整体清空）
      * @param decodedObserver 每个解码点回调（控制消息 + 'R' + 回放单元；Y/O 不解码不回调）
      */
-    public TransactionAssembler(TransactionListener listener, StreamingMode mode,
-            VersionedRelationRegistry registry, PipeConfig pipeConfig,
-            BiConsumer<PgOutputMessage, RelationLookup> decodedObserver) {
+    public TransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                VersionedRelationRegistry registry, PipeConfig pipeConfig,
+                                BiConsumer<PgOutputMessage, RelationLookup> decodedObserver) {
         this(listener, mode, registry, pipeConfig, decodedObserver, new AtomicLong(), () -> { }, false);
     }
 
@@ -163,8 +163,8 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * @param registry    Relation 版本日志
      * @param pipeConfig  管道配置
      */
-    public TransactionAssembler(TransactionListener listener, StreamingMode mode,
-            VersionedRelationRegistry registry, PipeConfig pipeConfig) {
+    public TransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                VersionedRelationRegistry registry, PipeConfig pipeConfig) {
         this(listener, mode, registry, pipeConfig, (msg, view) -> { });
     }
 
@@ -172,10 +172,10 @@ public final class TransactionAssembler implements RawMessageListener, AutoClose
      * 全量构造（两形态公共初始化）：字段赋值 + 建管道 + 建消费器；async=true 时另起并启动
      * consumer 线程。管道建立失败原样上抛（fail-fast，同上）。
      */
-    private TransactionAssembler(TransactionListener listener, StreamingMode mode,
-            VersionedRelationRegistry registry, PipeConfig pipeConfig,
-            BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
-            AtomicLong outputFrontier, Runnable onFailure, boolean async) {
+    private TransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, PipeConfig pipeConfig,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 AtomicLong outputFrontier, Runnable onFailure, boolean async) {
         this.decoder = new PgOutputDecoder(Objects.requireNonNull(mode, "mode"));
         this.registry = Objects.requireNonNull(registry, "registry");
         Objects.requireNonNull(pipeConfig, "pipeConfig");

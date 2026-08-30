@@ -33,7 +33,7 @@ final class TransactionConsumer implements Runnable {
     private static final long STATS_INTERVAL_NANOS = 10_000_000_000L;
     private static final long STALE_WARN_NANOS = 60_000_000_000L;
 
-    private final TransactionListener listener;
+    private final StreamingTransactionListener listener;
     private final BucketReplayer replayer;
     private final MessagePipe pipe;
     private final BlockingQueue<TxBuffer> queue;
@@ -53,10 +53,10 @@ final class TransactionConsumer implements Runnable {
      * @param onFailure       回放失败时的逃生回调（fail-fast 路径，如通知会话停机）
      * @param replayObserver 每个回放解码点回调（第二参为该桶的 RelationSnapshot 渲染视图）
      */
-    TransactionConsumer(TransactionListener listener, StreamingMode mode, MessagePipe pipe,
-            BlockingQueue<TxBuffer> queue, AtomicLong outputFrontier,
-            AtomicInteger liveBucketCount, Runnable onFailure,
-            BiConsumer<PgOutputMessage, RelationLookup> replayObserver) {
+    TransactionConsumer(StreamingTransactionListener listener, StreamingMode mode, MessagePipe pipe,
+                        BlockingQueue<TxBuffer> queue, AtomicLong outputFrontier,
+                        AtomicInteger liveBucketCount, Runnable onFailure,
+                        BiConsumer<PgOutputMessage, RelationLookup> replayObserver) {
         this.listener = Objects.requireNonNull(listener, "listener");
         this.pipe = Objects.requireNonNull(pipe, "pipe");
         this.queue = Objects.requireNonNull(queue, "queue");

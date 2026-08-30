@@ -25,7 +25,7 @@ import java.time.Instant;
  * End 永不发出。
  *
  * <p>线程约束：三个形态均为不可变值对象，可跨线程持有传递；事件的发出与消费发生在
- * transaction-consumer 线程（同步测试形态即调用线程），见 {@link TransactionListener}。
+ * transaction-consumer 线程（同步测试形态即调用线程），见 {@link StreamingTransactionListener}。
  */
 public sealed interface TransactionEvent permits TransactionEvent.Begin, TransactionEvent.End, TxChange {
 

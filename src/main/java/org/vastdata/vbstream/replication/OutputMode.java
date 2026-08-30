@@ -8,7 +8,7 @@ import java.util.Arrays;
  * （1.7 语义逃生门，堆 O(事务)、原子交付——{@code vb.output.mode=block} 启用）。
  *
  * <p>两模式的内存语义差异（内存有界性的最终一步）：STREAMING 下回放期堆内不再物化整事务
- * 变更列表；BLOCK 经 {@link BlockOutputAdapter} 攒集，恢复 1.7 的 O(事务) 瞬态。
+ * 变更列表；BLOCK 经 {@link StreamingToBlockAdapter} 攒集，恢复 1.7 的 O(事务) 瞬态。
  */
 public enum OutputMode {
     STREAMING, BLOCK;

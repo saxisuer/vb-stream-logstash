@@ -1,6 +1,6 @@
 # replication/ 模块——复制会话、raw 接缝与解耦事务组装（IO + 组装层）
 
-职责：管理两条 JDBC 连接（普通 SQL + 复制专用），把复制流按**原始字节**交付上层（raw 接缝，里程碑 1.6 起）；本包同时承载 raw 驱动的 `TransactionAssembler`（1.7 起 reader/consumer 双线程解耦：**reader 记账 + Chronicle Queue 主缓冲管道 + 独立消费器回放输出**；2.0 起输出契约流式化：**`onEvent(TransactionEvent)` 事件交付，回放期堆峰 O(单条)**，block 逃生门经 `BlockOutputAdapter` 攒回整块）。上游 `Main` 依赖 `PgReplicationSession` + `TransactionAssembler`（raw 接缝直连）；集成测试 `SessionHarness` 双轨录制（raw + 经 `DecodedMessageBridge` 的解码消息）。
+职责：管理两条 JDBC 连接（普通 SQL + 复制专用），把复制流按**原始字节**交付上层（raw 接缝，里程碑 1.6 起）；本包同时承载 raw 驱动的 `TransactionAssembler`（1.7 起 reader/consumer 双线程解耦：**reader 记账 + Chronicle Queue 主缓冲管道 + 独立消费器回放输出**；2.0 起输出契约流式化：**`onEvent(TransactionEvent)` 事件交付，回放期堆峰 O(单条)**，block 逃生门经 `StreamingToBlockAdapter` 攒回整块）。上游 `Main` 依赖 `PgReplicationSession` + `TransactionAssembler`（raw 接缝直连）；集成测试 `SessionHarness` 双轨录制（raw + 经 `DecodedMessageBridge` 的解码消息）。
 
 ## 数据流（2.0 解耦 + 流式输出形态，设计文档 `docs/superpowers/specs/2026-08-29-reader-consumer-decoupling-design.md` 与 `...-transaction-streaming-output-design.md`）
 
@@ -20,7 +20,7 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部创建）
   aborted 过滤前）→ BucketReplayer 逐段 readRange + 桶内快照渲染，逐条 TxChange 经 sink 即时回调
   （不攒 List，堆峰 O(单条)）→ 发 End 尾（emitted=过滤后实付数）→ 前沿 AtomicLong ← endLsn → state=DONE
   listener.onEvent(TransactionEvent)：Begin → TxChange* → End（单回调单背压点；
-  End 返回 = 完整消费确认——前沿随之推进；block 模式经 BlockOutputAdapter 在此边界攒回整块）
+  End 返回 = 完整消费确认——前沿随之推进；block 模式经 StreamingToBlockAdapter 在此边界攒回整块）
 ```
 
 记账发生在 reader 收到消息的瞬间（live 解码控制消息 + 窥数据消息前缀），CQ 里的数据字节只在 consumer 回放时读一次；提交点不含回放，reader 永不被输出耗时阻塞，LSN 反馈不因大事务回放停摆（1.7 的两个动因）。2.0 在此之上把**输出侧**也流式化：回放期逐条解码逐条交付、不攒整事务列表——1.7 回放瞬态的"解码形态较原始字节膨胀 2~4×、1GB 流式事务回放瞬间堆峰 2~4GB"随输出契约换血消失（堆峰 O(单条)），交付机制变、输出格式逐字节不变。
@@ -134,7 +134,7 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 - **线程约束（红线）**：`onRaw`/`close` 单写者（reader 线程——decoder 的流块状态、全部桶指针、registry、pipe appender 都要求）；consumer 只触碰冻结桶 + 交接队列 + pipe tailer + 前沿 AtomicLong。不可与 onRaw 并发调 close
 - 日志：非事务性 M 丢弃、RollbackPrepared 丢弃 WARN；Y/O 丢弃与 PREPARE 入挂起池 DEBUG
 
-构造两形态：**异步**（Main 用：`(listener, mode, registry, pipeConfig, decodedObserver, outputFrontier, onFailure)`——构造即建管道并起非守护 `transaction-consumer` 线程）与**同步**（测试锚定既有期望：`(listener, mode, registry, pipeConfig, decodedObserver)`——handoff 在调用线程直调 processBucket，无线程拆分；另有 observer 缺省便捷构造）。`listener` 是 `TransactionListener`（2.0 流式事件契约——Main 按 `vb.output.mode` 接线：STREAMING 直传下游、BLOCK 包 `BlockOutputAdapter`；组装器与消费器对模式无感知，内部恒流式）。`decodedObserver` 是 `BiConsumer<PgOutputMessage, RelationLookup>`（ConsoleListener 逐消息挂点），live 解码点（reader）传 registry、回放解码点（consumer）传桶快照。
+构造两形态：**异步**（Main 用：`(listener, mode, registry, pipeConfig, decodedObserver, outputFrontier, onFailure)`——构造即建管道并起非守护 `transaction-consumer` 线程）与**同步**（测试锚定既有期望：`(listener, mode, registry, pipeConfig, decodedObserver)`——handoff 在调用线程直调 processBucket，无线程拆分；另有 observer 缺省便捷构造）。`listener` 是 `StreamingTransactionListener`（2.0 流式事件契约——Main 按 `vb.output.mode` 接线：STREAMING 直传下游、BLOCK 包 `StreamingToBlockAdapter`；组装器与消费器对模式无感知，内部恒流式）。`decodedObserver` 是 `BiConsumer<PgOutputMessage, RelationLookup>`（ConsoleListener 逐消息挂点），live 解码点（reader）传 registry、回放解码点（consumer）传桶快照。
 
 ## TransactionConsumer（包私有，消费器循环）
 
@@ -163,14 +163,14 @@ raw 字节窥探辅助：`intAt`（big-endian 有符号 I32，oid 窥探——�
 
 回放期对外交付的不可变值对象族。`TransactionEvent` 是 2.0 主契约的事件基接口（sealed，permits `Begin`/`End`/`TxChange`——两层 sealed 叠加，TxChange 族直接挂头接口不包壳）；`Transaction` 换角色为 block 形态的重组值对象。全部为值语义 record：集合组件经紧凑构造器防御性拷贝（null 或含 null 元素抛 NPE）、Optional 组件 null 归一 empty。两个例外：`Transaction.gid` 非 TWO_PHASE 时刻意为 null；`MsgChange` 无紧凑构造器（content 为解码器独占新建数组、共享引用不复制——"构造后不得改写"约定）。不可变、可跨线程传递。各类完整 javadoc 见源文件。
 
-- **`TransactionListener.onEvent(TransactionEvent)`**：**流式主契约**（@FunctionalInterface，2.0）。一个事务的事件序列 `Begin → TxChange* → End`（空事务 `End(0)`）按序经单回调逐条交付，不再整块封箱。契约注记：**单回调 = 单一背压点**（回调内耗时/阻塞天然反压上游，无需额外流控）；**End 返回 = 下游确认完整消费**（End 未达则前沿不推进、重启后整个事务经复制槽重发——at-least-once，下游可能见重复头行）；中途失败 fail-fast 截断（已输出条数进 ERROR，End 永不发出）。**调用线程 = transaction-consumer**（异步形态；同步形态即调用线程）——回调耗时只拖慢输出不阻塞读取，但仍应快速返回或自行转交；ROLLBACK 路径不产生任何事件
+- **`StreamingTransactionListener.onEvent(TransactionEvent)`**：**流式主契约**（@FunctionalInterface，2.0）。一个事务的事件序列 `Begin → TxChange* → End`（空事务 `End(0)`）按序经单回调逐条交付，不再整块封箱。契约注记：**单回调 = 单一背压点**（回调内耗时/阻塞天然反压上游，无需额外流控）；**End 返回 = 下游确认完整消费**（End 未达则前沿不推进、重启后整个事务经复制槽重发——at-least-once，下游可能见重复头行）；中途失败 fail-fast 截断（已输出条数进 ERROR，End 永不发出）。**调用线程 = transaction-consumer**（异步形态；同步形态即调用线程）——回调耗时只拖慢输出不阻塞读取，但仍应快速返回或自行转交；ROLLBACK 路径不产生任何事件
 - **`TransactionEvent.Begin(xid, kind, gid, commitLsn, endLsn, commitTimestamp, expectedChanges)`**：事务头——回放开始前发出（下游先见元数据再见数据）。组件语义与 `Transaction` 同名组件一致；`expectedChanges` 来自 reader 桶记账 `unitCount`，是 aborted 过滤**前**的值（流式头行 `changes=N` 由此保持 1.7 输出格式）
 - **`TransactionEvent.End(xid, emittedChanges)`**：事务尾——`emittedChanges` 为过滤**后**实付数；`emitted < expected` 合法（StreamAbort 子事务剔除属正常路径），`> expected` 属记账异常（下游校验应 fail-fast）
-- **`BlockTransactionListener.onTransaction(Transaction)`**：**整块契约**（1.7 契约保留改名，非默认——`vb.output.mode=block` 时经 `BlockOutputAdapter` 启用）。原子性在 block 模式保留：适配器攒齐才转发、中途失败下游零输出。线程模型与流式契约一致
-- **`BlockOutputAdapter`**：流式→整块输出边界适配器（implements `TransactionListener`）。Begin 开桶攒 TxChange、End 封箱转发目标 `onTransaction` 后丢弃；中途异常攒的内容随失败丢弃。与 `TransactionCollector` 的差异：面向**下游转发**（事务级转发后不累积历史）vs 面向**测试断言**（全部产物驻留）。堆 O(事务)；攒集 ArrayList 有高水位保留（`clear` 不缩容——曾经过的大事务会留下大 backing array，长跑 block 形态的内存注记）。End 无匹配 Begin、Begin 内嵌 Begin、变更先于 Begin 抛 ISE fail-fast
+- **`BlockTransactionListener.onTransaction(Transaction)`**： **整块契约**（1.7 契约保留改名，非默认——`vb.output.mode=block` 时经 `StreamingToBlockAdapter` 启用）。原子性在 block 模式保留：适配器攒齐才转发、中途失败下游零输出。线程模型与流式契约一致
+- **`StreamingToBlockAdapter`**：流式→整块输出边界适配器（implements `StreamingTransactionListener`）。Begin 开桶攒 TxChange、End 封箱转发目标 `onTransaction` 后丢弃；中途异常攒的内容随失败丢弃。与 `TransactionRecorder` 的差异：面向 **下游转发**（事务级转发后不累积历史）vs 面向 **测试断言**（全部产物驻留）。堆 O (事务)；攒集 ArrayList 有高水位保留（`clear` 不缩容——曾经过的大事务会留下大 backing array，长跑 block 形态的内存注记）。End 无匹配 Begin、Begin 内嵌 Begin、变更先于 Begin 抛 ISE fail-fast
 - **`OutputMode`**：输出形态枚举（STREAMING=默认流式事件交付；BLOCK=边界适配器重组整块）。`fromSystemProperties()` 读 `vb.output.mode`（大小写宽容，未知值抛 IAE 启动期 fail-fast）
-- **`TransactionCollector`**：事件流重组器（implements `TransactionListener`）——**测试等价币**（既有 `List<Transaction>` 断言经它存活）。End 处对账 `emitted ≤ expected` 且 `emitted == 实收条数`（对账抛出时机在 End 分支，`transactions()` 恒不抛）；产物 `transactions()` 按完成序。非线程安全（跨线程读取前需自建 happens-before，如组装器 close 的 join）
-- **`Transaction(xid, kind, gid, commitLsn, endLsn, commitTimestamp, changes)`**：一个已确认提交的完整事务（**block 形态交付单元**：`BlockOutputAdapter`/`TransactionCollector` 从事件流重组的值对象；1.7 时期由 consumer 直接构造，2.0 起 consumer 不再构造它）。xid 来源随 kind 而定（NORMAL←Begin、STREAMED←StreamStart、TWO_PHASE←BeginPrepare/StreamPrepare）；gid 非 null **当且仅当** kind=TWO_PHASE；changes 按协议到达顺序，紧凑构造器 `List.copyOf` 防御性拷贝
+- **`TransactionRecorder`**：事件流重组器（implements `StreamingTransactionListener`）—— **测试等价币**（既有 `List<Transaction>` 断言经它存活）。End 处对账 `emitted ≤ expected` 且 `emitted == 实收条数`（对账抛出时机在 End 分支，`transactions()` 恒不抛）；产物 `transactions()` 按完成序。非线程安全（跨线程读取前需自建 happens-before，如组装器 close 的 join）
+- **`Transaction(xid, kind, gid, commitLsn, endLsn, commitTimestamp, changes)`**：一个已确认提交的完整事务（ **block 形态交付单元**：`StreamingToBlockAdapter`/`TransactionRecorder` 从事件流重组的值对象；1.7 时期由 consumer 直接构造，2.0 起 consumer 不再构造它）。xid 来源随 kind 而定（NORMAL←Begin、STREAMED←StreamStart、TWO_PHASE←BeginPrepare/StreamPrepare）；gid 非 null **当且仅当** kind=TWO_PHASE；changes 按协议到达顺序，紧凑构造器 `List.copyOf` 防御性拷贝
 - **`TransactionKind`**（枚举）：NORMAL（变更整体缓冲，Commit 后一次输出）/ STREAMED（越过 logical_decoding_work_mem 被驱逐流式，StreamCommit 后一次输出）/ TWO_PHASE（PREPARE 后挂起，COMMIT PREPARED 才输出，ROLLBACK PREPARED 丢弃）
 - **`TxChange`（sealed interface，permits RowChange/TruncateChange/MsgChange，且 `extends TransactionEvent`）**：事务内一条变更的基接口——2.0 起兼任事件族的中间形态成员（直接 permits 挂头接口，不包 Change 壳）。公共组件 `streamXid`（OptionalLong）：流式块内非空——DML/Truncate 的 xid 前缀 = 产生变更的**（子）事务** xid、Message 的前缀 = 顶层 xid；非流式块内恒 empty。供回放期按子事务剔除与下游追溯归属
 - **`RowChange(dml, relation, before, after, streamXid)`**：行变更。`relation` 是**变更时刻的 Relation 快照嵌入**（经桶快照 asOf 取版后随变更冻结——下游自包含，DDL 后旧行不按新 schema 错解）；before/after 统一 Optional：INSERT 仅 after、DELETE 仅 before、UPDATE 的 before 取决于 replica identity
@@ -193,4 +193,4 @@ raw 字节窥探辅助：`intAt`（big-endian 有符号 I32，oid 窥探——�
 3. 输出前沿 `AtomicLong`（consumer 单调 max 累加，reader 每轮读一次做反馈封顶）
 4. `MessagePipe` 的 appender（reader 独占）与 tailer（consumer 独占）——各自单线程使用，跨线程可见性由 CQ 的单 appender/多 tailer 内存模型保证
 
-同步测试形态（`TransactionConsumer.processBucket` 直调）把 consumer 半程折叠回调用线程——既有组装器单测以此锚定既有期望，`DecoupledEquivalenceTest` 断言同一字节流同步/异步两形态完整事件流全等（经 `TransactionCollector` 重组对账，Task 3 升级）。`VersionedRelationRegistry` 是 reader 侧单写者设计；`DecodedMessageBridge` 非线程安全（inStream）；`ConsoleListener` 近乎无状态——唯流式行号 `rowSeq` 为实例可变字段，线程限定 consumer（onEvent 调用线程；onMessage/静态渲染不触碰），slf4j 线程安全（双线程回调安全）；输出的 `TransactionEvent`/`Transaction`/`TxChange` 不可变，可跨线程传递。
+同步测试形态（`TransactionConsumer.processBucket` 直调）把 consumer 半程折叠回调用线程——既有组装器单测以此锚定既有期望，`DecoupledEquivalenceTest` 断言同一字节流同步/异步两形态完整事件流全等（经 `TransactionRecorder` 重组对账，Task 3 升级）。`VersionedRelationRegistry` 是 reader 侧单写者设计；`DecodedMessageBridge` 非线程安全（inStream）；`ConsoleListener` 近乎无状态——唯流式行号 `rowSeq` 为实例可变字段，线程限定 consumer（onEvent 调用线程；onMessage/静态渲染不触碰），slf4j 线程安全（双线程回调安全）；输出的 `TransactionEvent`/`Transaction`/`TxChange` 不可变，可跨线程传递。

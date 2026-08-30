@@ -14,7 +14,7 @@ import org.vastdata.vbstream.replication.PipeConfig;
 import org.vastdata.vbstream.replication.RowChange;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionAssembler;
-import org.vastdata.vbstream.replication.TransactionCollector;
+import org.vastdata.vbstream.replication.TransactionRecorder;
 import org.vastdata.vbstream.replication.TransactionKind;
 import org.vastdata.vbstream.replication.TxChange;
 import org.vastdata.vbstream.replication.VersionedRelationRegistry;
@@ -81,8 +81,8 @@ class TransactionAssemblyTest {
      */
     private List<Transaction> assembleRecording(List<byte[]> rawMessages) {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        // 2.0 起组装器回调流式事件，经 TransactionCollector 重组回整块——既有断言零改动的等价币
-        TransactionCollector out = new TransactionCollector();
+        // 2.0 起组装器回调流式事件，经 TransactionRecorder 重组回整块——既有断言零改动的等价币
+        TransactionRecorder out = new TransactionRecorder();
         try (TransactionAssembler assembler = new TransactionAssembler(out, StreamingMode.PARALLEL,
                 registry, new PipeConfig(pipeDir, LegacyRollCycles.MINUTELY))) {
             for (byte[] raw : rawMessages) {

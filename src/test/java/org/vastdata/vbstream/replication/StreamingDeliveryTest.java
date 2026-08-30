@@ -60,7 +60,7 @@ class StreamingDeliveryTest {
         AtomicLong frontier = new AtomicLong();
         // 计数单位核对（Task 2 迁移教训）：changesSeen/endSeen 均以"事件"为单位（TxChange/End
         // 各计一条），与 1.7 的"事务"计数单位不同——分支按事件形态收窄，不存在编译不可见漂移
-        TransactionListener blocking = event -> {
+        StreamingTransactionListener blocking = event -> {
             if (event instanceof TxChange) {
                 if (changesSeen.incrementAndGet() == 1) {
                     firstChange.countDown();

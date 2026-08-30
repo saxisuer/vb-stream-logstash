@@ -4,7 +4,7 @@ package org.vastdata.vbstream.replication;
  * 事务输出契约（2.0 流式主形态）：一个事务的事件序列
  * {@code Begin → TxChange* → End} 按序经单回调逐条交付，不再整块封箱
  * （1.7 的 {@code onTransaction(Transaction)} 整块契约保留改名为
- * {@link BlockTransactionListener}，经 {@link BlockOutputAdapter} 适配启用，非默认）。
+ * {@link BlockTransactionListener}，经 {@link StreamingToBlockAdapter} 适配启用，非默认）。
  *
  * <p>契约注记（2.0 设计 §2）：
  * <ul>
@@ -20,7 +20,7 @@ package org.vastdata.vbstream.replication;
  * 拖长会积压交接队列、推迟输出前沿与 LSN 反馈位点推进。
  */
 @FunctionalInterface
-public interface TransactionListener {
+public interface StreamingTransactionListener {
 
     /**
      * 收到一个事务输出事件（头 {@link TransactionEvent.Begin Begin} / 逐变更

@@ -16,11 +16,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * 解耦等价性与输出形态等价验收（1.7 设计 §9.1 + 2.0 spec §5.1）：同一字节流分别过
  * 三种形态——同步消费（单线程直调 processBucket——既有 33+ 用例的驱动形态，锚定 1.6 期望）、
  * 真实双线程管道（异步构造器 + close 排干）、block 输出形态（异步构造器 +
- * {@link BlockOutputAdapter} 重组整块）——断言三者产物全等。
+ * {@link StreamingToBlockAdapter} 重组整块）——断言三者产物全等。
  *
  * <p>三重断言（2.0 升级）：① 同步/异步**完整事件流**全等（{@code List<TransactionEvent>}
  * 含 Begin 头与 End 尾元数据——比整块 Transaction 更严，头尾进断言）；② 整块
- * {@code List<Transaction>} 全等（经 {@link TransactionCollector} 重组，1.7 既有断言的
+ * {@code List<Transaction>} 全等（经 {@link TransactionRecorder} 重组，1.7 既有断言的
  * 双保险）；③ block 适配器转发序列与收集器重组结果全等（流式/block 两模式输出语义一致性）。
  *
  * <p>夹具约定（PgWire 实际签名对齐）：commit/streamCommit 不带 LSN 参数（占位 1/2 内建）、
@@ -66,7 +66,7 @@ class DecoupledEquivalenceTest {
      * 责任：解耦等价本体——同一字节流依次驱动三个组装器形态，close 后断言三重全等与前沿推进。
      * 关键步骤：① 同步形态（包私有构造器，handoff 直调 processBucket）收集事件流 + 收集器重组
      * → ② 异步形态（public 构造器起 consumer 线程）同样双收集 → ③ block 形态（异步构造器 +
-     * BlockOutputAdapter 攒整块转发）→ 逐级断言：事件流全等、整块全等（双保险）、block 产物
+     * StreamingToBlockAdapter 攒整块转发）→ 逐级断言：事件流全等、整块全等（双保险）、block 产物
      * 与收集器重组全等、两个异步形态的前沿 = 末个输出事务的 endLsn（End 返回后推进，两模式
      * 语义一致）。
      * 边界：异步 close 前队列里可能有未消费桶，join 保证断言时全部已输出（确定性）；事件流
@@ -80,7 +80,7 @@ class DecoupledEquivalenceTest {
         byte[][] stream = mixedStream();
         // ① 同步形态：事件流直攒 + 收集器并行重组（同一 lambda 双写——事件流断言与整块断言共用驱动）
         List<TransactionEvent> syncEvents = new ArrayList<>();
-        TransactionCollector syncCollector = new TransactionCollector();
+        TransactionRecorder syncCollector = new TransactionRecorder();
         try (TransactionAssembler sync = new TransactionAssembler(
                 dualCapture(syncEvents, syncCollector), StreamingMode.ON,
                 new VersionedRelationRegistry(), pipeCfg())) {
@@ -88,17 +88,17 @@ class DecoupledEquivalenceTest {
         }
         // ② 异步形态：真实双线程管道，同样双收集
         List<TransactionEvent> asyncEvents = new ArrayList<>();
-        TransactionCollector asyncCollector = new TransactionCollector();
+        TransactionRecorder asyncCollector = new TransactionRecorder();
         AtomicLong frontier = new AtomicLong();
         try (TransactionAssembler async = new TransactionAssembler(dualCapture(asyncEvents, asyncCollector),
                 StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg(),
                 (msg, view) -> { }, frontier, () -> { })) {
             feed(async, stream);
         }   // close：毒丸 → consumer 排干余桶 → join → pipe 关闭——排干后输出确定
-        // ③ block 形态：同一字节流再过一异步组装器，BlockOutputAdapter 攒整块转发（1.7 语义逃生门）
+        // ③ block 形态：同一字节流再过一异步组装器，StreamingToBlockAdapter 攒整块转发（1.7 语义逃生门）
         List<Transaction> blockOut = new ArrayList<>();
         AtomicLong blockFrontier = new AtomicLong();
-        try (TransactionAssembler block = new TransactionAssembler(new BlockOutputAdapter(blockOut::add),
+        try (TransactionAssembler block = new TransactionAssembler(new StreamingToBlockAdapter(blockOut::add),
                 StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg(),
                 (msg, view) -> { }, blockFrontier, () -> { })) {
             feed(block, stream);
@@ -121,7 +121,7 @@ class DecoupledEquivalenceTest {
      * 边界：events 列表只在 consumer（或同步调用）线程写、join 后测试线程读；collector 的
      * 流合法性校验（End 对账等）在写入路径内联生效，违约即抛 ISE 直传驱动方。
      */
-    private static TransactionListener dualCapture(List<TransactionEvent> events, TransactionCollector collector) {
+    private static StreamingTransactionListener dualCapture(List<TransactionEvent> events, TransactionRecorder collector) {
         return event -> {
             events.add(event);
             collector.onEvent(event);

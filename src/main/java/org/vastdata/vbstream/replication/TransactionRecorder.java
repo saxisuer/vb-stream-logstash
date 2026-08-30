@@ -15,7 +15,7 @@ import java.util.List;
  * <p>线程约束：非线程安全——单 consumer 线程（与流式主契约同线程模型；跨线程消费输出列表
  * 前需自建 happens-before，如组装器 close 的 join）。
  */
-public final class TransactionCollector implements TransactionListener {
+public final class TransactionRecorder implements StreamingTransactionListener {
 
     private final List<Transaction> transactions = new ArrayList<>();
     private TransactionEvent.Begin open;

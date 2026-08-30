@@ -15,7 +15,7 @@ import org.vastdata.vbstream.replication.PipeWatermarkProbe;
 import org.vastdata.vbstream.replication.RowChange;
 import org.vastdata.vbstream.replication.Transaction;
 import org.vastdata.vbstream.replication.TransactionAssembler;
-import org.vastdata.vbstream.replication.TransactionCollector;
+import org.vastdata.vbstream.replication.TransactionRecorder;
 import org.vastdata.vbstream.replication.TransactionKind;
 import org.vastdata.vbstream.replication.TxChange;
 import org.vastdata.vbstream.replication.VersionedRelationRegistry;
@@ -401,9 +401,9 @@ class DecoupledPipelineTest {
      */
     private static ReplayOutcome replayAsync(List<byte[]> rawMessages, Path pipeDir, Runnable atFirstAbort) {
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        // 2.0 起组装器回调流式事件，经 TransactionCollector 重组回整块——既有断言零改动的
+        // 2.0 起组装器回调流式事件，经 TransactionRecorder 重组回整块——既有断言零改动的
         // 等价币（跨线程安全前提：close 的 join 建立读侧 happens-before，见下）
-        TransactionCollector out = new TransactionCollector();
+        TransactionRecorder out = new TransactionRecorder();
         AtomicLong frontier = new AtomicLong();
         AtomicBoolean consumerFailed = new AtomicBoolean();
         TransactionAssembler assembler = new TransactionAssembler(out, StreamingMode.PARALLEL,
