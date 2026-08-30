@@ -115,7 +115,7 @@ JMH 基准在独立源码根 `src/jmh`（`-Pjmh` 档才参与编译，默认构�
 
 ## 路线
 
-- 里程碑 1（完成）：pgoutput 解码器 + 复制会话 + Main/ConsoleListener
+- 里程碑 1（完成）：pgoutput 解码器 + 复制会话 + Main/ConsoleRenderer
 - 里程碑 1.5（完成）：raw 驱动的事务组装器——桶模型、StreamAbort 子事务剔除、2PC 挂起、Relation 版本日志 asOf 渲染
 - 里程碑 1.6（完成）：组装缓冲溢写 Chronicle Queue——MEMORY/SPILLED 混合桶、低水位删档、瞬态工作区语义 + JMH 基线
 - 里程碑 1.7（完成）：读取与组装输出解耦——reader 记账 + CQ 主缓冲管道（MEMORY/SPILLED 双形态与溢写阈值退役，桶纯 index 段记账）+ transaction-consumer 回放输出 + Relation 版本快照随行 + 输出前沿反馈封顶
