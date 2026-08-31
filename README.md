@@ -106,7 +106,7 @@ DML 统一带 `BEFORE=`/`AFTER=` 镜像（缺失侧为 `-`）。注意 BEFORE �
 
 ```bash
 mvn test                # 全部：协议/组装单元测试 + Testcontainers 集成测试（158 用例）
-mvn test -Dtest=StreamedTransactionTest    # 单类
+mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 
 集成测试（`org.vastdata.vbstream.it`，11 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
