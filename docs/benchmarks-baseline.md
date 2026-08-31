@@ -1,6 +1,6 @@
 # JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段，2.0 Task 5 增输出契约换血对照段）
 
-五个 JMH 基准（`src/jmh/java/org/vastdata/vbstream/bench/`，`-Pjmh` 档才参与编译）以**真实录制语料**
+五个 JMH 基准（`vb-stream-engine/src/jmh/java/org/vastdata/vbstream/bench/`，`-Pjmh` 档才参与编译）以**真实录制语料**
 离线回放，度量 pgoutput 解码、路由窥探、组装总成本与管道路径（`MessagePipe` append / 冻结桶回放）
 的成本面，为"原始字节驱动 + 延迟解码 + reader/consumer 解耦"路线提供量化对照。语料与基准均不
 依赖运行期 Docker——录制一次，反复回放。
@@ -9,7 +9,7 @@
 
 ```bash
 # 1) 编译（jmh profile 引入 org.openjdk.jmh:jmh-core/jmh-generator-annprocess:1.37（test scope），
-#    把 src/jmh/java 挂为 test 源码目录，并经 annotationProcessorPaths 生成基准桩）
+#    把 vb-stream-engine/src/jmh/java 挂为 test 源码目录，并经 annotationProcessorPaths 生成基准桩）
 mvn -pl vb-stream-engine -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 
 # 2) 运行（冒烟档：1 fork / 预热 1s / 测量 2s；两条命令都在仓库根目录执行）
@@ -37,8 +37,8 @@ java -cp "vb-stream-engine/target/classes:vb-stream-engine/target/test-classes:$
 
 ## 语料
 
-`src/test/resources/bench-corpus/corpus.bin`（提交进库，`.gitattributes` 标 binary）：由
-`it.BenchCorpusRecordTest`（生成器测试）对 Testcontainers PG 执行 `src/main/resources/sql/`
+`vb-stream-engine/src/test/resources/bench-corpus/corpus.bin`（提交进库，`.gitattributes` 标 binary）：由
+`it.BenchCorpusRecordTest`（生成器测试）对 Testcontainers PG 执行 `vb-stream-engine/src/main/resources/sql/`
 全部 6 个场景脚本（psql 容器内执行）经 `SessionHarness.rawMessages()` 录制的真实 pgoutput
 字节流。**重录触发**：语料缺失，或脚本/建表 DDL 内容变化（SHA-256 指纹边车
 `scripts.sha256` 比对）；指纹一致时该测试只做健康断言（不启容器，秒过）。

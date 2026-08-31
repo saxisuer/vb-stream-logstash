@@ -6,12 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 PostgreSQL 最新的逻辑解码（logical decoding）**stream 模式**，通过 pgjdbc 的 `ReplicationConnection` / `PGReplicationStream` API 实时获取 CDC 数据。
 
-- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom）+ 两模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）与 `vb-stream-connector-postgres-stream`（Debezium 流式连接器,设计见 docs/superpowers/specs/2026-09-01-debezium-connector-postgres-stream-design.md）
+- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom）+ 两模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）与 `vb-stream-connector-postgres-stream`（Debezium 流式连接器，设计见 docs/superpowers/specs/2026-09-01-debezium-connector-postgres-stream-design.md）
 - 工具链：Java 17 + Maven
 - 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`StreamingTransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `StreamingToBlockAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 177 用例全绿；**吞吐与分布指标已内建**（`ThroughputMetrics`——slot 读取/组装/输出三段速率 + 回放耗时/事务大小分位数 + 八项会话峰值行，10s 周期 INFO 日志行，2026-08-31 设计）；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`，另含 2026-08-31 端到端在线吞吐基线段：单 slot 双上限——窄行 ~34 万条/s、宽行 ~320MB/s，组装 ~4.4 万 tx/s，Main 全程非瓶颈）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
     - `net.openhft:chronicle-queue`（持久化低延迟队列——1.7 起是 reader 与 consumer 之间的**主缓冲管道**；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`；其传递的 `chronicle-analytics` 遥测打点已在 pom 排除——core 反射缺类回落 MuteAnalytics 空实现，官方 DISCLAIMER 认可的关闭方式，启动横幅与上报一并消失）
-    - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
+    - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `vb-stream-engine/src/main/resources/logback.xml` 与 `vb-stream-engine/src/test/resources/logback-test.xml`）
     - `org.hdrhistogram:HdrHistogram`（分位数直方图数据结构，零传递依赖——`ThroughputMetrics` 的 P90/P95/max 区间窗口。⚠️ Maven 坐标小写 `org.hdrhistogram`、Java 包名**大写** `org.HdrHistogram`，import 别写反）
 
 ## 架构总览
@@ -49,8 +49,8 @@ ConsoleRenderer（CDC 专用 logger org.vastdata.vbstream.cdc，INFO；STREAMING
 
 | 层 | 位置 | 职责 | 细节文档 |
 |---|---|---|---|
-| 协议解析 | `org.vastdata.vbstream.protocol` | pgoutput 消息字节 → 强类型 record，纯函数无 IO | `src/main/java/.../protocol/CLAUDE.md` |
-| 会话与组装 | `org.vastdata.vbstream.replication` | 双 JDBC 连接、raw 字节交付接缝、解耦事务组装（reader 记账 + MessagePipe 管道 + consumer 回放） | `src/main/java/.../replication/CLAUDE.md` |
+| 协议解析 | `org.vastdata.vbstream.protocol` | pgoutput 消息字节 → 强类型 record，纯函数无 IO | `vb-stream-engine/src/main/java/.../protocol/CLAUDE.md` |
+| 会话与组装 | `org.vastdata.vbstream.replication` | 双 JDBC 连接、raw 字节交付接缝、解耦事务组装（reader 记账 + MessagePipe 管道 + consumer 回放） | `vb-stream-engine/src/main/java/.../replication/CLAUDE.md` |
 | 入口与输出 | `org.vastdata.vbstream`（顶层） | `Main` 装配、`ConsoleRenderer` 控制台输出 | 本节 |
 
 - **`Main`**：冒烟入口（2.0 双线程流式装配）。校验配置（含 pipe 配置与输出形态解析 `vb.output.mode`，非法值启动期 fail-fast）→ session open/ensureSlot/start → reader 线程（`pgoutput-reader`）内 try-with-resources 建**异步**组装器（独享 `VersionedRelationRegistry` 与 `PipeConfig`；构造即建管道并起非守护 `transaction-consumer` 线程）→ 输出形态接线：STREAMING（默认）`ConsoleRenderer` 直接作 `StreamingTransactionListener`（onEvent 逐事件渲染）；BLOCK 包 `StreamingToBlockAdapter(console)` 攒齐整块再回调 onTransaction（1.7 原子交付逃生门）——`ConsoleRenderer` 一个实例三角色（流式事件渲染 + 整块渲染 + 解码点 observer：组装器是唯一解码者，live 解码点传 registry、回放解码点传桶快照作渲染视图）→ `session.run(assembler, frontier::get)` 把 LSN 确认按输出前沿封顶（前沿锚 End：End 事件处理完毕即推进，block 形态 = 适配器转发 + onTransaction 返回）→ 主线程 await 停机信号（Ctrl+C 触发 shutdown hook——hook 除 countDown 外还 join reader 线程，保证 JVM halt 前走完"run 退出 → 组装器毒丸排干"，已提交未输出的事务不丢）→ 关闭次序：会话 → 组装器（排干）→ 管道。启动失败 exit 1；复制流中断保留槽位并倒计时停机（重启续传）；consumer 回放失败经 onFailure 触发同一停机路径（fail-fast）
@@ -67,7 +67,7 @@ mvn test -pl vb-stream-engine -Dtest=ClassName#method     # 运行引擎单个�
 mvn dependency:tree                  # 查看依赖树
 ```
 
-注意：测试基于 JUnit 6（JUnit Jupiter，要求 Java 17+）+ Surefire，已可在 `src/test/java` 下直接编写测试。涉及 PG 复制的集成测试可用本地 Docker 起 PostgreSQL 容器。
+注意：测试基于 JUnit 6（JUnit Jupiter，要求 Java 17+）+ Surefire，已可在 `vb-stream-engine/src/test/java` 下直接编写测试。涉及 PG 复制的集成测试可用本地 Docker 起 PostgreSQL 容器。
 
 ## 开发规约
 
