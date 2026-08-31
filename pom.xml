@@ -11,6 +11,7 @@
 
     <modules>
         <module>vb-stream-engine</module>
+        <module>vb-stream-connector-postgres-stream</module>
     </modules>
 
     <properties>
