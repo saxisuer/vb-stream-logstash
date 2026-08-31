@@ -5,6 +5,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.StreamingMode;
 import org.vastdata.vbstream.protocol.TupleData;
@@ -27,6 +29,8 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -52,6 +56,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class DecoupledPipelineTest {
 
+    private static final Logger LOG = LoggerFactory.getLogger(DecoupledPipelineTest.class);
+
     /** 本测试类共用的复制槽名：cleanup 与各场景 newConfig 统一引用，防多处字面量拼写漂移。 */
     private static final String SLOT = "slot_pipeline";
 
@@ -73,10 +79,27 @@ class DecoupledPipelineTest {
         PgTestEnv.dropSlotQuietly(SLOT);
     }
 
-    /** 每用例后清理本测试专用槽：先杀 walsender 再删，避免槽残留跨用例干扰（槽不存在时静默）。 */
+    /**
+     * 本用例经 {@link #replayAsync} 建立的管道目录——@AfterEach 在 @TempDir 收尾**之前**执行，
+     * 届时对其做 gc 重试删除（Windows 上 Chronicle 的 mmap 句柄在 queue.close() 后经 GC/cleaner
+     * 异步释放，紧随的删除会失败，进而让 @TempDir 收尾报 Error 判红测试；POSIX 的 unlink 语义
+     * 允许删除仍映射的文件，macOS/Linux 无此约束——首轮直接删即成）。
+     */
+    private final List<Path> createdPipeDirs = new ArrayList<>();
+
+    /**
+     * 每用例后清理本测试专用槽与管道目录：槽先杀 walsender 再删（避免残留跨用例干扰，槽不存在时
+     * 静默）；管道目录带 gc 重试尽力删除（清理失败不判测试红——残留仅占临时目录空间，详见
+     * {@link #deletePipeDirWithGcRetry}）。@TempDir 的删除在 @AfterEach 之后，此时目录已清空，
+     * 其收尾只剩删空目录，Windows 上不再被占用句柄卡死。
+     */
     @AfterEach
     void cleanup() {
         PgTestEnv.dropSlotQuietly(SLOT);
+        for (Path pipeDir : createdPipeDirs) {
+            deletePipeDirWithGcRetry(pipeDir);
+        }
+        createdPipeDirs.clear();
     }
 
     /**
@@ -399,7 +422,8 @@ class DecoupledPipelineTest {
      * @param atFirstAbort 首个 StreamAbort('A') 喂入前的钩子（注入删档观测用，无操作传空 Runnable）
      * @return 输出事务列表 + 两个低水位观测点（close 排干后）
      */
-    private static ReplayOutcome replayAsync(List<byte[]> rawMessages, Path pipeDir, Runnable atFirstAbort) {
+    private ReplayOutcome replayAsync(List<byte[]> rawMessages, Path pipeDir, Runnable atFirstAbort) {
+        createdPipeDirs.add(pipeDir);   // 登记 @AfterEach gc 重试删除（Windows mmap 句柄异步释放，见其 javadoc）
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
         // 2.0 起组装器回调流式事件，经 TransactionRecorder 重组回整块——既有断言零改动的
         // 等价币（跨线程安全前提：close 的 join 建立读侧 happens-before，见下）
@@ -423,6 +447,51 @@ class DecoupledPipelineTest {
         }
         assertFalse(consumerFailed.get(), "consumer 回放失败（fail-fast）——异常堆栈见 transaction-consumer 的 ERROR 日志");
         return new ReplayOutcome(List.copyOf(out.transactions()), PipeWatermarkProbe.of(assembler), beforeFirstAbort);
+    }
+
+    /**
+     * 责任：尽力删除一个管道目录，为 Windows 上的 mmap 句柄异步释放做 gc 重试。关键步骤：先试
+     * 一轮直接删除 → 仍有残留则 System.gc() 唤醒 cleaner 释放 chronicle-core 的 native unmap 后
+     * 重试（至多 5 轮、间隔 100ms——close 后句柄释放通常在一两轮内完成）。边界：重试耗尽仍有
+     * 残留时 WARN 放行——清理失败不应判测试失败（残留仅占临时目录空间；@TempDir 若随之收尾失败
+     * 会在报告里显形，属环境极端态）。线程：JUnit 测试线程（@AfterEach）。
+     */
+    private static void deletePipeDirWithGcRetry(Path pipeDir) {
+        for (int attempt = 0; attempt < 5 && !deleteRecursively(pipeDir); attempt++) {
+            System.gc();   // 唤醒 cleaner 释放 mmap 句柄——Windows 上删除被占用文件的前置
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        if (Files.exists(pipeDir)) {
+            LOG.warn("管道目录未能完全删除（mmap 句柄未及释放，残留仅占临时空间）: {}", pipeDir);
+        }
+    }
+
+    /**
+     * 责任：递归删除目录树并报告是否删净。关键步骤：Files.walk 深度优先逆序（子先父后）逐个删除。
+     * 边界：单文件删除失败不抛不中断（占用中的 mmap 文件本轮注定失败——静默留给调用方的 gc 重试
+     * 兜底）；walk 本身失败或删后仍有残留返回 false；目录不存在视为已删净返回 true。
+     */
+    private static boolean deleteRecursively(Path root) {
+        if (Files.notExists(root)) {
+            return true;
+        }
+        try (Stream<Path> walk = Files.walk(root)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.delete(p);
+                } catch (IOException e) {
+                    // 占用中的 mmap 文件本轮失败——由调用方的 gc 重试兜底，不中断其余条目
+                }
+            });
+        } catch (IOException e) {
+            return false;
+        }
+        return Files.notExists(root);
     }
 
     /**
