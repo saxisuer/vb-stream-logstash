@@ -1,6 +1,6 @@
 # replication/ 模块——复制会话、raw 接缝与解耦事务组装（IO + 组装层）
 
-职责：管理两条 JDBC 连接（普通 SQL + 复制专用），把复制流按**原始字节**交付上层（raw 接缝，里程碑 1.6 起）；本包同时承载 raw 驱动的 `TransactionAssembler`（1.7 起 reader/consumer 双线程解耦：**reader 记账 + Chronicle Queue 主缓冲管道 + 独立消费器回放输出**；2.0 起输出契约流式化：**`onEvent(TransactionEvent)` 事件交付，回放期堆峰 O(单条)**，block 逃生门经 `StreamingToBlockAdapter` 攒回整块）；2026-08-31 起内建**吞吐与分布指标**（`ThroughputMetrics`：slot 读取/组装/输出三段速率 + 事务回放耗时与事务大小分位数，10s 周期 INFO 日志行）。上游 `Main` 依赖 `PgReplicationSession` + `TransactionAssembler`（raw 接缝直连）；集成测试 `SessionHarness` 双轨录制（raw + 经 `DecodedMessageBridge` 的解码消息）。
+职责：管理两条 JDBC 连接（普通 SQL + 复制专用），把复制流按**原始字节**交付上层（raw 接缝，里程碑 1.6 起）；本包同时承载 raw 驱动的 `TransactionAssembler`（1.7 起 reader/consumer 双线程解耦：**reader 记账 + Chronicle Queue 主缓冲管道 + 独立消费器回放输出**；2.0 起输出契约流式化：**`onEvent(TransactionEvent)` 事件交付，回放期堆峰 O(单条)**，block 逃生门经 `StreamingToBlockAdapter` 攒回整块）；2026-08-31 起内建**吞吐与分布指标**（`ThroughputMetrics`：slot 读取/组装/输出三段速率 + 事务回放耗时与事务大小分位数 + 八项会话峰值行，10s 周期 INFO 日志行）。上游 `Main` 依赖 `PgReplicationSession` + `TransactionAssembler`（raw 接缝直连）；集成测试 `SessionHarness` 双轨录制（raw + 经 `DecodedMessageBridge` 的解码消息）。
 
 ## 数据流（2.0 解耦 + 流式输出形态，设计文档 `docs/superpowers/specs/2026-08-29-reader-consumer-decoupling-design.md` 与 `...-transaction-streaming-output-design.md`）
 
@@ -143,7 +143,7 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 - **processBucket（单桶处理半程，同步/异步共用，2.0 三段事件流）**：起计回放耗时 → `state=OUTPUTTING` → 发 `TransactionEvent.Begin` 头（expectedChanges 取桶记账 `unitCount`，aborted 过滤前）→ `BucketReplayer.replay(bucket, pipe, sink)` 逐条交付（sink = `listener.onEvent(change)` 即时回调，**先交付后计数**——listener 自身抛出时该条不计入"已输出"；不构造整事务列表，堆 O(单条)）→ 发 `End` 尾（emitted 为过滤后实付数）→ 前沿以 endLsn 单调累加（`accumulateAndGet(max)`，**End 处理完毕后**——End 返回 = 完整消费确认，block 形态即适配器转发 + onTransaction 返回）→ `state=DONE` → 指标回填（`onTxOutput`：输出 tx/records 计数 + 耗时/大小两分布样本——**仅完整交付的事务入分布**，fail-fast 截断的不入）。空桶产出 `Begin → End(0)`；回放异常在 End 发出前原样上抛并记 ERROR（带已输出/预期条数与 firstIndex——fail-fast 截断留痕，End 永不发出、前沿不推进、指标不回填）——异步由 run 捕获、同步直传调用方（既有用例的 fail-fast 断言路径）
 - **失败语义**：处理中抛出的任何 Throwable 记 ERROR、触发 onFailure（如 `stop::countDown`）、退出循环**不排干**（fail-fast，与 1.6"异常上抛终止会话"等价）；捕捉 Throwable 防 consumer 静默死亡导致 reader 无限追加
 - **交接队列** `LinkedBlockingQueue<TxBuffer>`（无界——元素只有元数据，真缓冲是 CQ）
-- **周期统计**（10s 固定周期，常量不做配置面）：①各状态桶计数（LIVE/HANDED_OFF/OUTPUTTING）+ 输出前沿一行 INFO；②吞吐与分布两行 INFO（`metrics.reportLines(now)`——**每次调用即窗口边界**，速率按窗口差分、分位按区间隔离，见 ThroughputMetrics 节）；最老 HANDED_OFF 桶滞留超 60s 升 WARN（consumer 或下游回调阻塞的信号）
+- **周期统计**（10s 固定周期，常量不做配置面）：①各状态桶计数（LIVE/HANDED_OFF/OUTPUTTING）+ 输出前沿一行 INFO；②吞吐/分布/峰值三行 INFO（`metrics.reportLines(now)`——**每次调用即窗口边界**，速率按窗口差分、分位按区间隔离、峰值为会话历史最高，见 ThroughputMetrics 节）；最老 HANDED_OFF 桶滞留超 60s 升 WARN（consumer 或下游回调阻塞的信号）
 - **线程约束**：run() 仅 consumer 线程；processBucket 的触碰面 = 冻结桶 + pipe.readRange + listener 回调 + 前沿累加 + 桶状态字段——全部在 consumer 线程或并发安全结构上
 
 ## BucketReplayer（包私有，桶回放器）
@@ -152,13 +152,14 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 
 ## ThroughputMetrics（包私有，吞吐与分布指标）
 
-本地周期日志行观测面（2026-08-31 设计，spec `docs/superpowers/specs/2026-08-31-throughput-metrics-design.md`）：六项速率计数 + 两项分位数分布。**选型**：计数与窗口差分手写（消费通道仅日志行，Micrometer/Dropwizard 的速率算法与输出格式对本场景无净值），分位数用 HdrHistogram `SingleWriterRecorder`（零传递依赖；Micrometer `DistributionSummary` 百分位内部同源）——全部计量收在本类后面，未来接监控系统只换实现、四个埋点点位不动。
+本地周期日志行观测面（2026-08-31 设计，spec `docs/superpowers/specs/2026-08-31-throughput-metrics-design.md`；同日增补会话峰值行，spec `.../2026-08-31-peak-metrics-design.md`）：六项速率计数 + 两项分位数分布 + 八项会话峰值。**选型**：计数与窗口差分手写（消费通道仅日志行，Micrometer/Dropwizard 的速率算法与输出格式对本场景无净值），分位数用 HdrHistogram `SingleWriterRecorder`（零传递依赖；Micrometer `DistributionSummary` 百分位内部同源）——全部计量收在本类后面，未来接监控系统只换实现、四个埋点点位不动。
 
 - **六计数口径**（LongAdder，只增不清零）：slot bytes/messages 在组装器 `onRaw` 入口记（含控制消息与 'R'——"从槽读到什么"的诚实口径，与输出侧 records **不可对照**，bytes 才是两端口径一致的对照对）；组装 tx 在 `handoff` 记（提交交接才计，回滚丢弃不计）；输出 bytes 在回放器逐单元记（aborted 过滤**前**）；输出 tx/records 在 `processBucket` 尾经 `onTxOutput` 记（实付 TxChange 数，Begin/End 事件不计）
 - **两分布**（`SingleWriterRecorder`，2 位有效数字 ≈1% 精度）：事务回放耗时（processBucket 起止，**含下游回调**）与事务大小（`unitCount`，aborted 过滤前——事务"本相"多大，与输出 records 的差 = 被剔除的子事务量）；**仅完整交付的事务入分布**（fail-fast 截断不入）；越上界（耗时 1h / 大小 10 亿单元）钳制到上界——指标永不向热路径抛异常
-- **报告语义**（`reportLines(nowNanos)`，每次调用即窗口边界）：速率 = 六计数窗口内 delta ÷ 实际流逝秒数（nanoTime 差）；分位 = Recorder 取走的上一区间（窗口外样本不稀释当前值，返回的直方图回收复用、读后即弃）；零样本窗口分布段打 `n/a`。格式：字节 SI 十进制恒一位小数（`12.4 MB/s`）、耗时 ns→µs→ms→s 千进位（同档 ≥100 取整）、计数速率 <100 一位小数 / ≥100 整数千分位——两行样例：
+- **报告语义**（`reportLines(nowNanos)`，每次调用即窗口边界，返回**三行**）：速率 = 六计数窗口内 delta ÷ 实际流逝秒数（nanoTime 差）；分位 = Recorder 取走的上一区间（窗口外样本不稀释当前值，返回的直方图回收复用、读后即弃）；峰值 = 八项**会话历史最高**（2026-08-31 峰值 spec：窗口速率 >0 才刷新速率峰值——空窗零速率不构成峰值，分布区间 max 在取走时顺手留存——否则随区间回收丢弃；空载窗口峰值行也常驻输出，峰值不随窗口翻页消失；"从未有过记录"打 `n/a`）。格式：字节 SI 十进制恒一位小数（`12.4 MB/s`）、耗时 ns→µs→ms→s 千进位（同档 ≥100 取整）、计数速率 <100 一位小数 / ≥100 整数千分位——三行样例：
   - `吞吐: slot=12.4 MB/s (85,231 msg/s) | 组装=42 tx/s | 输出=11.8 MB/s (81,004 rec/s, 41 tx/s)`
   - `分布: 回放耗时 p90=3.2ms p95=6.8ms max=125ms | 事务大小 p90=2,150 rec p95=5,100 rec max=48,200 rec`
+  - `峰值: slot=15.1 MB/s (102,400 msg/s) | 组装=48 tx/s | 输出=13.6 MB/s (95,200 rec/s, 44 tx/s) | 耗时=1.1s | 大小=200,703 rec`
 - **接线**（Main/公共 API/配置面**零改动**，指标常开）：组装器构造时创建实例 → 自用（slot/组装）→ 穿 `TransactionConsumer` 构造（输出计数 + 分布 + 报告挂 `maybeStats` 统计 tick）→ 穿 `BucketReplayer` 构造（回读字节）。同步测试形态 `run()` 不被调用 → 只计数不打印；`assembler.throughputMetrics()` 是包私有测试观测口
 - **注意**：HDR 的 Maven 坐标小写 `org.hdrhistogram`、Java 包名**大写** `org.HdrHistogram`（上游历史命名，import 别写反）；HDR 按有效数字做桶级量化，读回值可有 ±1% 偏差（3600s 记入读回 3608s 属正常），断言用容差
 - 测试：`ThroughputMetricsTest`（格式化边界/窗口差分/区间隔离/钳制）+ `ThroughputMetricsWiringTest`（同步组装器走完整业务路径，断言 4 处埋点无一漏挂）

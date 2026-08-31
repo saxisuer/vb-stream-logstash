@@ -8,7 +8,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态；artifactId 暗示最终会以某种形式与 Logstash 集成，集成方式尚未确定）
 - 工具链：Java 17 + Maven
-- 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`StreamingTransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `StreamingToBlockAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 171 用例全绿；**吞吐与分布指标已内建**（`ThroughputMetrics`——slot 读取/组装/输出三段速率 + 回放耗时/事务大小分位数，10s 周期 INFO 日志行，2026-08-31 设计）；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
+- 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`StreamingTransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `StreamingToBlockAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 174 用例全绿；**吞吐与分布指标已内建**（`ThroughputMetrics`——slot 读取/组装/输出三段速率 + 回放耗时/事务大小分位数 + 八项会话峰值行，10s 周期 INFO 日志行，2026-08-31 设计）；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
     - `net.openhft:chronicle-queue`（持久化低延迟队列——1.7 起是 reader 与 consumer 之间的**主缓冲管道**；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`；其传递的 `chronicle-analytics` 遥测打点已在 pom 排除——core 反射缺类回落 MuteAnalytics 空实现，官方 DISCLAIMER 认可的关闭方式，启动横幅与上报一并消失）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
@@ -38,7 +38,7 @@ TransactionConsumer  ←交接队列取桶 → 发 Begin 头（expectedChanges=�
   │                   回放期堆峰 O(单条)）→ 发 End 尾（emitted=过滤后实付数）→ 前沿 AtomicLong ← endLsn
   │ StreamingTransactionListener.onEvent(TransactionEvent)：流式事件交付（Begin → TxChange* → End，
   │   单回调单背压点；End 返回 = 完整消费确认——前沿随之推进，End 未达则重启整事务重发）
-  │ ThroughputMetrics（10s 周期 INFO 两行：六速率 + 回放耗时/事务大小 p90/p95/max——reader 记
+  │ ThroughputMetrics（10s 周期 INFO 三行：六速率 + 回放耗时/事务大小 p90/p95/max + 八项会话峰值——reader 记
   │   slot/组装，consumer 记输出与分布，报告挂 consumer 统计 tick；设计见 2026-08-31 spec）
   ▼
 ConsoleRenderer（CDC 专用 logger org.vastdata.vbstream.cdc，INFO；STREAMING 直渲染 /
@@ -93,7 +93,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 #           -Dvb.pipe.dir=... -Dvb.pipe.rollCycle=... -Dvb.output.mode=streaming|block
 ```
 
-- **运行期每 10s 打三行统计 INFO**（consumer 统计行 + `吞吐:` 行 + `分布:` 行——`ThroughputMetrics`，指标常开无配置面；速率按窗口差分、分位按区间隔离，口径与格式见 `replication/CLAUDE.md` 的 ThroughputMetrics 节）
+- **运行期每 10s 打四行统计 INFO**（consumer 统计行 + `吞吐:` 行 + `分布:` 行 + `峰值:` 行——`ThroughputMetrics`，指标常开无配置面；速率按窗口差分、分位按区间隔离、峰值为会话历史最高（空载窗口也常驻），口径与格式见 `replication/CLAUDE.md` 的 ThroughputMetrics 节）
 
 - **`--add-opens` 清单必带**：Main 装配的 `TransactionAssembler` 构造即建 Chronicle Queue 管道（`MessagePipe`——1.7 起是主缓冲，不再是"越过阈值才溢写"），chronicle-core 的 mmap 在 Java 17 需开放内部包（反射调 `sun.nio.ch.FileChannelImpl.map0`，官方支持说明 https://chronicle.software/chronicle-support-java-17）；清单与 pom 的 surefire argLine 同源
 - **pipe 参数（`-Dvb.pipe.*`，`PipeConfig`，默认值即下表）**：

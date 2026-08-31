@@ -7,6 +7,7 @@ import org.HdrHistogram.SingleWriterRecorder;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
 
 /**
@@ -18,6 +19,12 @@ import java.util.function.LongFunction;
  * 的速率算法与输出格式都对本场景无净值）；分位数用 {@link SingleWriterRecorder}
  * （HdrHistogram，零传递依赖）——每次报告 {@code getIntervalHistogram()} 取走上一区间，
  * 窗口外样本不稀释当前值。全部计量收在本类后面，未来接监控系统只换实现、埋点点位不动。
+ *
+ * <p>会话峰值行（2026-08-31 峰值 spec，同日第二份）：窗口隔离报告使峰值转瞬即逝——负载
+ * 只占一个窗口，下一窗口速率归零、分布变 n/a。报告增补第三行"峰值:"留存八项**会话历史
+ * 最高**（六项窗口速率峰值 + 两项分布区间 max 峰值）：速率峰值粒度 = 统计窗口均值的会话
+ * 最高（非亚秒瞬时值）；空窗零速率不构成峰值（窗口速率 &gt; 0 才刷新，初始 -1 即"从未有过
+ * 记录"打 n/a）；空载窗口也常驻输出——峰值不随窗口翻页消失。
  *
  * <p>口径（设计 §2）：slot 侧含全部 pgoutput 消息（控制消息与 Relation——"从槽读到什么"的
  * 诚实口径，与输出侧 records 不可直接对照，bytes 才是两端口径一致的对照对）；组装 tx 仅计
@@ -68,6 +75,19 @@ final class ThroughputMetrics {
     private long lastReportNanos;
     /** 上次报告的计数快照——速率差分的分子（当前累计 - 本值）。 */
     private Totals lastTotals;
+
+    // 会话峰值八字段（2026-08-31 峰值 spec §3）：六项窗口速率峰值（double）+ 两项分布区间
+    // max 峰值（long）。初始 -1 表"从未有过记录"（报告行打 n/a）；更新与报告同在
+    // reportLines（consumer 线程）——单写者、无并发结构。速率峰值仅当窗口速率 > 0 刷新
+    // （空窗零速率不构成峰值）；分布峰值取各区间直方图 max 的会话最高。
+    private double peakSlotBytesRate = -1.0;
+    private double peakSlotMsgRate = -1.0;
+    private double peakAssembledTxRate = -1.0;
+    private double peakOutputBytesRate = -1.0;
+    private double peakOutputRecRate = -1.0;
+    private double peakOutputTxRate = -1.0;
+    private long peakReplayNanos = -1L;
+    private long peakTxUnits = -1L;
 
     /**
      * 构造指标器并以当前 nanoTime 为首窗基线（生产路径——组装器构造时调用，首窗自此起算）。
@@ -136,30 +156,67 @@ final class ThroughputMetrics {
     /**
      * 责任：生成报告窗口的两行 INFO 文案（吞吐行 + 分布行），并把计数/时间基线推进到本次
      * 报告时刻——**每次调用都是一个窗口边界**，速率 = 六计数窗口内 delta ÷ 实际流逝秒数
-     * （nanoTime 差，非固定周期除法）；分布 = Recorder 取走的上一区间（窗口外样本不进本次）。
-     * 关键步骤：累计快照 → 差分与格式化 → 取两个区间直方图 → 推进基线。边界：elapsed ≤ 0
+     * （nanoTime 差，非固定周期除法）；分布 = Recorder 取走的上一区间（窗口外样本不进本次）；
+     * 峰值 = 八项会话历史最高的留存快照（窗口速率 &gt; 0 才刷新速率峰值、区间 max 顺手留存
+     * 分布峰值——空窗不稀释、零速率不构成峰值，见类 javadoc 峰值段）。
+     * 关键步骤：累计快照 → 差分与格式化 → 取两个区间直方图（同时更新分布峰值）→ 刷新六项
+     * 速率峰值并格式化峰值行 → 推进基线。边界：elapsed ≤ 0
      * （时钟异常/测试注入失序）钳为 1ns 防除零；分布段零样本打 n/a；返回的直方图是 Recorder
      * 回收复用的对象，只读即弃、不得持有。线程：consumer 线程（统计 tick；与分布的写入同
      * 线程，Recorder 单写者假设由此成立）。
      *
      * @param nowNanos 报告时刻（System.nanoTime 时域；调用方持有以便与其余统计共用同一戳）
-     * @return 两行文案（下标 0 = 吞吐行，1 = 分品行）；格式即契约，单测整行断言
+     * @return 三行文案（下标 0 = 吞吐行，1 = 分支行，2 = 峰值行）；格式即契约，单测整行断言
      */
     List<String> reportLines(long nowNanos) {
         Totals now = totals();
         long elapsedNanos = Math.max(1L, nowNanos - lastReportNanos);
         double seconds = elapsedNanos / 1_000_000_000.0;
-        String throughput = "吞吐: slot=" + formatBytesPerSec(deltaPerSecond(now.slotBytes(), lastTotals.slotBytes(), seconds))
-                + " (" + formatCountPerSec(deltaPerSecond(now.slotMessages(), lastTotals.slotMessages(), seconds)) + " msg/s)"
-                + " | 组装=" + formatCountPerSec(deltaPerSecond(now.assembledTxs(), lastTotals.assembledTxs(), seconds)) + " tx/s"
-                + " | 输出=" + formatBytesPerSec(deltaPerSecond(now.outputBytes(), lastTotals.outputBytes(), seconds))
-                + " (" + formatCountPerSec(deltaPerSecond(now.outputRecords(), lastTotals.outputRecords(), seconds)) + " rec/s, "
-                + formatCountPerSec(deltaPerSecond(now.outputTxs(), lastTotals.outputTxs(), seconds)) + " tx/s)";
-        String distribution = "分布: 回放耗时 " + intervalPart(replayNanos, ThroughputMetrics::formatNanos)
-                + " | 事务大小 " + intervalPart(txSizes, v -> grouped(v) + " rec");
+        double slotBytesRate = deltaPerSecond(now.slotBytes(), lastTotals.slotBytes(), seconds);
+        double slotMsgRate = deltaPerSecond(now.slotMessages(), lastTotals.slotMessages(), seconds);
+        double assembledTxRate = deltaPerSecond(now.assembledTxs(), lastTotals.assembledTxs(), seconds);
+        double outputBytesRate = deltaPerSecond(now.outputBytes(), lastTotals.outputBytes(), seconds);
+        double outputRecRate = deltaPerSecond(now.outputRecords(), lastTotals.outputRecords(), seconds);
+        double outputTxRate = deltaPerSecond(now.outputTxs(), lastTotals.outputTxs(), seconds);
+        String throughput = "吞吐: slot=" + formatBytesPerSec(slotBytesRate)
+                + " (" + formatCountPerSec(slotMsgRate) + " msg/s)"
+                + " | 组装=" + formatCountPerSec(assembledTxRate) + " tx/s"
+                + " | 输出=" + formatBytesPerSec(outputBytesRate)
+                + " (" + formatCountPerSec(outputRecRate) + " rec/s, " + formatCountPerSec(outputTxRate) + " tx/s)";
+        String distribution = "分布: 回放耗时 "
+                + intervalPart(replayNanos, ThroughputMetrics::formatNanos,
+                        v -> peakReplayNanos = Math.max(peakReplayNanos, v))
+                + " | 事务大小 "
+                + intervalPart(txSizes, v -> grouped(v) + " rec",
+                        v -> peakTxUnits = Math.max(peakTxUnits, v));
+        if (slotBytesRate > 0) {
+            peakSlotBytesRate = Math.max(peakSlotBytesRate, slotBytesRate);
+        }
+        if (slotMsgRate > 0) {
+            peakSlotMsgRate = Math.max(peakSlotMsgRate, slotMsgRate);
+        }
+        if (assembledTxRate > 0) {
+            peakAssembledTxRate = Math.max(peakAssembledTxRate, assembledTxRate);
+        }
+        if (outputBytesRate > 0) {
+            peakOutputBytesRate = Math.max(peakOutputBytesRate, outputBytesRate);
+        }
+        if (outputRecRate > 0) {
+            peakOutputRecRate = Math.max(peakOutputRecRate, outputRecRate);
+        }
+        if (outputTxRate > 0) {
+            peakOutputTxRate = Math.max(peakOutputTxRate, outputTxRate);
+        }
+        String peak = "峰值: slot=" + peakBytesPerSec(peakSlotBytesRate)
+                + " (" + peakCountPerSec(peakSlotMsgRate) + " msg/s)"
+                + " | 组装=" + peakCountPerSec(peakAssembledTxRate) + " tx/s"
+                + " | 输出=" + peakBytesPerSec(peakOutputBytesRate)
+                + " (" + peakCountPerSec(peakOutputRecRate) + " rec/s, " + peakCountPerSec(peakOutputTxRate) + " tx/s)"
+                + " | 耗时=" + (peakReplayNanos < 0 ? NOT_AVAILABLE : formatNanos(peakReplayNanos))
+                + " | 大小=" + (peakTxUnits < 0 ? NOT_AVAILABLE : grouped(peakTxUnits) + " rec");
         lastTotals = now;
         lastReportNanos = nowNanos;
-        return List.of(throughput, distribution);
+        return List.of(throughput, distribution, peak);
     }
 
     /**
@@ -175,14 +232,21 @@ final class ThroughputMetrics {
     /**
      * 责任：分布段文案——取 Recorder 上一区间的 p90/p95/max，经 formatter 渲染成带单位的值
      * （耗时用 {@link #formatNanos} 自带 ns..s 单位、事务大小用 grouped + " rec" 后缀）；
-     * 零样本区间整体打 n/a。边界：返回的 Histogram 是 Recorder 回收复用对象，本方法内读毕即弃。
-     * 线程：consumer 线程（与 recordValue 同线程）。
+     * 零样本区间整体打 n/a。区间 max 顺手经 peakUpdater 留存会话峰值（2026-08-31 峰值
+     * spec §2 #7/#8——区间即将被 Recorder 回收，取走时机仅此一处）。边界：返回的 Histogram
+     * 是 Recorder 回收复用对象，本方法内读毕即弃。线程：consumer 线程（与 recordValue 同线程）。
+     *
+     * @param recorder    分布记录器（replayNanos / txSizes 之一）
+     * @param formatter   值 → 带单位文案（耗时与事务大小各一套）
+     * @param peakUpdater 区间 max 的会话峰值留存回调（Math::max 语义，调用方闭包峰值字段）
      */
-    private static String intervalPart(SingleWriterRecorder recorder, LongFunction<String> formatter) {
+    private String intervalPart(SingleWriterRecorder recorder, LongFunction<String> formatter,
+                                LongConsumer peakUpdater) {
         Histogram interval = recorder.getIntervalHistogram();
         if (interval.getTotalCount() == 0) {
             return NOT_AVAILABLE;
         }
+        peakUpdater.accept(interval.getMaxValue());
         return "p90=" + formatter.apply(interval.getValueAtPercentile(90))
                 + " p95=" + formatter.apply(interval.getValueAtPercentile(95))
                 + " max=" + formatter.apply(interval.getMaxValue());
@@ -236,5 +300,15 @@ final class ThroughputMetrics {
     /** 整数千分位渲染（Locale.ROOT 固定逗号分隔，分位数与计数速率的 ≥100 档共用）。 */
     private static String grouped(long v) {
         return String.format(Locale.ROOT, "%,d", v);
+    }
+
+    /** 峰值字节速率格式化：负值（从未有过记录，2026-08-31 峰值 spec §2）打 n/a，其余复用 {@link #formatBytesPerSec}。 */
+    private static String peakBytesPerSec(double peak) {
+        return peak < 0 ? NOT_AVAILABLE : formatBytesPerSec(peak);
+    }
+
+    /** 峰值计数速率格式化：同上——负值打 n/a，其余复用 {@link #formatCountPerSec}。 */
+    private static String peakCountPerSec(double peak) {
+        return peak < 0 ? NOT_AVAILABLE : formatCountPerSec(peak);
     }
 }

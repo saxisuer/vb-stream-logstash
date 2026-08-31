@@ -157,4 +157,61 @@ class ThroughputMetricsTest {
         assertEquals(2, t.outputRecords());
         assertEquals(1, t.outputTxs());
     }
+
+    /**
+     * 峰值行首窗语义（2026-08-31 峰值 spec §2）：从未有过任何记录时八项全部 n/a——
+     * 速率峰值在首个非零窗口出现前为无记录（空窗的零速率不构成峰值），分布峰值沿用
+     * 零样本语义。整行断言（格式即契约）。
+     */
+    @Test
+    void 峰值行_首窗无记录八项全n_a() {
+        ThroughputMetrics metrics = new ThroughputMetrics(0L);
+        List<String> lines = metrics.reportLines(TEN_SECONDS);
+        assertEquals("峰值: slot=n/a (n/a msg/s) | 组装=n/a tx/s | 输出=n/a (n/a rec/s, n/a tx/s) | 耗时=n/a | 大小=n/a",
+                lines.get(2));
+    }
+
+    /**
+     * 峰值行的存在理由（spec §1）：高窗之后空窗，吞吐行归零、分布行变 n/a，峰值行完整
+     * 保留高窗的八项——峰值不随窗口翻页消失。高窗事件组与"速率报告"用例同构（速率期望
+     * 值可交叉核对），空窗后整行断言八项留存。
+     */
+    @Test
+    void 峰值行_高窗后空窗八项留存() {
+        ThroughputMetrics metrics = new ThroughputMetrics(0L);
+        for (int i = 0; i < 1000; i++) {
+            metrics.onSlotMessage(new byte[100]);       // slot: 100,000 B / 1000 msg
+        }
+        for (int i = 0; i < 50; i++) {
+            metrics.onTxHandedOff();                    // 组装: 50 tx
+            metrics.onReplayedUnit(100);                // 输出字节: 5,000 B
+        }
+        for (int i = 0; i < 10; i++) {
+            metrics.onTxOutput(1_000_000L, 5L, 5L);     // 输出: 10 tx / 50 rec，样本 1ms/5rec
+        }
+        metrics.reportLines(TEN_SECONDS);               // 高窗
+        List<String> idle = metrics.reportLines(2 * TEN_SECONDS);   // 空窗：吞吐归零、分布 n/a
+        assertEquals("吞吐: slot=0.0 B/s (0.0 msg/s) | 组装=0.0 tx/s | 输出=0.0 B/s (0.0 rec/s, 0.0 tx/s)",
+                idle.get(0));
+        assertEquals("分布: 回放耗时 n/a | 事务大小 n/a", idle.get(1));
+        assertEquals("峰值: slot=10.0 KB/s (100 msg/s) | 组装=5.0 tx/s | 输出=500.0 B/s (5.0 rec/s, 1.0 tx/s) | 耗时=1.0ms | 大小=5 rec",
+                idle.get(2));
+    }
+
+    /**
+     * 峰值与当前窗口的对照（spec §2 #7/#8）：次窗更小的样本使分布行回落（区间隔离），
+     * 峰值行仍取会话最高——两个时点的对照即"窗口报告"与"会话峰值"的语义分界。
+     */
+    @Test
+    void 峰值行_分布max会话留存取最高() {
+        ThroughputMetrics metrics = new ThroughputMetrics(0L);
+        metrics.onTxOutput(5_000_000L, 100L, 100L);
+        metrics.reportLines(TEN_SECONDS);
+        metrics.onTxOutput(2_000_000L, 50L, 50L);
+        List<String> second = metrics.reportLines(2 * TEN_SECONDS);
+        assertEquals("分布: 回放耗时 p90=2.0ms p95=2.0ms max=2.0ms | 事务大小 p90=50 rec p95=50 rec max=50 rec",
+                second.get(1));
+        assertTrue(second.get(2).contains("耗时=5.0ms"), "峰值应保留首窗 5ms: " + second.get(2));
+        assertTrue(second.get(2).contains("大小=100 rec"), "峰值应保留首窗 100 rec: " + second.get(2));
+    }
 }
