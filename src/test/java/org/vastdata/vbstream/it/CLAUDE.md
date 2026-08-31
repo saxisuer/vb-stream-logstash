@@ -8,7 +8,7 @@
 - **`SessionHarness`**：会话包装 + 双轨录制（raw 字节与解码消息两列表同序一一对应）。停止条件是 countDown latch——列表在 close 前仍会增长，**确定性全量断言必须先 `close()` 再读**。两种生命周期习语：多数用例（以停止条件收尾、块内断言）走 try-with-resources；需 close 后断言/回放的用例（RawSessionContractTest / DecoupledPipelineTest / BenchCorpusRecordTest）用显式 try/finally——harness 出块后仍可引用。机制细节见 replication 包 CLAUDE.md 的 SessionHarness 节
 - **录制→离线回放模式**（组装器类测试通用）：真库录制 raw 字节后把 `rawMessages()` 回放给 `TransactionAssembler`（确定性纯状态机，离线回放与在线组装一致）——随机数据只进录制侧，不进双配置对照断言。回放时点两种：`TransactionAssemblyTest` 五场景在 harness 块内（close 前）回放——停止条件恰在最后一条预期消息触发、尾部无多余流量才安全；`DecoupledPipelineTest`/`BenchCorpusRecordTest` close 后回放（DecoupledPipelineTest 用**异步**组装器 + close 毒丸排干后断言——排干承诺使输出成为确定性终态）——新场景若录制尾部含预期外消息必须用 close-first 形态
 
-## 11 组测试各自验证什么
+## 12 组测试各自验证什么
 
 | 测试类 | 验证场景 |
 |---|---|
@@ -22,6 +22,7 @@
 | `DecoupledPipelineTest` | 解耦管道三场景（原 AssemblySpillTest 升级，回放侧换**异步**组装器真实双线程）：①双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除，双回放输出全等 ②大事务内同事务 DDL，前后段按 asOf 版本渲染 ③流式大事务回滚后低水位推进 + 注入陈旧滚动文件验证 releaseBelow 实际删档；场景明细见根 CLAUDE.md"集成测试"条 |
 | `ReaderUnblockedTest` | **解耦头名验收**（1.7 设计 §9.3）：consumer 阻塞在输出回调期间 reader 持续从复制流接收（接收计数严格增长）；放行后排干输出 == 提交数（不丢不重） |
 | `FrontierCapTest` | **反馈语义验收**（1.7 设计 §5/§9.3）：consumer 阻塞期间未输出事务钉住槽 `confirmed_flush_lsn`（≤ before 锚点，两段式 + WAL 锚点策略），放行并补 WAL 活动后越过封顶 |
+| `ReaderThroughputTest` | **读取节拍回归**（2026-08-31 吞吐冒烟踩坑）：run 消息取送必须 drain——500 行单事务 35s 内录到提交消息；旧"每轮一条 + 固定 sleep 100ms"节拍 ~10 msg/s 下需 ~50s（硬性 sleep，确定性必红）。停止条件 Commit/StreamCommit 二选一（64kB work_mem 下 500 行小事务可能走流式路径） |
 | `BenchCorpusRecordTest` | JMH 语料生成器：6 场景脚本真库录制 → `corpus.bin` + SHA-256 指纹边车；指纹一致时**只做健康断言、不启容器**（PgTestEnv 引用收缩在录制分支内，常规 mvn test 秒级过）。改 `src/main/resources/sql/` 脚本或 DDL 即触发重录并**改写源码树**（产物须提交回库；无 Docker 环境下重录失败属预期） |
 
 ## 领域注意（不在本包重复）

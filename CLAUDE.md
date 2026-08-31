@@ -8,7 +8,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 
 - 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态；artifactId 暗示最终会以某种形式与 Logstash 集成，集成方式尚未确定）
 - 工具链：Java 17 + Maven
-- 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`StreamingTransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `StreamingToBlockAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 167 用例全绿；**吞吐与分布指标已内建**（`ThroughputMetrics`——slot 读取/组装/输出三段速率 + 回放耗时/事务大小分位数，10s 周期 INFO 日志行，2026-08-31 设计）；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
+- 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`StreamingTransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `StreamingToBlockAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 171 用例全绿；**吞吐与分布指标已内建**（`ThroughputMetrics`——slot 读取/组装/输出三段速率 + 回放耗时/事务大小分位数，10s 周期 INFO 日志行，2026-08-31 设计）；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
     - `net.openhft:chronicle-queue`（持久化低延迟队列——1.7 起是 reader 与 consumer 之间的**主缓冲管道**；会传递引入 chronicle-core/bytes/wire/threads 及 `slf4j-api`；其传递的 `chronicle-analytics` 遥测打点已在 pom 排除——core 反射缺类回落 MuteAnalytics 空实现，官方 DISCLAIMER 认可的关闭方式，启动横幅与上报一并消失）
     - `ch.qos.logback:logback-classic`（slf4j 绑定；CDC 数据输出走专用 logger 名 `org.vastdata.vbstream.cdc`（INFO），解析层逐消息 DEBUG 默认关闭，配置在 `src/main/resources/logback.xml` 与 `src/test/resources/logback-test.xml`）
@@ -22,7 +22,7 @@ vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 P
 PostgreSQL 18（walsender 逻辑解码：pgoutput v4 + streaming + two_phase）
   │ CopyData/'w' WAL 帧（pgjdbc 已剥复制协议封装）
   ▼
-PgReplicationSession.run()  ←100ms readPending 非阻塞轮询；LSN 确认 = min(已收到, 输出前沿)
+PgReplicationSession.run()  ←readPending drain 轮询（每轮取尽缓冲，空轮才睡 100ms）；LSN 确认 = min(已收到, 输出前沿)
   │ RawMessageListener.onRaw(byte[])：单条完整消息的独占数组（类型字节 + 流式块内可选 xid 前缀）
   ▼ reader 线程（pgoutput-reader）
 TransactionAssembler  ←每条消息先 pipe.append 取 CQ index 作 seq → 按类型字节路由：
@@ -114,9 +114,9 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 - **输出语义**：at-least-once——LSN 确认按输出前沿封顶，**前沿锚定 End 事件**（End 返回 = 下游确认完整消费；中途失败 fail-fast 截断、End 永不发出，前沿不推进），crash 时未输出（End 未达）事务必然被 PG 重发，console 可能重复输出已见事务的头行（不去重，文档化承诺）
 - **源码结构**（各源码根一行；包内细节见各模块级 CLAUDE.md，层间关系见上文“架构总览”）：
     - `src/main/java`：`protocol`（协议解析，纯函数）、`replication`（会话 + raw 接缝 + 解耦事务组装与管道 + 吞吐指标）、顶层 `Main`/`ConsoleRenderer`
-    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleRendererTest`、`it` 包集成测试 11 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
+    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleRendererTest`、`it` 包集成测试 12 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
     - `src/jmh/java`：五基准（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖，见其 CLAUDE.md）
-- 集成测试（`org.vastdata.vbstream.it`，11 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。解耦专项三组：`DecoupledPipelineTest` 三场景（①双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除，异步管道双回放输出全等 ②大事务内同事务 DDL，前后段按 asOf 版本渲染 ③流式大事务回滚后低水位推进 + 陈旧滚动文件实际删档）、`ReaderUnblockedTest`（头名验收——consumer 阻塞期间 reader 持续接收，放行后排干不丢不重）、`FrontierCapTest`（未输出事务钉住 confirmed_flush，输出后越过封顶）；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
+- 集成测试（`org.vastdata.vbstream.it`，12 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。解耦专项三组：`DecoupledPipelineTest` 三场景（①双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除，异步管道双回放输出全等 ②大事务内同事务 DDL，前后段按 asOf 版本渲染 ③流式大事务回滚后低水位推进 + 陈旧滚动文件实际删档）、`ReaderUnblockedTest`（头名验收——consumer 阻塞期间 reader 持续接收，放行后排干不丢不重）、`FrontierCapTest`（未输出事务钉住 confirmed_flush，输出后越过封顶）；另有 `ReaderThroughputTest` 读取节拍回归（500 行事务 35s 内录完——防"每轮一条+固定 sleep 100ms"的 ~10 msg/s 节拍退化，2026-08-31 吞吐冒烟实测踩坑）；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
 - JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 等号单 token 形式自带，详见该文档；基线数字在档作回归对照——2.0 段 + 1.7 段 + 1.6 历史参照，不进 CI）
 - src/docker 的 postgresql.conf 已含冒烟所需 `max_prepared_transactions=16` 与 `logical_decoding_work_mem=64kB`（改 conf 后 `docker compose restart postgres`）。注意：walsender 已追平时，单语句 `INSERT..SELECT` 批量写入的大事务不触发流式（整段于提交后回放）；构造流式场景需事务内分批/跨秒写入
 - **流式驱逐的内存记账按 TOAST 压缩后大小（实测，构造流式测试数据必读）**：reorder buffer 的 `rb->size` 按变更元组 TOAST 压缩后的实际字节数记账，不是 SQL 文本长度。规则图案载荷（`repeat('x',8192)`、`repeat(md5,N)`）被 pglz 压到百字节级——少量行永远越不过 `logical_decoding_work_mem=64kB`，事务整体走 Begin..Commit 的 NORMAL 路径（事务组装 Task 8 首版实测踩坑）。要少量行即触发流式，用不可压缩载荷：`(SELECT string_agg(md5(random()::text),'') FROM generate_series(1,512))` ≈16KB（`pg_column_size` 实测存满 16384）；数百行可压缩载荷靠总量也能触发（`StreamedTransactionTest` 的 500 行方案）。另注意阈值是**全局** `rb->size`（所有进行中事务合计），双连接并发大事务会轮番驱逐、流段交错下发（`TransactionAssemblyTest` 场景 4 即此构造）
@@ -124,7 +124,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 ## 领域要点（实现时的关键约束）
 
 - 目标是 stream 模式（**流式发送进行中的大事务**），而不是等事务提交后整体回放的传统模式。需要 PG 14+（复制槽 `streaming` 选项），pgoutput 插件需 `proto_version >= 2` 才会收到流式消息。
-- pgjdbc 复制 API 的入口链路（42.7.13 实际签名）：JDBC URL 带 `replication=database` **且必须 `assumeMinServerVersion=9.4`**（否则 replication 参数被驱动静默丢弃，START_REPLICATION 报语法错）→ `PGConnection.getReplicationAPI()`（返回 `PGReplicationConnection`）→ `replicationStream().logical()` 建流（slot options：`proto_version`/`publication_names`/`streaming`/`two_phase`）；本项目建槽走 SQL `pg_create_logical_replication_slot`。消费循环用非阻塞 `readPending()` 轮询（阻塞 `read()` 空闲期不按 statusInterval 醒来），周期 `setAppliedLSN()/setFlushedLSN()` + `forceUpdateStatus()` 回传确认。
+- pgjdbc 复制 API 的入口链路（42.7.13 实际签名）：JDBC URL 带 `replication=database` **且必须 `assumeMinServerVersion=9.4`**（否则 replication 参数被驱动静默丢弃，START_REPLICATION 报语法错）→ `PGConnection.getReplicationAPI()`（返回 `PGReplicationConnection`）→ `replicationStream().logical()` 建流（slot options：`proto_version`/`publication_names`/`streaming`/`two_phase`）；本项目建槽走 SQL `pg_create_logical_replication_slot`。消费循环用非阻塞 `readPending()` drain 轮询——每轮取尽当前缓冲的全部消息、空轮才睡 100ms（每轮取一条+固定 sleep 会把读取上限钉死 ~10 msg/s，大事务分钟级才收完；阻塞 `read()` 空闲期不按 statusInterval 醒来），周期 `setAppliedLSN()/setFlushedLSN()` + `forceUpdateStatus()` 回传确认。
 - **confirmed_flush_lsn 的服务端行为（Diag 实证，勿当 bug 排查）**：standby status 先被服务端采纳进 `pg_stat_replication.flush_lsn`；槽的 `confirmed_flush_lsn` 由 walsender 在**解码推进时**（candidate 机制）落库——空闲期不推进但确认不丢失，下一次任何 WAL 活动会使其一步跳到客户端已确认的最新位点；`max_slot_wal_keep_size` 兜底磁盘。1.7 起客户端确认值另经输出前沿封顶（`FrontierCapTest` 验收）。
 - 输出插件与 publication 的关系（已核实 PG 18 官方文档）：复制槽与 publication 相互独立，publication 只是 `START_REPLICATION` 的过滤参数。**pgoutput 必须传 `publication_names`（协议硬性要求，至少一个）**；`test_decoding` 无需 publication 且支持流式（stream-changes），定位是测试/示例，适合冒烟联调；wal2json 等第三方插件也免 publication 但需在 PG 侧安装。计划：联调用 test_decoding，生产用 pgoutput + `FOR ALL TABLES` publication。
 - 具体细节（快照导出、错误恢复/断线重连、与 Logstash 的集成方式等）尚未确定，涉及这类决策应先与用户确认，不要自行臆断。

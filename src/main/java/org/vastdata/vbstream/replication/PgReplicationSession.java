@@ -95,7 +95,7 @@ public final class PgReplicationSession implements AutoCloseable {
                 config.streamingParam(), config.twoPhase());
     }
 
-    /** 轮询间隔：readPending 非阻塞，空转 sleep 控 CPU，消息到达延迟上界即此值。 */
+    /** 轮询间隔：readPending 非阻塞，空轮 sleep 控 CPU，消息到达延迟上界即此值；搬运过消息的轮不睡（drain，见 {@link #drainPending}）。 */
     private static final long POLL_INTERVAL_MILLIS = 100;
 
     /** 兼容重载：无输出前沿（不封顶，等价 1.6 行为）。消息循环细节见 {@link #run(RawMessageListener, LongSupplier)}。 */
@@ -104,8 +104,9 @@ public final class PgReplicationSession implements AutoCloseable {
     }
 
     /**
-     * 消息循环：readPending 非阻塞轮询 → 拷贝单条消息完整字节 → 回调 listener；按周期
-     * forceUpdateStatus 反馈 LSN，确认值经 {@link #capFeedback} 按输出前沿封顶。会话只做字节交付
+     * 消息循环：每轮经 {@link #drainPending} 非阻塞取尽当前缓冲的全部消息（drain 语义——空轮才
+     * sleep 100ms 间歇，搬运过消息的轮立即续转，读取节拍与消息条数解耦，见该方法 javadoc 的动机）；
+     * 按周期 forceUpdateStatus 反馈 LSN，确认值经 {@link #capFeedback} 按输出前沿封顶。会话只做字节交付
      * （解码与 Relation 缓存移交给上层，如 {@link DecodedMessageBridge}），自身不再触碰协议层。
      * 用轮询而非阻塞 read()：实测（pgjdbc 42.7.13 + PG 18）阻塞 read 在空闲期不按 statusInterval 醒来，
      * status 依赖服务端 keepalive（约 wal_sender_timeout/2，默认 ~30s）才被触发；轮询使 status 周期
@@ -131,12 +132,7 @@ public final class PgReplicationSession implements AutoCloseable {
             if (stream.isClosed()) {
                 throw new SQLException("复制流已结束（连接断开）");
             }
-            ByteBuffer payload = stream.readPending(); // 非阻塞；无消息返回 null 属正常
-            if (payload != null && payload.remaining() > 0) {
-                byte[] raw = new byte[payload.remaining()];
-                payload.get(raw);
-                listener.onRaw(raw);
-            }
+            boolean receivedAny = drainPending(stream, listener);
             long confirmed = capFeedback(stream.getLastReceiveLSN().asLong(), outputFrontier.getAsLong());
             LogSequenceNumber last = LogSequenceNumber.valueOf(confirmed);
             stream.setAppliedLSN(last);
@@ -146,6 +142,11 @@ public final class PgReplicationSession implements AutoCloseable {
                 LOG.debug("LSN 反馈: applied=flushed={}", last);
                 lastFeedbackNanos = System.nanoTime();
             }
+            if (receivedAny) {
+                // 本轮搬运过消息：立即下一轮继续 drain——积压期不引入 100ms/轮的人为节流，
+                // onRaw 的真实工作量（CQ append + 记账）即天然 CPU 节流
+                continue;
+            }
             try {
                 Thread.sleep(POLL_INTERVAL_MILLIS);
             } catch (InterruptedException e) {
@@ -153,6 +154,34 @@ public final class PgReplicationSession implements AutoCloseable {
                 throw new SQLException("复制循环被中断", e);
             }
         }
+    }
+
+    /**
+     * 责任：非阻塞取尽复制流当前缓冲的全部消息并逐条回调 listener（drain 语义）。
+     * 关键步骤：循环 {@code readPending} 直到返回 null——每条消息拷入独占新建数组同步回调
+     * （与旧"每轮一条"路径同构）；remaining()==0 的载荷防御性跳过（pgjdbc 实际不产生）但
+     * 同样被消费，drain 自然终止于 null。存在动机（2026-08-31 吞吐冒烟实测踩坑）：旧形态
+     * 每轮取一条即固定 sleep 100ms，slot 读取上限被钉死在 ~10 msg/s——5 万行大事务需 90+
+     * 分钟才收完，Commit 迟迟不达、下游无任何输出；drain 把节拍与消息条数解耦，积压期连续
+     * 搬运，空轮才把间歇交还调用方。
+     * 边界：readPending 抛出的 SQLException/IOException 原样上抛——断连经此或调用方循环的
+     * isClosed 守卫终止；非 null 零载荷轮返回 false（视为空轮，无害——pgjdbc 不产生该形态）。
+     * 返回：本轮是否回调过至少一条消息——调用方据此决定立即续转（true）或空转 sleep（false）。
+     * 线程约束：与 run 循环同线程（调用方线程）串行执行。
+     */
+    static boolean drainPending(PGReplicationStream stream, RawMessageListener listener)
+            throws SQLException, IOException {
+        boolean receivedAny = false;
+        ByteBuffer payload;
+        while ((payload = stream.readPending()) != null) {
+            if (payload.remaining() > 0) {
+                byte[] raw = new byte[payload.remaining()];
+                payload.get(raw);
+                listener.onRaw(raw);
+                receivedAny = true;
+            }
+        }
+        return receivedAny;
     }
 
     /**

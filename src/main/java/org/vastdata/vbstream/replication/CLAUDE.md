@@ -6,7 +6,7 @@
 
 ```
 reader 线程（pgoutput-reader，沿用 1.6 名）
-  PgReplicationSession.run(listener, frontier)   ←100ms readPending 轮询；反馈 = min(收到, 前沿)
+  PgReplicationSession.run(listener, frontier)   ←readPending drain 轮询（空轮 100ms）；反馈 = min(收到, 前沿)
   │ TransactionAssembler.onRaw(raw)
   │   ├─ 每条消息先 pipe.append(raw)            ←返回的 CQ index 即 seq（seq ≡ index）
   │   ├─ 控制消息/'R'：live 解码 → 桶状态机/'R' 记版本日志（不回读 CQ）
@@ -32,10 +32,9 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部创建）
 - **`open()`**：建两条连接——普通 `config.jdbcUrl()` 与 `config.replicationUrl()`（带 `replication=database`）。复制连接要求见 ReplicationConfig。
 - **`ensureSlot()`**：`SELECT pg_create_logical_replication_slot(槽名, 'pgoutput', false, twoPhase)` **幂等建槽**；捕获 SQLState `42710`（duplicate_object）视为"已存在，直接复用"并打 WARN（提示槽的 two_phase 属性需与配置一致，不一致将由 start 时服务端报错），其余异常上抛。
 - **`start()`**：经 `PGConnection.getReplicationAPI()` 建 `PGReplicationStream`，slot options **四项**：`proto_version`、`publication_names`、`streaming`（OFF→"off"/ON→"on"/PARALLEL→"parallel"）、`two_phase`（on/off）；另经 `withStartPosition(INVALID_LSN)` 从槽当前确认点续传、`withStatusInterval` 设状态回传周期。
-- **`run(RawMessageListener)` / `run(RawMessageListener, LongSupplier outputFrontier)`**：**轮询式消息循环（100ms readPending 非阻塞轮询），由调用方线程执行**（Main/harness 中是名为 `pgoutput-reader` 的线程）。双参重载（1.7）把 LSN 确认**按输出前沿封顶**：每轮反馈 `capFeedback(received, frontier) = frontier ≤ 0 ? received : min(received, frontier)`——frontier=0 视为无 cap（首个事务输出前与 1.6 行为一致）；单参重载即恒不封顶的兼容形态。**会话只做字节交付**：每条消息的完整字节（含类型字节与流式块内可选 Int32 xid 前缀）拷入**独占新建数组**回调 `listener.onRaw(raw)`（调用方可无复制长期持有）；解码与 Relation 缓存完全移出 session（由组装器或桥承担），自身不触碰协议层。frontier 只在 reader 线程每轮读一次（AtomicLong 读，永不被 consumer 阻塞）。声明 `throws SQLException, IOException`：
-  1. 每轮先查 `stream.isClosed()`（断连快速感知，抛描述性 `SQLException`）；`stream.readPending()` 非阻塞取消息（null=暂无消息属正常，sleep 100ms 后继续；非 null 但 remaining()==0 的载荷防御性跳过不回调）
-  2. 回调 `listener.onRaw(raw)`（同步，回调耗时直接拖慢消息循环——1.7 起回放已不在回调里，onRaw 只做记账）
-  3. 每轮 `setAppliedLSN/setFlushedLSN(capFeedback(...))`；每满一个反馈周期 `forceUpdateStatus()` 上报确认位点
+- **`run(RawMessageListener)` / `run(RawMessageListener, LongSupplier outputFrontier)`**：**轮询式消息循环（readPending 非阻塞 drain——每轮经包私有静态 `drainPending` 取尽当前缓冲的全部消息，搬过消息的轮立即续转、空轮才 sleep 100ms），由调用方线程执行**（Main/harness 中是名为 `pgoutput-reader` 的线程）。双参重载（1.7）把 LSN 确认**按输出前沿封顶**：每轮反馈 `capFeedback(received, frontier) = frontier ≤ 0 ? received : min(received, frontier)`——frontier=0 视为无 cap（首个事务输出前与 1.6 行为一致）；单参重载即恒不封顶的兼容形态。**会话只做字节交付**：每条消息的完整字节（含类型字节与流式块内可选 Int32 xid 前缀）拷入**独占新建数组**回调 `listener.onRaw(raw)`（调用方可无复制长期持有）；解码与 Relation 缓存完全移出 session（由组装器或桥承担），自身不触碰协议层。frontier 只在 reader 线程每轮读一次（AtomicLong 读，永不被 consumer 阻塞）。声明 `throws SQLException, IOException`：
+  1. 每轮先查 `stream.isClosed()`（断连快速感知，抛描述性 `SQLException`）；随后 `drainPending(stream, listener)` 非阻塞取尽缓冲全部消息——逐条拷入独占数组同步回调 `listener.onRaw(raw)`（回调耗时直接拖慢消息循环——1.7 起回放已不在回调里，onRaw 只做记账；remaining()==0 的载荷防御性跳过不回调）。本轮搬过消息立即续转（onRaw 真实工作量即节流，不空转烧 CPU），**空轮才 sleep 100ms**——旧形态"每轮一条 + 固定 sleep"把读取上限钉死 ~10 msg/s，5 万行大事务 90+ 分钟才收完（2026-08-31 吞吐冒烟实测踩坑，回归锚定 it 包 `ReaderThroughputTest`）
+  2. 每轮 `setAppliedLSN/setFlushedLSN(capFeedback(...))`；每满一个反馈周期 `forceUpdateStatus()` 上报确认位点
   - **为什么轮询而非阻塞 `read()`**（实测 pgjdbc 42.7.13 + PG 18）：阻塞 read 空闲期不按 statusInterval 醒来，status 依赖服务端 keepalive（~wal_sender_timeout/2，默认约 30s）才触发；轮询使 status 周期独立于消息到达（反馈间隔=feedbackIntervalSeconds，`pg_stat_replication.flush_lsn` 及时反映客户端进度），且断连感知更快（isClosed 每轮检查）
   - **反馈封顶的语义（设计 §5）**：确认锚定**输出前沿**（consumer 已输出事务的最大 endLsn）而非读取进度——crash 时未输出事务必然被 PG 重发（at-least-once，console 可能重复输出已见事务，不去重）；consumer 停摆不会触发 `wal_sender_timeout` 断连（服务端只要求 status 到达，不要求 LSN 前进），代价是 PG 侧 WAL 保留与 CQ 磁盘增长（`max_slot_wal_keep_size` 兜底 + consumer 周期 WARN 告警）
   - **confirmed_flush_lsn 的服务端行为（Diag 实证，勿再当 bug 排查）**：standby status 到达后先被采纳进 `pg_stat_replication.flush_lsn`；槽的 `confirmed_flush_lsn` 由 walsender 在解码推进时（candidate 机制）落库——空闲期不推进，但确认不丢失，下一次任何 WAL 活动会使其一步跳到客户端已确认的最新位点。集成验证见 `NormalTransactionTest.feedbackIsAdoptedByServerAndConfirmedFlushAdvances` 与 `FrontierCapTest`（封顶/解封两段式）
