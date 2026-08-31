@@ -23,6 +23,7 @@ docker exec -i vb-stream-pg psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
 | `04-streaming-large-txn.sql` | 流式大事务（触发驱逐） | 12 行 × ~16KB 不可压缩载荷、分批间隔 0.7s；提交前 DEBUG 级可见 StreamStart/StreamInsert/StreamStop 分段陆续到达，提交时 StreamCommit → INFO 组装 12-Insert 事务块 |
 | `05-stream-abort.sql` | 流式大事务回滚 | 流段已下发后 StreamAbort；组装器丢弃半组装事务，INFO 级无事务块输出 |
 | `06-replica-identity-full.sql` | REPLICA IDENTITY FULL | ALTER 触发 Relation 元数据重发；UPDATE/DELETE 的 old tuple 携带全 8 列旧值；末尾恢复 DEFAULT（再次触发 Relation 重发） |
+| `07-throughput-smoke.sql` | 吞吐冒烟三段负载（专用表 `t_throughput`，显式挂入 `vb_pub`） | 每 10s 的"吞吐:/分布:"两行依次呈现：①单语句 20 万行大批量事务（不触发流式，看 slot 字节量级与事务大小 max）②16 批流式大事务（STREAMED 回放）③2000 个高频小事务（tx/s 陡增窗口）。**不进 BenchCorpusRecordTest 语料指纹**（显式 6 脚本列表），可随意改量级 |
 
 ## 说明
 
