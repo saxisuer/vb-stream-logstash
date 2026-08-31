@@ -1,10 +1,13 @@
 package org.vastdata.vbstream.replication;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -35,6 +38,39 @@ class ThroughputMetricsWiringTest {
     /** 组装器统一管道配置（目录取类级共享 @TempDir，滚动周期与生产默认同档）。 */
     private static PipeConfig pipeCfg() {
         return new PipeConfig(PIPE_DIR, LegacyRollCycles.MINUTELY);
+    }
+
+    /**
+     * 每用例后清空共享管道目录（Windows 兜底，同 DecoupledPipelineTest 的既有模式，commit
+     * 8863176）：pipe.close() 后 Chronicle 的 mmap 句柄经 GC/cleaner **异步**释放，Windows
+     * 拒绝删除仍被占用的文件（POSIX unlink 语义无此约束）——紧随的删除（下一用例
+     * MessagePipe 构造的 wipe-on-open、类收尾的 @TempDir 删除）会失败判红。此处 System.gc
+     * 提示 cleaner 释放 + 100ms×5 重试尽力清空：用例间目录已空，下一用例的 wipe-on-open
+     * 无事可做、@TempDir 收尾只剩删空目录。边界：重试耗尽仍失败则放弃（不判测试红——残留
+     * 仅占临时目录空间，届时下一用例的 wipe 会给出带路径的 UncheckedIOException 定位）。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        for (int attempt = 0; attempt < 5; attempt++) {
+            try (var files = Files.list(PIPE_DIR)) {
+                List<Path> entries = files.sorted().toList();
+                if (entries.isEmpty()) {
+                    return;
+                }
+                for (Path file : entries) {
+                    Files.deleteIfExists(file);   // 目录项只有队列文件（无子目录），直接删
+                }
+                return;   // 本轮全部删成即清空
+            } catch (IOException e) {
+                System.gc();   // 提示 cleaner 回收 native mmap，句柄释放后下一轮重试可删
+                try {
+                    Thread.sleep(100L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
     }
 
     /**
