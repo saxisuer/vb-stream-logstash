@@ -2,7 +2,7 @@
 
 适配 PostgreSQL 逻辑解码 **stream 模式**的 CDC 采集器：基于 pgjdbc `ReplicationConnection` 直连复制流，自研 pgoutput 协议解码器，实时解析普通事务、流式大事务（`streaming=parallel`）、两阶段提交（`two_phase`）与 Truncate，并把原始字节流组装后以**流式事件**输出（`事务头 → 逐变更 → 事务尾`，回放期堆峰 O(单条)；`vb.output.mode=block` 可切回原子事务块语义——读取与组装输出解耦：reader 记账写入 Chronicle Queue 主缓冲管道，独立消费线程回放输出，组装期桶内零字节引用，LSN 确认按输出前沿封顶且前沿锚定事务尾，at-least-once）。
 
-- 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态）
+- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 两模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）与 `vb-stream-connector-postgres-stream`（Debezium 流式连接器骨架）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），158 个测试全绿（单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段）
 
@@ -32,13 +32,13 @@ cd src/docker && docker compose up -d     # localhost:55432，postgres/postgres
 
 ```bash
 cd src/docker && docker compose up -d && cd ../..    # 起本地 PG（已起可跳过）
-mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+mvn -q -pl vb-stream-engine compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
      --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
      --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED \
      --add-opens java.base/sun.nio.fs=ALL-UNNAMED \
      --add-opens java.base/java.lang.reflect=ALL-UNNAMED \
-     -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
+     -cp "vb-stream-engine/target/classes:$(cat vb-stream-engine/target/cp.txt)" org.vastdata.vbstream.Main
 ```
 
 `--add-opens` 清单必带：组装器构造即建 Chronicle Queue 管道（主缓冲），其 mmap 在 Java 17 需开放内部包。
@@ -77,7 +77,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 ### 输出
 
 - **事务块**（`TXN-BEGIN`/`TXN-END` 头尾 + 逐变更行；流式形态逐事件即时打印、block 形态攒齐整块打印，格式一致）与**事务生命周期控制消息**（流式 Stream-Start/Stop/Commit/Abort/Prepare + 两阶段信号，共 9 种）：走 CDC 专用 logger `org.vastdata.vbstream.cdc`，INFO——任何事务形态（含回滚、无数据消息的事务）在 INFO 级至少留一行痕迹
-- 行级数据与元数据的逐消息细节：同 logger **DEBUG 默认关闭**（大事务防刷屏），排障时在 `src/main/resources/logback.xml` 加 `<logger name="org.vastdata.vbstream.cdc" level="DEBUG"/>`
+- 行级数据与元数据的逐消息细节：同 logger **DEBUG 默认关闭**（大事务防刷屏），排障时在 `vb-stream-engine/src/main/resources/logback.xml` 加 `<logger name="org.vastdata.vbstream.cdc" level="DEBUG"/>`
 - 诊断日志：会话生命周期 INFO（连接/建槽/开流/关闭）
 
 ```
@@ -106,12 +106,12 @@ DML 统一带 `BEFORE=`/`AFTER=` 镜像（缺失侧为 `-`）。注意 BEFORE �
 
 ```bash
 mvn test                # 全部：协议/组装单元测试 + Testcontainers 集成测试（158 用例）
-mvn test -Dtest=StreamedTransactionTest    # 单类
+mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 
 集成测试（`org.vastdata.vbstream.it`，11 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
 
-JMH 基准在独立源码根 `src/jmh`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）；运行方式与基线数字见 `docs/benchmarks-baseline.md`。
+JMH 基准在引擎模块的独立源码根 `vb-stream-engine/src/jmh`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）；运行方式与基线数字见 `docs/benchmarks-baseline.md`。
 
 ## 路线
 

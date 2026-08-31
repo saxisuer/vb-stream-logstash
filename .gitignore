@@ -43,3 +43,4 @@ src/docker/pgdata/
 
 ### 管道队列目录（MessagePipe wipe-on-open 瞬态工作区，默认 vb.pipe.dir）###
 pipe-queue/
+pg-stream-pipe-queue/

@@ -7,6 +7,12 @@
     <groupId>org.vastdata</groupId>
     <artifactId>vb-stream-logstash</artifactId>
     <version>1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>vb-stream-engine</module>
+        <module>vb-stream-connector-postgres-stream</module>
+    </modules>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
@@ -23,64 +29,6 @@
         <maven-build-helper-plugin.version>3.6.0</maven-build-helper-plugin.version>
     </properties>
 
-    <dependencies>
-        <!-- PostgreSQL JDBC 驱动：含逻辑复制 API（ReplicationConnection / PGReplicationStream） -->
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <version>${postgresql.version}</version>
-        </dependency>
-
-        <!-- Chronicle Queue：持久化低延迟消息队列，用于缓存/回放 CDC 事件。
-             排除 chronicle-analytics（chronicle-core 传递引入的用量遥测，HTTP 打点上报）：
-             core 的 AnalyticsFacade 对其反射加载、缺类即回落 MuteAnalytics 空实现，排除是官方
-             DISCLAIMER 认可的关闭方式；对 classpath 全局生效（Main/测试/JMH），启动横幅
-             "Chronicle Queue reports usage statistics" 随之消失 -->
-        <dependency>
-            <groupId>net.openhft</groupId>
-            <artifactId>chronicle-queue</artifactId>
-            <version>${chronicle-queue.version}</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>net.openhft</groupId>
-                    <artifactId>chronicle-analytics</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-
-        <!-- HdrHistogram：高动态范围直方图（零传递依赖）——ThroughputMetrics 的分位数数据结构
-             （P90/P95/max，SingleWriterRecorder 区间窗口），设计见
-             docs/superpowers/specs/2026-08-31-throughput-metrics-design.md -->
-        <dependency>
-            <groupId>org.hdrhistogram</groupId>
-            <artifactId>HdrHistogram</artifactId>
-            <version>${hdrhistogram.version}</version>
-        </dependency>
-
-        <!-- logback：slf4j 绑定（chronicle 传递引入 slf4j-api，缺实现时 NOP 静默） -->
-        <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <version>${logback.version}</version>
-        </dependency>
-
-        <!-- JUnit 6（要求 Java 17+） -->
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>${junit-jupiter.version}</version>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- 集成测试：PG 容器（2.x 起坐标改名 testcontainers-postgresql） -->
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>testcontainers-postgresql</artifactId>
-            <version>${testcontainers.version}</version>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
     <build>
         <plugins>
             <!-- Surefire 3.6.0+ 才能以 JUnit Platform 作为统一测试执行机制（JUnit 6 必需） -->
@@ -96,69 +44,5 @@
             </plugin>
         </plugins>
     </build>
-
-    <profiles>
-        <!-- JMH 基准档（Task 13）：-Pjmh 激活。基准源码放独立根 src/jmh/java（经 build-helper 挂为
-             test 源码目录），默认构建完全不引入 JMH 依赖与基准编译——`mvn clean test` 不受影响；
-             `-Pjmh test-compile` 才把四类 *Benchmark 与 JMH 生成的基准桩编进 target/test-classes。
-             annprocess 以 compiler 的 annotationProcessorPaths 显式接入（不依赖 classpath 隐式发现，
-             新版 JDK 已默认禁用隐式注解处理）；桩类由 Surefire 默认命名规则排除（*Benchmark 非 *Test），
-             `mvn -Pjmh test` 也不会误跑基准。运行方法见 docs/benchmarks-baseline.md。 -->
-        <profile>
-            <id>jmh</id>
-            <dependencies>
-                <!-- JMH 核心：基准注解 + 运行器（org.openjdk.jmh.Main 入口在测试 classpath 上） -->
-                <dependency>
-                    <groupId>org.openjdk.jmh</groupId>
-                    <artifactId>jmh-core</artifactId>
-                    <version>${jmh.version}</version>
-                    <scope>test</scope>
-                </dependency>
-                <!-- JMH 注解处理器：把 @Benchmark 方法生成为可被 Main 发现的基准桩类 -->
-                <dependency>
-                    <groupId>org.openjdk.jmh</groupId>
-                    <artifactId>jmh-generator-annprocess</artifactId>
-                    <version>${jmh.version}</version>
-                    <scope>test</scope>
-                </dependency>
-            </dependencies>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>build-helper-maven-plugin</artifactId>
-                        <version>${maven-build-helper-plugin.version}</version>
-                        <executions>
-                            <execution>
-                                <id>add-jmh-test-source</id>
-                                <phase>generate-test-sources</phase>
-                                <goals>
-                                    <goal>add-test-source</goal>
-                                </goals>
-                                <configuration>
-                                    <sources>
-                                        <source>src/jmh/java</source>
-                                    </sources>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-compiler-plugin</artifactId>
-                        <configuration>
-                            <annotationProcessorPaths>
-                                <path>
-                                    <groupId>org.openjdk.jmh</groupId>
-                                    <artifactId>jmh-generator-annprocess</artifactId>
-                                    <version>${jmh.version}</version>
-                                </path>
-                            </annotationProcessorPaths>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-    </profiles>
 
 </project>
