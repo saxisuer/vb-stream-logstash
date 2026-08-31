@@ -173,14 +173,15 @@ class ThroughputMetricsTest {
 
     /**
      * 峰值行的存在理由（spec §1）：高窗之后空窗，吞吐行归零、分布行变 n/a，峰值行完整
-     * 保留高窗的八项——峰值不随窗口翻页消失。高窗事件组与"速率报告"用例同构（速率期望
-     * 值可交叉核对），空窗后整行断言八项留存。
+     * 保留高窗的八项——峰值不随窗口翻页消失。峰值速率口径为**最高单秒**（秒桶 spec，
+     * 2026-08-31 第二份）：事件全部同秒灌入时秒峰值 = 灌入总量，空窗报告取悬空桶候选。
      */
     @Test
     void 峰值行_高窗后空窗八项留存() {
-        ThroughputMetrics metrics = new ThroughputMetrics(0L);
+        long[] clock = {500_000_000L};                  // 固定 0.5s：全部事件钉在同一受控秒内，不依赖真实时钟
+        ThroughputMetrics metrics = new ThroughputMetrics(0L, () -> clock[0]);
         for (int i = 0; i < 1000; i++) {
-            metrics.onSlotMessage(new byte[100]);       // slot: 100,000 B / 1000 msg
+            metrics.onSlotMessage(new byte[100]);       // slot: 100,000 B / 1000 msg（同秒）
         }
         for (int i = 0; i < 50; i++) {
             metrics.onTxHandedOff();                    // 组装: 50 tx
@@ -194,7 +195,7 @@ class ThroughputMetricsTest {
         assertEquals("吞吐: slot=0.0 B/s (0.0 msg/s) | 组装=0.0 tx/s | 输出=0.0 B/s (0.0 rec/s, 0.0 tx/s)",
                 idle.get(0));
         assertEquals("分布: 回放耗时 n/a | 事务大小 n/a", idle.get(1));
-        assertEquals("峰值: slot=10.0 KB/s (100 msg/s) | 组装=5.0 tx/s | 输出=500.0 B/s (5.0 rec/s, 1.0 tx/s) | 耗时=1.0ms | 大小=5 rec",
+        assertEquals("峰值: slot=100.0 KB/s (1,000 msg/s) | 组装=50.0 tx/s | 输出=5.0 KB/s (50.0 rec/s, 10.0 tx/s) | 耗时=1.0ms | 大小=5 rec",
                 idle.get(2));
     }
 
@@ -213,5 +214,62 @@ class ThroughputMetricsTest {
                 second.get(1));
         assertTrue(second.get(2).contains("耗时=5.0ms"), "峰值应保留首窗 5ms: " + second.get(2));
         assertTrue(second.get(2).contains("大小=100 rec"), "峰值应保留首窗 100 rec: " + second.get(2));
+    }
+
+    /**
+     * 秒桶核心语义（秒桶 spec §4）：突发不被窗口摊薄——受控时钟同秒灌 2000 条后推进一秒结算，
+     * 峰值段如实反映 2,000 msg/s，而吞吐行仍按窗口均值显示摊薄值（200.1 msg/s）——两行
+     * 双语义的直接对照锚定（这正是 2026-08-31 WSL 基线实测暴露的失真场景）。
+     */
+    @Test
+    void 峰值行_秒桶突发不摊薄() {
+        long[] clock = {500_000_000L};                  // 从 0.5s 起步（首秒内）
+        ThroughputMetrics metrics = new ThroughputMetrics(0L, () -> clock[0]);
+        for (int i = 0; i < 2000; i++) {
+            metrics.onSlotMessage(new byte[100]);       // 同一秒内 2000 条 / 200,000 B
+        }
+        clock[0] = 1_200_000_000L;                      // 推进到下一秒：再灌一条触发上一秒结算
+        metrics.onSlotMessage(new byte[100]);
+        List<String> lines = metrics.reportLines(10 * TEN_SECONDS);   // 窗口按 100s 计（极限摊薄）
+        assertTrue(lines.get(0).contains("(20.0 msg/s)"),
+                "吞吐行应按窗口均值摊薄: " + lines.get(0));
+        assertTrue(lines.get(2).contains("(2,000 msg/s)"),
+                "峰值行应为最高单秒速率、不被窗口摊薄: " + lines.get(2));
+    }
+
+    /**
+     * 悬空桶下界（秒桶 spec §2）：当前秒未结算（此后再无消息触发结算）时，报告取
+     * max(已结算峰, 当前桶累计)——最后一秒的突发不因秒未走满而丢失；当前桶计数是该秒
+     * 速率的下界，不会高估。
+     */
+    @Test
+    void 峰值行_悬空桶计数作下界候选() {
+        long[] clock = {300_000_000L};                  // 0.3s（秒未走满）
+        ThroughputMetrics metrics = new ThroughputMetrics(0L, () -> clock[0]);
+        for (int i = 0; i < 300; i++) {
+            metrics.onSlotMessage(new byte[10]);
+        }
+        List<String> lines = metrics.reportLines(TEN_SECONDS);
+        assertTrue(lines.get(2).contains("(300 msg/s)"), "悬空桶 300 条应作峰值候选: " + lines.get(2));
+    }
+
+    /**
+     * 秒桶跨秒结算重置：两秒各灌不同量，峰值取最高单秒（100）而非两秒合计（130）。
+     */
+    @Test
+    void 峰值行_跨秒结算峰值取最高单秒() {
+        long[] clock = {0L};
+        ThroughputMetrics metrics = new ThroughputMetrics(0L, () -> clock[0]);
+        for (int i = 0; i < 100; i++) {
+            metrics.onSlotMessage(new byte[10]);
+        }
+        clock[0] = 1_500_000_000L;                      // 下一秒
+        for (int i = 0; i < 30; i++) {
+            metrics.onSlotMessage(new byte[10]);
+        }
+        clock[0] = 2_500_000_000L;                      // 再推进触发第二秒结算
+        metrics.onSlotMessage(new byte[10]);
+        List<String> lines = metrics.reportLines(3 * TEN_SECONDS);
+        assertTrue(lines.get(2).contains("(100 msg/s)"), "峰值应为最高单秒 100 而非合计: " + lines.get(2));
     }
 }

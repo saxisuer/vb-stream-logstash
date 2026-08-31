@@ -9,6 +9,7 @@ import java.util.Locale;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
+import java.util.function.LongSupplier;
 
 /**
  * 管线吞吐与分布指标（2026-08-31 设计，spec docs/superpowers/specs/2026-08-31-throughput-metrics-design.md）：
@@ -20,11 +21,12 @@ import java.util.function.LongFunction;
  * （HdrHistogram，零传递依赖）——每次报告 {@code getIntervalHistogram()} 取走上一区间，
  * 窗口外样本不稀释当前值。全部计量收在本类后面，未来接监控系统只换实现、埋点点位不动。
  *
- * <p>会话峰值行（2026-08-31 峰值 spec，同日第二份）：窗口隔离报告使峰值转瞬即逝——负载
- * 只占一个窗口，下一窗口速率归零、分布变 n/a。报告增补第三行"峰值:"留存八项**会话历史
- * 最高**（六项窗口速率峰值 + 两项分布区间 max 峰值）：速率峰值粒度 = 统计窗口均值的会话
- * 最高（非亚秒瞬时值）；空窗零速率不构成峰值（窗口速率 &gt; 0 才刷新，初始 -1 即"从未有过
- * 记录"打 n/a）；空载窗口也常驻输出——峰值不随窗口翻页消失。
+ * <p>会话峰值行（2026-08-31 峰值 spec，同日第二份；速率口径修订见同日秒桶 spec 第三份）：
+ * 窗口隔离报告使峰值转瞬即逝——负载只占一个窗口，下一窗口速率归零、分布变 n/a。报告增补
+ * 第三行"峰值:"留存八项**会话历史最高**：六项速率峰值取**最高单秒速率**（秒桶——窗口均值
+ * 会把突发摊薄约窗口/突发时长之倍数，2026-08-31 WSL 基线实测 20 万条 1 秒到达被 10s 窗口
+ * 显示为 1/10 速率，故峰值行改秒级分桶），两项分布 max 不受摊薄影响取区间 max 峰值；空载
+ * 窗口峰值行也常驻输出——峰值不随窗口翻页消失；从未有过记录打 n/a。
  *
  * <p>口径（设计 §2）：slot 侧含全部 pgoutput 消息（控制消息与 Relation——"从槽读到什么"的
  * 诚实口径，与输出侧 records 不可直接对照，bytes 才是两端口径一致的对照对）；组装 tx 仅计
@@ -76,16 +78,17 @@ final class ThroughputMetrics {
     /** 上次报告的计数快照——速率差分的分子（当前累计 - 本值）。 */
     private Totals lastTotals;
 
-    // 会话峰值八字段（2026-08-31 峰值 spec §3）：六项窗口速率峰值（double）+ 两项分布区间
-    // max 峰值（long）。初始 -1 表"从未有过记录"（报告行打 n/a）；更新与报告同在
-    // reportLines（consumer 线程）——单写者、无并发结构。速率峰值仅当窗口速率 > 0 刷新
-    // （空窗零速率不构成峰值）；分布峰值取各区间直方图 max 的会话最高。
-    private double peakSlotBytesRate = -1.0;
-    private double peakSlotMsgRate = -1.0;
-    private double peakAssembledTxRate = -1.0;
-    private double peakOutputBytesRate = -1.0;
-    private double peakOutputRecRate = -1.0;
-    private double peakOutputTxRate = -1.0;
+    // 会话峰值（2026-08-31 峰值 spec + 同日秒桶 spec 修订）：六项速率峰值 = 秒桶
+    // （SecondBucket，见类尾——埋点单写者线程内分桶结算，报告侧弱一致读 max(已结算峰,
+    // 当前桶)）；两项分布区间 max 峰值（long，reportLines 里更新——空窗零速率不构成峰值，
+    // 分布峰值取各区间直方图 max 的会话最高）。
+    private final LongSupplier clock;
+    private final SecondBucket slotBytesSec = new SecondBucket();
+    private final SecondBucket slotMsgSec = new SecondBucket();
+    private final SecondBucket assembledTxSec = new SecondBucket();
+    private final SecondBucket outputBytesSec = new SecondBucket();
+    private final SecondBucket outputRecSec = new SecondBucket();
+    private final SecondBucket outputTxSec = new SecondBucket();
     private long peakReplayNanos = -1L;
     private long peakTxUnits = -1L;
 
@@ -98,13 +101,25 @@ final class ThroughputMetrics {
 
     /**
      * 构造指标器并注入受控基线戳（测试路径——配合 {@link #reportLines} 的显式 nowNanos
-     * 构造确定性窗口，不依赖真实睡眠）。
+     * 构造确定性窗口，不依赖真实睡眠；秒桶时钟用真实 System.nanoTime）。
      *
      * @param baselineNanos 首窗基线（System.nanoTime 时域）
      */
     ThroughputMetrics(long baselineNanos) {
+        this(baselineNanos, System::nanoTime);
+    }
+
+    /**
+     * 构造指标器并注入受控基线戳与秒桶时钟（测试路径——秒桶行为可确定性驱动：固定时钟
+     * 值把事件钉在同一受控秒内、推进时钟触发跨秒结算，见秒桶 spec §4）。
+     *
+     * @param baselineNanos 首窗基线（与 clock 同一时域即可，窗口差分用）
+     * @param clock         秒桶时钟（生产为 System::nanoTime）
+     */
+    ThroughputMetrics(long baselineNanos, LongSupplier clock) {
         this.lastReportNanos = baselineNanos;
         this.lastTotals = new Totals(0, 0, 0, 0, 0, 0);
+        this.clock = clock;
     }
 
     /**
@@ -114,8 +129,11 @@ final class ThroughputMetrics {
      * @param raw 完整单条消息字节（含类型字节与可选流式 xid 前缀）
      */
     void onSlotMessage(byte[] raw) {
+        long now = clock.getAsLong();
         slotBytes.add(raw.length);
         slotMessages.increment();
+        slotBytesSec.bump(now, raw.length);
+        slotMsgSec.bump(now, 1L);
     }
 
     /**
@@ -124,6 +142,7 @@ final class ThroughputMetrics {
      */
     void onTxHandedOff() {
         assembledTxs.increment();
+        assembledTxSec.bump(clock.getAsLong(), 1L);
     }
 
     /**
@@ -134,6 +153,7 @@ final class ThroughputMetrics {
      */
     void onReplayedUnit(int payloadLength) {
         outputBytes.add(payloadLength);
+        outputBytesSec.bump(clock.getAsLong(), payloadLength);
     }
 
     /**
@@ -147,10 +167,13 @@ final class ThroughputMetrics {
      * @param emittedRecords  实付 TxChange 数（aborted 过滤后）
      */
     void onTxOutput(long durationNanos, long unitCount, long emittedRecords) {
+        long now = clock.getAsLong();
         replayNanos.recordValue(Math.min(durationNanos, MAX_TRACKED_DURATION_NANOS));
         txSizes.recordValue(Math.min(unitCount, MAX_TRACKED_TX_UNITS));
         outputRecords.add(emittedRecords);
         outputTxs.increment();
+        outputRecSec.bump(now, emittedRecords);
+        outputTxSec.bump(now, 1L);
     }
 
     /**
@@ -189,29 +212,13 @@ final class ThroughputMetrics {
                 + " | 事务大小 "
                 + intervalPart(txSizes, v -> grouped(v) + " rec",
                         v -> peakTxUnits = Math.max(peakTxUnits, v));
-        if (slotBytesRate > 0) {
-            peakSlotBytesRate = Math.max(peakSlotBytesRate, slotBytesRate);
-        }
-        if (slotMsgRate > 0) {
-            peakSlotMsgRate = Math.max(peakSlotMsgRate, slotMsgRate);
-        }
-        if (assembledTxRate > 0) {
-            peakAssembledTxRate = Math.max(peakAssembledTxRate, assembledTxRate);
-        }
-        if (outputBytesRate > 0) {
-            peakOutputBytesRate = Math.max(peakOutputBytesRate, outputBytesRate);
-        }
-        if (outputRecRate > 0) {
-            peakOutputRecRate = Math.max(peakOutputRecRate, outputRecRate);
-        }
-        if (outputTxRate > 0) {
-            peakOutputTxRate = Math.max(peakOutputTxRate, outputTxRate);
-        }
-        String peak = "峰值: slot=" + peakBytesPerSec(peakSlotBytesRate)
-                + " (" + peakCountPerSec(peakSlotMsgRate) + " msg/s)"
-                + " | 组装=" + peakCountPerSec(peakAssembledTxRate) + " tx/s"
-                + " | 输出=" + peakBytesPerSec(peakOutputBytesRate)
-                + " (" + peakCountPerSec(peakOutputRecRate) + " rec/s, " + peakCountPerSec(peakOutputTxRate) + " tx/s)"
+        // 速率峰值取秒桶会话最高单秒（秒桶 spec：窗口均值会把突发摊薄，峰值行须反映真实突发；
+        // 未结算的当前桶计数作为下界候选参与比较——悬空桶不丢最后一秒的突发）
+        String peak = "峰值: slot=" + peakBytesPerSec(slotBytesSec.peakOrCurrent())
+                + " (" + peakCountPerSec(slotMsgSec.peakOrCurrent()) + " msg/s)"
+                + " | 组装=" + peakCountPerSec(assembledTxSec.peakOrCurrent()) + " tx/s"
+                + " | 输出=" + peakBytesPerSec(outputBytesSec.peakOrCurrent())
+                + " (" + peakCountPerSec(outputRecSec.peakOrCurrent()) + " rec/s, " + peakCountPerSec(outputTxSec.peakOrCurrent()) + " tx/s)"
                 + " | 耗时=" + (peakReplayNanos < 0 ? NOT_AVAILABLE : formatNanos(peakReplayNanos))
                 + " | 大小=" + (peakTxUnits < 0 ? NOT_AVAILABLE : grouped(peakTxUnits) + " rec");
         lastTotals = now;
@@ -302,13 +309,48 @@ final class ThroughputMetrics {
         return String.format(Locale.ROOT, "%,d", v);
     }
 
-    /** 峰值字节速率格式化：负值（从未有过记录，2026-08-31 峰值 spec §2）打 n/a，其余复用 {@link #formatBytesPerSec}。 */
+    /** 峰值字节速率格式化：≤0（从未有过记录，秒桶空态）打 n/a，其余复用 {@link #formatBytesPerSec}。 */
     private static String peakBytesPerSec(double peak) {
-        return peak < 0 ? NOT_AVAILABLE : formatBytesPerSec(peak);
+        return peak <= 0 ? NOT_AVAILABLE : formatBytesPerSec(peak);
     }
 
-    /** 峰值计数速率格式化：同上——负值打 n/a，其余复用 {@link #formatCountPerSec}。 */
+    /** 峰值计数速率格式化：同上——≤0 打 n/a，其余复用 {@link #formatCountPerSec}。 */
     private static String peakCountPerSec(double peak) {
-        return peak < 0 ? NOT_AVAILABLE : formatCountPerSec(peak);
+        return peak <= 0 ? NOT_AVAILABLE : formatCountPerSec(peak);
+    }
+
+    /**
+     * 秒桶（2026-08-31 秒桶 spec）：一项速率计数的"当前秒累计 + 会话最高单秒速率"。
+     * 关键步骤：{@link #bump} 按时钟秒号累计，秒号翻滚即结算上一秒（{@code peak = max(peak, cur)}）
+     * 并重置当前桶；{@link #peakOrCurrent} 取"已结算峰与当前未结算桶的较大者"——悬空桶
+     * （最后一条消息后秒未走满、无人触发结算）的计数作为该秒速率的**下界**候选，不会高估。
+     * 边界效应：消息横跨秒号拆两桶，秒峰为下界、随秒结算收敛——秒级粒度本就是近似。
+     * 线程约束：bump 由该埋点的单写者线程调用（slot/组装 = reader、输出 = consumer）；
+     * peak/cur 为 volatile——报告线程（consumer）弱一致读，与 LongAdder 的统计语义同级。
+     */
+    private static final class SecondBucket {
+
+        /** 当前桶秒号（nanoTime/1s；Long.MIN_VALUE 保证首条消息必然开桶）。 */
+        private long secNo = Long.MIN_VALUE;
+        /** 当前秒内累计（该秒速率的进行值）。 */
+        private volatile long cur;
+        /** 会话最高单秒速率（仅秒结算时刷新）。 */
+        private volatile long peak;
+
+        /** 累计 delta 进当前秒；秒号翻滚时结算上一秒峰值并重置桶。 */
+        void bump(long nanos, long delta) {
+            long sec = nanos / 1_000_000_000L;
+            if (sec != secNo) {
+                peak = Math.max(peak, cur);
+                cur = 0L;
+                secNo = sec;
+            }
+            cur += delta;
+        }
+
+        /** 会话最高单秒速率（含未结算当前桶下界候选）。 */
+        long peakOrCurrent() {
+            return Math.max(peak, cur);
+        }
     }
 }
