@@ -20,6 +20,9 @@
 
         <postgresql.version>42.7.13</postgresql.version>
         <chronicle-queue.version>2026.6</chronicle-queue.version>
+        <debezium.version>3.6.1.Final</debezium.version>
+        <kafka.connect-api.version>4.3.0</kafka.connect-api.version>
+        <slf4j-api.version>1.7.36</slf4j-api.version>
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
         <logback.version>1.5.18</logback.version>
         <junit-jupiter.version>6.1.3</junit-jupiter.version>
