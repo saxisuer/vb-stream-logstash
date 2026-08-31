@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 vb-stream-logstash 是一个**全新（greenfield）项目**，目标：适配 PostgreSQL 最新的逻辑解码（logical decoding）**stream 模式**，通过 pgjdbc 的 `ReplicationConnection` / `PGReplicationStream` API 实时获取 CDC 数据。
 
-- 坐标：`org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（Vastbase 生态；artifactId 暗示最终会以某种形式与 Logstash 集成，集成方式尚未确定）
+- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom）+ 两模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）与 `vb-stream-connector-postgres-stream`（Debezium 流式连接器,设计见 docs/superpowers/specs/2026-09-01-debezium-connector-postgres-stream-design.md）
 - 工具链：Java 17 + Maven
 - 当前状态：**里程碑 2.0 已完成**（在 pgoutput 流式解码器、复制会话（raw 字节接缝）、事务组装与读取/输出解耦之上，**输出契约流式化**：`StreamingTransactionListener.onEvent(TransactionEvent)` 单回调事件交付（`Begin → TxChange* → End`），回放期逐条解码逐条交付、堆峰从 O(事务) 降到 O(单条)；`End` 返回 = 下游确认完整消费，输出前沿随 End 推进；block 逃生门 `vb.output.mode=block` 经 `StreamingToBlockAdapter` 在输出边界攒回整块恢复 1.7 原子交付语义；输出格式（TXN-BEGIN/逐行/TXN-END）逐字节不变，`mvn test` 177 用例全绿；**吞吐与分布指标已内建**（`ThroughputMetrics`——slot 读取/组装/输出三段速率 + 回放耗时/事务大小分位数 + 八项会话峰值行，10s 周期 INFO 日志行，2026-08-31 设计）；JMH 基线含 2.0 契约换血对照段（`docs/benchmarks-baseline.md`，另含 2026-08-31 端到端在线吞吐基线段：单 slot 双上限——窄行 ~34 万条/s、宽行 ~320MB/s，组装 ~4.4 万 tx/s，Main 全程非瓶颈）；**1.7/1.7.1 成果沿用**——读取与组装输出解耦（reader 记账 + `MessagePipe` 主缓冲 + consumer 回放、LSN 确认按输出前沿封顶、at-least-once）；组装成本归因三腿互证（存储路径 ≈58%、缺页 ≈46.8% 属固有；deletableFiles 节流 −38.3%；1.7.2 判定不开混合存储，见 baseline 文档 1.7.1 段））。核心依赖（版本以 pom 的 `<properties>` 为准）：
     - `org.postgresql:postgresql`（pgjdbc，含逻辑复制 API）
@@ -62,8 +62,8 @@ ConsoleRenderer（CDC 专用 logger org.vastdata.vbstream.cdc，INFO；STREAMING
 mvn clean package                    # 构建
 mvn compile                          # 仅编译
 mvn test                             # 运行全部测试
-mvn test -Dtest=ClassName            # 运行单个测试类
-mvn test -Dtest=ClassName#method     # 运行单个测试方法
+mvn test -pl vb-stream-engine -Dtest=ClassName            # 运行引擎单个测试类(多模块后 -Dtest 须带 -pl)
+mvn test -pl vb-stream-engine -Dtest=ClassName#method     # 运行引擎单个测试方法
 mvn dependency:tree                  # 查看依赖树
 ```
 
@@ -82,13 +82,13 @@ mvn dependency:tree                  # 查看依赖树
 
 ```bash
 cd src/docker && docker compose up -d && cd ../..     # 起本地 PG
-mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+mvn -q -pl vb-stream-engine compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
      --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
      --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED \
      --add-opens java.base/sun.nio.fs=ALL-UNNAMED \
      --add-opens java.base/java.lang.reflect=ALL-UNNAMED \
-     -cp "target/classes:$(cat target/cp.txt)" org.vastdata.vbstream.Main
+     -cp "vb-stream-engine/target/classes:$(cat vb-stream-engine/target/cp.txt)" org.vastdata.vbstream.Main
 # 可选覆盖：-Dvb.pg.slot=... -Dvb.pg.publication=... -Dvb.pg.streaming=on|parallel|off
 #           -Dvb.pipe.dir=... -Dvb.pipe.rollCycle=... -Dvb.output.mode=streaming|block
 ```
@@ -113,11 +113,12 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 - **内存有界性（2.0 形态）**：**组装期堆内零字节引用**——数据消息字节只在 `pipe.append` 时落盘一次，桶只记 CQ index 段（段数 × long[2]）与 oid/aborted 集合；**回放期（consumer 线程）STREAMING 形态堆峰 O(单条)**——逐单元 readRange 回读、解码、渲染、交付后即不可达（消费路径无跨单元累积容器），readRange 载荷副本与 TxChange 双份瞬态仅单单元量级；BLOCK 形态经 `StreamingToBlockAdapter` 攒回整块，恢复 1.7 的 O(事务) 回放期瞬态（攒集 ArrayList 有高水位保留——`clear` 不缩容，曾经过的大事务会留下大 backing array）。仍随事务/会话增长的堆结构：`abortedSubxids`（每回滚子事务一个 Long，随桶完结释放）、`preparedByGid` 挂起池（未决 2PC 数，协议固有）、交接队列与 `handedOff` 记账（待输出桶数 × 元数据，DONE 惰性清理）、registry 版本日志（随新表/DDL 线性——组装器在桶完结点按存活桶 firstIndex 低水位 `pruneBelow` 剪枝，floor 语义，2PC 挂起桶算存活、已交接桶不算；剪枝后仅随不同表 oid 数线性）。吞吐指标（`ThroughputMetrics`）常驻**有界**：6 LongAdder + 2 个 2 位精度 HDR Recorder 各 KB 量级，区间直方图回收复用不累积。consumer 慢/停摆不回压 reader，代价转移到磁盘：CQ 目录与 PG 侧 WAL 保留增长（`max_slot_wal_keep_size=2GB` 兜底 + consumer 周期 WARN 告警）
 - **输出语义**：at-least-once——LSN 确认按输出前沿封顶，**前沿锚定 End 事件**（End 返回 = 下游确认完整消费；中途失败 fail-fast 截断、End 永不发出，前沿不推进），crash 时未输出（End 未达）事务必然被 PG 重发，console 可能重复输出已见事务的头行（不去重，文档化承诺）
 - **源码结构**（各源码根一行；包内细节见各模块级 CLAUDE.md，层间关系见上文“架构总览”）：
-    - `src/main/java`：`protocol`（协议解析，纯函数）、`replication`（会话 + raw 接缝 + 解耦事务组装与管道 + 吞吐指标）、顶层 `Main`/`ConsoleRenderer`
-    - `src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleRendererTest`、`it` 包集成测试 12 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
-    - `src/jmh/java`：五基准（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖，见其 CLAUDE.md）
+    - `vb-stream-engine/src/main/java`：`protocol`（协议解析，纯函数）、`replication`（会话 + raw 接缝 + 解耦事务组装与管道 + 吞吐指标）、顶层 `Main`/`ConsoleRenderer`
+    - `vb-stream-engine/src/test/java`：`protocol`/`replication` 包字节级单测（`MsgBuilder`/`PgWire` 手造字节辅助）与顶层 `ConsoleRendererTest`、`it` 包集成测试 12 组（Testcontainers，见其 CLAUDE.md）、`bench` 包语料基建（JMH 语料来源）
+    - `vb-stream-engine/src/jmh/java`：五基准（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖，见其 CLAUDE.md）
+    - `vb-stream-connector-postgres-stream/src/main/java`：`org.vastdata.debezium.connector.postgresql.stream`（Debezium 流式连接器,MS1 起开发）
 - 集成测试（`org.vastdata.vbstream.it`，12 组）经 Testcontainers 自动起 postgres:18 容器，需本机 Docker；`mvn test` 单命令跑全部。解耦专项三组：`DecoupledPipelineTest` 三场景（①双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除，异步管道双回放输出全等 ②大事务内同事务 DDL，前后段按 asOf 版本渲染 ③流式大事务回滚后低水位推进 + 陈旧滚动文件实际删档）、`ReaderUnblockedTest`（头名验收——consumer 阻塞期间 reader 持续接收，放行后排干不丢不重）、`FrontierCapTest`（未输出事务钉住 confirmed_flush，输出后越过封顶）；另有 `ReaderThroughputTest` 读取节拍回归（500 行事务 35s 内录完——防"每轮一条+固定 sleep 100ms"的 ~10 msg/s 节拍退化，2026-08-31 吞吐冒烟实测踩坑）；`BenchCorpusRecordTest` 为基准语料生成器（语料缺失或场景脚本 SHA-256 指纹变化才起容器重录，指纹一致时秒过）
-- JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在模块根目录运行）：`mvn -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "target/classes:target/test-classes:$(cat target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 等号单 token 形式自带，详见该文档；基线数字在档作回归对照——2.0 段 + 1.7 段 + 1.6 历史参照，不进 CI）
+- JMH 基准运行方式见 `docs/benchmarks-baseline.md`（须在仓库根目录带 `-pl vb-stream-engine` 运行（或进入 vb-stream-engine/ 目录））：`mvn -pl vb-stream-engine -Pjmh clean test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt` 后 `java -cp "vb-stream-engine/target/classes:vb-stream-engine/target/test-classes:$(cat vb-stream-engine/target/cp.txt)" org.openjdk.jmh.Main "org.vastdata.vbstream.bench" ...`（JMH fork 是全新 JVM，`--add-opens` 须经 `-jvmArgsAppend` 等号单 token 形式自带，详见该文档；基线数字在档作回归对照——2.0 段 + 1.7 段 + 1.6 历史参照，不进 CI）
 - src/docker 的 postgresql.conf 已含冒烟所需 `max_prepared_transactions=16` 与 `logical_decoding_work_mem=64kB`（改 conf 后 `docker compose restart postgres`）。注意：walsender 已追平时，单语句 `INSERT..SELECT` 批量写入的大事务不触发流式（整段于提交后回放）；构造流式场景需事务内分批/跨秒写入
 - **流式驱逐的内存记账按 TOAST 压缩后大小（实测，构造流式测试数据必读）**：reorder buffer 的 `rb->size` 按变更元组 TOAST 压缩后的实际字节数记账，不是 SQL 文本长度。规则图案载荷（`repeat('x',8192)`、`repeat(md5,N)`）被 pglz 压到百字节级——少量行永远越不过 `logical_decoding_work_mem=64kB`，事务整体走 Begin..Commit 的 NORMAL 路径（事务组装 Task 8 首版实测踩坑）。要少量行即触发流式，用不可压缩载荷：`(SELECT string_agg(md5(random()::text),'') FROM generate_series(1,512))` ≈16KB（`pg_column_size` 实测存满 16384）；数百行可压缩载荷靠总量也能触发（`StreamedTransactionTest` 的 500 行方案）。另注意阈值是**全局** `rb->size`（所有进行中事务合计），双连接并发大事务会轮番驱逐、流段交错下发（`TransactionAssemblyTest` 场景 4 即此构造）
 
