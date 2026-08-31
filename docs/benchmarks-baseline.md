@@ -332,6 +332,63 @@ Decode / RoutePeek / 两 append / AssemblyAttribution 不触碰输出契约（�
 0.761 ± 0.107 均 CI 重叠、同量级：2.0 契约换血对组装主路径成本无统计可见影响（每桶新增的
 Begin/End 事件对象为每轮 12 组 record，量级可忽略；no-op listener 交付零成本）。
 
+### 端到端在线吞吐基线（2026-08-31，真 PG + Main 在线，非 JMH 离线）
+
+**性质**：以上各节是 JMH 离线回放（语料无网络无 PG），本节是**在线端到端**——真 walsender 供给
+经 loopback 进 Main 全管线（reader 记账 + CQ 管道 + consumer 回放），度量整链吞吐上限。两个直接
+动因：① reader 循环 drain 修复（commit c9fdd3d）与峰值行秒桶口径（e419167）落地后的真实验证；
+② Docker Desktop 绑定挂载盘把 walsender 溢写读回压到 10~13 MB/s 的环境瓶颈需要一块原生磁盘基线。
+
+**环境**：WSL2 Ubuntu 22.04（宿主 AMD Ryzen 7 8845HS 16 线程 / 14GB 配额）· PG 18.6（PGDG，
+`wal_level=logical`、`max_prepared_transactions=16`、`logical_decoding_work_mem=512MB`、
+`max_slot_wal_keep_size=2GB`）· Main（OpenJDK 17.0.20）与 PG 同 VM 走 loopback ·
+负载表 `t_assembly_types`（8 列全类型）· cdc 输出 logger OFF（排除渲染与日志写占用）。
+复测脚本（WSL /tmp，源在 `target/wsl-*.sh`）：吞吐域 `WIDTH=… ROWS=… bash /tmp/limit.sh`、
+组装域单客户端 `/tmp/txrate.sh`（`TXS/WIDTH`）与并发 `/tmp/txpar.sh`（`PAR/TXS/WIDTH`）。
+
+**大事务吞吐域**（单事务 N 行，slot 峰值 = `ThroughputMetrics` 秒桶口径）：
+
+| v_text 行宽 | 单条消息 | slot 峰值 | 消息速率 | 组装 tx/s |
+|---|---|---|---|---|
+| 8B | ~119B | 40.5 MB/s | 341k msg/s | 1.0（单事务，无 tx/s 意义） |
+| 43B | ~154B | 41~46 MB/s | 268~297k | 1.0 |
+| 256B | ~366B | 100.5 MB/s | 274k | 1.0 |
+| 512B | ~630B | 119.2 MB/s | 191k | 1.0 |
+| 2KB | ~2.2KB | 195.0 MB/s | 90k | 1.0 |
+| 4KB | ~4.1KB | 224.4 MB/s | 53k | 1.0 |
+| **64KB** | ~64KB | **320.3 MB/s**（实测峰值） | 4.9k | 1.0 |
+| 256KB | ~256KB | 251.2 MB/s* | 959 | 1.0 |
+
+\* 256KB 档事务恰好跨秒界被秒桶拆分摊薄（256MB/1.02s），实际与 64KB 档同量级。
+
+**高频小事务组装域**（每事务 1 行，`synchronous_commit=off` 排除 PG commit fsync 干扰）：
+
+| 场景 | 组装 tx/s 峰值 | 输出 tx/s | slot 消息速率 |
+|---|---|---|---|
+| 单客户端 × 5 万事务 × 40B | 31,096 | 32,116 | 93k msg/s（3.0 消息/事务 ✓） |
+| **4 并发 × 2 万事务 × 40B** | **44,342** | 44,342 | 133k msg/s（3.0 ✓） |
+| 单客户端 × 1 万事务 × 2KB | 9,855 | 9,855 | 21.7 MB/s |
+
+**结论（单 slot 双上限 + 组装稳态）**：
+
+- **条数上限 ≈30~34 万 msg/s**（窄行域生效，与行宽基本无关）——PG walsender 单线程逐条序列化
+  发送的 CPU 上限；**字节上限 ≈250~320 MB/s**（宽行域生效，64KB 附近实测峰值 320.3，继续加宽
+  平台化而非断崖）。两上限交点在 ~500B~1KB 消息宽度；**60 MB/s 目标需消息 ≥~200B（v_text
+  ≥~150B）**——256B 行宽实测 100.5，512B 实测 119.2，轻松达标。
+- **组装事务稳态 ≈4.4 万 tx/s**（4 并发生成实测；单客户端生成端只能顶到 3.1 万——该域限制在
+  PG 生成端并发 + walsender 事务间切换，非 Main 单一环节）。每事务 3 条消息口径两场景均精确
+  对上（93,287/31,096 与 133,026/44,342 均 = 3.0）。
+- **Main 管线全程非瓶颈**：负载高峰期 reader 线程 CPU 仅 ~15%（JFR 线程 CPU + /proc task
+  jiffies 差分双口径）；tmpfs pipe 对照（40.1 vs 41.3 MB/s）排除 CQ 磁盘写穿透；consumer 单秒
+  交付 50 万 rec。**不要在这条链上再做 reader 侧微优化**——限制永远在 walsender 条数 × 行宽。
+- 对照：Docker Desktop（绑定挂载盘、`work_mem=64kB`）同窄行负载仅 10~13 MB/s（walsender
+  `ReorderBufferRead/Write` 溢写读回）——环境差可达 3~4 倍，判读吞吐先看环境与行宽。
+
+**口径限制**：单事务峰值受秒桶边界拆分影响（事务恰跨秒界会被低估，256KB 档即此例——判读取
+TXN-BEGIN/END 时序差交叉核对）；组装域 DO 块生成速率是下界口径（未测更多并发的上限拐点）；
+仅单 slot 单 publication（多 slot 分表并行未测）；cdc OFF 排除了渲染路径（含渲染的综合上限
+更低，渲染成本另见 JMH `replayBucket` 口径）。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/
