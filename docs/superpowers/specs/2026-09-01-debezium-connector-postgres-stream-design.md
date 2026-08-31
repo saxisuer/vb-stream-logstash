@@ -33,7 +33,7 @@ vb-stream-logstash/                          ← parent pom(packaging=pom,坐标
 │   ├─ pom.xml                               ← artifactId vb-stream-engine
 │   └─ src/{main,test,jmh}/java/...          ← protocol / replication / Main / ConsoleRenderer / it / bench 原样
 ├─ vb-stream-connector-postgres-stream/      ← 新模块(本设计主体)
-│   ├─ pom.xml                               ← 依赖 io.debezium:debezium-connector-postgres(D6)+ chronicle-queue(BOM 同源或显式 2026.x)
+│   ├─ pom.xml                               ← 依赖 io.debezium:debezium-connector-postgres(D6)+ chronicle-queue(BOM 同源或显式 2026.x);test 域另依赖 debezium-embedded 驱动 IT(见 §9)
 │   └─ src/{main,test}/java/org/vastdata/debezium/connector/postgresql/stream/...
 ├─ src/docker/                               ← 留根,两模块共用冒烟 PG(postgres:18)
 ├─ docs/                                     ← 留根共享
@@ -162,7 +162,7 @@ consumer 线程:交接队列取桶 → 逐段 `readRange` 回读 → 解码单�
 ## 9. 测试策略(三层)
 
 1. **字节级单测**(不起 PG):MsgBuilder/PgWire 式手造字节辅助按 Debezium 侧重写(现有先例仅反射+ByteBuffer 孤例,建正式 fixture);协议解码(流式块 xid 前缀、两阶段消息)、桶记账/交接/aborted 剔除/registry asOf/prune 离线可测
-2. **Testcontainers 集成测试**(postgres:18,`logical_decoding_work_mem=64kB` + `max_prepared_transactions=16`),场景库从引擎 it 整体翻译重写:
+2. **Testcontainers 集成测试**——以 **Debezium Embedded Engine 驱动**(参照 vanilla PG IT 范式:`debezium-embedded` 的 `DebeziumEngine<SourceRecord>` 在测试 JVM 内起连接器,`AbstractConnectorTest` 系基类 + `consumeRecordsByTopic(N).allRecordsInOrder()` 断言;容器 postgres:18,`logical_decoding_work_mem=64kB` + `max_prepared_transactions=16`)。场景库从引擎 it 整体翻译重写:
    - 双连接并发流式大事务多桶交错 + StreamAbort 子事务剔除
    - 大事务内同事务 DDL,前后段 asOf 渲染
    - 流式大事务回滚后低水位推进 + 陈旧滚动文件删档
@@ -172,7 +172,8 @@ consumer 线程:交接队列取桶 → 逐段 `readRange` 回读 → 解码单�
    - 半事务停机语义:不排干停机 → 重启重发 → 事务元数据 END 补齐
    - two_phase:挂起→交接/弃桶/重启续传 prepared
    - 快照 → 流式无缝衔接
-   - 断言沿用 `consumeRecordsByTopic(N).allRecordsInOrder()` 范式;流式数据构造经验照搬(不可压缩载荷 ~16KB md5 串、阈值是全局 `rb->size`、分批跨秒写入)
+   - **重启类场景统一走 embedded engine 的停止/重启**:engine 配文件 offset storage(`offset.storage.file.filename`),停引擎→断言半事务残段→重起→断言 PG 重发补齐与事务元数据 END——重启三情况、半事务停机语义、two_phase prepared 续传共用此骨架
+   - 流式数据构造经验照搬(不可压缩载荷 ~16KB md5 串、阈值是全局 `rb->size`、分批跨秒写入)
 3. **基准对照**(可选):引擎端到端吞吐基线(窄行 ~34 万条/s / 宽行 ~320MB/s)作回归参照
 
 ## 10. 里程碑(每期 commit + push)
