@@ -1,7 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import java.util.Arrays;
 import java.util.Locale;
 
+import net.openhft.chronicle.queue.RollCycle;
+import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.apache.kafka.common.config.ConfigDef.Type;
 
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
@@ -21,6 +24,9 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
  * OFF/ON/PARALLEL(大小写宽容);PARALLEL 档必须搭配 slot.two.phase=true,
  * 否则 {@link #validateSlotStreaming} 记 1 条问题并使配置整体不通过——
  * PG 侧 parallel 流式解码以 two_phase 为前置,漏配到运行期才失败代价过高。
+ * pipe.roll.cycle 只接受 {@link LegacyRollCycles} 枚举名(大小写宽容,引擎
+ * PipeConfig.parseRollCycle 同语义),未知值由 {@link #validateRollCycle} 记 1 条
+ * 附可用值清单的问题——拼写错误残余到建管道才炸会拖垮 reader 线程,且管道目录可能已被 wipe。
  *
  * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 扩展 5 新 Field(floor 语义,父类必填项、
  * 校验器全部保留),供任务侧配置完整性校验;Connect REST 暴露面见
@@ -50,11 +56,12 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
             .withType(Type.STRING)
             .withDefault("pg-stream-pipe-queue");
 
-    /** 管道滚动周期:LegacyRollCycles 枚举名(大小写宽容,由 MS2 管道装配解析),默认 MINUTELY。 */
+    /** 管道滚动周期:LegacyRollCycles 枚举名(大小写宽容,validateRollCycle 启动期校验),默认 MINUTELY。 */
     public static final Field PIPE_ROLL_CYCLE = Field.create("pipe.roll.cycle")
             .withDisplayName("Pipe roll cycle")
             .withType(Type.STRING)
-            .withDefault("MINUTELY");
+            .withDefault("MINUTELY")
+            .withValidation(PostgresStreamConnectorConfig::validateRollCycle);
 
     /** LSN 反馈间隔(毫秒):复制会话 run 轮询循环 forceUpdateStatus 的节流周期(确认值经输出前沿封顶),默认 10000(=10 秒),正整数校验。 */
     public static final Field SLOT_FEEDBACK_INTERVAL_MS = Field.create("slot.feedback.interval.ms")
@@ -110,6 +117,49 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
     }
 
     /**
+     * pipe.roll.cycle 的枚举校验器(Field.ValidationOutput 三元契约,引擎 PipeConfig.
+     * parseRollCycle 的校验面形态):合法返回 0;值不在 {@link LegacyRollCycles} 枚举名
+     * 名单(大小写宽容)时向 problems 记 1 条附可用值清单的消息并返回 1——拼写错误应在
+     * 启动期暴露而非静默回落(残余到建管道才 IAE 会拖垮 reader 线程)。
+     *
+     * @param config   待校验的完整配置
+     * @param field    被校验字段(恒为 PIPE_ROLL_CYCLE)
+     * @param problems 问题接收器;校验失败时恰好 accept 一次
+     * @return 0 表示通过,1 表示发现 1 个问题
+     */
+    static int validateRollCycle(Configuration config, Field field, Field.ValidationOutput problems) {
+        String value = config.getString(field);
+        try {
+            parseRollCycle(value);
+            return 0;
+        }
+        catch (IllegalArgumentException e) {
+            problems.accept(field, value, "Invalid value '" + value + "': expected one of "
+                    + Arrays.toString(LegacyRollCycles.values()) + " (case-insensitive)");
+            return 1;
+        }
+    }
+
+    /**
+     * 大小写宽容地解析滚动周期枚举名(引擎 PipeConfig.parseRollCycle 逐行同语义)。只在
+     * {@link LegacyRollCycles} 中查找:chronicle-queue 2026.6 已把 MINUTELY/HOURLY/DAILY
+     * 从 {@code RollCycles} 迁入 {@code LegacyRollCycles},且两者枚举名无重叠。
+     * 未命中即抛 {@link IllegalArgumentException} 并附全部可用名。校验器与 {@link #rollCycle()}
+     * 共用此解析,保证两侧口径一致。
+     *
+     * @param name 配置给出的枚举名(任意大小写)
+     * @return 对应的 RollCycle 实例(LegacyRollCycles 枚举单例)
+     */
+    private static RollCycle parseRollCycle(String name) {
+        return Arrays.stream(LegacyRollCycles.values())
+                .filter(rc -> rc.name().equalsIgnoreCase(name))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "unknown pipe.roll.cycle '%s', usable values: %s"
+                                .formatted(name, Arrays.toString(LegacyRollCycles.values()))));
+    }
+
+    /**
      * 返回日志/指标上下文名(Debezium CdcSourceTaskContext 语境),
      * 覆盖父类以指向本模块而非 io.debezium 的 PG 连接器。
      *
@@ -152,7 +202,8 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
     }
 
     /**
-     * 读取管道工作目录名。
+     * 读取管道工作目录名(MessagePipe 构造方自行 {@code Path.of} 成路径——瞬态工作区,
+     * 相对工作目录解析)。
      *
      * @return 配置的目录名;缺省时按 Field 默认值回落为 pg-stream-pipe-queue
      */
@@ -161,12 +212,25 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
     }
 
     /**
-     * 读取管道滚动周期名(LegacyRollCycles 枚举名,由 MS2 管道装配解析)。
+     * 读取管道滚动周期名(LegacyRollCycles 枚举名的原样字符串形态,日志归因用;
+     * 管道装配请用已解析的 {@link #rollCycle()})。
      *
      * @return 配置的周期名;缺省时按 Field 默认值回落为 MINUTELY
      */
     public String pipeRollCycle() {
         return getConfig().getString(PIPE_ROLL_CYCLE);
+    }
+
+    /**
+     * 解析管道滚动周期为枚举单例(MessagePipe 构造的直接入参形态):经
+     * {@link #parseRollCycle} 大小写宽容解析。非法值已由 {@link #validateRollCycle}
+     * 在启动期挡下,此处不再容错(未经校验直接构造时若值非法将抛
+     * IllegalArgumentException,属调用方违约)。
+     *
+     * @return LegacyRollCycles 枚举单例;缺省时按 Field 默认值回落为 MINUTELY
+     */
+    public RollCycle rollCycle() {
+        return parseRollCycle(getConfig().getString(PIPE_ROLL_CYCLE));
     }
 
     /**

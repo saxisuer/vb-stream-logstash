@@ -1,6 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.config.Configuration;
+import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.apache.kafka.common.config.ConfigValue;
 import org.junit.jupiter.api.Test;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
@@ -162,5 +163,47 @@ class PostgresStreamConnectorConfigTest {
         }
         assertTrue(connectorFieldNames.contains("slot.feedback.interval.ms"),
                 "getConfigFields() 返回的 ALL_FIELDS 应同含新配置名");
+    }
+
+    /**
+     * 用例⑨rollCycle() 枚举解析默认:pipe.roll.cycle 不配置时 {@code rollCycle()} 返回
+     * {@link LegacyRollCycles#MINUTELY}——管道装配(MessagePipe 构造)直接消费枚举实例,
+     * 默认错位会同时改变滚动文件粒度与低水位删除的档位节奏。
+     */
+    @Test
+    void rollCycleDefaultsToMinutelyEnum() {
+        PostgresStreamConnectorConfig config = new PostgresStreamConnectorConfig(configWith(Map.of()));
+        assertEquals(LegacyRollCycles.MINUTELY, config.rollCycle(),
+                "pipe.roll.cycle 默认应解析为 LegacyRollCycles.MINUTELY 枚举单例");
+    }
+
+    /**
+     * 用例⑩大小写宽容:minutely/houRly 经 {@code rollCycle()} 解析为同一枚举单例
+     * (MINUTELY/HOURLY)——校验器与 getter 两侧都按 equalsIgnoreCase 在 LegacyRollCycles
+     * 中查找(引擎 PipeConfig.parseRollCycle 同语义),配置面不必整大写。
+     */
+    @Test
+    void rollCycleIsCaseInsensitive() {
+        assertEquals(LegacyRollCycles.MINUTELY,
+                new PostgresStreamConnectorConfig(configWith(Map.of("pipe.roll.cycle", "minutely"))).rollCycle(),
+                "小写 minutely 应解析为 MINUTELY");
+        assertEquals(LegacyRollCycles.HOURLY,
+                new PostgresStreamConnectorConfig(configWith(Map.of("pipe.roll.cycle", "houRly"))).rollCycle(),
+                "混合大小写 houRly 应解析为 HOURLY");
+    }
+
+    /**
+     * 用例⑪未知 rollCycle 拒收:pipe.roll.cycle=NOPE 时 validate 恰好 1 条错误且消息附
+     * 可用值清单(以 MINUTELY 为代表)——启动期把拼写错误挡在建管道之前(残余到管道构造
+     * 后才炸会拖垮 reader 线程,且队列目录可能已被 wipe)。
+     */
+    @Test
+    void unknownRollCycleRejectedWithUsableValues() {
+        Map<String, ConfigValue> problems = configWith(Map.of("pipe.roll.cycle", "NOPE"))
+                .validate(PostgresStreamConnectorConfig.ALL_FIELDS);
+        assertEquals(1, problems.get("pipe.roll.cycle").errorMessages().size(),
+                "未知滚动周期应恰好 1 条校验错误");
+        assertTrue(problems.get("pipe.roll.cycle").errorMessages().get(0).contains("MINUTELY"),
+                "错误消息应附可用值清单(以 MINUTELY 为代表)");
     }
 }
