@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
@@ -58,11 +59,13 @@ import net.openhft.chronicle.queue.RollCycle;
  * 的滚动文件;registry 剪枝低水位 = 全部存活桶 firstIndex 的最小值,驱动
  * {@link VersionedRelationRegistry#pruneBelow}。两者都挂在桶完结点(交接/整桶丢弃)。
  *
- * <p><b>MS2 Task 4 形态裁定</b>:本类只落<b>同步形态</b>的"冻结 + 记账"——交接分发是空骨架
- * ({@link #dispatchHandedOff},事件流 Begin → TxChange* → End 的发出属 Task 5 的
- * {@code TransactionConsumer.processBucket});Task 6 再加异步构造(consumer 线程与交接队列)
- * 与停机两形态。相对引擎的另两处接缝偏差:吞吐指标(引擎构造穿 ThroughputMetrics)整体删除,
- * MS5 以监听器形态加回;'R' 路由经 {@link RelationResolver}(见上)。
+ * <p><b>MS2 形态裁定</b>:Task 4 落同步形态的"冻结 + 记账"(dispatchHandedOff 空骨架),
+ * Task 5 起骨架接上 {@code TransactionConsumer.processBucket}——交接分发在调用线程内联完成
+ * 事件流交付(Begin → TxChange* → End)、End 之后的前沿累加与桶状态后两态;Task 6 再加
+ * 异步构造(consumer 线程与交接队列)与停机两形态。相对引擎的另三处接缝偏差:吞吐指标
+ * (引擎构造穿 ThroughputMetrics)整体删除,MS5 以监听器形态加回;'R' 路由经
+ * {@link RelationResolver}(见上);listener 侧 asOf 表解析经 {@link BucketTableResolver}
+ * (消费器每桶绑定快照,Task 7 注入真实现)。
  *
  * <p>内存量级:组装期记账恒 O(桶元数据)(段数 × long[2] + oid/aborted 集合);提交回放逐单元
  * 解码逐条交付(Task 5 起,堆内 O(单条))。
@@ -92,6 +95,11 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private final ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
     /** reader 侧存活桶计数(LIVE 状态桶数,交接/整桶丢弃时递减)——consumer 周期统计与测试锚定用。 */
     private final AtomicInteger liveCount = new AtomicInteger();
+    /** 输出前沿(已输出事务 endLsn 的单调 max,反馈封顶用):Task 5 起由 {@link #consumer} 在 End 后累加;
+     *  同步形态内部自持(调用方经测试观测口 {@link #outputFrontierForTest()} 读),Task 6 的异步形态改由调用方穿入。 */
+    private final AtomicLong outputFrontier = new AtomicLong();
+    /** 消费器(Task 5 起 dispatch 在调用线程直调其 processBucket;Task 6 的异步形态经交接队列由 consumer 线程驱动)。 */
+    private final TransactionConsumer consumer;
 
     /** 最近一次 append 的 index(reader 记账,替代 pipe.lastAppendedIndex()——空队列时后者会抛;
      *  未 append 过为 -1)。watermark 的"已落盘内容全是垃圾"上界由此 +1 派生。 */
@@ -112,13 +120,14 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private final Map<String, TxBuffer> preparedByGid = new HashMap<>();
 
     /**
-     * 构造<b>同步形态</b>组装器(Task 4 唯一形态):不开消费器——handoff 只完成"冻结 + 记账",
-     * 事件流交付是 {@link #dispatchHandedOff} 的空骨架(Task 5 接 {@code TransactionConsumer.
-     * processBucket},Task 6 再分流同步直调/异步入队)。急切建立管道——{@link MessagePipe}
+     * 构造<b>同步形态</b>组装器(默认表解析接缝):{@code dispatchHandedOff} 在调用线程直调
+     * {@code TransactionConsumer.processBucket}——回放与回调对 onRaw 同步可见,fail-fast 异常
+     * 直传调用方;listener 侧 asOf 表解析走默认的快照透传接缝
+     * ({@code BucketTableResolver.snapshotBacked()}),需要注入自有实现的同包调用方(Task 7 起)
+     * 用包私有八参构造。急切建立管道——{@link MessagePipe}
      * 构造即清空目录建队列,失败原样上抛 fail-fast:管道是地基,建不起来就没有可运行形态。
      *
-     * @param listener         事务事件流回调(Begin/TxChange/End 按序流式交付;本形态无人触发,
-     *                         参数面按 Task 5 的消费器接线预留)
+     * @param listener         事务事件流回调(Begin/TxChange/End 按序流式交付,交接时同步调用)
      * @param mode             流式模式(仅影响 decoder 对 StreamAbort 附加字段的解析,须与
      *                         START_REPLICATION 的 streaming 参数一致,否则 abort 解析错位 fail-fast)
      * @param registry         Relation 版本日志('R' 路由与交接快照共用,本组装器独占写入)
@@ -131,6 +140,28 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
                                         VersionedRelationRegistry registry, RelationResolver relationResolver,
                                         Path pipeDir, RollCycle pipeRollCycle,
                                         BiConsumer<PgOutputMessage, RelationLookup> decodedObserver) {
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                BucketTableResolver.snapshotBacked());
+    }
+
+    /**
+     * 构造<b>同步形态</b>组装器(全量,包私有——{@link BucketTableResolver} 是包内接缝,留给
+     * 同包装配点注入 listener 侧表解析的真实现,Task 7 的接线用):其余语义同七参公共构造。
+     *
+     * @param listener         事务事件流回调(交接时同步调用;listener 侧经 tableResolver 取 asOf 表)
+     * @param mode             流式模式
+     * @param registry         Relation 版本日志
+     * @param relationResolver 'R' → ResolvedRelation 解析接缝
+     * @param pipeDir          管道目录(瞬态工作区,打开即整体清空)
+     * @param pipeRollCycle    管道滚动周期
+     * @param decodedObserver  每个解码点回调
+     * @param tableResolver    listener 侧按 (oid, seq) 解析 asOf 表定义的接缝(每个桶回放前由消费器绑定快照)
+     */
+    StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                 Path pipeDir, RollCycle pipeRollCycle,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 BucketTableResolver tableResolver) {
         this.decoder = new PgOutputStreamDecoder(Objects.requireNonNull(mode, "mode"));
         this.registry = Objects.requireNonNull(registry, "registry");
         this.relationResolver = Objects.requireNonNull(relationResolver, "relationResolver");
@@ -138,7 +169,9 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
         Objects.requireNonNull(pipeRollCycle, "pipeRollCycle");
         this.pipe = new MessagePipe(pipeDir, pipeRollCycle);
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
-        Objects.requireNonNull(listener, "listener");   // 参数面校验(本形态不持有,Task 5 的消费器接线消费)
+        this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
+                this.pipe, this.outputFrontier, this.decodedObserver,
+                Objects.requireNonNull(tableResolver, "tableResolver"));
     }
 
     /**
@@ -571,8 +604,9 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
 
     /**
      * 交接:拷快照(oidSet 圈定,截止 lastIndex)→ 捕获封箱元数据 → state=HANDED_OFF → 入
-     * handedOff 记账 → 退出 LIVE 记账 → {@link #dispatchHandedOff}(Task 4 空骨架)→ 维护
-     * 低水位。立即返回——reader 路径从此不含回放。只在 reader 线程调用。
+     * handedOff 记账 → 退出 LIVE 记账 → {@link #dispatchHandedOff}(Task 5 起同步直调
+     * processBucket,桶当即推 DONE)→ 维护低水位。立即返回——reader 路径从此不含回放。
+     * 只在 reader 线程调用。
      */
     private void handoff(TxBuffer bucket, TransactionKind kind, long commitLsn, long endLsn,
             Instant commitTimestamp) {
@@ -590,25 +624,26 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
-     * 交接分发钩子(MS2 Task 4 裁定的语义骨架,包私有接缝):<b>本任务为空实现</b>——
-     * 事件流(Begin → TxChange* → End)的发出属 Task 5 的 {@code TransactionConsumer.
-     * processBucket}(引擎同步形态在 handoff 里直调它,回放与回调对 onRaw 同步可见);
-     * Task 6 的异步形态再按 consumer 线程是否存在分流(直调 vs 交接队列入队)。
+     * 交接分发(同步形态,引擎 handoff 同位调用):在调用线程直调
+     * {@link TransactionConsumer#processBucket}——事件流(Begin → TxChange* → End)的发出、
+     * End 之后的前沿累加与桶状态后两态都在其中对 onRaw 同步可见;回放失败异常直传调用方
+     * (fail-fast,End 永不发、前沿不推进)。Task 6 的异步形态再按 consumer 线程是否存在
+     * 分流(直调 vs 交接队列入队)。
      * 调用点位于 liveCount 递减之后、maintainWatermarks 之前(与引擎 handoff 同位)——
-     * 桶此刻已冻结,消费侧可安全只读。
+     * 桶此刻已冻结,消费侧可安全只读;processBucket 把桶推到 DONE 后,maintainWatermarks
+     * 即在同一个 handoff 里把它惰性清出交接记账。
      *
      * @param bucket 刚冻结的交接桶(HANDED_OFF,封箱元数据与快照已就绪)
      */
     void dispatchHandedOff(TxBuffer bucket) {
-        // Task 4 骨架:不交付(见方法 javadoc)——引擎对位的 throughputMetrics.onTxHandedOff()
-        // 组装完成记账亦随 metrics 接缝整体删除,MS5 以监听器形态加回
+        consumer.processBucket(bucket);   // Task 5:同步直调;Task 6:按形态分流入队
     }
 
     /**
      * 桶完结点统一收尾(交接/整桶丢弃时调用):先从交接记账里清掉已 DONE 的桶
-     * (consumer 写 state、reader 清引用——reader 只读 state 的 volatile 值,清理是惰性的,
-     * 恰好发生在下一个完结点;Task 4 无 consumer,DONE 不会出现,此步空转)→ CQ 删除低水位
-     * 检查(滚动文件回收,非 DONE 交接桶参与钉住)→ registry 剪枝(版本日志收缩,
+     * (consumer 写 state、reader 清引用——reader 只读 state 的 volatile 值,清理是惰性的;
+     * 同步形态下 processBucket 在 dispatchHandedOff 内已把本桶推 DONE,本步当即清出它)→
+     * CQ 删除低水位检查(滚动文件回收,非 DONE 交接桶参与钉住)→ registry 剪枝(版本日志收缩,
      * <b>不含</b>交接桶——快照自足,交接桶回放不再查 registry)。只在 reader 线程调用。
      */
     private void maintainWatermarks() {
@@ -641,6 +676,15 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      */
     int liveBucketsForTest() {
         return liveCount.get();
+    }
+
+    /**
+     * 输出前沿当前值(测试面):已输出事务 endLsn 的单调 max,End 之后才推进——同步形态下
+     * 前沿由组装器内部自持(引擎异步形态改由调用方穿入,Task 6 对齐),测试以本观测口断言
+     * "End 未达则前沿不动 / End 之后推进到 endLsn"。包私有机动,不是公开 API。
+     */
+    long outputFrontierForTest() {
+        return outputFrontier.get();
     }
 
     /**
@@ -688,7 +732,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * 必然大于当前全部已 append 条目,不构成约束);交接桶按 state 过滤——DONE(consumer 已
      * 输出完成)不再约束,HANDED_OFF/OUTPUTTING 仍会被 readRange 读回必须钉住(state 是
      * volatile,本方法在 reader 线程读到的是 consumer 写入的即时值,语义即"此刻仍在途";
-     * Task 4 无 consumer,交接桶恒 HANDED_OFF——滞留桶钉住水位是本形态的预期语义);
+     * 同步形态下正常路径交接即 DONE 即清出,只有 listener 回调中截断/阻塞的桶会滞留钉住);
      * 管道刚建立未 append 过时 maxAppendedIndex=-1,水位为 0(空队列无物可删,天然安全)。
      * 包私有机动:仅供同包单测/探针断言低水位推进,不是公开 API。只在 reader 线程调用。
      *
