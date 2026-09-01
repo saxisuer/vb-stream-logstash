@@ -18,6 +18,9 @@ import java.sql.Types;
 import java.time.Instant;
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -775,6 +778,49 @@ class StreamedTransactionAssemblerTest {
         try (StreamedTransactionAssembler assembler = newAssembler(event -> { })) {
             assertEquals(0L, assembler.pipeWatermark());
             assertFalse(assembler.pipeWatermark() < 0L);
+        }
+    }
+
+    /**
+     * 在途(OUTPUTTING)交接桶约束 CQ 删除低水位(<b>Task 6 异步阻塞形态</b>,引擎同名用例
+     * 形态回归):异步构造器起 consumer 线程,listener 阻塞在首事件(Begin)回调里把第一个桶
+     * 定格 OUTPUTTING;第二个事务随交接排队(同样非 DONE)——此刻 {@code pipeWatermark()}
+     * 应被阻塞桶的 firstIndex 钉住。同步等价形态见 {@link #handedOffBucketConstrainsPipeWatermark()}
+     * (Begin 回调内取景),本用例以真实跨线程定格补齐引擎原版形态(Task 5 报告预告的回补项)。
+     * 线程约束:喂流与水位断言在测试线程(reader 角色——pipeWatermark 只在 reader 线程调用);
+     * latched countDown→await 建立 consumer→测试线程的 happens-before;finally 先放行再
+     * close(排干后 join 秒回——try/finally 而非 try-with-resources:latch 要先放行)。
+     */
+    @Test
+    void handedOffBucketConstrainsPipeWatermarkWhileConsumerBlocked() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch inCallback = new CountDownLatch(1);
+        AtomicLong frontier = new AtomicLong();
+        // 回调面是流式事件,阻塞点任意事件即可,取首事件(Begin)——与引擎 2.0 形态一致
+        StreamedTransactionAssembler assembler = new StreamedTransactionAssembler(event -> {
+            inCallback.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }, StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER, PIPE_DIR, LegacyRollCycles.MINUTELY,
+                (msg, view) -> { }, frontier, () -> { });
+        try {
+            assembler.onRaw(relation());
+            assembler.onRaw(PgWire.begin(101L));
+            assembler.onRaw(insert("1", "a"));
+            assembler.onRaw(PgWire.commit());   // 第一个桶交接,consumer 进入回调并阻塞
+            assertTrue(inCallback.await(5, TimeUnit.SECONDS));
+            long blockedFirst = assembler.handedOffForTest().get(0).firstIndex;
+            assembler.onRaw(PgWire.begin(102L));
+            assembler.onRaw(insert("2", "b"));
+            assembler.onRaw(PgWire.commit());   // 第二个桶交接(排队,同样非 DONE)
+            assertTrue(assembler.pipeWatermark() <= blockedFirst,
+                    "在途桶应钉住删除低水位: wm=" + assembler.pipeWatermark() + " blockedFirst=" + blockedFirst);
+        } finally {
+            release.countDown();
+            assembler.close();                  // 排干并退出
         }
     }
 }

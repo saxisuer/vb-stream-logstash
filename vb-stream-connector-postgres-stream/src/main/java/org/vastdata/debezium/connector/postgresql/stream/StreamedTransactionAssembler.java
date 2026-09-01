@@ -61,10 +61,13 @@ import net.openhft.chronicle.queue.RollCycle;
  * 的滚动文件;registry 剪枝低水位 = 全部存活桶 firstIndex 的最小值,驱动
  * {@link VersionedRelationRegistry#pruneBelow}。两者都挂在桶完结点(交接/整桶丢弃)。
  *
- * <p><b>MS2 形态裁定</b>:Task 4 落同步形态的"冻结 + 记账"(dispatchHandedOff 空骨架),
- * Task 5 起骨架接上 {@code TransactionConsumer.processBucket}——交接分发在调用线程内联完成
- * 事件流交付(Begin → TxChange* → End)、End 之后的前沿累加与桶状态后两态;Task 6 再加
- * 异步构造(consumer 线程与交接队列)与停机两形态。相对引擎的另三处接缝偏差:吞吐指标
+ * <p><b>MS2 形态裁定</b>(Task 6 收口):构造分两形态——<b>同步</b>(既有单测的驱动形态:
+ * dispatchHandedOff 在调用线程直调 {@code TransactionConsumer.processBucket},回放与回调对
+ * onRaw 同步可见、fail-fast 异常直传调用方)与<b>异步</b>(连接器生产形态:构造即起非守护
+ * {@code transaction-consumer} 线程消费交接队列,reader 记账与 consumer 回放双线程解耦,
+ * 前沿与 onFailure 由调用方穿入)。停机两形态:{@link #close()}(毒丸排干——join 60s,
+ * 已提交未输出的事务不丢,测试确定性断言用)与 {@link #shutdownFast()}(D7 快速停机——
+ * 毒丸 + interrupt + 不 join,连接器 source 停机序用)。相对引擎的另三处接缝偏差:吞吐指标
  * (引擎构造穿 ThroughputMetrics)整体删除,MS5 以监听器形态加回;'R' 路由经
  * {@link RelationResolver}(见上);listener 侧 asOf 表解析经 {@link BucketTableResolver}
  * (消费器每桶绑定快照,Task 7 注入真实现)。
@@ -74,9 +77,9 @@ import net.openhft.chronicle.queue.RollCycle;
  *
  * <p>线程约束:<b>reader 侧</b>(onRaw 及其全部私有路由/记账/registry/低水位维护)设计为由
  * run 循环的单一线程调用(decoder 的流块状态与全部桶指针都要求单写者);consumer 侧
- * (readRange、冻结桶回放、listener 回调、前沿累加、桶状态后两态)属 Task 5/6 的消费器,
- * 在 consumer 线程(同步形态即调用线程)执行。跨线程共享仅有:{@code TxBuffer.state}
- * (volatile)。
+ * (readRange、冻结桶回放、listener 回调、前沿累加、桶状态后两态)由 {@link TransactionConsumer}
+ * 在 consumer 线程执行(同步形态即调用线程)。跨线程共享面:交接队列(并发安全)、
+ * {@code TxBuffer.state}(volatile)与 outputFrontier(AtomicLong)。
  */
 public final class StreamedTransactionAssembler implements RawMessageListener, AutoCloseable {
 
@@ -97,12 +100,17 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private final ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
     /** reader 侧存活桶计数(LIVE 状态桶数,交接/整桶丢弃时递减)——consumer 周期统计与测试锚定用。 */
     private final AtomicInteger liveCount = new AtomicInteger();
-    /** 输出前沿(已输出事务 endLsn 的单调 max,反馈封顶用):Task 5 起由 {@link #consumer} 在 End 后累加;
-     *  同步形态内部自持(调用方经测试观测口 {@link #outputFrontierForTest()} 读),Task 6 的异步形态改由调用方穿入。 */
-    private final AtomicLong outputFrontier = new AtomicLong();
-    /** 消费器(Task 5 起 dispatch 在调用线程直调其 processBucket;Task 6 的异步形态经交接队列由 consumer 线程驱动)。 */
+    /** 输出前沿(已输出事务 endLsn 的单调 max,反馈封顶用):由 {@link #consumer} 在 End 后累加;
+     *  同步形态组装器内部自持(调用方经测试观测口 {@link #outputFrontierForTest()} 读),
+     *  异步形态由调用方穿入同一实例(session 反馈封顶读它)。 */
+    private final AtomicLong outputFrontier;
+    /** 消费器:交接桶的回放输出半程(冻结桶 + readRange + 回调 + 前沿),同步/异步两形态共用。
+     *  listener、交接队列、前沿与 onFailure 在构造时交它持有(组装器自身不触碰回调与前沿)。 */
     private final TransactionConsumer consumer;
-    /** 交接队列(reader 投入 → consumer 取出,Task 6 异步形态):无界 LinkedBlockingQueue,
+    /** consumer 线程(异步形态非 null,名 {@code transaction-consumer} 非守护——未排干的交接桶
+     *  在 JVM 退出前必须有机会输出);同步形态为 null——dispatch 直调 processBucket。 */
+    private final Thread consumerThread;
+    /** 交接队列(reader 投入 → consumer 取出,异步形态):无界 LinkedBlockingQueue,
      *  FIFO 保证交接序即提交序;同步形态恒空(dispatch 直调 processBucket 不经队列)。 */
     private final BlockingQueue<TxBuffer> handoffQueue = new LinkedBlockingQueue<>();
 
@@ -125,11 +133,66 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private final Map<String, TxBuffer> preparedByGid = new HashMap<>();
 
     /**
+     * 构造<b>异步形态</b>组装器(连接器生产形态,引擎 Main 用途的对位):建管道与消费器之外,
+     * 另起 {@code transaction-consumer} 线程(非守护——未排干的交接桶在 JVM 退出前必须有机会
+     * 输出)立即开始消费交接队列;输出前沿与失败逃生回调由调用方穿入(前沿供 session 的
+     * LSN 反馈封顶读,onFailure 供停机联动)。停机走 {@link #close()}(毒丸排干)或
+     * {@link #shutdownFast()}(D7 快速停机),两者均不可与 onRaw 并发调用。
+     * 急切建立管道——{@link MessagePipe} 构造即清空目录建队列,失败原样上抛 fail-fast:
+     * 管道是地基,建不起来就没有可运行形态(此时 consumer 线程尚未创建,无泄漏)。
+     *
+     * @param listener         事务事件流回调(Begin/TxChange/End 按序流式交付,consumer 线程同步调用)
+     * @param mode             流式模式(仅影响 decoder 对 StreamAbort 附加字段的解析,须与
+     *                         START_REPLICATION 的 streaming 参数一致,否则 abort 解析错位 fail-fast)
+     * @param registry         Relation 版本日志('R' 路由与交接快照共用,本组装器独占写入)
+     * @param relationResolver 'R' → ResolvedRelation 解析接缝(测试假实现 / Task 7 真实现)
+     * @param pipeDir          管道目录(瞬态工作区,打开即整体清空)
+     * @param pipeRollCycle    管道滚动周期(决定低水位删除的档位粒度)
+     * @param decodedObserver  每个解码点回调(控制消息 + 'R' + 回放单元;Y/O 不解码不回调)
+     * @param outputFrontier   输出前沿载体(调用方持有以便反馈封顶;本实例只做单调 max 累加)
+     * @param onFailure        consumer 回放失败的逃生回调(consumer 线程调用,如通知停机;不得再抛)
+     */
+    public StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                        VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                        Path pipeDir, RollCycle pipeRollCycle,
+                                        BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                        AtomicLong outputFrontier, Runnable onFailure) {
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                outputFrontier, onFailure, BucketTableResolver.snapshotBacked());
+    }
+
+    /**
+     * 构造<b>异步形态</b>组装器(全量,包私有——{@link BucketTableResolver} 是包内接缝,留给
+     * 同包装配点注入 listener 侧表解析的真实现,Task 7 的接线用):其余语义同九参公共异步构造。
+     *
+     * @param listener         事务事件流回调(consumer 线程调用;listener 侧经 tableResolver 取 asOf 表)
+     * @param mode             流式模式
+     * @param registry         Relation 版本日志
+     * @param relationResolver 'R' → ResolvedRelation 解析接缝
+     * @param pipeDir          管道目录(瞬态工作区,打开即整体清空)
+     * @param pipeRollCycle    管道滚动周期(决定低水位删除的档位粒度)
+     * @param decodedObserver  每个解码点回调
+     * @param outputFrontier   输出前沿载体(调用方持有;本实例只做单调 max 累加)
+     * @param onFailure        回放失败的逃生回调(consumer 线程调用)
+     * @param tableResolver    listener 侧按 (oid, seq) 解析 asOf 表定义的接缝(每个桶回放前由消费器绑定快照)
+     */
+    StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                 Path pipeDir, RollCycle pipeRollCycle,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 AtomicLong outputFrontier, Runnable onFailure,
+                                 BucketTableResolver tableResolver) {
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                outputFrontier, onFailure, tableResolver, true);
+    }
+
+    /**
      * 构造<b>同步形态</b>组装器(默认表解析接缝):{@code dispatchHandedOff} 在调用线程直调
      * {@code TransactionConsumer.processBucket}——回放与回调对 onRaw 同步可见,fail-fast 异常
-     * 直传调用方;listener 侧 asOf 表解析走默认的快照透传接缝
-     * ({@code BucketTableResolver.snapshotBacked()}),需要注入自有实现的同包调用方(Task 7 起)
-     * 用包私有八参构造。急切建立管道——{@link MessagePipe}
+     * 直传调用方;输出前沿内部自持(测试经 {@link #outputFrontierForTest()} 读)、onFailure
+     * 置空消费(同步形态异常直传调用方,无人可通知)。listener 侧 asOf 表解析走默认的快照
+     * 透传接缝({@code BucketTableResolver.snapshotBacked()}),需要注入自有实现的同包调用方
+     * (Task 7 起)用包私有构造。急切建立管道——{@link MessagePipe}
      * 构造即清空目录建队列,失败原样上抛 fail-fast:管道是地基,建不起来就没有可运行形态。
      *
      * @param listener         事务事件流回调(Begin/TxChange/End 按序流式交付,交接时同步调用)
@@ -167,16 +230,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
                                  Path pipeDir, RollCycle pipeRollCycle,
                                  BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
                                  BucketTableResolver tableResolver) {
-        this.decoder = new PgOutputStreamDecoder(Objects.requireNonNull(mode, "mode"));
-        this.registry = Objects.requireNonNull(registry, "registry");
-        this.relationResolver = Objects.requireNonNull(relationResolver, "relationResolver");
-        Objects.requireNonNull(pipeDir, "pipeDir");
-        Objects.requireNonNull(pipeRollCycle, "pipeRollCycle");
-        this.pipe = new MessagePipe(pipeDir, pipeRollCycle);
-        this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
-        this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
-                this.pipe, handoffQueue, this.outputFrontier, () -> { }, this.decodedObserver,
-                Objects.requireNonNull(tableResolver, "tableResolver"));
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                new AtomicLong(), () -> { }, tableResolver, false);
     }
 
     /**
@@ -193,6 +248,38 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
                                         VersionedRelationRegistry registry, RelationResolver relationResolver,
                                         Path pipeDir, RollCycle pipeRollCycle) {
         this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, (msg, view) -> { });
+    }
+
+    /**
+     * 全量构造(两形态公共初始化,引擎私有全量构造的 1:1 对位):字段赋值 + 建管道 + 建消费器
+     * (交接队列、前沿、onFailure 随消费器落位);async=true 时另起并启动非守护
+     * {@code transaction-consumer} 线程立即消费交接队列。管道建立失败原样上抛
+     * (fail-fast,同上——此时 consumer 线程尚未创建,无线程泄漏)。
+     */
+    private StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                         VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                         Path pipeDir, RollCycle pipeRollCycle,
+                                         BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                         AtomicLong outputFrontier, Runnable onFailure,
+                                         BucketTableResolver tableResolver, boolean async) {
+        this.decoder = new PgOutputStreamDecoder(Objects.requireNonNull(mode, "mode"));
+        this.registry = Objects.requireNonNull(registry, "registry");
+        this.relationResolver = Objects.requireNonNull(relationResolver, "relationResolver");
+        Objects.requireNonNull(pipeDir, "pipeDir");
+        Objects.requireNonNull(pipeRollCycle, "pipeRollCycle");
+        this.pipe = new MessagePipe(pipeDir, pipeRollCycle);
+        this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
+        this.outputFrontier = Objects.requireNonNull(outputFrontier, "outputFrontier");
+        this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
+                this.pipe, handoffQueue, this.outputFrontier, Objects.requireNonNull(onFailure, "onFailure"),
+                this.decodedObserver, Objects.requireNonNull(tableResolver, "tableResolver"));
+        if (async) {
+            this.consumerThread = new Thread(consumer, "transaction-consumer");
+            this.consumerThread.setDaemon(false);
+            this.consumerThread.start();
+        } else {
+            this.consumerThread = null;
+        }
     }
 
     /**
@@ -266,14 +353,62 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
-     * 关闭组装器(Task 4 同步形态):无消费器与交接队列,直接关管道。
-     * {@link MessagePipe#close} 内部已逐资源 WARN 吸收,这里只兜住意外逃逸的异常——
-     * close 不应掩盖业务异常(最坏代价是句柄延迟回收)。在 run 线程收尾或调用方线程调用
-     * 一次,不可与 onRaw 并发。Task 6 的异步形态在此之前追加毒丸排干协议
-     * (毒丸入队 → join consumer 60s → 关管道——已提交未输出的事务不丢)。
+     * 关闭组装器:<b>排干协议</b>(异步形态,引擎 close 的 1:1 对位)——毒丸入队 → 等 consumer
+     * 线程退出(join 60s 超时 WARN 放行——防回调卡死拖住停机,超时后放弃等待继续关管道)→
+     * 关管道。毒丸排在队列尾,FIFO 保证 consumer 先排干此前交接的全部冻结桶再见到毒丸——
+     * <b>已提交未输出的事务不丢</b>(排干语义的核心承诺,测试确定性断言依赖它:join 返回即
+     * 全部输出可见)。同步形态无 consumer 线程,跳过前两步直接关管道(回放本就同步内联完成,
+     * 无未排干存量)。
+     *
+     * <p>{@link MessagePipe#close} 内部已逐资源 WARN 吸收,这里只兜住意外逃逸的异常——
+     * close 不应掩盖业务异常(最坏代价是句柄延迟回收)。在 run 线程收尾或调用方线程调用一次,
+     * <b>不可与 onRaw 并发</b>(pipe 的 appender 是 reader 单写者资源,关它必须发生在 reader
+     * 停止之后——调用方约束,Task 7 的 source 停机序以 session.close → reader.join 保证)。
+     * join 被中断时恢复中断标志并放弃等待(不重试——停机路径不应被阻塞)。shutdownFast 之后
+     * 再调 close 是安全组合:毒丸重复入队无害、join 对已亡线程立即返回、管道 close 幂等。
      */
     @Override
     public void close() {
+        if (consumerThread != null) {
+            handoffQueue.add(TxBuffer.POISON);
+            try {
+                consumerThread.join(60_000L);
+                if (consumerThread.isAlive()) {
+                    LOG.warn("consumer 线程 60s 内未退出(可能卡在 listener 回调),放弃等待直接关管道");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.warn("等待 consumer 退出被中断,放弃等待直接关管道");
+            }
+        }
+        try {
+            pipe.close();
+        } catch (RuntimeException e) {
+            LOG.warn("管道关闭失败(忽略)", e);
+        }
+    }
+
+    /**
+     * 责任:<b>D7 快速停机</b>(MS2 新增形态,引擎无对应物——连接器 source 停机序用):
+     * 毒丸入队 + 中断 consumer 线程 + <b>不 join</b>(不等在途回放/排队桶排干——这正是与
+     * {@link #close()} 排干协议的分叉点)+ 直接关管道。
+     * 关键步骤:毒丸入队(consumer 若能走到队列即见退出信号)→ {@code interrupt}(防 consumer
+     * 阻塞在 poll 的 1s 等待——中断使下一次 poll 立即抛 InterruptedException 退出;若正阻塞在
+     * listener 回调,中断只置标志,回调返回后的下一次 poll 即退)→ 关管道(资源即刻回收)。
+     * 边界:同步形态无 consumer 线程,退化为直接关管道;重复调用安全(毒丸重复入队无害、
+     * interrupt 对已亡线程无效果、pipe.close 幂等 WARN);关管道后仍在途的回放会因管道已关
+     * 而失败,经 {@code TransactionConsumer.run} 的 fail-fast 路径(onFailure)退出——不排干
+     * 属预期(D7 语义:停机快于输出,未输出事务由复制槽在重启后重发,at-least-once)。
+     * <b>不可与 onRaw 并发调用</b>——与 close 同一调用方约束(Task 7 的 source 停机序
+     * session.close → reader.join → assembler.shutdownFast 保证 reader 已停,此处不再碰
+     * reader 侧结构)。
+     * 线程:停机线程(与 close 同)。
+     */
+    public void shutdownFast() {
+        if (consumerThread != null) {
+            handoffQueue.add(TxBuffer.POISON);
+            consumerThread.interrupt();
+        }
         try {
             pipe.close();
         } catch (RuntimeException e) {
@@ -609,9 +744,9 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
 
     /**
      * 交接:拷快照(oidSet 圈定,截止 lastIndex)→ 捕获封箱元数据 → state=HANDED_OFF → 入
-     * handedOff 记账 → 退出 LIVE 记账 → {@link #dispatchHandedOff}(Task 5 起同步直调
-     * processBucket,桶当即推 DONE)→ 维护低水位。立即返回——reader 路径从此不含回放。
-     * 只在 reader 线程调用。
+     * handedOff 记账 → 退出 LIVE 记账 → {@link #dispatchHandedOff}(按形态分流:同步直调
+     * processBucket 桶当即推 DONE;异步入交接队列由 consumer 线程回放)→ 维护低水位。
+     * 立即返回——reader 路径从此不含回放。只在 reader 线程调用。
      */
     private void handoff(TxBuffer bucket, TransactionKind kind, long commitLsn, long endLsn,
             Instant commitTimestamp) {
@@ -629,19 +764,24 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
-     * 交接分发(同步形态,引擎 handoff 同位调用):在调用线程直调
-     * {@link TransactionConsumer#processBucket}——事件流(Begin → TxChange* → End)的发出、
-     * End 之后的前沿累加与桶状态后两态都在其中对 onRaw 同步可见;回放失败异常直传调用方
-     * (fail-fast,End 永不发、前沿不推进)。Task 6 的异步形态再按 consumer 线程是否存在
-     * 分流(直调 vs 交接队列入队)。
+     * 交接分发(引擎 handoff 同位调用,按形态分流):同步形态(consumerThread 为 null)在调用
+     * 线程直调 {@link TransactionConsumer#processBucket}——事件流(Begin → TxChange* → End)
+     * 的发出、End 之后的前沿累加与桶状态后两态都对 onRaw 同步可见,回放失败异常直传调用方
+     * (fail-fast,End 永不发、前沿不推进);异步形态交接入队({@link #handoffQueue}),FIFO
+     * 保证交接序即提交序,回放交由 consumer 线程异步完成——reader 路径从此不含回放。
      * 调用点位于 liveCount 递减之后、maintainWatermarks 之前(与引擎 handoff 同位)——
-     * 桶此刻已冻结,消费侧可安全只读;processBucket 把桶推到 DONE 后,maintainWatermarks
-     * 即在同一个 handoff 里把它惰性清出交接记账。
+     * 桶此刻已冻结,消费侧可安全只读;同步形态下 processBucket 把桶推到 DONE 后,
+     * maintainWatermarks 即在同一个 handoff 里把它惰性清出交接记账(异步形态下清出延后到
+     * 下一个完结点,期间该桶以非 DONE 状态钉住 CQ 删除低水位——防 consumer 未回放先删档)。
      *
      * @param bucket 刚冻结的交接桶(HANDED_OFF,封箱元数据与快照已就绪)
      */
     void dispatchHandedOff(TxBuffer bucket) {
-        consumer.processBucket(bucket);   // Task 5:同步直调;Task 6:按形态分流入队
+        if (consumerThread == null) {
+            consumer.processBucket(bucket);   // 同步消费(测试锚定路径):回放与回调在调用线程内联完成
+        } else {
+            handoffQueue.add(bucket);         // 异步形态:交接入队,consumer 线程取走回放
+        }
     }
 
     /**
@@ -685,8 +825,9 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
 
     /**
      * 输出前沿当前值(测试面):已输出事务 endLsn 的单调 max,End 之后才推进——同步形态下
-     * 前沿由组装器内部自持(引擎异步形态改由调用方穿入,Task 6 对齐),测试以本观测口断言
-     * "End 未达则前沿不动 / End 之后推进到 endLsn"。包私有机动,不是公开 API。
+     * 前沿由组装器内部自持,测试以本观测口断言"End 未达则前沿不动 / End 之后推进到 endLsn";
+     * 异步形态前沿由调用方穿入同一实例(本观测口与调用方持有的引用同值)。包私有机动,
+     * 不是公开 API。
      */
     long outputFrontierForTest() {
         return outputFrontier.get();
