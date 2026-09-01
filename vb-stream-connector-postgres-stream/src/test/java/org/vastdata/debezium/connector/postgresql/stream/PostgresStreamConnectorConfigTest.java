@@ -14,9 +14,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@link PostgresStreamConnectorConfig} 配置面单测:四个新配置项的默认值解析、
+ * {@link PostgresStreamConnectorConfig} 配置面单测:五个新配置项的默认值解析、
  * slot.streaming 的枚举校验(非法值拒收)、parallel×two_phase 联合校验
- * (spec §5.1 启动期 fail-fast)、ALL_FIELDS 对父集合的扩展完整性、大小写宽容。
+ * (spec §5.1 启动期 fail-fast)、slot.feedback.interval.ms 的正整数校验与毫秒→秒换算、
+ * ALL_FIELDS 对父集合的扩展完整性、大小写宽容。
  * 纯构造 + {@code Configuration.validate(Field.Set)} 断言,不连库、不起 Connect runtime。
  */
 class PostgresStreamConnectorConfigTest {
@@ -114,5 +115,52 @@ class PostgresStreamConnectorConfigTest {
         assertEquals(StreamingMode.OFF,
                 new PostgresStreamConnectorConfig(configWith(Map.of("slot.streaming", "off"))).streamingMode(),
                 "小写 off 应解析为 OFF");
+    }
+
+    /**
+     * 用例⑥反馈间隔默认:slot.feedback.interval.ms 不配置时默认 10000ms,
+     * feedbackIntervalSeconds() 整除换算为 10 秒——复制会话 run 循环的 forceUpdateStatus
+     * 节流周期(默认错位会静默改变 LSN 反馈频率,运维面从 pg_stat_replication 读到的进度随之失真)。
+     */
+    @Test
+    void feedbackIntervalDefaultsToTenSeconds() {
+        PostgresStreamConnectorConfig config = new PostgresStreamConnectorConfig(configWith(Map.of()));
+        assertEquals(10, config.feedbackIntervalSeconds(), "缺省 10000ms 应换算为 10 秒反馈间隔");
+    }
+
+    /**
+     * 用例⑦正整数校验:slot.feedback.interval.ms=0 不满足 isPositiveInteger,validate
+     * 恰好 1 条错误——启动期把非正值挡在连库之前(0 或负数进 run 循环会让状态包发送节流失控)。
+     */
+    @Test
+    void nonPositiveFeedbackIntervalRejected() {
+        Map<String, ConfigValue> problems = configWith(Map.of("slot.feedback.interval.ms", "0"))
+                .validate(PostgresStreamConnectorConfig.ALL_FIELDS);
+        assertEquals(1, problems.get("slot.feedback.interval.ms").errorMessages().size(),
+                "非正整数应恰好 1 条校验错误");
+    }
+
+    /**
+     * 用例⑧显式值换算 + ALL_FIELDS 收录:15000ms 显式配置换算 15 秒(毫秒→秒整除,
+     * 亚秒值截断语义见 getter javadoc);ALL_FIELDS 与 getConfigFields() 同源含新名
+     * slot.feedback.interval.ms——证明是父集合的继续扩展而非漏挂。
+     */
+    @Test
+    void feedbackIntervalExplicitValueConvertsAndFieldJoinsAllFields() {
+        assertEquals(15, new PostgresStreamConnectorConfig(configWith(Map.of("slot.feedback.interval.ms", "15000")))
+                .feedbackIntervalSeconds(), "显式 15000ms 应换算为 15 秒");
+
+        Set<String> names = new HashSet<>();
+        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+            names.add(field.name());
+        }
+        assertTrue(names.contains("slot.feedback.interval.ms"), "ALL_FIELDS 应含 slot.feedback.interval.ms");
+
+        Set<String> connectorFieldNames = new HashSet<>();
+        for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
+            connectorFieldNames.add(field.name());
+        }
+        assertTrue(connectorFieldNames.contains("slot.feedback.interval.ms"),
+                "getConfigFields() 返回的 ALL_FIELDS 应同含新配置名");
     }
 }

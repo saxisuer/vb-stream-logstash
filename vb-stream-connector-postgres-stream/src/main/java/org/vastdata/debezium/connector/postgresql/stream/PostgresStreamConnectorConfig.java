@@ -12,16 +12,17 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
 
 /**
  * 流式连接器配置:在父类 {@link PostgresConnectorConfig} 的完整配置面之上追加
- * 四个本模块专属配置项——slot.streaming(流式档位)、slot.two.phase(两阶段提交)、
+ * 五个本模块专属配置项——slot.streaming(流式档位)、slot.two.phase(两阶段提交)、
  * pipe.dir / pipe.roll.cycle(reader 与 consumer 之间的 Chronicle Queue 管道参数,
- * 对应引擎侧 {@code vb.pipe.dir} / {@code vb.pipe.rollCycle})。
+ * 对应引擎侧 {@code vb.pipe.dir} / {@code vb.pipe.rollCycle})、slot.feedback.interval.ms
+ * (复制会话的 LSN 反馈节流周期,对应引擎侧 {@code vb.pg.feedbackSeconds},默认 10 秒)。
  *
  * <p>校验语义(spec §5.1 启动期 fail-fast):slot.streaming 只接受
  * OFF/ON/PARALLEL(大小写宽容);PARALLEL 档必须搭配 slot.two.phase=true,
  * 否则 {@link #validateSlotStreaming} 记 1 条问题并使配置整体不通过——
  * PG 侧 parallel 流式解码以 two_phase 为前置,漏配到运行期才失败代价过高。
  *
- * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 扩展 4 新 Field(floor 语义,父类必填项、
+ * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 扩展 5 新 Field(floor 语义,父类必填项、
  * 校验器全部保留),供任务侧配置完整性校验;Connect REST 暴露面见
  * {@link PostgresStreamConnector#config()}。
  *
@@ -55,13 +56,22 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
             .withType(Type.STRING)
             .withDefault("MINUTELY");
 
-    /** 本连接器的完整配置面:父 ALL_FIELDS + 4 新 Field(新 Set,不改父类静态集合)。 */
-    public static final Field.Set ALL_FIELDS = PostgresConnectorConfig.ALL_FIELDS.with(SLOT_STREAMING, SLOT_TWO_PHASE, PIPE_DIR, PIPE_ROLL_CYCLE);
+    /** LSN 反馈间隔(毫秒):复制会话 run 轮询循环 forceUpdateStatus 的节流周期(确认值经输出前沿封顶),默认 10000(=10 秒),正整数校验。 */
+    public static final Field SLOT_FEEDBACK_INTERVAL_MS = Field.create("slot.feedback.interval.ms")
+            .withDisplayName("Slot feedback interval (ms)")
+            .withType(Type.INT)
+            .withDefault(10000)
+            .withValidation(Field::isPositiveInteger);
+
+    /** 本连接器的完整配置面:父 ALL_FIELDS + 5 新 Field(新 Set,不改父类静态集合)。 */
+    public static final Field.Set ALL_FIELDS = PostgresConnectorConfig.ALL_FIELDS.with(SLOT_STREAMING, SLOT_TWO_PHASE, PIPE_DIR, PIPE_ROLL_CYCLE,
+            SLOT_FEEDBACK_INTERVAL_MS);
 
     /**
      * 以给定的不可变配置构造:单行 super 委派父构造器(public,负责快照模式、
-     * 处理模式等既有配置项的解析与默认值回落);本类不新增构造期解析——4 个新项
-     * 均由 getter 惰性读取,校验责任在 {@link #validateSlotStreaming}。
+     * 处理模式等既有配置项的解析与默认值回落);本类不新增构造期解析——5 个新项
+     * 均由 getter 惰性读取,校验责任在 {@link #validateSlotStreaming} 与各 Field
+     * 声明的校验器。
      *
      * @param config 连接器配置;应已通过 ALL_FIELDS 校验(未校验也能构造,行为按默认值回落)
      */
@@ -157,5 +167,16 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
      */
     public String pipeRollCycle() {
         return getConfig().getString(PIPE_ROLL_CYCLE);
+    }
+
+    /**
+     * 读取 LSN 反馈间隔并换算为秒:复制会话的 run 循环(pgjdbc withStatusInterval 同
+     * 粒度)以秒节流 forceUpdateStatus,配置面按 Kafka Connect 惯例用毫秒。整除换算——
+     * 亚秒值(如 500)截断为 0,即每轮都反馈(最快档,间隔计时永不满),不会静默翻倍。
+     *
+     * @return 配置毫秒值整除 1000;缺省时按 Field 默认值回落为 10
+     */
+    public int feedbackIntervalSeconds() {
+        return getConfig().getInteger(SLOT_FEEDBACK_INTERVAL_MS) / 1000;
     }
 }

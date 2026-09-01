@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link PostgresStreamConnector} 连接器级单测:taskClass/version 的模块元数据正确性、
- * config() 暴露面(Connect REST 可见的 ConfigDef 含 4 个新 key 且默认值与 Field 声明一致)、
+ * config() 暴露面(Connect REST 可见的 ConfigDef 含 5 个新 key 且默认值与 Field 声明一致)、
  * getConfigFields() 与 ALL_FIELDS 同源。纯方法级断言,不调 start(Map)——连接器生命周期
  * 留给 MS2 的 embedded engine 场景。
  */
@@ -38,17 +38,18 @@ class PostgresStreamConnectorTest {
     }
 
     /**
-     * 用例③config() 暴露面:父类 configDef() 之上补 4 个新 key,ConfigDef 默认值与
+     * 用例③config() 暴露面:父类 configDef() 之上补 5 个新 key,ConfigDef 默认值与
      * 对应 Field.defaultValue() 一致(REST 推荐值与引擎实际读取面错位会造成"界面写 A、
-     * 运行读 B"的隐性配置漂移);getConfigFields() 返回的 ALL_FIELDS 同含 4 个新名。
+     * 运行读 B"的隐性配置漂移);getConfigFields() 返回的 ALL_FIELDS 同含 5 个新名。
      */
     @Test
     void configDefExposesNewKeysWithFieldDefaults() {
         ConfigDef def = new PostgresStreamConnector().config();
         Map<String, Object> defaults = def.defaultValues();
-        Set<String> expected = Set.of("slot.streaming", "slot.two.phase", "pipe.dir", "pipe.roll.cycle");
+        Set<String> expected = Set.of("slot.streaming", "slot.two.phase", "pipe.dir", "pipe.roll.cycle",
+                "slot.feedback.interval.ms");
         assertTrue(defaults.keySet().containsAll(expected),
-                "Connect REST 暴露的 ConfigDef 应含 4 个新 key");
+                "Connect REST 暴露的 ConfigDef 应含 5 个新 key");
         assertEquals(PostgresStreamConnectorConfig.SLOT_STREAMING.defaultValue(), defaults.get("slot.streaming"),
                 "slot.streaming 的 ConfigDef 默认值应与 Field 声明一致");
         assertEquals(PostgresStreamConnectorConfig.SLOT_TWO_PHASE.defaultValue(), defaults.get("slot.two.phase"),
@@ -57,12 +58,14 @@ class PostgresStreamConnectorTest {
                 "pipe.dir 的 ConfigDef 默认值应与 Field 声明一致");
         assertEquals(PostgresStreamConnectorConfig.PIPE_ROLL_CYCLE.defaultValue(), defaults.get("pipe.roll.cycle"),
                 "pipe.roll.cycle 的 ConfigDef 默认值应与 Field 声明一致");
+        assertEquals(PostgresStreamConnectorConfig.SLOT_FEEDBACK_INTERVAL_MS.defaultValue(), defaults.get("slot.feedback.interval.ms"),
+                "slot.feedback.interval.ms 的 ConfigDef 默认值应与 Field 声明一致");
 
         Set<String> fieldNames = new HashSet<>();
         for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
             fieldNames.add(field.name());
         }
         assertTrue(fieldNames.containsAll(expected),
-                "getConfigFields() 返回的 ALL_FIELDS 应含 4 个新配置名");
+                "getConfigFields() 返回的 ALL_FIELDS 应含 5 个新配置名");
     }
 }
