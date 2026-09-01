@@ -1,12 +1,8 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.relational.Column;
-import io.debezium.relational.Table;
-import io.debezium.relational.TableId;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.vastdata.debezium.connector.postgresql.stream.protocol.PgOutputMessage;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TruncateOption;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleData;
@@ -14,7 +10,6 @@ import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleValue;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.UnknownMessageTypeException;
 
 import java.nio.file.Path;
-import java.sql.Types;
 import java.time.Instant;
 import java.util.List;
 import java.util.OptionalLong;
@@ -64,20 +59,11 @@ class StreamedTransactionAssemblerTest {
     static Path PIPE_DIR;
 
     /**
-     * 测试用 RelationResolver 假实现:wire Relation 原样包进 {@link ResolvedRelation},
-     * Table 用 {@code Table.editor()} 造最小形态(TableId 取 wire 的 schema/table,
-     * 列名沿用 wire 列序)——不连库;JDBC enrich 的真实现属 Task 7 的 RelationTableFactory。
+     * 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},
+     * 此前为本类私有的逐字重复工厂):wire Relation 原样包进 {@link ResolvedRelation},
+     * Table 取最小形态——不连库;JDBC enrich 的真实现属 Task 7 的 RelationTableFactory。
      */
-    private static final RelationResolver RESOLVER = (seq, wire) -> new ResolvedRelation(wire, tableOf(wire));
-
-    /** 责任:按 wire Relation 造最小 Debezium Table——TableId 取 wire 的 schema/table(同名互证),列沿 wire 列序全 text。 */
-    private static Table tableOf(PgOutputMessage.Relation wire) {
-        var editor = Table.editor().tableId(new TableId(null, wire.schema(), wire.table()));
-        for (var col : wire.columns()) {
-            editor.addColumn(Column.editor().name(col.name()).jdbcType(Types.VARCHAR).type("text").create());
-        }
-        return editor.create();
-    }
+    private static final RelationResolver RESOLVER = TestRelations.RESOLVER;
 
     /** 构造默认 oid 的两列 (id, v) Relation 字节,供单表场景使用。 */
     private static byte[] relation() {

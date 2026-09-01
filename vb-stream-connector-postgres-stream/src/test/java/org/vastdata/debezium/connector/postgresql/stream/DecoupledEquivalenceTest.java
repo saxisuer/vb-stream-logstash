@@ -1,15 +1,11 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.relational.Table;
-import io.debezium.relational.TableId;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.vastdata.debezium.connector.postgresql.stream.protocol.PgOutputMessage;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
 import java.nio.file.Path;
-import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -51,18 +47,8 @@ class DecoupledEquivalenceTest {
     @TempDir
     Path dir;
 
-    /** 测试用 RelationResolver 假实现(与 StreamedTransactionAssemblerTest 同款):wire + 最小 Debezium Table。 */
-    private static final RelationResolver RESOLVER = (seq, wire) -> new ResolvedRelation(wire, tableOf(wire));
-
-    /** 责任:按 wire Relation 造最小 Debezium Table——TableId 取 wire 的 schema/table(同名互证),列沿 wire 列序全 text。 */
-    private static Table tableOf(PgOutputMessage.Relation wire) {
-        var editor = Table.editor().tableId(new TableId(null, wire.schema(), wire.table()));
-        for (var col : wire.columns()) {
-            editor.addColumn(io.debezium.relational.Column.editor()
-                    .name(col.name()).jdbcType(Types.VARCHAR).type("text").create());
-        }
-        return editor.create();
-    }
+    /** 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},此前为本类私有的逐字重复工厂)。 */
+    private static final RelationResolver RESOLVER = TestRelations.RESOLVER;
 
     /**
      * 责任:生成一段多形态字节流(普通事务 + 两阶段 + 流式交错 + 子事务回滚,PgWire 构造,
