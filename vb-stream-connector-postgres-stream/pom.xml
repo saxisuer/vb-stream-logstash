@@ -21,6 +21,28 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- pgjdbc:显式 pin 根属性 42.7.13(MS1 终审交接项——压掉 Debezium 传递的 42.7.11,
+             复制会话 API 与引擎同版本;两模块若共类路径也不会分叉) -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+        </dependency>
+
+        <!-- Chronicle Queue:CQ 主缓冲管道(MS2 MessagePipe)。排除 chronicle-analytics
+             (core 反射缺类回落 MuteAnalytics,官方 DISCLAIMER 认可的关闭方式,照引擎 pom 同款) -->
+        <dependency>
+            <groupId>net.openhft</groupId>
+            <artifactId>chronicle-queue</artifactId>
+            <version>${chronicle-queue.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>net.openhft</groupId>
+                    <artifactId>chronicle-analytics</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
         <!-- Debezium PG 连接器:复用其 Config/Schema/Emitter/快照/offset 体系(spec D3);
              版本锚定 Central 最新 Final(spec §11/D6,2026-09-01 查证),3.7 线仅 Beta 不取 -->
         <dependency>
@@ -52,6 +74,52 @@
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
             <version>${logback.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- embedded engine IT(async 引擎是 3.x 唯一实现;tests classifier 提供测试基类) -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-embedded</artifactId>
+            <version>${debezium.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-embedded</artifactId>
+            <version>${debezium.version}</version>
+            <classifier>tests</classifier>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-util</artifactId>
+            <version>${debezium.version}</version>
+            <classifier>tests</classifier>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-runtime</artifactId>
+            <version>${kafka.connect-api.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-json</artifactId>
+            <version>${kafka.connect-api.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <version>4.3.0</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
