@@ -90,6 +90,7 @@
 ```
 
 注意:`${kafka.connect-api.version}` 与 slf4j-api 的版本都**无现成属性/管理**——流程:先只加 debezium 依赖,跑 `mvn -pl vb-stream-connector-postgres-stream dependency:tree` 从输出读出 `org.apache.kafka:connect-api` 与 `org.slf4j:slf4j-api` 的传递解析版本(与 debezium 3.6.1.Final 对齐),写入根 pom 新属性 `<kafka.connect-api.version>` 与 `<slf4j-api.version>`,再落上面两条带版本声明(本仓库无 dependencyManagement,无版本声明会直接构建失败)。两版本号记入提交说明留档。
+【2026-09-01 裁决更新:slf4j-api 后升 2.0.17(用户裁决,恢复 logback 测试域绑定,见 LoggingBindingTest),原 1.7.36 锚定指令作废】
 
 - [ ] **Step 3: Module 类**
 
