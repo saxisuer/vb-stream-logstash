@@ -15,6 +15,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
@@ -100,6 +102,9 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private final AtomicLong outputFrontier = new AtomicLong();
     /** 消费器(Task 5 起 dispatch 在调用线程直调其 processBucket;Task 6 的异步形态经交接队列由 consumer 线程驱动)。 */
     private final TransactionConsumer consumer;
+    /** 交接队列(reader 投入 → consumer 取出,Task 6 异步形态):无界 LinkedBlockingQueue,
+     *  FIFO 保证交接序即提交序;同步形态恒空(dispatch 直调 processBucket 不经队列)。 */
+    private final BlockingQueue<TxBuffer> handoffQueue = new LinkedBlockingQueue<>();
 
     /** 最近一次 append 的 index(reader 记账,替代 pipe.lastAppendedIndex()——空队列时后者会抛;
      *  未 append 过为 -1)。watermark 的"已落盘内容全是垃圾"上界由此 +1 派生。 */
@@ -170,7 +175,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
         this.pipe = new MessagePipe(pipeDir, pipeRollCycle);
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
         this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
-                this.pipe, this.outputFrontier, this.decodedObserver,
+                this.pipe, handoffQueue, this.outputFrontier, () -> { }, this.decodedObserver,
                 Objects.requireNonNull(tableResolver, "tableResolver"));
     }
 
