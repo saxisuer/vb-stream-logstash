@@ -12,13 +12,46 @@
 
     <artifactId>vb-stream-connector-postgres-stream</artifactId>
 
-    <!-- MS0 骨架：不引任何 Debezium / 引擎依赖（spec D2/D6/§11——Debezium 稳定版版本号 MS1 定，
-         引擎类不 import）。此处仅挂 JUnit 以保证模块测试骨架就绪。 -->
+    <!-- 模块边界（spec D2）：不依赖 vb-stream-engine（引擎类不 import），协议层只面向 Debezium / Kafka Connect API。 -->
     <dependencies>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>${junit-jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Debezium PG 连接器:复用其 Config/Schema/Emitter/快照/offset 体系(spec D3);
+             版本锚定 Central 最新 Final(spec §11/D6,2026-09-01 查证),3.7 线仅 Beta 不取 -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connector-postgres</artifactId>
+            <version>${debezium.version}</version>
+        </dependency>
+
+        <!-- Kafka Connect API:Connector/Task/ConfigDef 编译面;运行期由 Connect runtime 提供 -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-api</artifactId>
+            <version>${kafka.connect-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- slf4j:日志门面(Debezium 同款 provided 姿态;实现由运行环境/测试域 logback 提供)。
+             2.x 与 Debezium(1.7 编译)二进制兼容,ServiceLoader 绑定恢复 logback 1.5——
+             2026-09-01 用户裁决:1.7.36 被 provided 直连钉住后,logback 1.3+ 无 StaticLoggerBinder,测试域 NOP -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- 测试域日志实现 -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
