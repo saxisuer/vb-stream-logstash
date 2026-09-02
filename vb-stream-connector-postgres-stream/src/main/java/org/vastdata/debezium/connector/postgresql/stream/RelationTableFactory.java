@@ -6,6 +6,7 @@ import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableEditor;
 import io.debezium.relational.TableId;
+import io.debezium.util.Strings;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.PgOutputMessage;
 
 import java.sql.SQLException;
@@ -27,6 +28,10 @@ import java.util.Set;
  * <ul>
  *   <li><b>列序 = wire 列序</b>(协议列序是元组位序的真源,Table 列按到达顺序建)——
  *       vanilla 逐 wire 列建 ColumnMetaData 后依序 resolveRelationFromMetadata 同构</li>
+ *   <li><b>列名去引号</b>(DBZ-298):wire 列名经 {@code Strings.unquoteIdentifierPart}
+ *       落地——带引号创建的标识符 pgoutput 原样发送(引号保留),而 JDBC 元数据名不带引号,
+ *       不去引号则 enrich 按名 miss 且 PK retainAll 误剔键列(vanilla 在解码点做同款
+ *       unquote;schema/table 名 vanilla 无此处理,照旧原样)</li>
  *   <li><b>类型五件套</b>经 {@link RelationMetadataSource#type(int, int)}(生产实现 =
  *       TypeRegistry.get(oid) + typmod 精度换算);ColumnEditor 签名注意
  *       {@code type(String, String)} 双参(名 + 带修饰表达式),无 typeName 方法</li>
@@ -97,7 +102,10 @@ public final class RelationTableFactory implements RelationResolver {
         Set<String> seenLowercaseNames = new HashSet<>();
         List<Column> columns = new ArrayList<>(wire.columns().size());
         for (var wireColumn : wire.columns()) {
-            String columnName = wireColumn.name();
+            // DBZ-298 口径:pgoutput 对带引号创建的标识符按原样发送列名(引号保留),
+            // 而 JDBC 元数据里的名字不带引号——不去引号则 enrich 按名 miss、PK retainAll
+            // 误剔键列(vanilla handleRelationMessage 在解码点做同款 unquote,我们在建表点做)
+            String columnName = Strings.unquoteIdentifierPart(wireColumn.name());
             if (!seenLowercaseNames.add(columnName.toLowerCase())) {
                 throw new DebeziumException(String.format(
                         "表 '%s' 存在仅大小写不同的重名列 '%s':列名错位会造成数据污染,请改名后重试",

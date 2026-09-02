@@ -17,7 +17,8 @@ import java.util.Objects;
  * <p><b>连接供给器的 fail-fast 口径(MS2 已文档化限制)</b>:vanilla 在流式线程上持有
  * 复制连接,数组/未知类型列的解析会经 {@code PgConnectionSupplier} 取活连接
  * (PgArray 构造等);本连接器的 consumer 线程不持有任何 JDBC 连接(main 连接归
- * reader 线程的 'R' enrich 独占,R3),故供给器直接抛 SQLException 终止——
+ * reader 线程的 'R' enrich 独占,R3),故供给器直接抛 {@link DebeziumException}
+ * (非受检,经供给器的受检签名合法上抛)终止——
  * 数组与未注册类型的实时转换属 MS2 不支持的列族,静默错值比 fail-fast 更糟。
  * Task 8 IT 起按需重议(如 reader 线程旁路代转)。
  *

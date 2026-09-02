@@ -193,4 +193,38 @@ class RelationTableFactoryTest {
                 () -> new RelationTableFactory(source).resolve(1L, decodeRelation()));
         assertEquals("boom", e.getCause().getMessage());
     }
+
+    /**
+     * 带引号标识符列名(DBZ-298 修复回归):pgoutput 对引号创建的列原样发送列名(引号保留),
+     * 而 JDBC 元数据名不带引号——工厂须先去引号再比对:①建出的 Table 列名去引号;
+     * ②enrich 按名命中(可选性取 JDBC 而非缺省 true);③PK retainAll 不误剔键列
+     * (不去引号时 "my id" 与 my id 不等,键被剔、key schema 错——本用例即该 bug 的锚)。
+     */
+    @Test
+    void unquotesQuotedColumnNamesBeforeJdbcEnrichmentAndPkRetention() {
+        FakeMetadataSource source = new FakeMetadataSource();
+        registerTypes(source);
+        TableId tableId = new TableId(null, "public", "t_q");
+        // JDBC 侧登记<b>不带引号</b>的名字(系统目录的真实形态);引号列非空、带默认值
+        var quotedPk = Column.editor().name("my id").jdbcType(Types.INTEGER).type("int4").optional(false).create();
+        var quotedV = Column.editor().name("my v").jdbcType(Types.VARCHAR).type("varchar").optional(true)
+                .defaultValueExpression("'d'").create();
+        source.columnsByTable.put(tableId, List.of(quotedPk, quotedV));
+        source.pkByTable.put(tableId, List.of("my id"));
+
+        byte[] raw = PgWire.relation(OID, "public", "t_q", 'd',
+                new PgWire.Col("\"my id\"", true, 23, -1),
+                new PgWire.Col("\"my v\"", false, 25, -1));
+        PgOutputMessage.Relation wire = (PgOutputMessage.Relation) new PgOutputStreamDecoder(MODE)
+                .decode(ByteBuffer.wrap(raw));
+        Table table = new RelationTableFactory(source).resolve(1L, wire).table();
+
+        assertEquals(List.of("my id", "my v"),
+                table.columns().stream().map(Column::name).toList(),
+                "Table 列名去引号落地(与 JDBC 元数据同名互证)");
+        assertFalse(table.columns().get(0).isOptional(), "enrich 按去引号名命中:可选性取 JDBC");
+        assertEquals(Optional.of("'d'"), table.columns().get(1).defaultValueExpression(), "默认值同理命中");
+        assertEquals(List.of("my id"), table.primaryKeyColumnNames(),
+                "PK retainAll 不误剔引号键列(key schema 正确性锚点)");
+    }
 }

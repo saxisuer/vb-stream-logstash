@@ -85,20 +85,19 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
     private OffsetContext.Loader<PostgresOffsetContext> offsetContextLoader = null;
 
     private final ReentrantLock commitLock = new ReentrantLock();
-    private PostgresStreamConnectorConfig connectorConfig;
 
     /**
      * 构造任务上下文:原始配置 + 本连接器 config 包装 + 空自定义指标标签。
      * 返回值不可为 null——基类 start(Map) 立即解引用;类型参数取父类
      * {@code PostgresConnectorConfig}({@link StreamPostgresSchema} 的 protected 构造
-     * 链要求,实例配置仍是 {@link PostgresStreamConnectorConfig})。
+     * 链要求,实例配置仍是 {@link PostgresStreamConnectorConfig},start 另建局部实例)。
      *
      * @param config 任务的完整配置(应为已通过 ALL_FIELDS 校验的原始配置)
      * @return 携带本连接器 config 的非 null 上下文
      */
     @Override
     public CdcSourceTaskContext<? extends CommonConnectorConfig> preStart(Configuration config) {
-        connectorConfig = new PostgresStreamConnectorConfig(config);
+        PostgresConnectorConfig connectorConfig = new PostgresStreamConnectorConfig(config);
         taskContext = new CdcSourceTaskContext<>(config, connectorConfig, Map.of());
         return taskContext;
     }
