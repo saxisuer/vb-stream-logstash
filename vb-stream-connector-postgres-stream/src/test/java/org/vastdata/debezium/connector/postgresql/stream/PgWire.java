@@ -123,6 +123,25 @@ public final class PgWire {
         return new Wire().type('Y').i32(typeOid).str("pg_catalog").str(name).toByteArray();
     }
 
+    /** 富 Relation 列描述(供 {@link PgWire#relation(int, String, String, char, Col...)}):名称/键旗标/类型 oid/typmod 全显式。 */
+    public record Col(String name, boolean key, int typeId, int typmod) {
+    }
+
+    /**
+     * 责任:构造<b>全显式</b>的 Relation('R')——schema/replicaIdentity/逐列
+     * (flags bit0=key, name, typeId, typmod)均由调用方给出(RelationTableFactory 单测
+     * 需要类型 oid/typmod 的真实变化面,简版 {@link #relation(int, String, String...)}的
+     * 占位约定不够用)。
+     * 边界:cols 为空产出零列表(布局合法,调用方自负语义)。
+     */
+    public static byte[] relation(int oid, String schema, String table, char replicaIdentity, Col... cols) {
+        Wire w = new Wire().type('R').i32(oid).str(schema).str(table).i8(replicaIdentity).i16(cols.length);
+        for (Col col : cols) {
+            w.i8(col.key() ? 0x01 : 0x00).str(col.name()).i32(col.typeId()).i32(col.typmod());
+        }
+        return w.toByteArray();
+    }
+
     /**
      * 责任:构造 Origin('O')——I64 originCommitLsn(占位 1)+ name CString。
      * 组装器对 'O' 直接 DEBUG 丢弃,字节内容仅保持布局合法。
