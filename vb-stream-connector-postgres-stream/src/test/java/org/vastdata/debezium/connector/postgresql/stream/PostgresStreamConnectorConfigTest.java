@@ -1,6 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.config.Configuration;
+import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.apache.kafka.common.config.ConfigValue;
 import org.junit.jupiter.api.Test;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
@@ -14,9 +15,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@link PostgresStreamConnectorConfig} 配置面单测:四个新配置项的默认值解析、
+ * {@link PostgresStreamConnectorConfig} 配置面单测:五个新配置项的默认值解析、
  * slot.streaming 的枚举校验(非法值拒收)、parallel×two_phase 联合校验
- * (spec §5.1 启动期 fail-fast)、ALL_FIELDS 对父集合的扩展完整性、大小写宽容。
+ * (spec §5.1 启动期 fail-fast)、slot.feedback.interval.ms 的正整数校验与毫秒→秒换算、
+ * ALL_FIELDS 对父集合的扩展完整性、大小写宽容。
  * 纯构造 + {@code Configuration.validate(Field.Set)} 断言,不连库、不起 Connect runtime。
  */
 class PostgresStreamConnectorConfigTest {
@@ -42,7 +44,7 @@ class PostgresStreamConnectorConfigTest {
 
     /**
      * 用例①默认值解析:四项全不配置时,streamingMode() 解析为 ON、twoPhase() 为 true、
-     * pipeDir() 为 pg-stream-pipe-queue、pipeRollCycle() 为 MINUTELY——与 Field 声明的
+     * pipeDir() 为 pg-stream-pipe-queue、rollCycle() 为 MINUTELY——与 Field 声明的
      * 默认值一一对应(MS2 管道与复制流启动按此默认面接线,默认错位会静默改变行为)。
      */
     @Test
@@ -51,7 +53,7 @@ class PostgresStreamConnectorConfigTest {
         assertEquals(StreamingMode.ON, config.streamingMode(), "slot.streaming 默认应解析为 ON");
         assertTrue(config.twoPhase(), "slot.two.phase 默认应为 true");
         assertEquals("pg-stream-pipe-queue", config.pipeDir(), "pipe.dir 默认应为引擎侧管道目录名");
-        assertEquals("MINUTELY", config.pipeRollCycle(), "pipe.roll.cycle 默认应为 MINUTELY");
+        assertEquals(LegacyRollCycles.MINUTELY, config.rollCycle(), "pipe.roll.cycle 默认应为 MINUTELY");
     }
 
     /**
@@ -114,5 +116,94 @@ class PostgresStreamConnectorConfigTest {
         assertEquals(StreamingMode.OFF,
                 new PostgresStreamConnectorConfig(configWith(Map.of("slot.streaming", "off"))).streamingMode(),
                 "小写 off 应解析为 OFF");
+    }
+
+    /**
+     * 用例⑥反馈间隔默认:slot.feedback.interval.ms 不配置时默认 10000ms,
+     * feedbackIntervalSeconds() 整除换算为 10 秒——复制会话 run 循环的 forceUpdateStatus
+     * 节流周期(默认错位会静默改变 LSN 反馈频率,运维面从 pg_stat_replication 读到的进度随之失真)。
+     */
+    @Test
+    void feedbackIntervalDefaultsToTenSeconds() {
+        PostgresStreamConnectorConfig config = new PostgresStreamConnectorConfig(configWith(Map.of()));
+        assertEquals(10, config.feedbackIntervalSeconds(), "缺省 10000ms 应换算为 10 秒反馈间隔");
+    }
+
+    /**
+     * 用例⑦正整数校验:slot.feedback.interval.ms=0 不满足 isPositiveInteger,validate
+     * 恰好 1 条错误——启动期把非正值挡在连库之前(0 或负数进 run 循环会让状态包发送节流失控)。
+     */
+    @Test
+    void nonPositiveFeedbackIntervalRejected() {
+        Map<String, ConfigValue> problems = configWith(Map.of("slot.feedback.interval.ms", "0"))
+                .validate(PostgresStreamConnectorConfig.ALL_FIELDS);
+        assertEquals(1, problems.get("slot.feedback.interval.ms").errorMessages().size(),
+                "非正整数应恰好 1 条校验错误");
+    }
+
+    /**
+     * 用例⑧显式值换算 + ALL_FIELDS 收录:15000ms 显式配置换算 15 秒(毫秒→秒整除,
+     * 亚秒值截断语义见 getter javadoc);ALL_FIELDS 与 getConfigFields() 同源含新名
+     * slot.feedback.interval.ms——证明是父集合的继续扩展而非漏挂。
+     */
+    @Test
+    void feedbackIntervalExplicitValueConvertsAndFieldJoinsAllFields() {
+        assertEquals(15, new PostgresStreamConnectorConfig(configWith(Map.of("slot.feedback.interval.ms", "15000")))
+                .feedbackIntervalSeconds(), "显式 15000ms 应换算为 15 秒");
+
+        Set<String> names = new HashSet<>();
+        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+            names.add(field.name());
+        }
+        assertTrue(names.contains("slot.feedback.interval.ms"), "ALL_FIELDS 应含 slot.feedback.interval.ms");
+
+        Set<String> connectorFieldNames = new HashSet<>();
+        for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
+            connectorFieldNames.add(field.name());
+        }
+        assertTrue(connectorFieldNames.contains("slot.feedback.interval.ms"),
+                "getConfigFields() 返回的 ALL_FIELDS 应同含新配置名");
+    }
+
+    /**
+     * 用例⑨rollCycle() 枚举解析默认:pipe.roll.cycle 不配置时 {@code rollCycle()} 返回
+     * {@link LegacyRollCycles#MINUTELY}——管道装配(MessagePipe 构造)直接消费枚举实例,
+     * 默认错位会同时改变滚动文件粒度与低水位删除的档位节奏。
+     */
+    @Test
+    void rollCycleDefaultsToMinutelyEnum() {
+        PostgresStreamConnectorConfig config = new PostgresStreamConnectorConfig(configWith(Map.of()));
+        assertEquals(LegacyRollCycles.MINUTELY, config.rollCycle(),
+                "pipe.roll.cycle 默认应解析为 LegacyRollCycles.MINUTELY 枚举单例");
+    }
+
+    /**
+     * 用例⑩大小写宽容:minutely/houRly 经 {@code rollCycle()} 解析为同一枚举单例
+     * (MINUTELY/HOURLY)——校验器与 getter 两侧都按 equalsIgnoreCase 在 LegacyRollCycles
+     * 中查找(引擎 PipeConfig.parseRollCycle 同语义),配置面不必整大写。
+     */
+    @Test
+    void rollCycleIsCaseInsensitive() {
+        assertEquals(LegacyRollCycles.MINUTELY,
+                new PostgresStreamConnectorConfig(configWith(Map.of("pipe.roll.cycle", "minutely"))).rollCycle(),
+                "小写 minutely 应解析为 MINUTELY");
+        assertEquals(LegacyRollCycles.HOURLY,
+                new PostgresStreamConnectorConfig(configWith(Map.of("pipe.roll.cycle", "houRly"))).rollCycle(),
+                "混合大小写 houRly 应解析为 HOURLY");
+    }
+
+    /**
+     * 用例⑪未知 rollCycle 拒收:pipe.roll.cycle=NOPE 时 validate 恰好 1 条错误且消息附
+     * 可用值清单(以 MINUTELY 为代表)——启动期把拼写错误挡在建管道之前(残余到管道构造
+     * 后才炸会拖垮 reader 线程,且队列目录可能已被 wipe)。
+     */
+    @Test
+    void unknownRollCycleRejectedWithUsableValues() {
+        Map<String, ConfigValue> problems = configWith(Map.of("pipe.roll.cycle", "NOPE"))
+                .validate(PostgresStreamConnectorConfig.ALL_FIELDS);
+        assertEquals(1, problems.get("pipe.roll.cycle").errorMessages().size(),
+                "未知滚动周期应恰好 1 条校验错误");
+        assertTrue(problems.get("pipe.roll.cycle").errorMessages().get(0).contains("MINUTELY"),
+                "错误消息应附可用值清单(以 MINUTELY 为代表)");
     }
 }

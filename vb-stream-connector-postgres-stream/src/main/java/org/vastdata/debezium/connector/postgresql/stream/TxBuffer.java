@@ -1,0 +1,69 @@
+package org.vastdata.debezium.connector.postgresql.stream;
+
+import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * 组装桶:纯 CQ index 段记账——桶内不持有任何 payload 字节,堆占用只有元数据
+ * (段数 × long[2] + oid/aborted 集合)。数据消息字节只在 reader 追加时写一次 CQ、
+ * consumer 回放时读一次。引擎 {@code org.vastdata.vbstream.replication.TxBuffer} 的
+ * 1:1 重写(文字参照,非依赖)。
+ *
+ * <p>字段语义:firstIndex/lastIndex 是桶内数据单元的 CQ index 全局端点(firstIndex &lt; 0 = 空桶);
+ * firstIndex 兼任 registry 剪枝低水位候选(seq ≡ CQ index,见组装器 javadoc)。
+ * segments 是 [first,last] 闭区间连续段列表(追加顺序);连续段规则 = 上一次全局 append
+ * (含控制消息)是本桶数据消息才顺延,否则新开段——一段内全部是同桶数据单元(构造保证)。
+ *
+ * <p>hasPrefix 是桶级不变量:流式桶的单元恒在流块内收到(带 4 字节 xid 前缀)、普通/两阶段
+ * 桶恒在块外(无前缀);追加期校验,混现即 ISE fail-fast(协议不允许,防御)。回放据此决定
+ * {@code decodeSingle} 的 inStream 实参并重窥前缀值作 streamXid(子事务过滤用,
+ * Task 5 的回放器)。
+ *
+ * <p>冻结语义:桶在 LIVE 期间由 reader 记账;交接(handoff)瞬间 reader 把封箱元数据与
+ * Relation 版本快照写入冻结字段、state 推进到 HANDED_OFF,此后除 {@link #state} 外的
+ * 全部字段终生不变——consumer 线程只读消费。state 是唯一跨线程可变字段(volatile):
+ * reader 写 LIVE→HANDED_OFF,consumer 写 HANDED_OFF→OUTPUTTING→DONE。
+ *
+ * <p>线程约束:LIVE 期间仅 reader 线程触碰(单写者);交接后冻结字段任意线程只读,
+ * {@link #state} 按 volatile 单写者分段(reader 前段、consumer 后段)。
+ */
+final class TxBuffer {
+
+    final long xid;
+    String gid;
+    long firstIndex = -1L;
+    long lastIndex = -1L;
+    final ArrayDeque<long[]> segments = new ArrayDeque<>();
+    /** 追加的数据单元计数:reader 追加期随 appendUnit 自增、交接后只读——即
+     *  {@code TransactionEvent.Begin#expectedChanges} 的来源(aborted 过滤<b>前</b>的值)。 */
+    long unitCount;
+    /** 追加期窥出的 relation oid 集合(I/U/D 单 oid、T 多 oid、M 无)——交接快照圈定范围用。 */
+    final Set<Integer> oidSet = new HashSet<>();
+    boolean hasPrefix;
+    boolean prefixKnown = false;
+    final Set<Long> abortedSubxids = new HashSet<>();
+
+    /** 桶生命周期状态。写侧归属:reader 写到 HANDED_OFF(交接即冻结),consumer 写后两态。唯一跨线程可变字段。 */
+    volatile BucketState state = BucketState.LIVE;
+    /** 交接时捕获的封箱元数据(来自提交控制消息 live 解码)。冻结字段。 */
+    TransactionKind kind;
+    /** 交接时捕获的提交记录 LSN(Commit/StreamCommit/CommitPrepared 对应字段)。冻结字段。 */
+    long commitLsn;
+    /** 交接时捕获的提交结束 LSN(前沿累加用)。冻结字段。 */
+    long endLsn;
+    /** 交接时捕获的提交时间戳。冻结字段。 */
+    Instant commitTimestamp;
+    /** 交接时从 registry 拷出的版本快照(oidSet 圈定,截止 lastIndex)。冻结字段;空桶为空快照。 */
+    RelationSnapshot relationSnapshot;
+    /** 交接时刻(nanoTime)——consumer 统计最老滞留用。冻结字段。 */
+    long handoffNanos;
+
+    /** 毒丸哨兵:consumer 循环见到即退出(close 排干协议,Task 6)。xid=-1 与真实 xid(无符号 Int32 值域)区分。 */
+    static final TxBuffer POISON = new TxBuffer(-1L);
+
+    TxBuffer(long xid) {
+        this.xid = xid;
+    }
+}

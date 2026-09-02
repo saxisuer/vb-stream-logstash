@@ -10,7 +10,7 @@ import io.debezium.connector.postgresql.PostgresConnector;
  * 流式连接器的 Connect 入口:继承 {@link PostgresConnector} 复用其插槽管理、
  * 连接校验等生命周期骨架,仅做三处最小覆盖——任务类指向本模块的
  * {@link PostgresStreamConnectorTask}、版本/名称取自本模块 {@link Module}、
- * Connect REST 配置暴露面在父类 configDef() 之上补 4 个新配置项。
+ * Connect REST 配置暴露面在父类 configDef() 之上补 5 个新配置项。
  *
  * <p>MS1 形态:仅元数据与配置面,不改变连接器启动/校验行为;
  * 流式源协调器的接入在 MS2 经任务的 start(Configuration) 完成。
@@ -40,11 +40,11 @@ public class PostgresStreamConnector extends PostgresConnector {
 
     /**
      * 构造 Connect REST 暴露的配置定义:取父类静态 configDef() 的可变副本
-     * (每次调用新建 ConfigDef,不改父类静态状态),再 define 4 个新配置项
+     * (每次调用新建 ConfigDef,不改父类静态状态),再 define 5 个新配置项
      * ——类型/默认值与 {@link PostgresStreamConnectorConfig} 的 Field 声明一一对应
      * (默认值显式取 Field.defaultValue(),防两处字面量漂移),重要性/描述为暴露面专用文案。
      *
-     * @return 含父类全部配置项 + 4 个新配置项的 {@link ConfigDef}
+     * @return 含父类全部配置项 + 5 个新配置项的 {@link ConfigDef}
      */
     @Override
     public ConfigDef config() {
@@ -61,6 +61,9 @@ public class PostgresStreamConnector extends PostgresConnector {
         def.define(PostgresStreamConnectorConfig.PIPE_ROLL_CYCLE.name(), ConfigDef.Type.STRING,
                 PostgresStreamConnectorConfig.PIPE_ROLL_CYCLE.defaultValue(), ConfigDef.Importance.LOW,
                 "Roll cycle of the Chronicle Queue pipe (LegacyRollCycles enum name, case-insensitive).");
+        def.define(PostgresStreamConnectorConfig.SLOT_FEEDBACK_INTERVAL_MS.name(), ConfigDef.Type.INT,
+                PostgresStreamConnectorConfig.SLOT_FEEDBACK_INTERVAL_MS.defaultValue(), ConfigDef.Importance.LOW,
+                "Interval in milliseconds between LSN status feedback to the server (the confirmed LSN is capped at the output frontier so unoutput transactions are resent after a crash). Values are truncated to whole seconds.");
         return def;
     }
 
