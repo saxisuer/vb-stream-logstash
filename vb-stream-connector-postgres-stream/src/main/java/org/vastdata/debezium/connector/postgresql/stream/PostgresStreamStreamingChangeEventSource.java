@@ -45,7 +45,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * consumer 线程由 execute 创建、{@link #stopStreaming()} 收敛(次序:session.close →
  * reader.join(5s) → assembler.shutdownFast——D7 快速停机,已提交未输出事务由复制槽
  * 重发,at-least-once)。reader/consumer 失败经 {@link #fail(Throwable)} 汇聚到
- * errorHandler(vanilla 同款出口)。
+ * errorHandler(vanilla 同款出口;停机中 stopping 已置时忽略——shutdownFast 砸中在途回放
+ * 属正常收敛,不上报,Connect 记 STOPPED 而非 FAILED)。
  */
 public class PostgresStreamStreamingChangeEventSource
         implements StreamingChangeEventSource<PostgresPartition, PostgresOffsetContext> {
@@ -240,10 +241,18 @@ public class PostgresStreamStreamingChangeEventSource
 
     /**
      * 责任:失败汇聚——置 failed(收敛监督循环)并上报 errorHandler(vanilla 出口;
-     * Connect runtime 经 queue.poll 感知后停任务)。边界:多次调用可能重复上报
-     * (reader 与 consumer 同时失败时),errorHandler 以首报为准不影响停机语义。
+     * Connect runtime 经 queue.poll 感知后停任务)。停机中(stopping 已置)的一切失败
+     * 按正常收敛忽略(DEBUG 留痕):D7 的 shutdownFast 关管道会砸中在途回放,consumer 的
+     * onFailure→fail() 若无此守卫会把正常停机当真失败上报——Connect 记 FAILED 而非
+     * STOPPED(终审修复;runReader 的同款守卫由此统一收敛到本方法)。
+     * 边界:多次调用可能重复上报(reader 与 consumer 同时失败时),errorHandler 以
+     * 首报为准不影响停机语义。
      */
     private void fail(Throwable t) {
+        if (stopping) {
+            LOG.debug("停机期失败忽略(正常收敛的一部分): {}", t.getMessage());
+            return;
+        }
         failed.set(true);
         lastFailure = t;
         LOG.error("流式源失败,停机收敛: {}", t.getMessage(), t);

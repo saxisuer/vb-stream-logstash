@@ -208,29 +208,6 @@ public final class StreamPgTestEnv {
     }
 
     /**
-     * walsender 已发送位点(sent_lsn)的 long 形态——"reader 仍在接收"的服务端观测面:
-     * walsender 每向客户端写出一段解码输出即推进,与客户端确认位点(flush_lsn)独立。
-     *
-     * @param slotName 槽名
-     * @return sent_lsn;槽无活跃 walsender 抛 ISE(调用方应在建流后调用)
-     * @throws SQLException 查询失败原样上抛
-     */
-    public static long sentLsn(String slotName) throws SQLException {
-        try (Connection c = newSqlConnection();
-             PreparedStatement ps = c.prepareStatement(
-                     "SELECT r.sent_lsn FROM pg_stat_replication r "
-                             + "JOIN pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = ?")) {
-            ps.setString(1, slotName);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next() || rs.getString(1) == null) {
-                    throw new IllegalStateException("槽 " + slotName + " 无活跃 walsender,sent_lsn 不可查");
-                }
-                return LogSequenceNumber.valueOf(rs.getString(1)).asLong();
-            }
-        }
-    }
-
-    /**
      * 等待槽的 walsender 挂上(pg_stat_replication 出现该槽的行)——"建槽完成 +
      * START_REPLICATION 完成 + reader 循环在跑"的可观测汇合点。IT 在 start 引擎后、
      * 写入测试数据前必须等此条件:①建流前写入的事务 WAL 可能落在 restart_lsn 之前,

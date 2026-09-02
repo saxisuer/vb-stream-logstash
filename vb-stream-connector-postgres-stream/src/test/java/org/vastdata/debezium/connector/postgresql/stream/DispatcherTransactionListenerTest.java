@@ -60,6 +60,9 @@ class DispatcherTransactionListenerTest {
     /** 顶层事务 xid。 */
     private static final long XID = 4242L;
 
+    /** 流式单元携带的子事务 xid(SAVEPOINT 层级,与顶层 XID 不同)。 */
+    private static final long SUBXID = 9001L;
+
     /** 责任:离线构造最小合法配置(topic.prefix 是 TopicNamingStrategy 的必填项)。 */
     private static PostgresStreamConnectorConfig config() {
         Map<String, String> props = new HashMap<>();
@@ -181,13 +184,25 @@ class DispatcherTransactionListenerTest {
         return new TransactionEvent.Begin(XID, TransactionKind.NORMAL, null, END_LSN, END_LSN, COMMIT_TS, 1L);
     }
 
-    /** 一条 INSERT RowChange(seq 指向 v1 版本)。 */
+    /** 一条 INSERT RowChange(seq 指向 v1 版本,streamXid 空 = 非流式单元)。 */
     private static RowChange rowChange(long seq) {
         return new RowChange(DmlKind.INSERT,
                 new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
                         List.of(new RelationColumn("id", 25, -1, true), new RelationColumn("v", 25, -1, false))),
                 Optional.empty(), Optional.of(new TupleData(List.of(TupleValue.NULL, new TupleValue.Text("x")))),
                 OptionalLong.empty(), seq);
+    }
+
+    /**
+     * 一条带子事务 xid 的流式 INSERT RowChange:streamXid 是 SAVEPOINT 层级的子事务
+     * xid(终审修复的触发形态——子事务提交存活的变更到达 listener 时携带它)。
+     */
+    private static RowChange streamedSubxidRowChange(long seq) {
+        return new RowChange(DmlKind.INSERT,
+                new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
+                        List.of(new RelationColumn("id", 25, -1, true), new RelationColumn("v", 25, -1, false))),
+                Optional.empty(), Optional.of(new TupleData(List.of(TupleValue.NULL, new TupleValue.Text("x")))),
+                OptionalLong.of(SUBXID), seq);
     }
 
     /**
@@ -238,6 +253,26 @@ class DispatcherTransactionListenerTest {
         listener.onEvent(rowChange(35L));
         assertEquals(2, f.schema().installed.size(), "变更版本(列集变化)重装");
         assertEquals(3, f.dispatcher().dataChangeArgs.size());
+    }
+
+    /**
+     * 流式子事务单元的 source txId 同源:RowChange 携带子事务 xid(SUBXID,SAVEPOINT
+     * 层级——aborted 过滤正依赖该语义区分),但 updateWalPosition 写入 source 块的
+     * txId 必须恒取<b>顶层</b> xid(Begin 记住的 currentXid,与事务块 id 同源)——
+     * 若此处透传 subxid,SAVEPOINT 提交存活的变更会让首条记录 source.txId ≠ 事务块 id,
+     * TransactionMonitor 按"事务变更"补发空 END+BEGIN,事务元数据 topic 分裂(终审修复,
+     * Task 8 修的 id 同源缺口在子事务边界的复现形态)。断言面:offset 的 txId 键(记录
+     * source 块 txId 的同源写点)等于顶层 XID 而非 SUBXID;数据事件照常发射不受影响。
+     */
+    @Test
+    void streamedSubxidRowChangeReportsTopLevelTxId() {
+        Fixture f = fixture("id", "v");
+        f.listener().onEvent(begin());
+        f.listener().onEvent(streamedSubxidRowChange(11L));
+
+        assertEquals(XID, f.listener().offsetForTest().getOffset().get("txId"),
+                "source 块 txId 恒取顶层 xid——与事务块 id 同源(子事务 xid 不得透传)");
+        assertEquals(1, f.dispatcher().dataChangeArgs.size(), "数据事件照常发射");
     }
 
     /** Truncate/MsgChange:MS2 跳过发射(DEBUG 口径)——不装版本、不发数据事件。 */

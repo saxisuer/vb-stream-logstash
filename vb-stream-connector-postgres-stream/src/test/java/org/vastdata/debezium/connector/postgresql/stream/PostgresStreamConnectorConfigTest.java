@@ -44,7 +44,7 @@ class PostgresStreamConnectorConfigTest {
 
     /**
      * 用例①默认值解析:四项全不配置时,streamingMode() 解析为 ON、twoPhase() 为 true、
-     * pipeDir() 为 pg-stream-pipe-queue、pipeRollCycle() 为 MINUTELY——与 Field 声明的
+     * pipeDir() 为 pg-stream-pipe-queue、rollCycle() 为 MINUTELY——与 Field 声明的
      * 默认值一一对应(MS2 管道与复制流启动按此默认面接线,默认错位会静默改变行为)。
      */
     @Test
@@ -53,7 +53,7 @@ class PostgresStreamConnectorConfigTest {
         assertEquals(StreamingMode.ON, config.streamingMode(), "slot.streaming 默认应解析为 ON");
         assertTrue(config.twoPhase(), "slot.two.phase 默认应为 true");
         assertEquals("pg-stream-pipe-queue", config.pipeDir(), "pipe.dir 默认应为引擎侧管道目录名");
-        assertEquals("MINUTELY", config.pipeRollCycle(), "pipe.roll.cycle 默认应为 MINUTELY");
+        assertEquals(LegacyRollCycles.MINUTELY, config.rollCycle(), "pipe.roll.cycle 默认应为 MINUTELY");
     }
 
     /**

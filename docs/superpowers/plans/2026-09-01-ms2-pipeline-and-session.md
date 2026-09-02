@@ -228,6 +228,8 @@
 
 **验收场景(EndToEndStreamedTxIT)**:postgres:18 + `logical_decoding_work_mem=64kB`;表 + publication;`snapshot.mode=never` + `slot.streaming=parallel` + `slot.two.phase=true` + `provide.transaction.metadata=true`;单条连接开事务插 6 行×16KB 不可压缩载荷(行间 sleep 触发进行中驱逐)→ COMMIT → `consumeRecordsByTopic(N)` 断言:6 条 INSERT 记录进 topic、值结构列正确(text 列)、事务 topic 收 BEGIN/END、`source.lsn`=事务 endLsn 且组内一致;再验一个普通小事务。**ReaderUnblockedIT/FrontierCapIT/ReaderThroughputIT** 按 ENG-IT 同名测试翻译(断言面换成:记录数增长/confirmed_flush 钉住/节拍 35s)。
 
+【终审回写:snapshot.mode 用 no_data——3.6.1 SnapshotMode 枚举无 never】
+
 - [ ] **Step 1-5**:IT 先红后绿 → commit `feat: MS2 端到端验收——流式大事务进 Kafka 记录 + reader 不阻塞 + frontier 封顶 IT + R1/R3 审计入档`
 
 ---

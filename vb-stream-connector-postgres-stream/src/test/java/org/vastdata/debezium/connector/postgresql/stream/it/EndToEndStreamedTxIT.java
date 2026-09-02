@@ -231,7 +231,8 @@ class EndToEndStreamedTxIT extends StreamITBase {
      * 单用例内保留——基座只在 @BeforeEach 删)→断言停机窗口前后的已提交事务最终全部
      * 到达。重复(同 id 多条)属 at-least-once 文档化行为,不去重逐条;引擎 A 停机前已
      * 消费的行是否重发取决于服务端 confirmed_flush 的采纳进度,不强制。关键步骤:
-     * 引擎 A 消费 3 行确认运行(每事务 BEGIN+数据+END,按数消费 15 条覆盖 3 事务)→
+     * 引擎 A 消费 3 行确认运行(单连接单事务 → BEGIN+3 数据+END 共 5 条记录,按数消费
+     * 恰 5 条,不多等)→
      * stopConnector(槽保留,walsender 随任务停机断开)→ 停机窗口写 2 行 → 引擎 B 同
      * offset 文件重启 → 再写 2 行 → await 轮询非阻塞排空累计,直到两阶段 id 并集
      * 覆盖全部 7 行(总数不确定——重复数未知,不能用按数消费)。
@@ -245,7 +246,7 @@ class EndToEndStreamedTxIT extends StreamITBase {
         Map<Integer, String> expected = new HashMap<>();
         expected.putAll(StreamPgTestEnv.insertIncompressibleRows(TABLE, 1, 3, 200));
         Set<Integer> phaseAIds = new HashSet<>();
-        for (SourceRecord r : recordsForTopic(consumeRecordsUnchecked(15), TOPIC)) {
+        for (SourceRecord r : recordsForTopic(consumeRecordsUnchecked(5), TOPIC)) {
             phaseAIds.add(((Struct) r.value()).getStruct("after").getInt32("id"));
         }
         assertEquals(Set.of(1, 2, 3), phaseAIds, "引擎 A 应先消费到首批 3 行(重启基线)");

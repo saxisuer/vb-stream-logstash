@@ -212,16 +212,6 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
     }
 
     /**
-     * 读取管道滚动周期名(LegacyRollCycles 枚举名的原样字符串形态,日志归因用;
-     * 管道装配请用已解析的 {@link #rollCycle()})。
-     *
-     * @return 配置的周期名;缺省时按 Field 默认值回落为 MINUTELY
-     */
-    public String pipeRollCycle() {
-        return getConfig().getString(PIPE_ROLL_CYCLE);
-    }
-
-    /**
      * 解析管道滚动周期为枚举单例(MessagePipe 构造的直接入参形态):经
      * {@link #parseRollCycle} 大小写宽容解析。非法值已由 {@link #validateRollCycle}
      * 在启动期挡下,此处不再容错(未经校验直接构造时若值非法将抛

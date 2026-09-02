@@ -33,7 +33,10 @@ import java.util.Objects;
  *       shouldProvideTransactionMetadata 在 TransactionMonitor 内部裁决——无谓守卫</li>
  *   <li><b>RowChange</b>:按 (oid, seq) 从桶快照解析 asOf Table → 版本安装(值相等短路;
  *       变更即 applySchemaChangesForTable 重建 TableSchema,DDL 稀疏可接受)→
- *       updateWalPosition 补 source 块的 table/txId/messageType →
+ *       updateWalPosition 补 source 块的 table/txId/messageType(txId 恒取顶层 xid——
+ *       流式单元携带的是<b>子事务</b> xid(aborted 过滤正依赖该语义),source 块 txId
+ *       必须与事务块 id(同为顶层 xid)同源,否则子事务存活的变更使 TransactionMonitor
+ *       按"事务变更"补发空 END+BEGIN,事务元数据 topic 分裂)→
  *       {@code dispatchDataChangeEvent(tableId, RowChangeEmitter)}</li>
  *   <li><b>Truncate/MsgChange</b>:MS2 跳过发射(DEBUG 留痕)——Truncate 变更族 MS3 补,
  *       LogicalMsg 映射(dispatchLogicalDecodingMessage)后续里程碑接</li>
@@ -169,9 +172,13 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
             schema.applySchemaChangesForTable(relationOid, table);
         }
         TableId tableId = table.id();
-        Long txId = change.streamXid().isPresent() ? change.streamXid().getAsLong() : currentXid;
+        // txId 恒取顶层 xid(currentXid),不用流式单元的 streamXid(那是子事务 xid——
+        // aborted 过滤正依赖该语义区分):source 块 txId 必须与事务块 id(同为顶层 xid,
+        // Long.toString 形态)同源,否则 SAVEPOINT 提交存活的子事务变更会让首条记录
+        // source.txId ≠ 事务块 id,TransactionMonitor 按"事务变更"补发空 END+BEGIN,
+        // 事务元数据 topic 分裂(终审修复;offset 不受影响——锚 endLsn 恒定)
         offsetContext.updateWalPosition(Lsn.valueOf(currentEndLsn), Lsn.valueOf(currentEndLsn),
-                currentCommitTimestamp, txId, null, tableId, envelopeOperation(change.dml()));
+                currentCommitTimestamp, currentXid, null, tableId, envelopeOperation(change.dml()));
         dispatch(() -> dispatcher.dispatchDataChangeEvent(partition, tableId,
                 new RowChangeEmitter(partition, offsetContext, clock, connectorConfig, valueMapper, table, change)));
     }

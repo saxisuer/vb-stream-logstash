@@ -277,15 +277,6 @@ public final class ReplicationSession implements AutoCloseable {
     }
 
     /**
-     * 读取流的最后接收位点:供上层在异常退出时打印续传位点。
-     *
-     * @return 流未启动时 {@link LogSequenceNumber#INVALID_LSN},否则 stream.getLastReceiveLSN()
-     */
-    public LogSequenceNumber lastReceiveLsn() {
-        return stream != null ? stream.getLastReceiveLSN() : LogSequenceNumber.INVALID_LSN;
-    }
-
-    /**
      * 关闭顺序:流 → 复制连接 → SQL 连接,各步 WARN 吸收(close 永不抛出,停机路径不
      * 被次生异常掩盖)。stream.close 置关闭标志,轮询循环经 isClosed 守卫/readPending
      * 抛错在 ≤100ms 内退出(一个空轮间歇)。
