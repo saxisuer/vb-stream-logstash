@@ -17,6 +17,9 @@ import io.debezium.pipeline.spi.SnapshotResult;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 
+import org.apache.kafka.connect.errors.ConnectException;
+
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -114,16 +117,30 @@ public class StreamChangeEventSourceFactory
 
         /**
          * 责任:立即返回 skipped——previousOffset 为 null 时经 initialContext 从 main
-         * 连接读当前 xlog 位点建初始上下文(时序在 reader 线程创建之前)。
-         * 边界:库查询失败抛 ConnectException(initialContext 语义,装配 fail-fast)。
+         * 连接读当前 xlog 位点建初始上下文(时序在 reader 线程创建之前)。initialContext
+         * 的 {@code txid_current()} 会给 main 连接(autoCommit=false)强制分配 XID,
+         * 查完随即 commit 收敛该事务——否则复制会话在<b>另一条连接</b>上执行的
+         * {@code pg_create_logical_replication_slot} 会为等解码一致点而等待这个永不
+         * 提交的事务,连接器自死锁(Task 8 IT 首跑实测)。
+         * 边界:库查询失败抛 ConnectException(initialContext 语义,装配 fail-fast);
+         * commit 失败同样 ConnectException(连接已不可用,后续装配必然失败,fail-fast)。
          */
         @Override
         public SnapshotResult<PostgresOffsetContext> execute(ChangeEventSourceContext context,
                                                              PostgresPartition partition,
                                                              PostgresOffsetContext previousOffset,
                                                              SnapshottingTask snapshottingTask) {
-            return SnapshotResult.skipped(previousOffset != null ? previousOffset
-                    : PostgresOffsetContext.initialContext(connectorConfig, mainConnection, clock));
+            if (previousOffset != null) {
+                return SnapshotResult.skipped(previousOffset);
+            }
+            PostgresOffsetContext initial = PostgresOffsetContext.initialContext(connectorConfig, mainConnection, clock);
+            try {
+                mainConnection.commit();
+            }
+            catch (SQLException e) {
+                throw new ConnectException("Failed to commit the initial offset read on the main connection", e);
+            }
+            return SnapshotResult.skipped(initial);
         }
 
         /** 责任:快照任务面——schema/数据快照均不做。 */

@@ -193,7 +193,9 @@ class DispatcherTransactionListenerTest {
     /**
      * 事务边界 offset:Begin 后 offsetContext.getOffset() 的 lsn 与 lsn_commit 皆等于
      * 事务 endLsn(此后本事务每条记录的 offset 同值——事务边界原子性的 offset 面),
-     * 同时 dispatcher 收到 "xid-"+xid 的 transactionStarted(带 Begin 的提交时间戳)。
+     * 同时 dispatcher 收到纯数字 xid 的 transactionStarted(带 Begin 的提交时间戳)——
+     * id 形态必须与 StreamEventMetadataProvider.getTransactionId 同源,否则
+     * TransactionMonitor 按事务变更补发空 END+新 BEGIN(Task 8 IT 实测)。
      */
     @Test
     void beginAnchorsOffsetAtTransactionBoundaryAndStartsTransaction() {
@@ -203,7 +205,7 @@ class DispatcherTransactionListenerTest {
         Map<String, ?> offset = f.listener().offsetForTest().getOffset();
         assertEquals(END_LSN, offset.get(PostgresOffsetContext.LAST_COMMIT_LSN_KEY), "lsn_commit = endLsn");
         assertEquals(END_LSN, offset.get("lsn"), "lsn = endLsn(记录随事务边界推进)");
-        assertEquals(List.of("started:xid-" + XID + "@" + COMMIT_TS), f.dispatcher().calls);
+        assertEquals(List.of("started:" + XID + "@" + COMMIT_TS), f.dispatcher().calls);
     }
 
     /**
@@ -260,7 +262,7 @@ class DispatcherTransactionListenerTest {
         f.listener().onEvent(begin());
         f.listener().onEvent(new TransactionEvent.End(XID, 0L));
 
-        assertEquals(List.of("started:xid-" + XID + "@" + COMMIT_TS, "committed@" + COMMIT_TS),
+        assertEquals(List.of("started:" + XID + "@" + COMMIT_TS, "committed@" + COMMIT_TS),
                 f.dispatcher().calls, "End 不带时间戳组件——listener 记住 Begin 的提交时间戳复用");
     }
 }

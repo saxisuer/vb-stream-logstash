@@ -21,6 +21,16 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- assertj:AbstractConnectorTest(Debezium 测试基类)的 start/断言路径直接调用
+             org.assertj.core.api.Assertions——tests classifier 不传递它,缺席即运行期
+             NoClassDefFoundError;3.27.x 与 DBZ 3.6.1 体系兼容(测试域专用) -->
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.27.7</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- pgjdbc:显式 pin 根属性 42.7.13(MS1 终审交接项——压掉 Debezium 传递的 42.7.11,
              复制会话 API 与引擎同版本;两模块若共类路径也不会分叉) -->
         <dependency>
@@ -84,6 +94,18 @@
             <version>${debezium.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- debezium-connector-common tests:AbstractConnectorTest 的消费断言路径
+             (consumeRecordsUntil)直接调用 io.debezium.data.VerifyRecord——该类在
+             3.x 拆分后留在 connector-common 的 tests classifier(旧坐标 debezium-core
+             已整体 relocate 为 connector-common),embedded/tests 不传递,缺席即运行期
+             NoClassDefFoundError -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connector-common</artifactId>
+            <version>${debezium.version}</version>
+            <classifier>tests</classifier>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>io.debezium</groupId>
             <artifactId>debezium-embedded</artifactId>
@@ -123,5 +145,26 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- it 包的集成测试以 *IT 命名(区别于离线单测 *Test),默认 includes
+                         不含该模式——显式补全(默认四模式照抄 + IT),使 mvn test 单命令
+                         与引擎 it 包同轮跑全部测试;根 pom 的 add-opens argLine 原样继承 -->
+                    <includes>
+                        <include>**/Test*.java</include>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                        <include>**/*TestCase.java</include>
+                        <include>**/*IT.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>

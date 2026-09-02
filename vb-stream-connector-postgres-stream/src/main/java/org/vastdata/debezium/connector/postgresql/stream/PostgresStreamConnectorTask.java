@@ -78,6 +78,8 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
     private volatile CdcSourceTaskContext<PostgresConnectorConfig> taskContext;
     private volatile ChangeEventQueue<DataChangeEvent> queue;
     private volatile PostgresConnection jdbcConnection;
+    /** bean registry 专属 JDBC 连接(命名豆 JDBC_CONNECTION 的载体,vanilla 同款独立连接)。 */
+    private volatile PostgresConnection beanRegistryJdbcConnection;
     private volatile ErrorHandler errorHandler;
     private volatile StreamPostgresSchema schema;
 
@@ -105,7 +107,8 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
     /**
      * 真装配(vanilla :101-284 的同序替换版)。次序:config 解析(charset 临时连接 →
      * 共享 TypeRegistry[1 参] → 连接工厂/main 连接[autoCommit false])→ 服务注册 →
-     * StreamPostgresSchema → partition/offset 装载 → queue(Builder)→ PostgresErrorHandler
+     * StreamPostgresSchema → partition/offset 装载 → 命名豆注册(vanilla :151-159,
+     * SnapshotterServiceProvider 的查找前置)→ queue(Builder)→ PostgresErrorHandler
      * → StreamEventMetadataProvider → SignalProcessor → PostgresEventDispatcher[12 参] →
      * NotificationService → ChangeEventSourceCoordinator[基类 11 参] → start → 返回。
      * 边界:任一步失败原样上抛(Connect 任务启动失败;临时连接取 charset 失败转
@@ -171,6 +174,19 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
                 getPreviousOffsets(this.partitionProvider, this.offsetContextLoader);
         final io.debezium.util.Clock clock = io.debezium.util.Clock.system();
         final PostgresOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
+
+        // 命名豆注册(vanilla :151-159 同款):SnapshotterServiceProvider 等服务供应商经
+        // beanRegistry.lookupByName(CONNECTOR_CONFIG) 取连接器配置,缺失即 NPE(Task 8
+        // IT 首跑实测的装配缺口)。JDBC_CONNECTION 用 bean registry 专属的独立新连接,
+        // 不复用 main 连接(R3:main 连接 execute 后由 reader 线程独占)
+        beanRegistryJdbcConnection = connectionFactory.newConnection();
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.CONFIGURATION, config);
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.DATABASE_SCHEMA, schema);
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.JDBC_CONNECTION, beanRegistryJdbcConnection);
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.VALUE_CONVERTER, valueConverter);
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.OFFSETS, previousOffsets);
+        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.CDC_SOURCE_TASK_CONTEXT, taskContext);
 
         final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry()
                 .tryGetService(SnapshotterService.class);
@@ -293,11 +309,20 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
 
     /**
      * 停机收敛(vanilla doStop 的裁剪版,复制流/组装器的收敛归协调器停机 → 流式源
-     * stopStreaming 的次序,不在此重复):main 连接 → schema → queue。
+     * stopStreaming 的次序,不在此重复):bean registry 连接(TRACE 容错,vanilla 同款)
+     * → main 连接 → schema → queue。
      * 边界:字段 null(启动中途失败)安全跳过。
      */
     @Override
     protected void doStop() {
+        try {
+            if (beanRegistryJdbcConnection != null) {
+                beanRegistryJdbcConnection.close();
+            }
+        }
+        catch (Exception e) {
+            LOGGER.trace("Error while closing JDBC bean registry connection", e);
+        }
         if (jdbcConnection != null) {
             jdbcConnection.close();
         }

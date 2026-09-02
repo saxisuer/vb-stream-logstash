@@ -25,8 +25,12 @@ import java.util.Objects;
  *   <li><b>Begin</b>:{@code offsetContext.updateCommitPosition(endLsn, endLsn)}——此后本
  *       事务每条记录 getOffset() 的 lsn 与 lsn_commit 皆 endLsn(SourceInfo.updateLastCommit
  *       同源双写,重启续传/事务边界原子性的 offset 面);随后
- *       {@code dispatchTransactionStartedEvent("xid-"+xid, commitTs)}(是否真发事务块
- *       由 shouldProvideTransactionMetadata 在 TransactionMonitor 内部裁决——无谓守卫)</li>
+ *       {@code dispatchTransactionStartedEvent(Long.toString(xid), commitTs)}——事务 id 取
+ *       纯数字形态,必须与 {@code StreamEventMetadataProvider.getTransactionId} 的返回同源:
+ *       两处不一致时 TransactionMonitor 在首个数据事件处按"事务变更"处理,给本事务补发
+ *       一对空 END+新 BEGIN(Task 8 IT 实测:每事务多两条事务块记录);vanilla 3.6.1 同款
+ *       {@code toString(message.getTransactionId())}。是否真发事务块由
+ *       shouldProvideTransactionMetadata 在 TransactionMonitor 内部裁决——无谓守卫</li>
  *   <li><b>RowChange</b>:按 (oid, seq) 从桶快照解析 asOf Table → 版本安装(值相等短路;
  *       变更即 applySchemaChangesForTable 重建 TableSchema,DDL 稀疏可接受)→
  *       updateWalPosition 补 source 块的 table/txId/messageType →
@@ -135,16 +139,17 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
 
     /**
      * 责任:事务头——锚定事务边界 offset(双写 lsn/lsn_commit=endLsn)并记提交时间戳/
-     * xid 供后续事件使用,随后发事务块 BEGIN 事件(shouldProvideTransactionMetadata
-     * 关闭时 TransactionMonitor 内部 no-op)。边界:dispatcher 中断见
-     * {@link #dispatch(Interruptible)}。
+     * xid 供后续事件使用,随后发事务块 BEGIN 事件(事务 id 为 xid 的纯数字字符串,
+     * 与 StreamEventMetadataProvider.getTransactionId 同源,见类 javadoc;事务块
+     * 是否真发由 shouldProvideTransactionMetadata 关闭时 TransactionMonitor 内部
+     * no-op)。边界:dispatcher 中断见 {@link #dispatch(Interruptible)}。
      */
     private void onBegin(TransactionEvent.Begin begin) {
         this.currentEndLsn = begin.endLsn();
         this.currentCommitTimestamp = begin.commitTimestamp();
         this.currentXid = begin.xid();
         offsetContext.updateCommitPosition(Lsn.valueOf(begin.endLsn()), Lsn.valueOf(begin.endLsn()));
-        dispatch(() -> dispatcher.dispatchTransactionStartedEvent(partition, "xid-" + begin.xid(),
+        dispatch(() -> dispatcher.dispatchTransactionStartedEvent(partition, Long.toString(begin.xid()),
                 offsetContext, begin.commitTimestamp()));
     }
 

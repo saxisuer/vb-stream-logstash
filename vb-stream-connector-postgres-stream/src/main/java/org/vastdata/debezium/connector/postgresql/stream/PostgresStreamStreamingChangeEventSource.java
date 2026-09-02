@@ -121,12 +121,15 @@ public class PostgresStreamStreamingChangeEventSource
      * 责任:初始化——offsetContext 为 null(首启无存量 offset)时经
      * {@code PostgresOffsetContext.initialContext} 从 main 连接读当前 xlog 位点建初始上下文
      * (vanilla init 同款;此时 reader 线程尚未创建,与 main 连接的 reader 独占不冲突——
-     * 时序独占)。边界:库查询失败抛 ConnectException(initialContext 语义)。
+     * 时序独占)。读后随即 commit 收敛 main 连接(autoCommit=false)上被
+     * {@code txid_current()} 强制分配了 XID 的只读事务——不收敛则复制会话在另一条连接上的
+     * {@code pg_create_logical_replication_slot} 会为等解码一致点而等它,自死锁。
+     * 边界:库查询失败抛 ConnectException(initialContext 语义);commit 失败同样
+     * ConnectException(fail-fast)。
      */
     @Override
     public void init(PostgresOffsetContext offsetContext) {
-        this.effectiveOffset = offsetContext != null ? offsetContext
-                : PostgresOffsetContext.initialContext(connectorConfig, mainConnection, clock);
+        this.effectiveOffset = offsetContext != null ? offsetContext : initialOffsetWithCommit();
     }
 
     /**
@@ -146,8 +149,7 @@ public class PostgresStreamStreamingChangeEventSource
             this.effectiveOffset = offsetContext;
         }
         try {
-            PostgresOffsetContext offset = this.effectiveOffset != null ? this.effectiveOffset
-                    : PostgresOffsetContext.initialContext(connectorConfig, mainConnection, clock);
+            PostgresOffsetContext offset = this.effectiveOffset != null ? this.effectiveOffset : initialOffsetWithCommit();
             this.effectiveOffset = offset;
 
             session = new ReplicationSession(sessionParameters());
@@ -337,6 +339,27 @@ public class PostgresStreamStreamingChangeEventSource
                 jdbc.getUser(), jdbc.getPassword(), connectorConfig.slotName(),
                 connectorConfig.publicationName(), PROTO_VERSION, connectorConfig.streamingMode(),
                 connectorConfig.twoPhase(), connectorConfig.feedbackIntervalSeconds());
+    }
+
+    /**
+     * 责任:建初始 offset 并随即 commit 收敛 main 连接上的读事务。initialContext 的
+     * {@code txid_current()} 会给 main 连接(autoCommit=false)强制分配 XID,不提交则
+     * 该事务悬置到 doStop——复制会话在另一条连接上的 {@code pg_create_logical_
+     * replication_slot} 为等解码一致点会等所有进行中 XID 事务,连接器自死锁
+     * (Task 8 IT 首跑实测)。线程约束:调用点在 reader 线程创建之前(时序独占,R3)。
+     * 边界:查询/commit 失败抛 ConnectException(fail-fast,装配失败由 execute 的
+     * fail 汇聚或 init 直抛)。
+     */
+    private PostgresOffsetContext initialOffsetWithCommit() {
+        PostgresOffsetContext initial = PostgresOffsetContext.initialContext(connectorConfig, mainConnection, clock);
+        try {
+            mainConnection.commit();
+        }
+        catch (java.sql.SQLException e) {
+            throw new org.apache.kafka.connect.errors.ConnectException(
+                    "Failed to commit the initial offset read on the main connection", e);
+        }
+        return initial;
     }
 
     /**
