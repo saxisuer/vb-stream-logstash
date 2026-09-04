@@ -296,7 +296,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      *   <li>'I'/'U'/'D'/'T':不完整解码,校验桶级前缀不变量、窥 oid 后把 index 记入当前活动桶
      *       的连续段(没有活动桶则 fail-fast)</li>
      *   <li>'M':先窥 flags 的 bit0 判断事务性——事务性必须落在活动桶里(无桶 fail-fast);
-     *       非事务性有桶随桶走、无桶 WARN 丢弃(协议允许,不算异常)</li>
+     *       非事务性有桶随桶走、无桶则 INFO 即时留痕并经护栏推进前沿(MS3.5,见
+     *       {@link #routeLogicalMsg},仅槽选项 messages=true 时有输入)</li>
      *   <li>'Y'/'O':DEBUG 记录后丢弃(沿用旧组装器的忽略语义)</li>
      *   <li>未知类型字节:交给 decoder 抛 UnknownMessageTypeException(fail-fast 由解码层承担)</li>
      * </ul>
@@ -440,14 +441,24 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
-     * LogicalMsg('M')的轻窥路由,沿用引擎语义:
+     * LogicalMsg('M')的轻窥路由(MS3.5 起非事务游离分支从"WARN 丢弃"升级为"INFO 留痕 +
+     * 护栏推进",spec §3.2/§3.3):
      * 读 flags 的 bit0 判断是否事务性(flags 在流式块内有 4 字节 xid 前缀,偏移 5;顶层偏移 1)。
      * 事务性消息必须落在活动桶里(没有桶就 fail-fast,与 DML 相同);非事务性消息有桶就随桶走
-     * (将来 abort 剔除按 streamXid 判断,语义安全),没有桶则 WARN 后丢弃——协议允许它游离在
-     * 任何事务之外,不算异常。flags 偏移由 currentStream 是否在流块内决定,与 decoder 的
-     * inStream 状态同步变化。丢弃路径的 owner 置空属<b>防御性</b>(当前控制消息路径已统一置空;
+     * (将来 abort 剔除按 streamXid 判断,语义安全),没有桶则<b>即时留痕并推进前沿</b>——协议
+     * 允许它游离在任何事务之外,不算异常,但它是唯一不带事务的输出信号,不推进则空闲库的
+     * confirmed_flush 永远钉死(原始动机)。关键步骤:经 {@link RawPeeks} 窥 prefix/lsn/content
+     * (prefix NUL 之后的 I32 长度 + 字节段,不整条解码)→ INFO 一行(content 走 {@link MessagePreview}
+     * 预览)→ {@code outputFrontier} 以 {@link #safeMessageAdvance}(msgLsn, 交接记账)为上限
+     * 单调 max 累加——pending 桶的 commitLsn 钉住推进上限,防"确认越过未输出事务的 commit 位、
+     * 重启整桶被跳过、尾部永久丢失"。flags 偏移由 currentStream 是否在流块内决定,与 decoder 的
+     * inStream 状态同步变化。
+     * 边界:消息字节仍已在 onRaw 首行 append 进管道(<b>不动"先 append 再路由"红线</b>)——
+     * 此分支无桶引用,落盘字节无人回读,随 wipe-on-open(重启)或低水位删除清空,不构成泄漏;
+     * 该分支仅在槽选项 messages=true 时才可能有输入(PG 关闭时不发 'M')——组装器不感知配置,
+     * 行为天然由上游门控。游离路径的 owner 置空属<b>防御性</b>(当前控制消息路径已统一置空;
      * 此路径到达时无任何活动桶,owner 至多指向已退役/已交接的桶——它们不会再成为追加目标,
-     * 置空与否不影响段判定)。
+     * 置空与否不影响段判定)。线程:reader 线程(读 handedOff 的即时 state 即"此刻仍在途")。
      */
     private void routeLogicalMsg(byte[] raw, long seq) {
         int flagsOffset = currentStream != null ? 5 : 1;   // 流内前缀 4 字节在前
@@ -458,8 +469,14 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
             return;
         }
         lastAppendOwner = null;   // 防御性置空(见方法 javadoc)
-        LOG.warn("非事务性消息游离于任何事务之外,丢弃: prefix={} lsn=0x{}",
-                RawPeeks.cstringAt(raw, flagsOffset + 1 + 8), Long.toHexString(RawPeeks.longAt(raw, flagsOffset + 1)));
+        long msgLsn = RawPeeks.longAt(raw, flagsOffset + 1);
+        int prefixStart = flagsOffset + 1 + 8;   // flags(1) + lsn(8) 之后
+        String prefix = RawPeeks.cstringAt(raw, prefixStart);
+        int lenOffset = RawPeeks.cstringEnd(raw, prefixStart) + 1;   // prefix NUL 之后的 I32 长度字段
+        byte[] content = RawPeeks.bytesAt(raw, lenOffset + 4, RawPeeks.intAt(raw, lenOffset));
+        LOG.info("逻辑消息: prefix={}, lsn={}, 事务性={}, content={}", prefix, Long.toHexString(msgLsn),
+                false, MessagePreview.preview(content));
+        outputFrontier.accumulateAndGet(safeMessageAdvance(msgLsn, handedOff), Math::max);
     }
 
     /**
@@ -927,8 +944,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * §3.4:在途桶的 commit 在 WAL 序上必然晚于消息 X,PG restart_lsn 回放整体重发覆盖);
      * 且 live 桶尚无 commitLsn(未交接),firstIndex 也不是 LSN,塞进 min 反而引入类型/
      * 语义混乱。参数只取交接记账({@link #handedOff} 形态的 deque),调用方传入时照抄即可。
-     * 线程约束:纯函数;调用点在 reader 线程(非事务 'M' 的即时推进分支,Task 2 接线),
-     * 读 state 的即时 volatile 值即"此刻仍在途"的语义。
+     * 线程约束:纯函数;调用点在 reader 线程(非事务 'M' 的即时推进分支,
+     * {@link #routeLogicalMsg} 已接线),读 state 的即时 volatile 值即"此刻仍在途"的语义。
      *
      * @param msgLsn    非事务逻辑消息自身的 LSN(消息头 lsn 字段)
      * @param handedOff 交接记账(pending = state != DONE 的桶;空 deque 即"全发完了"场景)

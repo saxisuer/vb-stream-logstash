@@ -1,5 +1,9 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -9,6 +13,7 @@ import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleData;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleValue;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.UnknownMessageTypeException;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayDeque;
@@ -267,7 +272,11 @@ class StreamedTransactionAssemblerTest {
         assertEquals("p", mc.prefix());
     }
 
-    /** 旧例 10:非事务性 LogicalMsg 无任何活动桶 → WARN 丢弃(不抛异常、不产出 Transaction)。 */
+    /**
+     * 旧例 10:非事务性 LogicalMsg 无任何活动桶 → 不抛异常、不产出 Transaction(MS3.5 起
+     * 该分支升级为 INFO 留痕 + 护栏推进,不产生输出事务的语义不变——日志与推进断言见
+     * {@link #nonTransactionalMsgWithoutBucketLogsAndAdvancesFrontierToMsgLsn})。
+     */
     @Test
     void nonTransactionalMsgWithoutBucketIsDropped() {
         List<Transaction> out = run(
@@ -880,5 +889,119 @@ class StreamedTransactionAssemblerTest {
         handedOff.addLast(guardBucket(999L, BucketState.DONE));
         assertEquals(200L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
                 "多个 DONE 桶同样全部排除");
+    }
+
+    // --- 非事务 'M' 的组装器接线(MS3.5 Task 2:即时 INFO 留痕 + 护栏推进经 outputFrontier 观测) ------
+
+    /** 非事务 'M' 用消息 LSN 夹具值:与 Commit 占位(commitLsn=1/endLsn=2)拉开差距,使"推进到 msgLsn"与"压到 pending commitLsn"两断言可区分。 */
+    private static final long MSG_LSN = 0x1234L;
+
+    /**
+     * 责任:挂载捕获器到目标类 logger(测试域 logback;ListAppender 自身不过滤级别——
+     * INFO 过滤由断言侧 getLevel()==INFO 做),调用方 try/finally 摘除防泄漏到其他用例。
+     *
+     * @param owner 目标类(logger 名即类全名)
+     * @return 已 start 的捕获器
+     */
+    private static ListAppender<ILoggingEvent> attachInfoCapture(Class<?> owner) {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        ((Logger) org.slf4j.LoggerFactory.getLogger(owner)).addAppender(appender);
+        return appender;
+    }
+
+    /**
+     * 非事务 'M' 无桶(无 pending):即时 INFO 留痕一行(prefix / lsn(hex) / 事务性=false /
+     * content 预览),前沿推进到消息自身 LSN——护栏无 pending 分支的上限即 msgLsn
+     * (已输出事务前沿已覆盖、在途事务走 WAL 序论证,spec §3.4"全发完了"场景)。
+     * 字节仍先 append(红线),不产出任何 Transaction。
+     */
+    @Test
+    void nonTransactionalMsgWithoutBucketLogsAndAdvancesFrontierToMsgLsn() {
+        ListAppender<ILoggingEvent> appender = attachInfoCapture(StreamedTransactionAssembler.class);
+        try {
+            TransactionRecorder out = new TransactionRecorder();
+            try (StreamedTransactionAssembler assembler = newAssembler(out)) {
+                assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "hb",
+                        "hello".getBytes(StandardCharsets.US_ASCII)));
+                assertEquals(MSG_LSN, assembler.outputFrontierForTest(),
+                        "无 pending 桶:护栏上限即消息自身 LSN");
+            }
+            assertTrue(out.transactions().isEmpty());
+            List<String> lines = appender.list.stream()
+                    .filter(e -> e.getLevel() == Level.INFO)
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .toList();
+            assertEquals(1, lines.size(), "恰一行 INFO 留痕: " + lines);
+            String line = lines.get(0);
+            assertTrue(line.contains("prefix=hb"), line);
+            assertTrue(line.contains("lsn=" + Long.toHexString(MSG_LSN)), line);
+            assertTrue(line.contains("事务性=false"), line);
+            assertTrue(line.contains("content=hello"), line);
+        } finally {
+            ((Logger) org.slf4j.LoggerFactory.getLogger(StreamedTransactionAssembler.class)).detachAppender(appender);
+        }
+    }
+
+    /**
+     * 有 pending 交接桶时护栏压低推进:异步形态 + listener 阻塞在 Begin 回调,首桶定格
+     * OUTPUTTING(非 DONE,即 pending)滞留交接记账——此刻非事务 'M'(消息 LSN 远大于
+     * 其 commitLsn)的即时推进被压到该 pending 桶 commitLsn:确认值不得超过未输出事务的
+     * commit 记录位,否则重启整桶被服务端跳过、已输出头部的尾部永久丢失(spec §3.3
+     * off-by-one 论证)。形态取舍:同步形态 dispatchHandedOff 直调即 DONE 无法制造
+     * pending,故取异步阻塞(与 {@link #handedOffBucketConstrainsPipeWatermarkWhileConsumerBlocked()}
+     * 同款手法)。
+     */
+    @Test
+    void nonTransactionalMsgAdvanceIsPinnedByPendingHandedOffBucket() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch inCallback = new CountDownLatch(1);
+        AtomicLong frontier = new AtomicLong();
+        StreamedTransactionAssembler assembler = new StreamedTransactionAssembler(event -> {
+            inCallback.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }, StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER, PIPE_DIR, LegacyRollCycles.MINUTELY,
+                (msg, view) -> { }, frontier, () -> { });
+        try {
+            assembler.onRaw(relation());
+            assembler.onRaw(PgWire.begin(101L));
+            assembler.onRaw(insert("1", "a"));
+            assembler.onRaw(PgWire.commit());   // 首桶交接,consumer 进入 Begin 回调并阻塞 → OUTPUTTING(pending)
+            assertTrue(inCallback.await(5, TimeUnit.SECONDS));
+            long pendingCommitLsn = assembler.handedOffForTest().get(0).commitLsn;   // PgWire 占位 1
+            assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "hb", new byte[]{ 1 }));
+            assertEquals(pendingCommitLsn, frontier.get(),
+                    "推进被压到 pending 桶 commitLsn(不得越过未输出事务的 commit 位)");
+            assertTrue(frontier.get() < MSG_LSN, "消息 LSN 大于 pending commitLsn 时不得推到消息位");
+        } finally {
+            release.countDown();
+            assembler.close();
+        }
+    }
+
+    /**
+     * 有活动桶的 'M'(事务性与非事务性)随桶走、不即时推进前沿:两条消息都入桶(单元计数
+     * 照常),前沿在 Commit 交接前纹丝不动——即时推进只属"无桶非事务"分支;Commit 后
+     * End 路径写 endLsn(占位 2)且不被消息 LSN(0x1234)越位:两条推进路径各用各的值,
+     * 同写一个 AtomicLong、同一 max 语义(spec §3.3)。
+     */
+    @Test
+    void msgWithActiveBucketGoesToBucketWithoutImmediateAdvance() {
+        TransactionRecorder out = new TransactionRecorder();
+        try (StreamedTransactionAssembler assembler = newAssembler(out)) {
+            assembler.onRaw(PgWire.begin(1L));
+            assembler.onRaw(PgWire.logicalMsg(true, MSG_LSN, "p", new byte[]{ 1 }));
+            assertEquals(0L, assembler.outputFrontierForTest(), "事务性 'M' 入桶:交接前不推进前沿");
+            assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "p", new byte[]{ 2 }));   // 有桶随桶走
+            assertEquals(0L, assembler.outputFrontierForTest(), "非事务 'M' 有桶随桶走:同样不即时推进");
+            assembler.onRaw(PgWire.commit());
+            assertEquals(2L, assembler.outputFrontierForTest(),
+                    "End 路径写 endLsn(占位 2),消息 LSN 不越位(各用各的值)");
+            assertEquals(2, out.transactions().get(0).changes().size(), "两条消息都入桶随事务输出");
+        }
     }
 }

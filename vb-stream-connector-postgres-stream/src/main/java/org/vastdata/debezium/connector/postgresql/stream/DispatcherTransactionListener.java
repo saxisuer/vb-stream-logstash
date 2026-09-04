@@ -45,8 +45,10 @@ import java.util.Objects;
  *       {@code dispatchDataChangeEvent(tableId, TruncateEmitter)}(每表一条记录,op="t"、
  *       key=null、无 before/after);协议选项位(CASCADE/RESTART_IDENTITY)发射时丢弃
  *       对齐 vanilla({@link TruncateChange#options()} 保留属超集)</li>
- *   <li><b>MsgChange</b>:DEBUG 跳过留痕——LogicalMsg 映射(dispatchLogicalDecodingMessage)
- *       后续里程碑接</li>
+ *   <li><b>MsgChange</b>:事务性 'M' 的回放期 INFO 留痕(MS3.5 spec §3.2:prefix/content
+ *       从事件组件直取,content 走 {@link MessagePreview} 预览;aborted 子事务的消息在过滤
+ *       阶段已剔除,天然不记)——<b>不 dispatch、不计入 event_count</b>,LogicalMsg 的下游
+ *       映射(dispatchLogicalDecodingMessage)仍延期</li>
  *   <li><b>End</b>:{@code dispatchTransactionCommittedEvent(commitTs)}——时间戳组件
  *       End 事件不带,沿用 Begin 记住的提交时间戳</li>
  * </ul>
@@ -125,7 +127,7 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
      * 责任:消费一个事务事件并映射到 dispatcher。关键步骤:按事件形态分派——Begin 锚定
      * 事务边界 offset 并发事务头;RowChange 解析 asOf 版本、安装、补 source 块、发数据
      * 事件;TruncateChange 按 skipped.operations 门控(默认跳过,none 才逐表发射);
-     * MsgChange DEBUG 跳过;End 发事务尾。边界:任何异常原样上抛
+     * MsgChange INFO 留痕不 dispatch(MS3.5);End 发事务尾。边界:任何异常原样上抛
      * (组装器 fail-fast——End 未达则前沿不推进,事务重发);要求 bind 先于 TxChange
      * (组装器保证,调用序违约由 {@link BucketTableResolver#resolve} 抛 ISE)。
      */
@@ -140,8 +142,14 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
         else if (event instanceof TruncateChange change) {
             onTruncateChange(change);
         }
-        else if (event instanceof MsgChange) {
-            LOG.debug("跳过发射(LogicalMsg 后续里程碑接): {}", event);
+        else if (event instanceof MsgChange change) {
+            // 事务性 'M' 的回放期留痕(MS3.5 spec §3.2):INFO 同款格式,事务性恒 true——
+            // 到达此分支的必是随事务输出的消息;aborted 子事务的消息在回放过滤阶段已被剔除,
+            // 天然不记(与 CDC 数据语义对齐)。仍不 dispatch、不计入 event_count——发射仍延期
+            // (dispatchLogicalDecodingMessage 的映射后续里程碑接)。lsn 位缺省:MsgChange 事件
+            // 不携带 lsn 组件(协议解码层有、事件面未带),日志形态对齐 reader 时点但无 lsn 位。
+            LOG.info("逻辑消息: prefix={}, 事务性={}, content={}", change.prefix(), true,
+                    MessagePreview.preview(change.content()));
         }
         else if (event instanceof TransactionEvent.End end) {
             onEnd(end);
