@@ -84,8 +84,8 @@ public final class ReplicationSession implements AutoCloseable {
 
     /**
      * 幂等建槽:two_phase 随槽开启(PG 不允许后改);SQLState 42710(duplicate_object)
-     * 表示已存在,WARN 后复用——注意槽的 two_phase 属性需与配置匹配,否则 start 时由
-     * 服务端报错。实例形态为薄委派,静态工作体是离线单测以假 Connection 锚定 SQL 契约
+     * 表示已存在,经 {@link #verifySlotTwoPhaseMatches} 预检后复用(不匹配启动期拒绝)。
+     * 实例形态为薄委派,静态工作体是离线单测以假 Connection 锚定 SQL 契约
      * 与分支语义的接缝。
      *
      * @throws SQLException 非 42710 的建槽失败原样上抛
@@ -98,7 +98,8 @@ public final class ReplicationSession implements AutoCloseable {
      * 责任:幂等建槽(ensureSlot 实例形态的静态工作体,行为与引擎逐行一致)。
      * 关键步骤:预编译 {@code pg_create_logical_replication_slot(?, 'pgoutput', false, ?)}
      * ——第 1 参槽名、第 4 参 twoPhase(第 3 参 false=非临时槽);executeQuery 只取副作用;
-     * 捕获 SQLException,SQLState 42710 视为"槽已存在"WARN 复用,其余原样上抛。
+     * 捕获 SQLException,SQLState 42710 视为"槽已存在"转入 {@link #verifySlotTwoPhaseMatches}
+     * 预检(比对通过才复用,不匹配抛 IllegalStateException),其余原样上抛。
      * 边界:sqlConnection 为 null(未 open)抛 NPE,属调用次序违约。
      * 线程约束:与 open/start 同为装配方串行调用。
      */
@@ -113,10 +114,47 @@ public final class ReplicationSession implements AutoCloseable {
             LOG.info("复制槽已创建: {}（two_phase={}）", config.slotName(), config.twoPhase());
         } catch (SQLException e) {
             if (SQLSTATE_DUPLICATE_OBJECT.equals(e.getSQLState())) {
-                LOG.warn("复制槽 {} 已存在，直接复用；注意槽的 two_phase 属性需与配置匹配，否则 start 时将由服务端报错",
-                        config.slotName());
+                verifySlotTwoPhaseMatches(sqlConnection, config);
             } else {
                 throw e;
+            }
+        }
+    }
+
+    /**
+     * 责任:R5 存量槽 two_phase 预检——建槽撞 42710(槽已存在)时,查 pg_replication_slots
+     * 的 two_phase 列与配置比对,不匹配即启动期拒绝(PG 不允许后改槽属性,留给 START_
+     * REPLICATION 的服务端报错对用户不可读)。
+     * 关键步骤:预编译目录查询(槽名绑定)→ 行不存在直接 WARN 复用(42710 与目录可见性
+     * 之间的竞态兜底,极端情况留给 start 时服务端报错)→ 行存在则取 two_phase 比对:
+     * 匹配 WARN 复用,不匹配抛 IllegalStateException——文案含槽名/槽现状/配置期望/DROP
+     * SLOT 迁移指引(重插槽丢确认位点、重启后从更早位点重发,at-least-once 语义不变)。
+     * 边界:SQLException 原样上抛(目录查询失败属基础设施异常,不走复用);IllegalStateException
+     * 属运行时异常,经既有 fail-fast 路径任务失败、保留槽位。
+     * 线程约束:与 open/start 同为装配方串行调用。
+     *
+     * @param sqlConnection 已建立的普通 SQL 连接(建槽同一连接复用)
+     * @param config        含 slotName/twoPhase 的参数包
+     * @throws SQLException 目录查询失败原样上抛
+     */
+    static void verifySlotTwoPhaseMatches(Connection sqlConnection, Parameters config) throws SQLException {
+        try (PreparedStatement ps = sqlConnection.prepareStatement(
+                "SELECT two_phase FROM pg_replication_slots WHERE slot_name = ?")) {
+            ps.setString(1, config.slotName());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    LOG.warn("复制槽 {} 已存在但目录中不可见（罕见竞态），直接复用；属性不匹配时由 start 时服务端报错",
+                            config.slotName());
+                    return;
+                }
+                boolean slotTwoPhase = rs.getBoolean(1);
+                if (slotTwoPhase != config.twoPhase()) {
+                    throw new IllegalStateException("复制槽 " + config.slotName() + " 的 two_phase=" + slotTwoPhase
+                            + " 与配置 two_phase=" + config.twoPhase()
+                            + " 不匹配：PG 不允许后改槽属性，需 DROP SLOT 重建（会丢确认位点，"
+                            + "重启后 PG 从更早位点重发未输出事务，at-least-once 语义不变）");
+                }
+                LOG.warn("复制槽 {} 已存在且 two_phase 匹配，直接复用", config.slotName());
             }
         }
     }
