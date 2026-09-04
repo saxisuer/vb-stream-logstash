@@ -1,12 +1,14 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.connect.connector.Task;
 
 import java.util.List;
 import java.util.Map;
 
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.postgresql.PostgresConnector;
 
@@ -45,13 +47,33 @@ public class PostgresStreamConnector extends PostgresConnector {
     }
 
     /**
+     * 覆盖字段校验驱动集:父类 {@code PostgresConnector.validateAllFields} 硬编码
+     * <b>父</b>{@code PostgresConnectorConfig.ALL_FIELDS}(其 SNAPSHOT_MODE 接受
+     * initial 等),REST {@code validate(Map)} 端点(Connect PUT 配置校验)经虚分派
+     * 调本方法——不覆盖则 {@code snapshot.mode=initial} 在 REST 校验报零问题,首个
+     * 拒收推迟到任务侧构造器,"校验/注入/构造器"三层防线的 REST 层落空。改用
+     * {@link #getConfigFields()}(即 {@link PostgresStreamConnectorConfig#ALL_FIELDS},
+     * snapshot.mode 为同名替换的仅-no_data Field)驱动,使 {@code validateSnapshotMode}
+     * 在 REST 层真实生效。副作用面:父流程仅当全字段零问题才调 validateConnection
+     * (连库),校验错误先行挡下时 REST 校验天然离线。
+     *
+     * @param config 待校验的完整配置(REST 请求原文构造)
+     * @return 字段名 → ConfigValue(含 errorMessages)的校验结果
+     */
+    @Override
+    protected Map<String, ConfigValue> validateAllFields(Configuration config) {
+        return config.validate(getConfigFields());
+    }
+
+    /**
      * 构造 Connect REST 暴露的配置定义:取父类静态 configDef() 的可变副本
      * (每次调用新建 ConfigDef,不改父类静态状态),再覆盖两个默认值展示
-     * (snapshot.mode=no_data——父 configDef 的 initial 不再适用;provide.transaction.
-     * metadata=true——事务元数据默认开,与 {@link #taskConfigs(int)} 注入面一致)并
-     * define 6 个新配置项——类型/默认值与 {@link PostgresStreamConnectorConfig} 的
-     * Field 声明一一对应(默认值显式取 Field.defaultValue(),防两处字面量漂移),
-     * 重要性/描述为暴露面专用文案。
+     * (snapshot.mode=no_data——默认值取 {@code SNAPSHOT_MODE_NO_DATA.defaultValue()}
+     * 防与 Field 声明漂移;provide.transaction.metadata=true——展示值有意偏离父 Field
+     * 默认 false(事务元数据默认开,与 {@link #taskConfigs(int)} 注入面一致),无本模块
+     * Field 可源、只能字面量 TRUE)并 define 6 个新配置项——类型/默认值与
+     * {@link PostgresStreamConnectorConfig} 的 Field 声明一一对应(默认值显式取
+     * Field.defaultValue(),防两处字面量漂移),重要性/描述为暴露面专用文案。
      *
      * @return 含父类全部配置项(两处默认值覆盖)+ 6 个新配置项的 {@link ConfigDef}
      */
@@ -62,7 +84,8 @@ public class PostgresStreamConnector extends PostgresConnector {
         // 须先从 configKeys 挖旧再补新——与 ALL_FIELDS 的 Field 同名替换同一坑形。
         def.configKeys().remove(PostgresStreamConnectorConfig.SNAPSHOT_MODE_NO_DATA.name());
         def.configKeys().remove(CommonConnectorConfig.PROVIDE_TRANSACTION_METADATA.name());
-        def.define("snapshot.mode", ConfigDef.Type.STRING, "no_data", ConfigDef.Importance.MEDIUM,
+        def.define("snapshot.mode", ConfigDef.Type.STRING,
+                PostgresStreamConnectorConfig.SNAPSHOT_MODE_NO_DATA.defaultValue(), ConfigDef.Importance.MEDIUM,
                 "Streaming-only connector: snapshot.mode=no_data is the only supported value.");
         def.define("provide.transaction.metadata", ConfigDef.Type.BOOLEAN, Boolean.TRUE, ConfigDef.Importance.MEDIUM,
                 "Streaming-only connector: transaction metadata (BEGIN/END transaction boundary markers) is enabled by default.");

@@ -1,6 +1,8 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigValue;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
@@ -10,6 +12,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -131,5 +134,31 @@ class PostgresStreamConnectorTest {
                 "REST 暴露面 snapshot.mode 默认值应展示 no_data(唯一支持值)");
         assertEquals(Boolean.TRUE, def.defaultValues().get("provide.transaction.metadata"),
                 "REST 暴露面 provide.transaction.metadata 默认值应展示 true(事务元数据默认开)");
+    }
+
+    /**
+     * 用例⑦REST validate() 端到端走本连接器校验器:snapshot.mode=initial 经
+     * {@code validate(Map)}(Connect REST PUT /connector 配置校验的同路径)须在
+     * snapshot.mode 的 ConfigValue 上产出非零 errorMessages——父类
+     * {@code PostgresConnector.validateAllFields} 硬编码父 ALL_FIELDS(父 SNAPSHOT_MODE
+     * 接受 initial),不覆盖则 REST 校验报零问题、首个拒收推迟到任务侧构造器,"三层防线"
+     * 的 REST 层落空;父流程仅当全字段零问题才尝试连库,故本用例(带校验错误)离线可测。
+     */
+    @Test
+    void restValidateRejectsInitialSnapshotMode() {
+        PostgresStreamConnector connector = new PostgresStreamConnector();
+        Map<String, String> props = new HashMap<>();
+        props.put("hostname", "localhost");
+        props.put("port", "5432");
+        props.put("user", "postgres");
+        props.put("database", "postgres");
+        props.put("snapshot.mode", "initial");
+        Config config = connector.validate(props);
+        ConfigValue snapshotMode = config.configValues().stream()
+                .filter(value -> "snapshot.mode".equals(value.name()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("validate 结果应含 snapshot.mode 的 ConfigValue"));
+        assertFalse(snapshotMode.errorMessages().isEmpty(),
+                "REST validate() 应经本连接器 ALL_FIELDS 驱动校验,对 initial 产出非零 problems");
     }
 }
