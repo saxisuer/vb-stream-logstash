@@ -58,9 +58,12 @@ final class BucketReplayer {
     private final PgOutputStreamDecoder decoder;
     /** 每个回放解码点回调(与组装器 live 解码共用同一 observer,语义一致;第二参为桶快照渲染视图)。 */
     private final BiConsumer<PgOutputMessage, RelationLookup> decodedObserver;
+    /** 吞吐指标的输出字节记账(MS5:回放重读的管道载荷;与消费器共用组装器穿入的同一实例)。 */
+    private final StreamThroughputMetrics metrics;
 
     /**
-     * 构造回放器。
+     * 构造回放器(便捷形态):指标自建新实例——测试直连场景(手造桶/管道)没有观测方,
+     * 计数进一个无人读的实例,无害;生产路径走组装器→消费器穿入的三参构造。
      *
      * @param mode            流式模式(自持 decoder 用;白名单类型的解析不分支于模式档位,
      *                        仅为与组装器的 live decoder 同构保留)
@@ -68,8 +71,22 @@ final class BucketReplayer {
      *                        该桶的 RelationSnapshot 作逐消息渲染视图)
      */
     BucketReplayer(StreamingMode mode, BiConsumer<PgOutputMessage, RelationLookup> decodedObserver) {
+        this(mode, decodedObserver, new StreamThroughputMetrics());
+    }
+
+    /**
+     * 构造回放器(生产形态)。
+     *
+     * @param mode            流式模式(同上)
+     * @param decodedObserver 每个回放解码点回调(同上)
+     * @param metrics         吞吐指标(组装器创建、消费器转传——输出字节在此逐单元记账,
+     *                        口径:回读即记、aborted 过滤前)
+     */
+    BucketReplayer(StreamingMode mode, BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                   StreamThroughputMetrics metrics) {
         this.decoder = new PgOutputStreamDecoder(Objects.requireNonNull(mode, "mode"));
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
+        this.metrics = Objects.requireNonNull(metrics, "metrics");
     }
 
     /**
@@ -99,6 +116,7 @@ final class BucketReplayer {
         long[] emitted = {0L};
         for (long[] segment : bucket.segments) {
             pipe.readRange(segment[0], segment[1], (index, payload) -> {
+                metrics.onReplayedUnit(payload.length);   // 回读即记(aborted 过滤前——被剔除单元的字节也确实从管道读回了)
                 OptionalLong streamXid = bucket.hasPrefix
                         ? OptionalLong.of(RawPeeks.unsignedInt(payload, 1))
                         : OptionalLong.empty();

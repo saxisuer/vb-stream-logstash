@@ -115,7 +115,8 @@ class TransactionConsumerLoopTest {
             queue.add(frozenBucket(502L, 10L, registry, pipe));
             queue.add(TxBuffer.POISON);
             TransactionConsumer consumer = new TransactionConsumer(recorder, StreamingMode.ON, pipe,
-                    queue, frontier, () -> { }, (m, v) -> { }, BucketTableResolver.snapshotBacked());
+                    queue, frontier, () -> { }, (m, v) -> { }, BucketTableResolver.snapshotBacked(),
+                    new StreamThroughputMetrics());
 
             consumer.run();   // 测试线程同步执行:排干两桶 → 见毒丸 → 返回
 
@@ -148,7 +149,8 @@ class TransactionConsumerLoopTest {
             queue.add(broken);
             queue.add(frozenBucket(602L, 10L, registry, pipe));
             TransactionConsumer consumer = new TransactionConsumer(recorder, StreamingMode.ON, pipe,
-                    queue, frontier, failures::incrementAndGet, (m, v) -> { }, BucketTableResolver.snapshotBacked());
+                    queue, frontier, failures::incrementAndGet, (m, v) -> { }, BucketTableResolver.snapshotBacked(),
+                    new StreamThroughputMetrics());
 
             consumer.run();   // 首桶 ISE → ERROR + onFailure + return(不排干)
 

@@ -92,6 +92,11 @@ public class PostgresStreamStreamingChangeEventSource
     /** 异步组装器(consumer 线程随构造启动)。 */
     private StreamedTransactionAssembler assembler;
 
+    /** 管线吞吐与分布指标(MS5:execute 装配点创建并注入组装器,四点插桩共用;Task 4 的
+     *  bridge 以 {@link #throughputMetrics()} 为读源。volatile——coordinator 写、任意线程读;
+     *  execute 前为 null)。 */
+    private volatile StreamThroughputMetrics throughputMetrics;
+
     /**
      * 构造流式源(装配延迟到 init/execute)。
      *
@@ -135,8 +140,11 @@ public class PostgresStreamStreamingChangeEventSource
 
     /**
      * 责任:装配并监督 MS2 管道直至停机/失败。关键步骤:offset 定形(execute 入参优先)→
-     * 建/开/启动复制会话(open→ensureSlot→start,幂等建槽)→ 建异步组装器(listener =
-     * DispatcherTransactionListener,10 参构造注入 listener 侧表解析接缝)→ 起
+     * 建/开/启动复制会话(open→ensureSlot→start,幂等建槽)→ 建吞吐指标实例(MS5,首窗
+     * 基线取当前 nanoTime)→ 建异步组装器(listener =
+     * DispatcherTransactionListener,包私有 11 参构造注入 listener 侧表解析接缝与吞吐指标
+     * ——tableResolver 必须与 listener 构造时的<b>同一实例</b>,consumer 每桶 bind 的与
+     * listener 读的经它共享)→ 起
      * vb-pgoutput-reader 线程跑 {@code session.run(assembler, frontier::get)}(LSN 反馈按
      * 输出前沿封顶 = End 锚定)→ 监督循环(isRunning && !failed,空转周期发心跳)→
      * 退出后走停机次序。边界:装配/监督期任何 Throwable 经 {@link #fail} 汇聚
@@ -165,6 +173,7 @@ public class PostgresStreamStreamingChangeEventSource
                     new TypeRegistryColumnValueMapper(typeRegistry,
                             connectorConfig.getConfig().getBoolean(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES)),
                     tableResolver);
+            this.throughputMetrics = new StreamThroughputMetrics(System.nanoTime());
             assembler = new StreamedTransactionAssembler(listener, connectorConfig.streamingMode(),
                     new VersionedRelationRegistry(),
                     new RelationTableFactory(RelationMetadataSource.jdbc(mainConnection,
@@ -172,7 +181,7 @@ public class PostgresStreamStreamingChangeEventSource
                     Path.of(connectorConfig.pipeDir()), connectorConfig.rollCycle(),
                     (msg, view) -> { }, frontier,
                     () -> fail(new DebeziumException("consumer 回放失败,已 fail-fast(细节见 transaction-consumer 的 ERROR 日志)")),
-                    tableResolver);
+                    tableResolver, this.throughputMetrics);
 
             readerThread = new Thread(() -> runReader(frontier), "vb-pgoutput-reader");
             readerThread.setDaemon(false);
@@ -326,6 +335,16 @@ public class PostgresStreamStreamingChangeEventSource
     @Override
     public PostgresOffsetContext getOffsetContext() {
         return effectiveOffset;
+    }
+
+    /**
+     * 责任:取管线吞吐与分布指标(MS5,只读访问口——Task 4 的 MBean bridge 读源之一:
+     * 六计数 totals 快照作窗口差分分子)。返回的是组装器构造注入的同一实例,四点插桩
+     * (slot 读取/组装/回放字节/输出+分布)与 consumer 的 10s 报告 tick 全部落在这上面。
+     * 边界:execute 装配前为 null(指标随管道一起诞生,调用方须以 execute 完成为前提)。
+     */
+    public StreamThroughputMetrics throughputMetrics() {
+        return throughputMetrics;
     }
 
     /**
