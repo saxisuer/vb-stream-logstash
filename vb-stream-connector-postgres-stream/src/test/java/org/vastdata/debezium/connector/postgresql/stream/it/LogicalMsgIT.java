@@ -134,6 +134,22 @@ class LogicalMsgIT extends StreamITBase {
     }
 
     /**
+     * 夹具:DROP+CREATE 重建数据表与 publication(单表)。**DROP 而非 IF NOT EXISTS 的
+     * 自愈考量**:T4 起表带 payload 列(模式变更),持久化 pgdata 上跑过 T3 版夹具
+     * (无 payload 列)的旧表会让 IF NOT EXISTS 静默 no-op、随后的列数不符 INSERT 报错
+     * (跨机开发/复用容器必踩);DROP+CREATE 每次按当前模式重建,自愈(与
+     * StreamAbortFilterIT 的自愈惯例一致)。publication 同步 DROP+CREATE(挂名表必须
+     * 存在,建槽的边界)。DDL 先于建槽执行——不产生解码输出,不污染记录计数。
+     */
+    private void createFixture() throws SQLException {
+        StreamPgTestEnv.execSql(
+                "DROP TABLE IF EXISTS " + TABLE,
+                "CREATE TABLE " + TABLE + "(id int PRIMARY KEY, payload text)",
+                "DROP PUBLICATION IF EXISTS pub_msg_it",
+                "CREATE PUBLICATION pub_msg_it FOR TABLE " + TABLE);
+    }
+
+    /**
      * 纯非事务消息流(末笔事务输出后的空闲库)推进 confirmed_flush 越过消息位。
      * 关键步骤:夹具(表/publication 预建)→ 开 {@code slot.messages=true} start 引擎 →
      * 等 walsender 挂上(建流完成)→ 暖场事务 T0(单行 INSERT)并等 3 条记录消费完毕
@@ -148,11 +164,7 @@ class LogicalMsgIT extends StreamITBase {
      */
     @Test
     void idleDatabaseHeartbeatAdvancesConfirmedFlush() throws Exception {
-        StreamPgTestEnv.execSql(
-                "CREATE TABLE IF NOT EXISTS " + TABLE + "(id int PRIMARY KEY, payload text)",
-                "DROP PUBLICATION IF EXISTS pub_msg_it",
-                "CREATE PUBLICATION pub_msg_it FOR TABLE " + TABLE,
-                "TRUNCATE " + TABLE);
+        createFixture();
 
         start(PostgresStreamConnector.class,
                 baseConfig(SLOT, "pub_msg_it", pipeDir).with("slot.messages", true).build());
@@ -231,11 +243,7 @@ class LogicalMsgIT extends StreamITBase {
      */
     @Test
     void crashInjectionGuardPinsUnoutputTxAndRestartResendsWholeTx() throws Exception {
-        StreamPgTestEnv.execSql(
-                "CREATE TABLE IF NOT EXISTS " + TABLE + "(id int PRIMARY KEY, payload text)",
-                "DROP PUBLICATION IF EXISTS pub_msg_it",
-                "CREATE PUBLICATION pub_msg_it FOR TABLE " + TABLE,
-                "TRUNCATE " + TABLE);
+        createFixture();
 
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch blockedStarted = new CountDownLatch(1);
@@ -426,7 +434,7 @@ class LogicalMsgIT extends StreamITBase {
 
     /**
      * 事务 topic 是否存在任意 BEGIN 记录:整事务重发形态的最弱信号(BEGIN 与 END 配对
-     * 的完整计数由 {@link #hasEndWithEventCount} 承担,此处只排除"只有数据行、无事务
+     * 的完整计数由 {@link #hasEndWithEventCountAtLeast} 承担,此处只排除"只有数据行、无事务
      * 边界"的残段形态)。status 字段缺失的记录(理论不出现)跳过。
      *
      * @param records 全部到达记录
