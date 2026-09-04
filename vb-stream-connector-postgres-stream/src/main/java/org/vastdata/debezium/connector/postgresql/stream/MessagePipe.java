@@ -213,6 +213,48 @@ final class MessagePipe implements AutoCloseable {
     }
 
     /**
+     * 责任:管道目录当前磁盘占用(MS5 Task 4 的 MBean 观测面)——{@code Files.walk} 递归
+     * 遍历 dir,对全部常规文件求 size 和(含滚动数据文件 {@code .cq4} 与队列元数据
+     * {@code .cq4t}——运维关心的是目录整体占用,不做文件甄别)。
+     * 关键步骤:遍历是惰性流,reader 线程可能并发追加/低水位删除文件——单个文件的 size
+     * 读失败(遍历中被删)按 0 计入,不让一次观测被瞬态 IO 抖动打翻。
+     * 边界:目录级遍历失败(整体 IO 异常)记 WARN 返回 -1(未知哨兵,与"未装配"同形,
+     * 调用方<b>不得</b>把 -1 当真实字节数累计)。
+     * 线程约束:只读遍历,任意线程可调——但生产调用点是 consumer 的统计 tick
+     * (MBean 读路径不碰 IO,见 StreamMetricsBridge 的线程模型),JMX 侧读到的是 tick
+     * 内的采样快照。
+     *
+     * @return 目录全部常规文件的字节总和;目录遍历失败返回 -1
+     */
+    long diskUsageBytes() {
+        try (Stream<Path> paths = Files.walk(dir)) {
+            return paths.filter(Files::isRegularFile)
+                    .mapToLong(MessagePipe::sizeOrZero)
+                    .sum();
+        }
+        catch (IOException e) {
+            LOG.warn("MessagePipe 遍历管道目录 {} 求磁盘占用失败", dir, e);
+            return -1L;
+        }
+    }
+
+    /**
+     * 单文件 size 的 IO 容错读取:文件在遍历流推进到它之前被低水位删除(并发删档)按
+     * 0 计入——观测语义"此刻目录里存在且可读的文件之和"。
+     *
+     * @param file 遍历到的常规文件
+     * @return 文件字节数;读失败(已被删/不可访问)返回 0
+     */
+    private static long sizeOrZero(Path file) {
+        try {
+            return Files.size(file);
+        }
+        catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    /**
      * 释放管道资源:tailer → appender → queue 逆序关闭,任何一步失败仅 WARN 不上抛
      * (close 不应掩盖业务异常;最坏代价是句柄延迟回收)。幂等:重复 close 已关资源至多触发
      * 被吸收的 WARN,不上抛。

@@ -243,6 +243,27 @@ class ReplicationSessionTest {
     }
 
     /**
+     * 五参 run 的 receiveLsnSink 转发(MS5 Task 4 的 lastReceiveLsn 读源接线):假流
+     * lastReceive=500 驱动 run 至 closed 退出——每个循环轮收到一个值且全为 500(转发的是
+     * getLastReceiveLSN 的原值,不做封顶;封顶仍走③的 capFeedback,见上一用例)。轮数
+     * = 2:消息轮(drain 在取尽消息后的收尾 null 轮已消耗一次空轮计数)+ 一次空轮触达
+     * closed(第二次空轮计数后由 isClosed 守卫退出,不再进循环体)。
+     */
+    @Test
+    void runLoopForwardsReceivedLsnToSinkEachRound() {
+        RunLoopStream stream = new RunLoopStream(1, 2);
+        stream.lastReceive = 500L;
+        List<Long> sinkValues = new ArrayList<>();
+
+        assertThrows(SQLException.class,
+                () -> ReplicationSession.run(stream, parameters(StreamingMode.ON, true, 10),
+                        raw -> { }, () -> 300L, sinkValues::add));
+
+        assertEquals(2, sinkValues.size(), "两个循环轮(消息轮 + 触达 closed 的空轮)应各转发一次");
+        sinkValues.forEach(v -> assertEquals(500L, v, "转发的应是 getLastReceiveLSN 原值(不封顶)"));
+    }
+
+    /**
      * 组装测试参数包(messages 门控关闭形态,既有用例的便捷缺省):取引擎 src/docker 冒烟
      * 环境的同形坐标(localhost:55432/postgres,槽 vb_cdc_slot、publication vb_pub、
      * proto 4),档位/开关/反馈间隔由用例注入。

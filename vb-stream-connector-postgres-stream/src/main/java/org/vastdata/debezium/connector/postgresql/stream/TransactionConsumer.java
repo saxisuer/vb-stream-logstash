@@ -178,11 +178,14 @@ final class TransactionConsumer implements Runnable {
      * 责任:周期统计 tick(每 10s,引擎 maybeStats 的同构减裁):①吞吐与分布与峰值三行 INFO——
      * {@link StreamThroughputMetrics#reportLines}(速率窗口差分 + 分位区间 + 会话峰值,每次调用
      * 即窗口边界,文案与引擎逐字节同构);②最老交接桶(队头 peek,FIFO 即最老)滞留超 60s 升
-     * WARN——consumer 或下游回调阻塞的信号。引擎 tick 上另有的"consumer 统计"桶状态行
+     * WARN——consumer 或下游回调阻塞的信号;③触发指标的统计 tick 钩子(MS5 Task 4——
+     * {@link StreamMetricsBridge} 的速率预计算与 lagBytes/管道磁盘占用采样,与三行报告同窗口
+     * 边界,JMX 读侧只读 volatile)。引擎 tick 上另有的"consumer 统计"桶状态行
      * (LIVE/HANDED_OFF/OUTPUTTING 计数)不复活(见类 javadoc 偏差段)。
      * 关键步骤:距上次统计不足周期即原样返回旧戳;到点则让指标生成三行并以本类 logger 打出,
-     * 最后对队头 handoffNanos 做滞留判定。边界:队列为空时无滞留告警;指标零样本窗口打 n/a;
-     * peek 是并发安全操作,读数弱一致即可接受(告警非精确记账);返回本次统计时刻作下一轮基准。
+     * 对队头 handoffNanos 做滞留判定,最后触发统计 tick 钩子。边界:队列为空时无滞留告警;
+     * 指标零样本窗口打 n/a;peek 是并发安全操作,读数弱一致即可接受(告警非精确记账);
+     * 钩子异常在 metrics 内部 WARN 吞掉(指标不进业务路径);返回本次统计时刻作下一轮基准。
      * 线程:consumer 线程(指标报告与分布写入同线程,Recorder 单写者假设由此成立)。
      *
      * @param lastStats 上次统计的 nanoTime 戳
@@ -202,6 +205,7 @@ final class TransactionConsumer implements Runnable {
                     (now - oldest.handoffNanos) / 1_000_000L, STALE_WARN_NANOS / 1_000_000_000L,
                     oldest.xid, oldest.firstIndex);
         }
+        metrics.fireStatsTickHook();
         return now;
     }
 }

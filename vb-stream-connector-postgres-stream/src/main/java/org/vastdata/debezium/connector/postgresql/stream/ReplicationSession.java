@@ -50,6 +50,13 @@ public final class ReplicationSession implements AutoCloseable {
     private PGReplicationStream stream;
 
     /**
+     * 最近收到的 WAL 位点(run 循环每轮经 {@code stream.getLastReceiveLSN()} 刷新;volatile
+     * ——reader 线程写、任意线程读)。MS5 MBean 面的 lagBytes 读源之一:
+     * {@code lastReceiveLsn() - 输出前沿}。start 前恒 0。
+     */
+    private volatile long lastReceiveLsn;
+
+    /**
      * 以参数包构造会话。仅赋值不开网络——连接在 open() 建立;构造后须按
      * open → ensureSlot → start → run → close 次序驱动,跳步调用属调用方违约
      * (未 open 先 ensureSlot 抛 NPE、未 start 先 run 同理)。
@@ -215,12 +222,35 @@ public final class ReplicationSession implements AutoCloseable {
 
     /**
      * 消息循环(实例形态,静态工作体的薄委派):调用方线程(reader)执行至流关闭/异常。
+     * 委派时挂上本会话的 {@link #lastReceiveLsn} 刷新回调——MBean lagBytes 读源由此
+     * 每轮更新(MS5 Task 4)。
      *
      * @param listener       raw 字节消费者(独占数组承诺见接口 javadoc)
      * @param outputFrontier 输出前沿供应者(语义见静态工作体 javadoc)
      */
     public void run(RawMessageListener listener, LongSupplier outputFrontier) throws SQLException, IOException {
-        run(stream, config, listener, outputFrontier);
+        run(stream, config, listener, outputFrontier, lsn -> lastReceiveLsn = lsn);
+    }
+
+    /**
+     * 责任:最近收到的 WAL 位点只读访问器(MS5 Task 4 的 MBean lagBytes 读源)。值由
+     * run 循环每轮刷新(volatile 写在 reader 线程),任意线程弱一致读——统计语义足够
+     * (读到的至多旧一轮,≈100ms 量级)。
+     * 边界:start 之前(或 run 从未执行)恒 0。
+     *
+     * @return 最近收到的 LSN(run 前为 0)
+     */
+    public long lastReceiveLsn() {
+        return lastReceiveLsn;
+    }
+
+    /**
+     * 责任:消息循环的四参兼容形态——转发五参工作体,receiveLsnSink 传空消费(既有离线
+     * 单测锚定的接缝面不变;循环行为全量描述见五参工作体 javadoc)。
+     */
+    static void run(PGReplicationStream stream, Parameters config, RawMessageListener listener, LongSupplier outputFrontier)
+            throws SQLException, IOException {
+        run(stream, config, listener, outputFrontier, lsn -> { });
     }
 
     /**
@@ -228,7 +258,8 @@ public final class ReplicationSession implements AutoCloseable {
      * ①{@code stream.isClosed()} 守卫,已关闭即抛 SQLException(断连感知);
      * ②{@link #drainPending} 非阻塞取尽当前缓冲的全部消息逐条回调;
      * ③每轮经 {@link #capFeedback} 按输出前沿封顶确认值,同值写 setAppliedLSN/
-     *   setFlushedLSN;
+     *   setFlushedLSN;另有 receiveLsnSink 收到 LSN 即时转发(实例形态挂
+     *   {@link #lastReceiveLsn} 刷新作 MBean lagBytes 读源,MS5 Task 4;须廉价无副作用);
      * ④距上次反馈满 feedbackIntervalSeconds 才 forceUpdateStatus(计数器节流,status
      *   周期独立于消息到达);
      * ⑤receivedAny 立即续转(积压期不引入 100ms/轮的人为节流),空轮才 sleep 100ms。
@@ -249,8 +280,15 @@ public final class ReplicationSession implements AutoCloseable {
      * status 到达后服务端先采纳进 pg_stat_replication.flush_lsn;槽的 confirmed_flush_lsn
      * 由 walsender 在解码推进时(candidate 机制)落库——空闲期不推进,但确认不丢失:
      * 下一次任何 WAL 活动会使其一步跳到客户端已确认的最新位点。
+     *
+     * @param stream        已启动的复制流
+     * @param config        会话参数(反馈间隔)
+     * @param listener      raw 字节消费者
+     * @param outputFrontier 输出前沿供应者
+     * @param receiveLsnSink 每轮的最近收到 LSN 转发回调(实例形态为 lastReceiveLsn 的 volatile 写)
      */
-    static void run(PGReplicationStream stream, Parameters config, RawMessageListener listener, LongSupplier outputFrontier)
+    static void run(PGReplicationStream stream, Parameters config, RawMessageListener listener, LongSupplier outputFrontier,
+                    java.util.function.LongConsumer receiveLsnSink)
             throws SQLException, IOException {
         long feedbackIntervalNanos = config.feedbackIntervalSeconds() * 1_000_000_000L;
         long lastFeedbackNanos = System.nanoTime();
@@ -259,7 +297,9 @@ public final class ReplicationSession implements AutoCloseable {
                 throw new SQLException("复制流已结束（连接断开）");
             }
             boolean receivedAny = drainPending(stream, listener);
-            long confirmed = capFeedback(stream.getLastReceiveLSN().asLong(), outputFrontier.getAsLong());
+            long received = stream.getLastReceiveLSN().asLong();
+            receiveLsnSink.accept(received);
+            long confirmed = capFeedback(received, outputFrontier.getAsLong());
             LogSequenceNumber last = LogSequenceNumber.valueOf(confirmed);
             stream.setAppliedLSN(last);
             stream.setFlushedLSN(last);

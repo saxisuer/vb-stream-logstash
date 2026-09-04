@@ -3,6 +3,8 @@ package org.vastdata.debezium.connector.postgresql.stream;
 // 注：Maven 坐标是小写 org.hdrhistogram，Java 包名却是大写 H 的 org.HdrHistogram（上游历史命名）
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.SingleWriterRecorder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Locale;
@@ -48,6 +50,8 @@ import java.util.function.LongSupplier;
  */
 public final class StreamThroughputMetrics {
 
+    private static final Logger LOG = LoggerFactory.getLogger(StreamThroughputMetrics.class);
+
     /** 回放耗时可追踪上界：1h（ns）——正常负载远不可达，钳到上界本身即"病态慢"的信号。 */
     private static final long MAX_TRACKED_DURATION_NANOS = 3_600_000_000_000L;
     /** 事务大小可追踪上界：10 亿数据单元——同上，防御性钳制。 */
@@ -84,6 +88,14 @@ public final class StreamThroughputMetrics {
     private long lastReportNanos;
     /** 上次报告的计数快照——速率差分的分子（当前累计 - 本值）。 */
     private Totals lastTotals;
+
+    /**
+     * 统计 tick 钩子（MS5 Task 4）：装配点（流式源 execute）在管线建好后注册，consumer 的
+     * 10s 统计 tick（reportLines 同一处）触发一次——{@link StreamMetricsBridge} 的速率预计算
+     * 与 lagBytes/管道磁盘占用采样挂在这里，与三行报告共用窗口边界。volatile——coordinator
+     * 写一次、consumer 读（注册晚于 consumer 线程启动的窗口内最坏错过首个 tick，无害）。
+     */
+    private volatile Runnable statsTickHook;
 
     // 会话峰值（2026-08-31 峰值 spec + 同日秒桶 spec 修订）：六项速率峰值 = 秒桶
     // （SecondBucket，见类尾——埋点单写者线程内分桶结算，报告侧弱一致读 max(已结算峰,
@@ -241,6 +253,38 @@ public final class StreamThroughputMetrics {
     public Totals totals() {
         return new Totals(slotBytes.sum(), slotMessages.sum(), assembledTxs.sum(),
                 outputBytes.sum(), outputRecords.sum(), outputTxs.sum());
+    }
+
+    /**
+     * 责任：注册统计 tick 钩子（MS5 Task 4）——consumer 的每个 10s 统计窗口边界触发一次，
+     * 与 {@link #reportLines} 同 tick（装配点用 {@code metrics.statsTickHook(bridge::onStatsTick)}
+     * 把指标桥的预计算挂上既有周期，不动组装器构造链）。
+     * 边界：null 抛 NPE（装配期 fail-fast）；重复注册后写覆盖先写（生产只注册一次）。
+     * 线程：coordinator（execute）写一次；consumer（统计 tick）volatile 读。
+     *
+     * @param hook 每个 10s 统计 tick 触发的回调（须廉价或可容忍的采样成本，不得抛异常进业务路径）
+     */
+    public void statsTickHook(Runnable hook) {
+        this.statsTickHook = java.util.Objects.requireNonNull(hook, "hook");
+    }
+
+    /**
+     * 责任：触发已注册的统计 tick 钩子（consumer 统计 tick 的收尾步骤，包私有——仅
+     * {@code TransactionConsumer.maybeStats} 调用）。未注册时 no-op；钩子抛出的任何
+     * Throwable 记 WARN 吞掉——指标观测面（MBean 预计算）永不向 consumer 业务路径抛异常。
+     * 线程：仅 consumer 线程。
+     */
+    void fireStatsTickHook() {
+        Runnable hook = statsTickHook;
+        if (hook == null) {
+            return;
+        }
+        try {
+            hook.run();
+        }
+        catch (Throwable t) {
+            LOG.warn("统计 tick 钩子执行失败(指标桥保留上一次观测值)", t);
+        }
     }
 
     /**

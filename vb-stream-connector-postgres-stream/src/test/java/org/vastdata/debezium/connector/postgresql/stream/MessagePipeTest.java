@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
@@ -56,6 +57,60 @@ class MessagePipeTest {
             assertEquals((byte) 2, payloads.get(1)[1]);
             assertEquals((byte) 'C', payloads.get(2)[0]);
         }
+    }
+
+    /**
+     * 磁盘占用观测(MS5 Task 4 的 MBean 读源):空管道非负(目录里至少有队列元数据文件),
+     * append 后占用单调增长,且数值等于目录全部常规文件的 size 和——"运维关心的目录整体
+     * 占用"口径锚定(逐文件求和复算对照)。
+     * 边界:不做逐字节精确断言(CQ 内部布局非契约),只锚非负/单调/与逐文件求和等值三点。
+     */
+    @Test
+    void diskUsageBytesSumsRegularFilesAndGrowsWithAppends() throws IOException {
+        try (MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
+            long before = pipe.diskUsageBytes();
+            assertTrue(before >= 0, "空管道占用应非负(至少含队列元数据文件),实测 " + before);
+
+            pipe.append(new byte[]{'I', 1});
+            pipe.append(new byte[]{'C'});
+            long after = pipe.diskUsageBytes();
+            assertTrue(after > before, "append 后目录占用应单调增长: " + before + " → " + after);
+
+            long summed = 0;
+            try (var paths = Files.walk(dir)) {
+                summed = paths.filter(Files::isRegularFile).mapToLong(p -> {
+                    try {
+                        return Files.size(p);
+                    }
+                    catch (IOException e) {
+                        return 0L;
+                    }
+                }).sum();
+            }
+            assertEquals(summed, after, "占用应等于目录全部常规文件的逐文件求和");
+        }
+    }
+
+    /**
+     * 目录不可访问时的哨兵:管道目录被整体删除后 diskUsageBytes 返回 -1(未知哨兵,与
+     * "未装配"同形)——遍历失败 WARN 不上抛,调用方不得把 -1 当真实字节数累计。
+     */
+    @Test
+    void diskUsageBytesReturnsMinusOneWhenDirectoryVanishes() throws IOException {
+        MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY);
+        pipe.close();
+        // 管道已关,目录整体删除后遍历必然失败——正好锚 -1 哨兵路径
+        try (var paths = Files.walk(dir)) {
+            paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.delete(p);
+                }
+                catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        }
+        assertEquals(-1L, pipe.diskUsageBytes(), "目录消失后应返回 -1 哨兵而非抛异常");
     }
 
     /**

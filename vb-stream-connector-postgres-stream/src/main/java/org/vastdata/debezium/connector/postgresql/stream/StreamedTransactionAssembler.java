@@ -795,7 +795,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     /**
      * Prepare:活动两阶段桶转挂起池(gid 已存在 → fail-fast)。
      * 事务自此挂起,等待 CommitPrepared(输出)或 RollbackPrepared(丢弃),可能长期等待甚至跨重启
-     * (持久化非目标)。
+     * (持久化非目标)。挂起池变更在 {@code synchronized(preparedByGid)} 内——与跨线程读
+     * {@link #pendingPreparedCount()}(consumer 统计 tick)建立 happens-before(MS5 Task 4)。
      */
     private void prepare(PgOutputMessage.Prepare m) {
         if (currentPrepareTx == null || currentPrepareTx.xid != m.xid()
@@ -804,28 +805,41 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
         }
         TxBuffer bucket = currentPrepareTx;
         currentPrepareTx = null;
-        if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
-            throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+        synchronized (preparedByGid) {
+            if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
+                throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+            }
+            LOG.debug("两阶段事务 PREPARE 入挂起池: gid={} storage={} pending={}",
+                    bucket.gid, storageOf(bucket), preparedByGid.size());
         }
-        LOG.debug("两阶段事务 PREPARE 入挂起池: gid={} storage={} pending={}",
-                bucket.gid, storageOf(bucket), preparedByGid.size());
     }
 
     /**
      * CommitPrepared:挂起池取桶(miss → fail-fast)交接封箱 TWO_PHASE 输出(gid 随桶冻结;
-     * 用户确认的输出时机)。交接后桶完结(低水位维护 + 剪枝)。
+     * 用户确认的输出时机)。交接后桶完结(低水位维护 + 剪枝)。挂起池变更在
+     * {@code synchronized(preparedByGid)} 内(见 prepare 的并发注记)。
      */
     private void commitPrepared(PgOutputMessage.CommitPrepared m) {
-        TxBuffer bucket = preparedByGid.remove(m.gid());
+        TxBuffer bucket;
+        synchronized (preparedByGid) {
+            bucket = preparedByGid.remove(m.gid());
+        }
         if (bucket == null) {
             throw new IllegalStateException("CommitPrepared 对应 gid 不存在: " + m.gid());
         }
         handoff(bucket, TransactionKind.TWO_PHASE, m.commitLsn(), m.endLsn(), m.commitTimestamp());
     }
 
-    /** RollbackPrepared:挂起池取桶(miss → fail-fast)静默丢弃,不回调(用户确认的回滚语义);丢弃后低水位候选推进。 */
+    /**
+     * RollbackPrepared:挂起池取桶(miss → fail-fast)静默丢弃,不回调(用户确认的回滚语义);
+     * 丢弃后低水位候选推进。挂起池变更在 {@code synchronized(preparedByGid)} 内(见 prepare
+     * 的并发注记)。
+     */
     private void rollbackPrepared(PgOutputMessage.RollbackPrepared m) {
-        TxBuffer bucket = preparedByGid.remove(m.gid());
+        TxBuffer bucket;
+        synchronized (preparedByGid) {
+            bucket = preparedByGid.remove(m.gid());
+        }
         if (bucket == null) {
             throw new IllegalStateException("RollbackPrepared 对应 gid 不存在: " + m.gid());
         }
@@ -848,11 +862,13 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
             throw new IllegalStateException("StreamPrepare 对应流式事务桶不存在: xid=" + m.xid());
         }
         bucket.gid = m.gid();
-        if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
-            throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+        synchronized (preparedByGid) {
+            if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
+                throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+            }
+            LOG.debug("流式两阶段事务 StreamPrepare 入挂起池: gid={} storage={} pending={}",
+                    bucket.gid, storageOf(bucket), preparedByGid.size());
         }
-        LOG.debug("流式两阶段事务 StreamPrepare 入挂起池: gid={} storage={} pending={}",
-                bucket.gid, storageOf(bucket), preparedByGid.size());
     }
 
     /**
@@ -918,6 +934,35 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private TxBuffer newBucket(long xid) {
         liveCount.incrementAndGet();
         return new TxBuffer(xid);
+    }
+
+    /**
+     * 责任:两阶段挂起池的当前事务数只读访问器(MS5 Task 4 的 MBean 读源——未决 2PC
+     * 事务数,长期挂起会钉住 WAL 保留,运维观测面)。
+     * 关键步骤:读在 {@code synchronized(preparedByGid)} 内——与全部写路径(prepare/
+     * streamPrepare 的 putIfAbsent、commitPrepared/rollbackPrepared 的 remove,均在
+     * reader 线程)同锁,跨线程(consumer 统计 tick)读到的是锁定边界的即时值。
+     * 边界:弱一致快照(读到后 reader 可能立即变更),统计语义足够。
+     * 线程约束:任意线程可调(读锁不与 reader 热路径长争用——挂起池操作频率 = 2PC 事件率)。
+     *
+     * @return 挂起池当前 gid 数(PREPARE 到 COMMIT/ROLLBACK PREPARED 之间的未决事务数)
+     */
+    public int pendingPreparedCount() {
+        synchronized (preparedByGid) {
+            return preparedByGid.size();
+        }
+    }
+
+    /**
+     * 责任:管道目录当前磁盘占用只读访问器(MS5 Task 4 的 MBean 读源)——薄委派
+     * {@link MessagePipe#diskUsageBytes()}(包私有管道不外泄,本类作转发面)。
+     * 边界:目录遍历失败返回 -1(未知哨兵,语义见 MessagePipe)。
+     * 线程约束:任意线程可调;生产调用点是 consumer 统计 tick(MBean 读路径不碰 IO)。
+     *
+     * @return 管道目录字节占用;遍历失败 -1
+     */
+    public long pipeDiskUsageBytes() {
+        return pipe.diskUsageBytes();
     }
 
     /**

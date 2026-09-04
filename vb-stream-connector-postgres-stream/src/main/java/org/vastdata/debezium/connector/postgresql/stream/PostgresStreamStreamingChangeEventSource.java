@@ -98,6 +98,15 @@ public class PostgresStreamStreamingChangeEventSource
     private volatile StreamThroughputMetrics throughputMetrics;
 
     /**
+     * 管线指标桥(MS5 Task 4:Task.start 建立并经源工厂传入的同一实例——与 metrics 工厂
+     * 持有的是同一个 bridge,单向依赖 Task → 工厂 → 本源 → execute 填充)。execute 装配
+     * 完成后经 {@link StreamMetricsBridge#setSuppliers} 填入四个真实读源,并把
+     * {@link StreamMetricsBridge#onStatsTick} 挂上指标的 10s 统计 tick 钩子——MBean 面
+     * (JMX 读)由此获得零锁预计算值。
+     */
+    private final StreamMetricsBridge metricsBridge;
+
+    /**
      * 构造流式源(装配延迟到 init/execute)。
      *
      * @param connectorConfig 连接器配置(会话参数/管道参数/流式档位的来源)
@@ -107,13 +116,15 @@ public class PostgresStreamStreamingChangeEventSource
      * @param schema          schema 组件(listener 版本安装目标)
      * @param mainConnection  main JDBC 连接(元数据 enrich 源)
      * @param typeRegistry    共享类型注册表(值映射的类型真源)
+     * @param metricsBridge   管线指标桥(Task.start 建立的同一实例,execute 填充读源)
      */
     public PostgresStreamStreamingChangeEventSource(PostgresStreamConnectorConfig connectorConfig,
                                                     PostgresEventDispatcher<TableId> dispatcher,
                                                     ErrorHandler errorHandler, Clock clock,
                                                     StreamPostgresSchema schema,
                                                     PostgresConnection mainConnection,
-                                                    TypeRegistry typeRegistry) {
+                                                    TypeRegistry typeRegistry,
+                                                    StreamMetricsBridge metricsBridge) {
         this.connectorConfig = Objects.requireNonNull(connectorConfig, "connectorConfig");
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.errorHandler = Objects.requireNonNull(errorHandler, "errorHandler");
@@ -121,6 +132,7 @@ public class PostgresStreamStreamingChangeEventSource
         this.schema = Objects.requireNonNull(schema, "schema");
         this.mainConnection = Objects.requireNonNull(mainConnection, "mainConnection");
         this.typeRegistry = Objects.requireNonNull(typeRegistry, "typeRegistry");
+        this.metricsBridge = Objects.requireNonNull(metricsBridge, "metricsBridge");
     }
 
     /**
@@ -144,7 +156,8 @@ public class PostgresStreamStreamingChangeEventSource
      * 基线取当前 nanoTime)→ 建异步组装器(listener =
      * DispatcherTransactionListener,包私有 11 参构造注入 listener 侧表解析接缝与吞吐指标
      * ——tableResolver 必须与 listener 构造时的<b>同一实例</b>,consumer 每桶 bind 的与
-     * listener 读的经它共享)→ 起
+     * listener 读的经它共享)→ 接通指标桥(MS5 Task 4:totals/lagBytes/磁盘占用/挂起
+     * prepared 四读源 + onStatsTick 挂统计 tick,见 {@link #wireMetricsBridge})→ 起
      * vb-pgoutput-reader 线程跑 {@code session.run(assembler, frontier::get)}(LSN 反馈按
      * 输出前沿封顶 = End 锚定)→ 监督循环(isRunning && !failed,空转周期发心跳)→
      * 退出后走停机次序。边界:装配/监督期任何 Throwable 经 {@link #fail} 汇聚
@@ -174,7 +187,7 @@ public class PostgresStreamStreamingChangeEventSource
                             connectorConfig.getConfig().getBoolean(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES)),
                     tableResolver);
             this.throughputMetrics = new StreamThroughputMetrics(System.nanoTime());
-            assembler = new StreamedTransactionAssembler(listener, connectorConfig.streamingMode(),
+            StreamedTransactionAssembler wiredAssembler = new StreamedTransactionAssembler(listener, connectorConfig.streamingMode(),
                     new VersionedRelationRegistry(),
                     new RelationTableFactory(RelationMetadataSource.jdbc(mainConnection,
                             typeRegistry, connectorConfig.getColumnFilter())),
@@ -182,6 +195,8 @@ public class PostgresStreamStreamingChangeEventSource
                     (msg, view) -> { }, frontier,
                     () -> fail(new DebeziumException("consumer 回放失败,已 fail-fast(细节见 transaction-consumer 的 ERROR 日志)")),
                     tableResolver, this.throughputMetrics);
+            assembler = wiredAssembler;
+            wireMetricsBridge(frontier, wiredAssembler);
 
             readerThread = new Thread(() -> runReader(frontier), "vb-pgoutput-reader");
             readerThread.setDaemon(false);
@@ -198,6 +213,30 @@ public class PostgresStreamStreamingChangeEventSource
         finally {
             stopStreaming();
         }
+    }
+
+    /**
+     * 责任:接通管线指标桥(MS5 Task 4)——管线(会话 + 组装器 + 指标)装配完成后:
+     * ①向 bridge 填四个真实读源:六计数 totals(速率窗口差分分子)、lagBytes
+     * ({@code session.lastReceiveLsn() - 输出前沿})、管道磁盘占用(委派组装器)、挂起
+     * prepared 数(组装器,与写同锁的即时 size);②把 {@link StreamMetricsBridge#onStatsTick}
+     * 挂上指标的统计 tick 钩子——预计算与三行报告同窗口边界,在 consumer 线程执行,
+     * JMX 读侧零锁零计算零 IO。
+     * 边界:supplier 捕获局部 {@code wiredAssembler}(volatile 写前的完全构造对象,
+     * happens-before 由 bridge 的 volatile 槽位写建立);lagBytes 读源内的 {@code session}
+     * 字段在组装器(consumer 线程)启动前已赋值,Thread.start 的 happens-before 保证可见。
+     * 只在 execute(coordinator 线程)调用一次。
+     *
+     * @param frontier        输出前沿(lagBytes 的减数)
+     * @param wiredAssembler  已装配完成的组装器(磁盘占用与挂起 prepared 的读源)
+     */
+    private void wireMetricsBridge(AtomicLong frontier, StreamedTransactionAssembler wiredAssembler) {
+        metricsBridge.setSuppliers(
+                () -> this.throughputMetrics.totals(),
+                () -> session.lastReceiveLsn() - frontier.get(),
+                wiredAssembler::pipeDiskUsageBytes,
+                wiredAssembler::pendingPreparedCount);
+        this.throughputMetrics.statsTickHook(metricsBridge::onStatsTick);
     }
 
     /**
