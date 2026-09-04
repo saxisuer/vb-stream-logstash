@@ -53,6 +53,15 @@
             </exclusions>
         </dependency>
 
+        <!-- HdrHistogram:高动态范围直方图(零传递依赖)——StreamThroughputMetrics 的分位数数据结构
+             (P90/P95/max,SingleWriterRecorder 区间窗口),照引擎 pom 同款;设计见引擎
+             docs/superpowers/specs/2026-08-31-throughput-metrics-design.md -->
+        <dependency>
+            <groupId>org.hdrhistogram</groupId>
+            <artifactId>HdrHistogram</artifactId>
+            <version>${hdrhistogram.version}</version>
+        </dependency>
+
         <!-- Debezium PG 连接器:复用其 Config/Schema/Emitter/快照/offset 体系(spec D3);
              版本锚定 Central 最新 Final(spec §11/D6,2026-09-01 查证),3.7 线仅 Beta 不取 -->
         <dependency>
