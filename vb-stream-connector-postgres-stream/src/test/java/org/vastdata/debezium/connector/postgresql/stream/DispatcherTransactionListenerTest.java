@@ -3,6 +3,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.CdcSourceTaskContext;
+import io.debezium.data.Envelope.Operation;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresEventDispatcher;
 import io.debezium.connector.postgresql.PostgresOffsetContext;
@@ -38,8 +39,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * DispatcherTransactionListener 单测(离线,真库归 Task 8):事务边界 offset 语义
  * (Begin 后 offsetContext.getOffset() 的 lsn=lsn_commit=endLsn)、事件 → dispatcher
  * 映射面(Started/DataChange/Committed)、asOf 版本安装调用面(新版本装一次、同版本
- * 不重复装、变更版本重装——经假 {@link StreamPostgresSchema} 子类观测)、Truncate/MsgChange
- * 的 MS2 跳过口径。dispatcher 用真实 {@code PostgresEventDispatcher} 的记录子类
+ * 不重复装、变更版本重装——经假 {@link StreamPostgresSchema} 子类观测)、Truncate 的
+ * skipped.operations 门控(默认 "t" 跳过、none 才逐表发射)与 MsgChange 的跳过口径。
+ * dispatcher 用真实 {@code PostgresEventDispatcher} 的记录子类
  * (离线装配:noop 心跳 + null signalProcessor/headerProducer,被测方法全部覆写记录)。
  *
  * <p>夹具约定:offset 经 Loader 从空 map 装载;桶快照经真实
@@ -50,6 +52,9 @@ class DispatcherTransactionListenerTest {
 
     /** 测试表 oid。 */
     private static final int OID = 16386;
+
+    /** 第二张测试表 oid(多表 TRUNCATE 用例的受影响第二表)。 */
+    private static final int OID_B = 16387;
 
     /** 事务边界 LSN(Begin/End 事件的 endLsn 组件)。 */
     private static final long END_LSN = 0x16000000L;
@@ -65,12 +70,21 @@ class DispatcherTransactionListenerTest {
 
     /** 责任:离线构造最小合法配置(topic.prefix 是 TopicNamingStrategy 的必填项)。 */
     private static PostgresStreamConnectorConfig config() {
+        return config(Map.of());
+    }
+
+    /**
+     * 责任:离线构造最小合法配置并叠加覆盖项(如 skipped.operations=none——Truncate
+     * 发射门控的对照配置;覆盖项冲突时以覆盖项为准,Configuration.from 语义)。
+     */
+    private static PostgresStreamConnectorConfig config(Map<String, String> overrides) {
         Map<String, String> props = new HashMap<>();
         props.put("hostname", "localhost");
         props.put("port", "5432");
         props.put("user", "postgres");
         props.put("database", "postgres");
         props.put("topic.prefix", "tsrv");
+        props.putAll(overrides);
         return new PostgresStreamConnectorConfig(Configuration.from(props));
     }
 
@@ -90,7 +104,7 @@ class DispatcherTransactionListenerTest {
      */
     private static final class RecordingSchema extends StreamPostgresSchema {
         final List<Table> installed = new ArrayList<>();
-        Table current;
+        final Map<Integer, Table> current = new HashMap<>();
 
         RecordingSchema(CdcSourceTaskContext<PostgresConnectorConfig> taskContext) {
             super(taskContext, null, null, null, null);
@@ -98,13 +112,13 @@ class DispatcherTransactionListenerTest {
 
         @Override
         public Table tableFor(int relationId) {
-            return relationId == OID ? current : null;
+            return current.get(relationId);
         }
 
         @Override
         public void applySchemaChangesForTable(int relationId, Table table) {
             installed.add(table);
-            current = table;
+            current.put(relationId, table);
         }
     }
 
@@ -141,20 +155,39 @@ class DispatcherTransactionListenerTest {
 
     /** 责任:按列名集合造 v1/v2 两版 wire Relation + Table(经共享夹具,列名集合即版本差异)。 */
     private static ResolvedRelation resolved(String... colNames) {
-        PgOutputMessage.Relation wire = new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l",
+        return resolved(OID, "t_l", colNames);
+    }
+
+    /**
+     * 责任:按 oid/表名/列名集合造 wire Relation + Table(多表 TRUNCATE 用例需要
+     * 第二张表:oid 与表名都得独立可配)。
+     */
+    private static ResolvedRelation resolved(int oid, String tableName, String... colNames) {
+        PgOutputMessage.Relation wire = new PgOutputMessage.Relation(OptionalLong.empty(), oid, "public", tableName,
                 'd', Arrays.stream(colNames).map(n -> new RelationColumn(n, 25, -1, n.equals("id"))).toList());
         return new ResolvedRelation(wire, TestRelations.tableOf(wire));
     }
 
     /** 责任:构造 listener + 已绑定快照的 resolver(v1 版本已记入 registry)。 */
     private static Fixture fixture(String... colNames) {
-        PostgresStreamConnectorConfig config = config();
+        return fixture(config(), List.of(resolved(colNames)));
+    }
+
+    /**
+     * 责任:按显式配置与预登记版本构造 listener(快照覆盖全部登记 oid;多表 TRUNCATE
+     * 用例经本重载注入第二张表与 skipped.operations=none 的对照配置)。
+     */
+    private static Fixture fixture(PostgresStreamConnectorConfig config, List<ResolvedRelation> registered) {
         RecordingSchema schema = new RecordingSchema(taskContext(config));
         RecordingDispatcher dispatcher = new RecordingDispatcher(config, schema);
         VersionedRelationRegistry registry = new VersionedRelationRegistry();
-        registry.accept(10L, resolved(colNames));
+        Set<Integer> oids = new java.util.HashSet<>();
+        for (ResolvedRelation relation : registered) {
+            registry.accept(10L, relation);
+            oids.add(relation.wire().relationOid());
+        }
         BucketTableResolver resolver = BucketTableResolver.snapshotBacked();
-        resolver.bind(registry.snapshot(Set.of(OID), 20L));
+        resolver.bind(registry.snapshot(oids, 20L));
         DispatcherTransactionListener listener = new DispatcherTransactionListener(
                 new PostgresPartition("server", "db"), offset(), dispatcher, schema,
                 Clock.system(), config, new PassthroughMapper(),
@@ -275,19 +308,64 @@ class DispatcherTransactionListenerTest {
         assertEquals(1, f.dispatcher().dataChangeArgs.size(), "数据事件照常发射");
     }
 
-    /** Truncate/MsgChange:MS2 跳过发射(DEBUG 口径)——不装版本、不发数据事件。 */
+    /**
+     * Truncate 门控(默认配置):skipped.operations 默认 "t"(CommonConnectorConfig 继承,
+     * vanilla 同默认——TRUNCATE 默认跳过)→ TruncateChange 零 dispatch、零版本安装;
+     * MsgChange 仍为后续里程碑的 DEBUG 跳过。
+     */
     @Test
-    void truncateAndMsgChangeAreSkippedInMs2() {
+    void truncateChangeSkippedByDefaultConfigAndMsgChangeStillDeferred() {
         Fixture f = fixture("id", "v");
+        f.listener().onEvent(begin());
+        f.listener().onEvent(truncateChange());
+        f.listener().onEvent(new MsgChange(true, "pfx", new byte[0], OptionalLong.empty(), 12L));
+
+        assertTrue(f.schema().installed.isEmpty(), "门控跳过的 Truncate/Msg 不触发版本安装");
+        assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "默认配置下 Truncate 零 dispatch(MsgChange 仍跳过)");
+    }
+
+    /**
+     * Truncate 发射(skipped.operations=none):逐表 dispatch——每张受影响表一条数据事件,
+     * 每表一个 emitter(TruncateEmitter,Operation=TRUNCATE——key=null 的无 before/after
+     * 形态,vanilla PostgresChangeRecordEmitter.emitTruncateRecord 同款);表版本按
+     * (oid, seq) asOf 解析并安装(与 RowChange 同路径);事务块 BEGIN/COMMITTED 照常
+     * (每表一条 dataEvent,TransactionMonitor 自动计数)。
+     */
+    @Test
+    void truncateChangeWithNoneSkippedDispatchesPerTable() {
+        Fixture f = fixture(config(Map.of("skipped.operations", "none")),
+                List.of(resolved(OID, "t_l", "id", "v"), resolved(OID_B, "t_l_b", "id")));
         f.listener().onEvent(begin());
         f.listener().onEvent(new TruncateChange(
                 List.of(new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
-                        List.of(new RelationColumn("id", 25, -1, true)))),
+                                List.of(new RelationColumn("id", 25, -1, true))),
+                        new PgOutputMessage.Relation(OptionalLong.empty(), OID_B, "public", "t_l_b", 'd',
+                                List.of(new RelationColumn("id", 25, -1, true)))),
                 Set.of(), OptionalLong.empty(), 11L));
-        f.listener().onEvent(new MsgChange(true, "pfx", new byte[0], OptionalLong.empty(), 12L));
+        f.listener().onEvent(new TransactionEvent.End(XID, 0L));
 
-        assertTrue(f.schema().installed.isEmpty(), "Truncate/Msg 不触发版本安装");
-        assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "Truncate/Msg 不发数据事件(Truncate 族 MS3 补)");
+        assertEquals(2, f.dispatcher().dataChangeArgs.size(), "两表 TRUNCATE 应逐表各发一条数据事件");
+        assertEquals(2, f.schema().installed.size(), "两表版本各装一次(asOf 解析路径与 RowChange 同)");
+        TableId first = (TableId) f.dispatcher().dataChangeArgs.get(0)[1];
+        TableId second = (TableId) f.dispatcher().dataChangeArgs.get(1)[1];
+        assertEquals(new TableId(null, "public", "t_l"), first, "首表 tableId 取 asOf Table");
+        assertEquals(new TableId(null, "public", "t_l_b"), second, "第二表 tableId 取 asOf Table");
+        for (Object[] args : f.dispatcher().dataChangeArgs) {
+            ChangeRecordEmitter<?> emitter = (ChangeRecordEmitter<?>) args[2];
+            assertTrue(emitter instanceof TruncateEmitter, "每表一个 TruncateEmitter(普通数据事件路径)");
+            assertEquals(Operation.TRUNCATE, emitter.getOperation(), "TRUNCATE 形态(op=t、key=null 的信封由 emitter 构造)");
+        }
+        assertEquals(List.of("started:" + XID + "@" + COMMIT_TS,
+                "data:public.t_l", "data:public.t_l_b", "committed@" + COMMIT_TS),
+                f.dispatcher().calls, "BEGIN → 逐表数据事件 → COMMIT 的完整事件序列");
+    }
+
+    /** 一条单表 TruncateChange(oid=OID;多表形态由 fixture 的第二表 + 本事件组合覆盖)。 */
+    private static TruncateChange truncateChange() {
+        return new TruncateChange(
+                List.of(new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
+                        List.of(new RelationColumn("id", 25, -1, true)))),
+                Set.of(), OptionalLong.empty(), 11L);
     }
 
     /** 事务尾:End 事件映射 dispatchTransactionCommittedEvent(时间戳沿用 Begin 的提交时间戳)。 */
