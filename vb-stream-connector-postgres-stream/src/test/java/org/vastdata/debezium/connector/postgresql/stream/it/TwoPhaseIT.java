@@ -226,6 +226,43 @@ class TwoPhaseIT extends StreamITBase {
     }
 
     /**
+     * 场景③(<b>parallel 档端到端验收</b>):流式大事务 PREPARE 以 StreamPrepare 收尾、
+     * COMMIT PREPARED 后 500 行全达。关键步骤:start(baseConfig 默认 parallel + two_phase,
+     * 不覆盖——StreamPrepare 是 PARALLEL×two_phase 独有路径,引擎 TwoPhaseTransactionTest
+     * 场景三的翻译)→ 单事务 500 行×repeat('z',4096)(2MB,远超 64kB work_mem 必触发流式)
+     * PREPARE('gid_big')→ 立即 COMMIT PREPARED → 消费 502 条(BEGIN+500 数据+END)→
+     * 断言数据 ids 恰 1000..1499、END event_count=500。
+     * 边界:载荷可压缩但 2MB 总量靠 rb->size 全局记账必触发流式驱逐(引擎同款方案实测);
+     * 断言面是黑盒记录(StreamPrepare 消息路径由全量到达间接验收),不逐字节验载荷。
+     */
+    @Test
+    void largePreparedTransactionStreamsUnderParallelAndEmitsOnCommitPrepared() throws Exception {
+        createFixture();
+        start(PostgresStreamConnector.class, baseConfig(SLOT, PUB, pipeDir).build());
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        try (Connection c = StreamPgTestEnv.newSqlConnection()) {
+            try (Statement st = c.createStatement()) {
+                st.execute("BEGIN");
+                for (int i = 0; i < 500; i++) {
+                    st.execute("INSERT INTO " + TABLE + " VALUES (" + (1000 + i) + ", repeat('z', 4096))");
+                }
+                st.execute("PREPARE TRANSACTION 'gid_big'");
+                st.execute("COMMIT PREPARED 'gid_big'");
+            }
+        }
+
+        List<SourceRecord> all = consumeRecordsUnchecked(502);
+        assertEquals(502, all.size(), "BEGIN+500 数据+END 共 502 条应到达: " + describe(all));
+        Set<Integer> expected = new HashSet<>();
+        for (int i = 0; i < 500; i++) {
+            expected.add(1000 + i);
+        }
+        assertEquals(expected, dataIds(all), "流式两阶段事务 500 行应全量落 Kafka(parallel 档端到端)");
+        assertTrue(hasEndWithEventCount(all, 500), "事务 topic 应有 event_count=500 的 END: " + describe(all));
+    }
+
+    /**
      * 事务 topic 是否存在指定 event_count 的 END 记录(完整事务边界信号;其他事务的 END
      * 不影响命中)。status 字段缺失的记录(理论不出现)跳过。
      *
