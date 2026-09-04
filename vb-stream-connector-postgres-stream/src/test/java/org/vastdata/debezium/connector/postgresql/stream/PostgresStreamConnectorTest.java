@@ -3,7 +3,9 @@ package org.vastdata.debezium.connector.postgresql.stream;
 import org.apache.kafka.common.config.ConfigDef;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -67,5 +69,67 @@ class PostgresStreamConnectorTest {
         }
         assertTrue(fieldNames.containsAll(expected),
                 "getConfigFields() 返回的 ALL_FIELDS 应含 5 个新配置名");
+    }
+
+    /**
+     * 用例④taskConfigs 默认注入:缺省的 snapshot.mode 与 provide.transaction.metadata
+     * 被置入本连接器默认(no_data / true),用户显式配置的值原样透传不被覆盖——
+     * putIfAbsent 语义;显式值的合法性拒收责任在 REST 校验与构造器 fail-fast,
+     * 注入层不做静默改写(改写会让"配置了 A、运行了 B"的漂移难排查)。
+     */
+    @Test
+    void taskConfigsInjectsDefaultsWithoutOverridingExplicitValues() {
+        PostgresStreamConnector connector = new PostgresStreamConnector();
+        Map<String, String> props = new HashMap<>();
+        props.put("hostname", "localhost");
+        props.put("port", "5432");
+        props.put("user", "postgres");
+        props.put("database", "postgres");
+        props.put("provide.transaction.metadata", "false");
+        connector.start(props);
+        List<Map<String, String>> taskConfigs = connector.taskConfigs(1);
+        assertEquals(1, taskConfigs.size(), "单任务连接器应返回 1 份任务配置");
+        Map<String, String> taskConfig = taskConfigs.get(0);
+        assertEquals("no_data", taskConfig.get("snapshot.mode"),
+                "缺省 snapshot.mode 应注入 no_data");
+        assertEquals("false", taskConfig.get("provide.transaction.metadata"),
+                "显式 provide.transaction.metadata=false 不应被默认 true 覆盖");
+    }
+
+    /**
+     * 用例⑤事务元数据默认开:缺省的 provide.transaction.metadata 经 taskConfigs 注入为
+     * true(MS5 语义——流式连接器默认发 BEGIN/END 事务边界标记,下游可按事务分组);
+     * 同时显式 snapshot.mode=initial 原样透传(不做静默改写,拒收在防线后置层)。
+     */
+    @Test
+    void transactionMetadataDefaultsToTrueViaInjection() {
+        PostgresStreamConnector connector = new PostgresStreamConnector();
+        Map<String, String> props = new HashMap<>();
+        props.put("hostname", "localhost");
+        props.put("port", "5432");
+        props.put("user", "postgres");
+        props.put("database", "postgres");
+        props.put("snapshot.mode", "initial");
+        connector.start(props);
+        Map<String, String> taskConfig = connector.taskConfigs(1).get(0);
+        assertEquals("true", taskConfig.get("provide.transaction.metadata"),
+                "缺省 provide.transaction.metadata 应注入 true(事务元数据默认开)");
+        assertEquals("initial", taskConfig.get("snapshot.mode"),
+                "显式 snapshot.mode 应原样透传(拒收责任在 REST 校验/构造器 fail-fast)");
+    }
+
+    /**
+     * 用例⑥config() 展示面覆盖默认:snapshot.mode 的 ConfigDef 默认值改写为 no_data、
+     * provide.transaction.metadata 改写为 true——REST 推荐值与本连接器实际支持面
+     * (仅 no_data)与默认行为(事务元数据开)一致,防"界面推荐 initial、运行必拒"的
+     * 配置面裂缝(父 configDef 的默认 initial/false 不再适用)。
+     */
+    @Test
+    void configDefOverridesSnapshotModeAndTransactionMetadataDefaults() {
+        ConfigDef def = new PostgresStreamConnector().config();
+        assertEquals("no_data", def.defaultValues().get("snapshot.mode"),
+                "REST 暴露面 snapshot.mode 默认值应展示 no_data(唯一支持值)");
+        assertEquals(Boolean.TRUE, def.defaultValues().get("provide.transaction.metadata"),
+                "REST 暴露面 provide.transaction.metadata 默认值应展示 true(事务元数据默认开)");
     }
 }

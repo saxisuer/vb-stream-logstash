@@ -1,32 +1,40 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.apache.kafka.common.config.ConfigValue;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.Test;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link PostgresStreamConnectorConfig} 配置面单测:五个新配置项的默认值解析、
  * slot.streaming 的枚举校验(非法值拒收)、parallel×two_phase 联合校验
  * (spec §5.1 启动期 fail-fast)、slot.feedback.interval.ms 的正整数校验与毫秒→秒换算、
- * ALL_FIELDS 对父集合的扩展完整性、大小写宽容。
- * 纯构造 + {@code Configuration.validate(Field.Set)} 断言,不连库、不起 Connect runtime。
+ * ALL_FIELDS 对父集合的扩展完整性、大小写宽容、snapshot.mode 的仅-no_data 三层防线
+ * (Field 校验 + taskConfigs 注入默认 + 构造器 fail-fast 兜底,MS5)。
+ * 纯构造 + {@code Configuration.validate(Field.Set)} 断言,不连库、不起 Connect runtime
+ * (taskConfigs 注入面经真实 {@link PostgresStreamConnector#taskConfigs(int)} 驱动)。
  */
 class PostgresStreamConnectorConfigTest {
 
     /**
      * 构造最小可用的 PG 连接配置:补齐 Debezium 必填四件套
-     * (hostname/port/user/database,缺省 localhost/5432/postgres/postgres),
+     * (hostname/port/user/database,缺省 localhost/5432/postgres/postgres)与
+     * snapshot.mode=no_data(直接构造的最小合法面——镜像 PostgresStreamConnector.
+     * taskConfigs 注入后的配置;MS5 起构造器对非 no_data fail-fast),
      * 再叠加各用例自己的覆盖项,保证 {@code PostgresStreamConnectorConfig} 构造器
      * 与 validate 面向的是"合法基础 + 待测覆盖"的配置。
      *
@@ -39,8 +47,26 @@ class PostgresStreamConnectorConfigTest {
         props.put("port", "5432");
         props.put("user", "postgres");
         props.put("database", "postgres");
+        props.put("snapshot.mode", "no_data");
         props.putAll(overrides);
         return Configuration.from(props);
+    }
+
+    /**
+     * 构造未经 taskConfigs 注入的原始最小配置(必填四件套 + 覆盖项,无 snapshot.mode)
+     * ——专用于断言构造器 fail-fast 兜底:父 Field 默认 initial,缺省直接构造必抛。
+     *
+     * @param overrides 用例覆盖项(不含 snapshot.mode 时即父默认回落面)
+     * @return 未注入本连接器默认值的原始 {@link Configuration}
+     */
+    private static Map<String, String> uninjectedProps(Map<String, String> overrides) {
+        Map<String, String> props = new HashMap<>();
+        props.put("hostname", "localhost");
+        props.put("port", "5432");
+        props.put("user", "postgres");
+        props.put("database", "postgres");
+        props.putAll(overrides);
+        return props;
     }
 
     /**
@@ -251,5 +277,61 @@ class PostgresStreamConnectorConfigTest {
         assertTrue(def.names().contains("slot.messages"), "Connect REST configDef 应暴露 slot.messages");
         assertEquals(Boolean.FALSE, def.defaultValues().get("slot.messages"),
                 "REST 暴露面默认值应取 Field.defaultValue()(false)");
+    }
+
+    /**
+     * 用例⑭snapshot.mode=no_data 支持面:显式配置(小写)时 validate 零问题且构造成功、
+     * getSnapshotMode() 解析为 NO_DATA——本连接器唯一支持的快照模式(流式-only,不做快照
+     * 数据抽取,该职能属 vanilla postgresql-connector);小写面与父类枚举解析(大小写宽容)
+     * 两侧一致,用户配置面不必整小写。
+     */
+    @Test
+    void snapshotModeNoDataIsAccepted() {
+        Configuration config = configWith(Map.of("snapshot.mode", "no_data"));
+        Map<String, ConfigValue> problems = config.validate(PostgresStreamConnectorConfig.ALL_FIELDS);
+        assertTrue(problems.get("snapshot.mode") == null || problems.get("snapshot.mode").errorMessages().isEmpty(),
+                "snapshot.mode=no_data 不应产生校验问题");
+        assertEquals(PostgresConnectorConfig.SnapshotMode.NO_DATA, new PostgresStreamConnectorConfig(config).getSnapshotMode(),
+                "no_data 应构造成功且解析为 NO_DATA");
+    }
+
+    /**
+     * 用例⑮snapshot.mode=initial 拒收:validate 恰好 1 条问题且文案含 "no_data only"
+     * (启动期把非法快照模式挡在连库之前);REST 校验被绕过时构造器 fail-fast 兜底抛
+     * {@link ConnectException}——三层防线(REST 校验/注入默认/构造器)缺一不可。
+     */
+    @Test
+    void snapshotModeInitialIsRejected() {
+        Map<String, ConfigValue> problems = configWith(Map.of("snapshot.mode", "initial"))
+                .validate(PostgresStreamConnectorConfig.ALL_FIELDS);
+        assertEquals(1, problems.get("snapshot.mode").errorMessages().size(),
+                "snapshot.mode=initial 应恰好 1 条校验错误");
+        assertTrue(problems.get("snapshot.mode").errorMessages().get(0).contains("no_data only"),
+                "错误消息应说明仅支持 no_data");
+        assertThrows(ConnectException.class,
+                () -> new PostgresStreamConnectorConfig(configWith(Map.of("snapshot.mode", "initial"))),
+                "直构造路径(绕过 REST 校验)应由构造器 fail-fast 抛 ConnectException");
+    }
+
+    /**
+     * 用例⑯缺省 = no_data 只经注入成立:未注入的原始配置直接构造抛 ConnectException
+     * (getSnapshotMode() 经<b>父 Field 引用</b>回落到默认 initial——子类同名字段替换
+     * 不改变父引用的回落值,故"缺省 = no_data"必须由注入保证);经连接器 taskConfigs
+     * 注入后的配置构造成功且解析为 NO_DATA——Connect runtime 与 embedded engine 两侧
+     * 的默认值供给路径。
+     */
+    @Test
+    void snapshotModeDefaultsToNoDataViaTaskConfigsInjection() {
+        Map<String, String> raw = uninjectedProps(Map.of());
+        assertThrows(ConnectException.class,
+                () -> new PostgresStreamConnectorConfig(Configuration.from(raw)),
+                "注入前直接构造应抛 ConnectException(父默认 initial 的 fail-fast 兜底)");
+        PostgresStreamConnector connector = new PostgresStreamConnector();
+        connector.start(raw);
+        List<Map<String, String>> taskConfigs = connector.taskConfigs(1);
+        assertEquals(1, taskConfigs.size(), "单任务连接器应返回 1 份任务配置");
+        assertEquals(PostgresConnectorConfig.SnapshotMode.NO_DATA,
+                new PostgresStreamConnectorConfig(Configuration.from(taskConfigs.get(0))).getSnapshotMode(),
+                "注入 snapshot.mode=no_data 后应构造成功且解析为 NO_DATA");
     }
 }

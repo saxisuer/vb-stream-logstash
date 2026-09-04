@@ -82,6 +82,8 @@ class DispatcherTransactionListenerTest {
     /**
      * 责任:离线构造最小合法配置并叠加覆盖项(如 skipped.operations=none——Truncate
      * 发射门控的对照配置;覆盖项冲突时以覆盖项为准,Configuration.from 语义)。
+     * 基础面含 snapshot.mode=no_data——镜像 taskConfigs 注入后的直接构造最小合法面
+     * (MS5 起构造器对非 no_data 快照模式 fail-fast)。
      */
     private static PostgresStreamConnectorConfig config(Map<String, String> overrides) {
         Map<String, String> props = new HashMap<>();
@@ -90,6 +92,7 @@ class DispatcherTransactionListenerTest {
         props.put("user", "postgres");
         props.put("database", "postgres");
         props.put("topic.prefix", "tsrv");
+        props.put("snapshot.mode", "no_data");
         props.putAll(overrides);
         return new PostgresStreamConnectorConfig(Configuration.from(props));
     }

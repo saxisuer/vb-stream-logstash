@@ -46,8 +46,9 @@ class RowChangeEmitterTest {
     private static final Object TOAST_SENTINEL = new Object();
 
     /**
-     * 责任:离线构造最小合法配置(必填四项 + 无覆盖)——PostgresOffsetContext.Loader 与
-     * emitter 的 connectorConfig 形参都吃这个形态。
+     * 责任:离线构造最小合法配置(必填四项 + snapshot.mode=no_data 镜像 taskConfigs
+     * 注入面——MS5 起构造器对非 no_data 快照模式 fail-fast)——PostgresOffsetContext.Loader
+     * 与 emitter 的 connectorConfig 形参都吃这个形态。
      */
     private static PostgresStreamConnectorConfig config() {
         Map<String, String> props = new HashMap<>();
@@ -55,6 +56,7 @@ class RowChangeEmitterTest {
         props.put("port", "5432");
         props.put("user", "postgres");
         props.put("database", "postgres");
+        props.put("snapshot.mode", "no_data");
         return new PostgresStreamConnectorConfig(Configuration.from(props));
     }
 
