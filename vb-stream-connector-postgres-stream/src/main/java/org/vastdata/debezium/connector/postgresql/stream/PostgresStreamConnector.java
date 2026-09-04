@@ -40,11 +40,11 @@ public class PostgresStreamConnector extends PostgresConnector {
 
     /**
      * 构造 Connect REST 暴露的配置定义:取父类静态 configDef() 的可变副本
-     * (每次调用新建 ConfigDef,不改父类静态状态),再 define 5 个新配置项
+     * (每次调用新建 ConfigDef,不改父类静态状态),再 define 6 个新配置项
      * ——类型/默认值与 {@link PostgresStreamConnectorConfig} 的 Field 声明一一对应
      * (默认值显式取 Field.defaultValue(),防两处字面量漂移),重要性/描述为暴露面专用文案。
      *
-     * @return 含父类全部配置项 + 5 个新配置项的 {@link ConfigDef}
+     * @return 含父类全部配置项 + 6 个新配置项的 {@link ConfigDef}
      */
     @Override
     public ConfigDef config() {
@@ -64,11 +64,14 @@ public class PostgresStreamConnector extends PostgresConnector {
         def.define(PostgresStreamConnectorConfig.SLOT_FEEDBACK_INTERVAL_MS.name(), ConfigDef.Type.INT,
                 PostgresStreamConnectorConfig.SLOT_FEEDBACK_INTERVAL_MS.defaultValue(), ConfigDef.Importance.LOW,
                 "Interval in milliseconds between LSN status feedback to the server (the confirmed LSN is capped at the output frontier so unoutput transactions are resent after a crash). Values are truncated to whole seconds.");
+        def.define(PostgresStreamConnectorConfig.SLOT_MESSAGES.name(), ConfigDef.Type.BOOLEAN,
+                PostgresStreamConnectorConfig.SLOT_MESSAGES.defaultValue(), ConfigDef.Importance.LOW,
+                "Whether to request logical messages ('M') from the server by adding messages=true to the slot options (PostgreSQL 14+). When enabled, logical messages are parsed and logged, and non-transactional ones safely advance the output frontier; they are never emitted to topics.");
         return def;
     }
 
     /**
-     * 返回引擎侧读取的完整配置字段集(含父类字段与本模块 4 新项),
+     * 返回引擎侧读取的完整配置字段集(含父类字段与本模块 6 新项),
      * 供 embedded engine / 校验框架做配置完整性检查。
      *
      * @return {@link PostgresStreamConnectorConfig#ALL_FIELDS}(Set 不可变,可安全共享)

@@ -98,7 +98,16 @@ public final class PgWire {
      * prefix CString + I32 长度 + 内容字节。
      */
     public static byte[] logicalMsg(boolean transactional, String prefix, byte[] content) {
-        return new Wire().type('M').i8(transactional ? 0x01 : 0x00).i64(1L)
+        return logicalMsg(transactional, 1L, prefix, content);
+    }
+
+    /**
+     * 责任:构造显式 lsn 的 LogicalMsg('M')(MS3.5 护栏用例需要消息 LSN 与各控制消息的
+     * 占位 LSN 拉开差距——无 pending 推进到 msgLsn、有 pending 压到 commitLsn 之下,
+     * 占位 1 与 Commit 的占位 1 同值无法区分)。布局同三参重载,仅 lsn 由调用方给出。
+     */
+    public static byte[] logicalMsg(boolean transactional, long lsn, String prefix, byte[] content) {
+        return new Wire().type('M').i8(transactional ? 0x01 : 0x00).i64(lsn)
                 .str(prefix).i32(content.length).raw(content).toByteArray();
     }
 

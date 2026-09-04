@@ -1,5 +1,9 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.CdcSourceTaskContext;
@@ -22,6 +26,7 @@ import org.vastdata.debezium.connector.postgresql.stream.protocol.RelationColumn
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleData;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleValue;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -40,7 +45,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * (Begin 后 offsetContext.getOffset() 的 lsn=lsn_commit=endLsn)、事件 → dispatcher
  * 映射面(Started/DataChange/Committed)、asOf 版本安装调用面(新版本装一次、同版本
  * 不重复装、变更版本重装——经假 {@link StreamPostgresSchema} 子类观测)、Truncate 的
- * skipped.operations 门控(默认 "t" 跳过、none 才逐表发射)与 MsgChange 的跳过口径。
+ * skipped.operations 门控(默认 "t" 跳过、none 才逐表发射)与 MsgChange 的回放期
+ * INFO 留痕口径(MS3.5:记但不 dispatch,发射仍延期)。
  * dispatcher 用真实 {@code PostgresEventDispatcher} 的记录子类
  * (离线装配:noop 心跳 + null signalProcessor/headerProducer,被测方法全部覆写记录)。
  *
@@ -311,7 +317,8 @@ class DispatcherTransactionListenerTest {
     /**
      * Truncate 门控(默认配置):skipped.operations 默认 "t"(CommonConnectorConfig 继承,
      * vanilla 同默认——TRUNCATE 默认跳过)→ TruncateChange 零 dispatch、零版本安装;
-     * MsgChange 仍为后续里程碑的 DEBUG 跳过。
+     * MsgChange 自 MS3.5 起 INFO 留痕但仍不 dispatch(断言见
+     * {@link #msgChangeLogsInfoWithTransactionalTrueAndNeverDispatches()})。
      */
     @Test
     void truncateChangeSkippedByDefaultConfigAndMsgChangeStillDeferred() {
@@ -321,7 +328,7 @@ class DispatcherTransactionListenerTest {
         f.listener().onEvent(new MsgChange(true, "pfx", new byte[0], OptionalLong.empty(), 12L));
 
         assertTrue(f.schema().installed.isEmpty(), "门控跳过的 Truncate/Msg 不触发版本安装");
-        assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "默认配置下 Truncate 零 dispatch(MsgChange 仍跳过)");
+        assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "默认配置下 Truncate 零 dispatch(MsgChange 仅留痕)");
     }
 
     /**
@@ -377,5 +384,79 @@ class DispatcherTransactionListenerTest {
 
         assertEquals(List.of("started:" + XID + "@" + COMMIT_TS, "committed@" + COMMIT_TS),
                 f.dispatcher().calls, "End 不带时间戳组件——listener 记住 Begin 的提交时间戳复用");
+    }
+
+    /**
+     * MsgChange 回放期留痕(MS3.5 spec §3.2 事务性时点):INFO 恰一行(prefix 与 content
+     * 从 MsgChange 组件直取、事务性取组件真值,aborted 子事务的消息在回放过滤阶段已被
+     * 剔除,天然不记,与 CDC 数据语义对齐),content 经 {@link MessagePreview} 预览截断
+     * (100 字节可打印载荷 → 前 64 字符 + "...(100B)")。
+     * 仍不 dispatch(dispatcher 零 data/事务中间事件)、不计入 event_count——发射仍延期
+     * (begin/end 事务块头尾照常,事件序列不含消息)。
+     */
+    @Test
+    void msgChangeLogsInfoWithTransactionalTrueAndNeverDispatches() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        Logger log = (Logger) org.slf4j.LoggerFactory.getLogger(DispatcherTransactionListener.class);
+        log.addAppender(appender);
+        try {
+            Fixture f = fixture("id", "v");
+            f.listener().onEvent(begin());
+            f.listener().onEvent(new MsgChange(true, "pfx",
+                    "y".repeat(100).getBytes(StandardCharsets.US_ASCII), OptionalLong.empty(), 12L));
+            f.listener().onEvent(new TransactionEvent.End(XID, 0L));
+
+            List<String> lines = appender.list.stream()
+                    .filter(e -> e.getLevel() == Level.INFO)
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .toList();
+            assertEquals(1, lines.size(), "恰一行 INFO 留痕: " + lines);
+            String line = lines.get(0);
+            assertTrue(line.contains("prefix=pfx"), line);
+            assertTrue(line.contains("事务性=true"), line);
+            assertTrue(line.contains("content=" + "y".repeat(64) + "...(100B)"), line);
+            assertEquals(List.of("started:" + XID + "@" + COMMIT_TS, "committed@" + COMMIT_TS),
+                    f.dispatcher().calls, "零 dispatch:事件序列只有事务块头尾,消息不进任何 topic");
+            assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "无数据事件");
+        } finally {
+            log.detachAppender(appender);
+        }
+    }
+
+    /**
+     * 非事务 MsgChange 搭活跃桶形态(终审修复钉子):非事务 'M' 在有活跃桶时会被组装器
+     * routeLogicalMsg 的 {@code transactional || hasActiveBucket()} 分支收入桶中,回放期以
+     * {@code MsgChange(transactional=false)} 到达 listener——日志的事务性标记必须取组件
+     * 真值 false(硬编码 true 会打错标记,非事务消息被误标为事务性)。仍零 dispatch。
+     */
+    @Test
+    void nonTransactionalMsgChangeRidingActiveBucketLogsFalseAndNeverDispatches() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        Logger log = (Logger) org.slf4j.LoggerFactory.getLogger(DispatcherTransactionListener.class);
+        log.addAppender(appender);
+        try {
+            Fixture f = fixture("id", "v");
+            f.listener().onEvent(begin());
+            f.listener().onEvent(new MsgChange(false, "hb",
+                    "hello".getBytes(StandardCharsets.US_ASCII), OptionalLong.empty(), 12L));
+            f.listener().onEvent(new TransactionEvent.End(XID, 0L));
+
+            List<String> lines = appender.list.stream()
+                    .filter(e -> e.getLevel() == Level.INFO)
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .toList();
+            assertEquals(1, lines.size(), "恰一行 INFO 留痕: " + lines);
+            String line = lines.get(0);
+            assertTrue(line.contains("prefix=hb"), line);
+            assertTrue(line.contains("事务性=false"), line);
+            assertTrue(line.contains("content=hello"), line);
+            assertEquals(List.of("started:" + XID + "@" + COMMIT_TS, "committed@" + COMMIT_TS),
+                    f.dispatcher().calls, "零 dispatch:搭桶的非事务消息同样不进任何 topic");
+            assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "无数据事件");
+        } finally {
+            log.detachAppender(appender);
+        }
     }
 }

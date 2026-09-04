@@ -1,6 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * raw 字节窥探辅助(组装器路由与回放器 streamXid 重窥共用)。引擎
@@ -29,12 +30,34 @@ final class RawPeeks {
         return (unsignedInt(raw, offset) << 32) | unsignedInt(raw, offset + 4);
     }
 
-    /** 读 offset 起的 null 结尾 UTF-8 字符串(LogicalMsg prefix,仅异常/告警路径)。 */
+    /**
+     * 读 offset 起的 null 结尾 UTF-8 字符串(LogicalMsg prefix,异常/告警/留痕路径)。
+     * 结束边界由 {@link #cstringEnd} 承担,此处只做区间解码。
+     */
     static String cstringAt(byte[] raw, int offset) {
+        int end = cstringEnd(raw, offset);
+        return new String(raw, offset, end - offset, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 责任:定位 offset 起(含)第一个 NUL(0x00)字节的下标——CString 的结束边界。
+     * 边界:raw 无 NUL(协议违约)时一直扫描到数组越界抛 AIOOBE——与既有 cstringAt
+     * 行为一致,调用方自负线格式合法(窥探只服务日志,不承担协议校验)。
+     */
+    static int cstringEnd(byte[] raw, int offset) {
         int end = offset;
         while (raw[end] != 0) {
             end++;
         }
-        return new String(raw, offset, end - offset, StandardCharsets.UTF_8);
+        return end;
+    }
+
+    /**
+     * 责任:拷贝 {@code raw[offset, offset+length)} 的字节副本(LogicalMsg content 窥取)。
+     * 返回副本——调用方持有片段不碰原数组(原数组归 CQ appender 单写者所有)。
+     * 边界:区间越界由 Arrays.copyOfRange 抛异常(线格式违约,同上不承担校验)。
+     */
+    static byte[] bytesAt(byte[] raw, int offset, int length) {
+        return Arrays.copyOfRange(raw, offset, offset + length);
     }
 }

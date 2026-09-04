@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -295,7 +296,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      *   <li>'I'/'U'/'D'/'T':不完整解码,校验桶级前缀不变量、窥 oid 后把 index 记入当前活动桶
      *       的连续段(没有活动桶则 fail-fast)</li>
      *   <li>'M':先窥 flags 的 bit0 判断事务性——事务性必须落在活动桶里(无桶 fail-fast);
-     *       非事务性有桶随桶走、无桶 WARN 丢弃(协议允许,不算异常)</li>
+     *       非事务性有桶随桶走、无桶则 INFO 即时留痕并经护栏推进前沿(MS3.5,见
+     *       {@link #routeLogicalMsg},仅槽选项 messages=true 时有输入)</li>
      *   <li>'Y'/'O':DEBUG 记录后丢弃(沿用旧组装器的忽略语义)</li>
      *   <li>未知类型字节:交给 decoder 抛 UnknownMessageTypeException(fail-fast 由解码层承担)</li>
      * </ul>
@@ -439,14 +441,26 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
-     * LogicalMsg('M')的轻窥路由,沿用引擎语义:
+     * LogicalMsg('M')的轻窥路由(MS3.5 起非事务游离分支从"WARN 丢弃"升级为"INFO 留痕 +
+     * 护栏推进",spec §3.2/§3.3):
      * 读 flags 的 bit0 判断是否事务性(flags 在流式块内有 4 字节 xid 前缀,偏移 5;顶层偏移 1)。
      * 事务性消息必须落在活动桶里(没有桶就 fail-fast,与 DML 相同);非事务性消息有桶就随桶走
-     * (将来 abort 剔除按 streamXid 判断,语义安全),没有桶则 WARN 后丢弃——协议允许它游离在
-     * 任何事务之外,不算异常。flags 偏移由 currentStream 是否在流块内决定,与 decoder 的
-     * inStream 状态同步变化。丢弃路径的 owner 置空属<b>防御性</b>(当前控制消息路径已统一置空;
+     * (将来 abort 剔除按 streamXid 判断,语义安全),没有桶则<b>即时留痕并推进前沿</b>——协议
+     * 允许它游离在任何事务之外,不算异常,但它是唯一不带事务的输出信号,不推进则空闲库的
+     * confirmed_flush 永远钉死(原始动机)。关键步骤:经 {@link RawPeeks} 窥 prefix/lsn/content
+     * (prefix NUL 之后的 I32 长度 + 字节段,不整条解码)→ INFO 一行(content 走 {@link MessagePreview}
+     * 预览)→ {@code outputFrontier} 以 {@link #safeMessageAdvance}(msgLsn, 交接记账)的返回值
+     * 单调 max 累加——<b>全有或全无</b>(决策 L8):无 pending 桶推进到消息位;有 pending 桶
+     * 返回 {@link Long#MIN_VALUE},max 累加下天然 no-op,前沿一个字节都不动(pending 事务的
+     * 重发空间无条件保住,不再依赖 commitLsn/endLsn 字段级精确语义)。flags 偏移由
+     * currentStream 是否在流块内决定,与 decoder 的
+     * inStream 状态同步变化。
+     * 边界:消息字节仍已在 onRaw 首行 append 进管道(<b>不动"先 append 再路由"红线</b>)——
+     * 此分支无桶引用,落盘字节无人回读,随 wipe-on-open(重启)或低水位删除清空,不构成泄漏;
+     * 该分支仅在槽选项 messages=true 时才可能有输入(PG 关闭时不发 'M')——组装器不感知配置,
+     * 行为天然由上游门控。游离路径的 owner 置空属<b>防御性</b>(当前控制消息路径已统一置空;
      * 此路径到达时无任何活动桶,owner 至多指向已退役/已交接的桶——它们不会再成为追加目标,
-     * 置空与否不影响段判定)。
+     * 置空与否不影响段判定)。线程:reader 线程(读 handedOff 的即时 state 即"此刻仍在途")。
      */
     private void routeLogicalMsg(byte[] raw, long seq) {
         int flagsOffset = currentStream != null ? 5 : 1;   // 流内前缀 4 字节在前
@@ -457,8 +471,14 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
             return;
         }
         lastAppendOwner = null;   // 防御性置空(见方法 javadoc)
-        LOG.warn("非事务性消息游离于任何事务之外,丢弃: prefix={} lsn=0x{}",
-                RawPeeks.cstringAt(raw, flagsOffset + 1 + 8), Long.toHexString(RawPeeks.longAt(raw, flagsOffset + 1)));
+        long msgLsn = RawPeeks.longAt(raw, flagsOffset + 1);
+        int prefixStart = flagsOffset + 1 + 8;   // flags(1) + lsn(8) 之后
+        String prefix = RawPeeks.cstringAt(raw, prefixStart);
+        int lenOffset = RawPeeks.cstringEnd(raw, prefixStart) + 1;   // prefix NUL 之后的 I32 长度字段
+        byte[] content = RawPeeks.bytesAt(raw, lenOffset + 4, RawPeeks.intAt(raw, lenOffset));
+        LOG.info("逻辑消息: prefix={}, lsn={}, 事务性={}, content={}", prefix, Long.toHexString(msgLsn),
+                false, MessagePreview.preview(content));
+        outputFrontier.accumulateAndGet(safeMessageAdvance(msgLsn, handedOff), Math::max);
     }
 
     /**
@@ -905,6 +925,53 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     /** 存活桶的 firstIndex 低水位候选(CQ 删除与 registry 剪枝两个低水位共用);桶 null 或空桶返回 Long.MAX_VALUE。 */
     private static long floor(TxBuffer bucket) {
         return (bucket == null || bucket.firstIndex < 0) ? Long.MAX_VALUE : bucket.firstIndex;
+    }
+
+    /**
+     * 责任:非事务逻辑消息('M')的前沿推进护栏纯函数(MS3.5 spec §3.3 + 决策 L8 <b>全有或全无</b>)
+     * ——给定消息自身 LSN 与 reader 维护的交接记账,返回可写入 {@code outputFrontier} 的推进值:
+     * <b>没有未输出(pending)桶 → msgLsn(全有);有 → 完全不推进(全无,返回
+     * {@link Long#MIN_VALUE},经调用点 {@code accumulateAndGet(max)} 天然 no-op——前沿一个
+     * 字节都不动)</b>。
+     * 简化理由(L8,取代 T1 的部分推进公式):部分推进 {@code min(msgLsn, min(pending.
+     * commitLsn))} 的收益只是"积压期间的边际 WAL 修剪"(消息位到最老 pending commit 位
+     * 之间的窗口),代价则是整类 commitLsn/endLsn off-by-one 推导风险(见"历史决策"段);
+     * 而护栏的主场景是空闲库心跳(无 pending),两方案在该场景行为完全一致——收益边际、
+     * 风险整类,砍掉计算本身。积压期间失去的部分推进可自愈(pending 桶输出完毕后下一条
+     * 消息即全量推进,重复面只多不小)。
+     *
+     * <p><b>历史决策段(保留——它解释了为什么最终连这个计算都不要了)</b>:T1 版本为
+     * 部分推进 {@code min(msgLsn, min(pending.commitLsn))},其中"为何是 commitLsn 而
+     * <b>非</b> endLsn"的 off-by-one 论证:confirmed_flush 的服务端语义是"commit 结束位
+     * ≤ 确认值的事务视为已送达,重启跳过"。若护栏在某未输出桶的 <b>endLsn</b> 上取 min,
+     * 确认值 == 其 endLsn → 该桶被跳过 → 已输出头部还在、未输出尾部<b>永久丢失</b>;取
+     * commitLsn(commit 记录自身 LSN,恒 &lt; endLsn)保证该桶 commit 结束位 &gt; 确认值 →
+     * 重启<b>整桶重发</b>(头部重复允许,at-least-once,尾部补齐)。这条推导链上的每一步
+     * (哪个字段、开闭区间、边界字节)都是必须永远保持正确的隐患面——L8 以"有 pending 就
+     * 一个字节都不推"把该风险类整体消除:确认值停在 pending 事务的 commit 位之前<b>任意
+     * 距离</b>处都安全,不再依赖字段级精确语义。行为级硬验收(重启尾部不丢)不变。
+     *
+     * <p>pending 判定 = {@code state != DONE}(HANDED_OFF/OUTPUTTING 均算)。DONE 排除
+     * 正确性:consumer 次序"先写前沿后标 DONE",state 是 volatile——读到 DONE 即前沿已
+     * 覆盖其 endLsn;读到旧值只是多余冻结(只多重复不丢),两方向安全无需加锁。
+     * 边界与例外:<b>在途(live)桶刻意不进参数</b>——其安全性由 WAL 序论证承担(spec
+     * §3.4:在途桶的 commit 在 WAL 序上必然晚于消息 X,PG restart_lsn 回放整体重发覆盖);
+     * 参数只取交接记账({@link #handedOff} 形态的 deque),调用方传入时照抄即可。
+     * 线程约束:纯函数;调用点在 reader 线程(非事务 'M' 的即时推进分支,
+     * {@link #routeLogicalMsg} 已接线),读 state 的即时 volatile 值即"此刻仍在途"的语义。
+     *
+     * @param msgLsn    非事务逻辑消息自身的 LSN(消息头 lsn 字段)
+     * @param handedOff 交接记账(pending = state != DONE 的桶;空 deque 即"全发完了"场景)
+     * @return 无 pending 桶时 msgLsn(安全推进);有 pending 桶时 {@link Long#MIN_VALUE}
+     *         (调用点 accumulateAndGet(max) 天然 no-op,不推进)
+     */
+    static long safeMessageAdvance(long msgLsn, Deque<TxBuffer> handedOff) {
+        for (TxBuffer bucket : handedOff) {
+            if (bucket.state != BucketState.DONE) {
+                return Long.MIN_VALUE;   // 全无:任一 pending 桶即冻结(max 累加下 no-op)
+            }
+        }
+        return msgLsn;
     }
 
     /** 桶存储形态的日志描述(段数 + CQ index 端点)——prepare/回滚的日志留痕用。 */

@@ -52,9 +52,10 @@ TransactionConsumer(consumer 线程)
 - **R1/R3 线程审计**:全部 dispatch/offset/schema 写仅 consumer 线程;心跳仅监督线程
   (跨线程读 effectiveOffset 属已知无害项,心跳缺省关);main 连接 reader 独占(时序证明
   以快照恒 skipped 为前提)——结论档 `docs/superpowers/specs/2026-09-02-ms2-r1-r3-audit.md`。
-- 配置面五项:`slot.streaming`(OFF/ON/PARALLEL,parallel 强制 two_phase)、`slot.two.phase`、
+- 配置面六项:`slot.streaming`(OFF/ON/PARALLEL,parallel 强制 two_phase)、`slot.two.phase`、
   `pipe.dir`、`pipe.roll.cycle`(LegacyRollCycles 名)、`slot.feedback.interval.ms`(整除换算秒,
-  亚秒值截 0 = 每轮反馈)。
+  亚秒值截 0 = 每轮反馈)、`slot.messages`(MS3.5,默认 false——true 才在槽选项加 messages=true,
+  'M' 逻辑消息解析记录(INFO 两时点)且非事务消息经护栏即时推进前沿——全有或全无(L8):无未输出桶才推进到消息位,有则完全静止,不发射下游)。
 
 ## src/test/java — 测试形态
 

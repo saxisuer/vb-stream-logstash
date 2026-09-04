@@ -32,7 +32,7 @@ MS3 记档了 LogicalMsg('M')延期(见 `2026-09-02-ms2-r1-r3-audit.md` "已知�
 
 两处均**不入下游**。消息本身仍 `pipe.append`(不动"先 append 再路由"红线);无桶非事务 'M' 无桶引用,落盘后随 wipe-on-open 清除(javadoc 记)。
 
-### 3.3 护栏(核心新件)
+### 3.3 护栏(核心新件;终审 L8 已简化为全有或全无——本节公式为历史形态,见决策记录 L8 与实现 javadoc 的"历史决策"段)
 
 ```java
 // StreamedTransactionAssembler 包私有静态纯函数
@@ -106,3 +106,4 @@ MS3.5,独立分支(**MS3 PR 合并后**从新 main 拉),约 5 任务:
 | L5 | off-by-one 修正:commitLsn 而非 endLsn(确认 AT endLsn = 跳过未输出事务 = 尾部丢失) | 用户质询暴露,评审确认 |
 | L6 | 独立里程碑 MS3.5,MS3 合并后开工 | 用户裁定 |
 | L7 | 槽选项 messages=true **经配置门控**(新 Field `slot.messages`,默认 false),不强制——关闭时行为与 MS3 完全一致 | 用户审阅裁定 |
+| L8 | **护栏简化为全有或全无**(终审,取代 L4/L5 的部分推进公式):无未输出(pending)桶 → 推进 msgLsn;有 → 完全不推进 | 用户裁决。等价性论证(三状态对照,提案推进量 ≤ 原护栏 ≤ 安全上界):①DONE 已覆盖——两方案都推 msgLsn,一致;②存在 pending——提案 0 ≤ 原 min(commitLsn) ≤ 安全上界,失去的仅积压期部分推进(pending 输出完毕后下一条消息即全量补上,自愈,重复面稍大);③live/后续事务——WAL 序重发覆盖,与护栏无关。得到:commitLsn/endLsn off-by-one 风险类整体消失(L5 推导链不再需要保持正确)。空闲心跳主场景(无 pending)两方案行为完全一致 |

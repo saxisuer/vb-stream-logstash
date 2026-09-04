@@ -15,10 +15,11 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
 
 /**
  * 流式连接器配置:在父类 {@link PostgresConnectorConfig} 的完整配置面之上追加
- * 五个本模块专属配置项——slot.streaming(流式档位)、slot.two.phase(两阶段提交)、
+ * 六个本模块专属配置项——slot.streaming(流式档位)、slot.two.phase(两阶段提交)、
  * pipe.dir / pipe.roll.cycle(reader 与 consumer 之间的 Chronicle Queue 管道参数,
  * 对应引擎侧 {@code vb.pipe.dir} / {@code vb.pipe.rollCycle})、slot.feedback.interval.ms
- * (复制会话的 LSN 反馈节流周期,对应引擎侧 {@code vb.pg.feedbackSeconds},默认 10 秒)。
+ * (复制会话的 LSN 反馈节流周期,对应引擎侧 {@code vb.pg.feedbackSeconds},默认 10 秒)、
+ * slot.messages('M' 逻辑消息门控,MS3.5,默认 false)。
  *
  * <p>校验语义(spec §5.1 启动期 fail-fast):slot.streaming 只接受
  * OFF/ON/PARALLEL(大小写宽容);PARALLEL 档必须搭配 slot.two.phase=true,
@@ -28,7 +29,7 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
  * PipeConfig.parseRollCycle 同语义),未知值由 {@link #validateRollCycle} 记 1 条
  * 附可用值清单的问题——拼写错误残余到建管道才炸会拖垮 reader 线程,且管道目录可能已被 wipe。
  *
- * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 扩展 5 新 Field(floor 语义,父类必填项、
+ * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 扩展 6 新 Field(floor 语义,父类必填项、
  * 校验器全部保留),供任务侧配置完整性校验;Connect REST 暴露面见
  * {@link PostgresStreamConnector#config()}。
  *
@@ -70,9 +71,24 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
             .withDefault(10000)
             .withValidation(Field::isPositiveInteger);
 
-    /** 本连接器的完整配置面:父 ALL_FIELDS + 5 新 Field(新 Set,不改父类静态集合)。 */
+    /**
+     * 'M' 逻辑消息门控(MS3.5,spec §3.1):true 时 START_REPLICATION 槽选项追加第 5 项
+     * {@code messages=true}(PG 14+,vanilla Debezium 同款)——PG 开始下发非事务/事务性
+     * 逻辑消息,连接器逐条解析记录(INFO 日志留痕,内容经 {@link MessagePreview} 预览)
+     * 且非事务消息参与输出前沿的安全推进(护栏 {@code StreamedTransactionAssembler.
+     * safeMessageAdvance},确认值压到未输出桶 commitLsn 之下)。
+     * <b>不发射下游</b>(不进 Kafka topic,发射仍延期)。默认 false——槽选项维持 4 项,
+     * PG 不下发 'M',行为与 MS3 及之前完全一致。
+     */
+    public static final Field SLOT_MESSAGES = Field.create("slot.messages")
+            .withDisplayName("Slot messages")
+            .withType(Type.BOOLEAN)
+            .withDefault(false)
+            .withValidation(Field::isBoolean);
+
+    /** 本连接器的完整配置面:父 ALL_FIELDS + 6 新 Field(新 Set,不改父类静态集合)。 */
     public static final Field.Set ALL_FIELDS = PostgresConnectorConfig.ALL_FIELDS.with(SLOT_STREAMING, SLOT_TWO_PHASE, PIPE_DIR, PIPE_ROLL_CYCLE,
-            SLOT_FEEDBACK_INTERVAL_MS);
+            SLOT_FEEDBACK_INTERVAL_MS, SLOT_MESSAGES);
 
     /**
      * 以给定的不可变配置构造:单行 super 委派父构造器(public,负责快照模式、
@@ -232,5 +248,16 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
      */
     public int feedbackIntervalSeconds() {
         return getConfig().getInteger(SLOT_FEEDBACK_INTERVAL_MS) / 1000;
+    }
+
+    /**
+     * 读取 'M' 逻辑消息门控开关:开启后复制会话的槽选项追加 {@code messages=true}
+     * (PG 开始下发逻辑消息),连接器对 'M' 逐条解析记录并让非事务消息参与前沿安全推进
+     * (不发射下游——语义细节见 {@link #SLOT_MESSAGES} 的 Field javadoc)。
+     *
+     * @return 配置的布尔值;缺省时按 Field 默认值回落为 false
+     */
+    public boolean messagesEnabled() {
+        return getConfig().getBoolean(SLOT_MESSAGES);
     }
 }

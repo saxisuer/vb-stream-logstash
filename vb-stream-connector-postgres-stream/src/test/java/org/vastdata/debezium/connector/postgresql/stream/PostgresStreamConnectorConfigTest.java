@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -205,5 +206,50 @@ class PostgresStreamConnectorConfigTest {
                 "未知滚动周期应恰好 1 条校验错误");
         assertTrue(problems.get("pipe.roll.cycle").errorMessages().get(0).contains("MINUTELY"),
                 "错误消息应附可用值清单(以 MINUTELY 为代表)");
+    }
+
+    /**
+     * 用例⑫slot.messages 默认 false + 显式解析:缺省时 messagesEnabled() 为 false
+     * (门控关闭——槽选项维持 4 项,PG 不下发 'M',行为与 MS3 完全一致,MS3.5 spec §3.1
+     * 的默认关裁定);显式 "true" 解析为 true、显式 "false" 仍为 false——布尔开关两侧
+     * 口径一致,非布尔值会被 isBoolean 校验挡在启动期。
+     */
+    @Test
+    void messagesDefaultsToFalseAndExplicitValuesParse() {
+        assertFalse(new PostgresStreamConnectorConfig(configWith(Map.of())).messagesEnabled(),
+                "slot.messages 缺省应为 false(门控默认关)");
+        assertTrue(new PostgresStreamConnectorConfig(configWith(Map.of("slot.messages", "true"))).messagesEnabled(),
+                "显式 true 应解析为 true");
+        assertFalse(new PostgresStreamConnectorConfig(configWith(Map.of("slot.messages", "false"))).messagesEnabled(),
+                "显式 false 应解析为 false");
+        ConfigValue defaulted = configWith(Map.of()).validate(PostgresStreamConnectorConfig.ALL_FIELDS).get("slot.messages");
+        assertTrue(defaulted == null || defaulted.errorMessages().isEmpty(),
+                "缺省(默认 false)不产生 slot.messages 校验错误");
+    }
+
+    /**
+     * 用例⑬slot.messages 收录进三处配置面:ALL_FIELDS、{@code getConfigFields()} 与
+     * Connect REST 暴露面 {@code config()}(define 的默认值取 Field.defaultValue(),防两处
+     * 字面量漂移)——漏挂任一处会出现"校验认得但 REST 不可配"或"REST 可配但引擎读不到"
+     * 的配置面裂缝。
+     */
+    @Test
+    void messagesFieldJoinsAllFieldsConnectorFieldsAndRestConfigDef() {
+        Set<String> names = new HashSet<>();
+        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+            names.add(field.name());
+        }
+        assertTrue(names.contains("slot.messages"), "ALL_FIELDS 应含 slot.messages");
+
+        Set<String> connectorFieldNames = new HashSet<>();
+        for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
+            connectorFieldNames.add(field.name());
+        }
+        assertTrue(connectorFieldNames.contains("slot.messages"), "getConfigFields() 应同含 slot.messages");
+
+        org.apache.kafka.common.config.ConfigDef def = new PostgresStreamConnector().config();
+        assertTrue(def.names().contains("slot.messages"), "Connect REST configDef 应暴露 slot.messages");
+        assertEquals(Boolean.FALSE, def.defaultValues().get("slot.messages"),
+                "REST 暴露面默认值应取 Field.defaultValue()(false)");
     }
 }

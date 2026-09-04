@@ -339,7 +339,7 @@ public class PostgresStreamStreamingChangeEventSource
 
     /**
      * 责任:从配置组装会话参数(host/port/database/user/password 取 JDBC 配置面,
-     * slot/publication/proto/streaming/twoPhase/feedback 取本模块配置面)。
+     * slot/publication/proto/streaming/twoPhase/feedback/messages 取本模块配置面)。
      * 边界:纯函数;proto 固定 v4(流式与 two_phase 需 ≥2,引擎同款默认)。
      */
     private ReplicationSession.Parameters sessionParameters() {
@@ -347,7 +347,8 @@ public class PostgresStreamStreamingChangeEventSource
         return new ReplicationSession.Parameters(jdbc.getHostname(), jdbc.getPort(), jdbc.getDatabase(),
                 jdbc.getUser(), jdbc.getPassword(), connectorConfig.slotName(),
                 connectorConfig.publicationName(), PROTO_VERSION, connectorConfig.streamingMode(),
-                connectorConfig.twoPhase(), connectorConfig.feedbackIntervalSeconds());
+                connectorConfig.twoPhase(), connectorConfig.feedbackIntervalSeconds(),
+                connectorConfig.messagesEnabled());
     }
 
     /**

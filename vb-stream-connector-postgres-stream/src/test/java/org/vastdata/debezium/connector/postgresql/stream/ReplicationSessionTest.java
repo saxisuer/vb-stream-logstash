@@ -131,6 +131,36 @@ class ReplicationSessionTest {
     }
 
     /**
+     * messages 门控关闭(MS3.5 默认面):messagesEnabled=false 时槽选项恰四项、无
+     * "messages" 键、插入序与前四项完全一致——门控默认关的行为与 MS3 及之前逐字节相同
+     * (spec §3.1 裁定:不开则 PG 不下发 'M',现有部署零感知)。
+     */
+    @Test
+    void slotOptionsStayExactlyFourWhenMessagesDisabled() {
+        Map<String, String> options = ReplicationSession.slotOptions(parameters(StreamingMode.ON, true, 10, false));
+        assertEquals(4, options.size(), "messages 门控关闭时槽选项必须恰四项");
+        assertFalse(options.containsKey("messages"), "不得出现第五项 messages");
+        assertEquals(List.of("proto_version", "publication_names", "streaming", "two_phase"), new ArrayList<>(options.keySet()),
+                "前四项插入序与门控引入前逐字节一致");
+    }
+
+    /**
+     * messages 门控开启:messagesEnabled=true 时槽选项恰五项,第五项 messages=true 追加在
+     * 尾部(PG 14+ 的 pgoutput 选项,vanilla Debezium 同款;请求服务端下发 'M' 逻辑消息),
+     * 前四项的键值与插入序不受影响——门控只增不改。
+     */
+    @Test
+    void slotOptionsGainFifthMessagesOptionWhenEnabled() {
+        Map<String, String> options = ReplicationSession.slotOptions(parameters(StreamingMode.ON, true, 10, true));
+        assertEquals(5, options.size(), "messages 门控开启时槽选项必须恰五项");
+        assertEquals("true", options.get("messages"), "第五项应为 messages=true");
+        assertEquals(List.of("proto_version", "publication_names", "streaming", "two_phase", "messages"),
+                new ArrayList<>(options.keySet()), "messages 追加在尾部,前四项序不变");
+        assertEquals("4", options.get("proto_version"), "前四项键值不受门控影响");
+        assertEquals("on", options.get("two_phase"), "前四项键值不受门控影响");
+    }
+
+    /**
      * ensureSlot 的 42710 复用语义:SQLState 42710(duplicate_object)吞掉复用既有槽,
      * 其余 SQLState 原样上抛;建槽 SQL 文本与两个绑定参数固定(第 4 参 twoPhase 随槽声明)。
      * 引擎原用例经真库覆盖(建槽/复用副作用),归 Task 8 IT;本用例以动态代理假 Connection
@@ -190,17 +220,33 @@ class ReplicationSessionTest {
     }
 
     /**
-     * 组装测试参数包:取引擎 src/docker 冒烟环境的同形坐标(localhost:55432/postgres,
-     * 槽 vb_cdc_slot、publication vb_pub、proto 4),档位/开关/反馈间隔由用例注入。
+     * 组装测试参数包(messages 门控关闭形态,既有用例的便捷缺省):取引擎 src/docker 冒烟
+     * 环境的同形坐标(localhost:55432/postgres,槽 vb_cdc_slot、publication vb_pub、
+     * proto 4),档位/开关/反馈间隔由用例注入。
      *
      * @param mode 流式档位
      * @param twoPhase 两阶段开关
      * @param feedbackIntervalSeconds 反馈间隔(秒)
-     * @return 可直接驱动静态纯函数/静态接缝的参数包
+     * @return messagesEnabled=false 的参数包(与 MS3 及之前的槽选项面一致)
      */
     private static ReplicationSession.Parameters parameters(StreamingMode mode, boolean twoPhase, int feedbackIntervalSeconds) {
+        return parameters(mode, twoPhase, feedbackIntervalSeconds, false);
+    }
+
+    /**
+     * 组装测试参数包(全分量):坐标/档位/两阶段/反馈间隔同三参便捷形态,另注入
+     * slot.messages 门控开关——MS3.5 起的槽选项第 5 项 messages 由它决定。
+     *
+     * @param mode 流式档位
+     * @param twoPhase 两阶段开关
+     * @param feedbackIntervalSeconds 反馈间隔(秒)
+     * @param messagesEnabled 'M' 逻辑消息门控(true → 槽选项加 messages=true)
+     * @return 可直接驱动静态纯函数/静态接缝的参数包
+     */
+    private static ReplicationSession.Parameters parameters(StreamingMode mode, boolean twoPhase, int feedbackIntervalSeconds,
+            boolean messagesEnabled) {
         return new ReplicationSession.Parameters("localhost", 55432, "postgres", "postgres", "postgres",
-                "vb_cdc_slot", "vb_pub", 4, mode, twoPhase, feedbackIntervalSeconds);
+                "vb_cdc_slot", "vb_pub", 4, mode, twoPhase, feedbackIntervalSeconds, messagesEnabled);
     }
 
     /**
