@@ -36,7 +36,7 @@
 **Interfaces:**
 - Produces(Task 2/3 消费):`safeMessageAdvance` 与 `MessagePreview.preview(byte[] content)`(签名以实现为准,javadoc 记截断规则);`config.messagesEnabled()`
 
-- [ ] TDD 五步(红:各测试先行)→ commit `feat(ms35-t1): slot.messages 配置门控 + 护栏纯函数 + 消息预览件(TDD 全分支)`
+- [x] TDD 五步(红:各测试先行)→ commit `feat(ms35-t1): slot.messages 配置门控 + 护栏纯函数 + 消息预览件(TDD 全分支)`
 
 ---
 
@@ -47,7 +47,7 @@
 - Modify: `NEW/DispatcherTransactionListener.java`(MsgChange 分支:DEBUG 跳过 → INFO 日志(事务性=true,用 MsgChange 组件直取 prefix/content;仍不 dispatch))
 - Test: `StreamedTransactionAssemblerTest` 补(非事务 'M' 经 PgWire.logicalMsg 造字节:日志断言可用 logback ListAppender 或以推进值断言为主——推进值 = min(msgLsn, pending) 经自持 outputFrontier 观察;有 pending 桶时推进被压到其 commitLsn 下;事务性 'M' 入桶不受影响);`DispatcherTransactionListenerTest` 补(MsgChange → INFO 形态、零 dispatch)
 
-- [ ] TDD 五步 → commit `feat(ms35-t2): 组装器接线——非事务 'M' 即时记录+护栏推进;listener 事务性 'M' 回放期记录`
+- [x] TDD 五步 → commit `feat(ms35-t2): 组装器接线——非事务 'M' 即时记录+护栏推进;listener 事务性 'M' 回放期记录`
 
 ---
 
@@ -58,7 +58,7 @@
 
 **场景**:config 开 `slot.messages=true`;纯非事务消息流(若干 `pg_logical_emit_message(false,'heartbeat',...)`,间隔 sleep 产生独立 WAL 段与反馈周期;无任何表事务)→ 断言:`confirmed_flush` 轮询**越过**首条消息 LSN(暖场边界锚点,照 FrontierCapIT 的 awaitPredicate 形态)——钉"空闲库不钉死"。Javadoc 写机制依据(spec §3.4"全发完"场景)。
 
-- [ ] IT 先红后绿 → commit `feat(ms35-t3): IT 心跳推进——纯消息流 confirmed_flush 越过消息位`
+- [x] IT 先红后绿 → commit `feat(ms35-t3): IT 心跳推进——纯消息流 confirmed_flush 越过消息位`
 
 ---
 
@@ -70,7 +70,7 @@
 **场景 2(crash 注入主验收,硬验收)**:阻塞 listener(照 ReaderUnblockedIT 手法)使已提交事务滞留 HANDED_OFF → 发非事务心跳 → 断言 `confirmed_flush < 该桶 commitLsn`(护栏可见——轮询到稳态)→ 停 engine(确认已落库)→ **重启**(同 offset 文件)→ 放行/等待 → 断言滞留事务完整全达(BEGIN+全行+END,**尾部不丢**)。Javadoc:若对 restart_lsn/confirmed 语义理解有误此 IT 必红。
 **场景 3(状态②重复)**:部分输出后停机重启 → 整事务重发 → 并集断言(Set 口径,重复允许)。
 
-- [ ] IT 先红后绿 → commit `feat(ms35-t4): IT crash 注入主验收——护栏钉住未输出事务,重启尾部不丢 + 状态②整事务重发`
+- [x] IT 先红后绿 → commit `feat(ms35-t4): IT crash 注入主验收——护栏钉住未输出事务,重启尾部不丢 + 状态②整事务重发`
 
 ---
 
@@ -81,15 +81,15 @@
 - Modify: 根 `CLAUDE.md` connector 行(一句话)+ 计划验收复选框
 - 全量验收:`mvn clean test` 三段 SUCCESS;零引擎 import
 
-- [ ] commit `docs: MS3.5 收官——LogicalMsg 记档转部分实现 + CLAUDE.md 更新`
+- [x] commit `docs: MS3.5 收官——LogicalMsg 记档转部分实现 + CLAUDE.md 更新`
 
 ---
 
 ## 验收汇总
 
-- [ ] slot.messages=false 行为与 MS3 完全一致(4 槽选项,零 'M')
-- [ ] 护栏纯函数全分支单测;推进值经 IT 场景 2 实证(confirmed_flush < pending commitLsn)
-- [ ] 心跳推进 IT(纯消息流不钉死)
-- [ ] crash 注入 IT 尾部不丢(硬验收)
-- [ ] 状态②整事务重发(重复允许)
-- [ ] 全量绿;零引擎 import;记档更新
+- [x] slot.messages=false 行为与 MS3 完全一致(4 槽选项,零 'M')
+- [x] 护栏纯函数全分支单测;推进值经 IT 场景 2 实证(confirmed_flush < pending commitLsn)
+- [x] 心跳推进 IT(纯消息流不钉死)
+- [x] crash 注入 IT 尾部不丢(硬验收)
+- [x] 状态②整事务重发(重复允许)
+- [x] 全量绿;零引擎 import;记档更新
