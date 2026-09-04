@@ -10,7 +10,12 @@
 **MS3 三情况 IT**:`StreamAbortFilterIT`(SAVEPOINT 回滚行不进 Kafka、存活行完整、END 计数=
 实付)、`InTxnDdlAsOfIT`(同事务 DDL 前后段各按变更时刻表结构渲染、列数分界正确)、
 `RestartSemanticsIT` 三用例(半事务停机 D7 shutdownFast→槽重发补齐;offset 落后重启
-重复段取并集;无缝续传)。**已知限制与延期**记档于 R1/R3 审计文档「已知限制与延期」节
+重复段取并集;无缝续传)。**MS4 两阶段 + R5 预检**:`TwoPhaseIT` 四场景(PREPARE 挂起
+零发射/ROLLBACK PREPARED 弃桶/parallel 档 StreamPrepare 大事务全量落 Kafka/prepared
+挂起期停机重启续传——`preparedByGid` 挂起池按 gid 幂等吸收重发)、`SlotTwoPhaseMismatchIT`
+存量槽 two_phase 不匹配启动期拒绝(真 42710 + 真目录行;失败信号经基座 CompletionCallback
+捕获、异常链含 DROP SLOT 迁移指引、槽不删)——单测假件锚分支语义,IT 补真库面。
+**已知限制与延期**记档于 R1/R3 审计文档「已知限制与延期」节
 (数组列 fail-fast 不静默 null、未知类型静默 null、LogicalMsg 延期设计要点、Truncate
 选项位超集)。
 
@@ -26,6 +31,8 @@ PostgresStreamConnectorTask.start(Configuration)        ← Connect 任务装配
 PostgresStreamStreamingChangeEventSource.execute        ← 监督壳:装配 + 200ms 心跳周期 + 停机次序
   ├─ ReplicationSession(open→ensureSlot→start→run)      ← reader 线程(vb-pgoutput-reader):raw drain +
   │     LSN 反馈按输出前沿封顶(min(已收到,前沿))         ensureSlot 幂等建槽带 two_phase
+  │                                                       (42710 复用前 R5 预检目录 two_phase
+  │                                                        匹配,不匹配启动期拒绝)
   ├─ StreamedTransactionAssembler(异步形态)             ← 构造即起 consumer 线程(transaction-consumer)
   │     ├─ MessagePipe(Chronicle Queue,wipe-on-open)
   │     ├─ 桶记账:I/U/D 窥前缀记 index 段,控制消息 live 解码

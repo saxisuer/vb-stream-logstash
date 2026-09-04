@@ -1,0 +1,338 @@
+package org.vastdata.debezium.connector.postgresql.stream.it;
+
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector;
+
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * MS4 两阶段提交端到端验收(四场景):①PREPARE 挂起期零发射、COMMIT PREPARED 后全量落
+ * Kafka(on 档);②ROLLBACK PREPARED 弃桶全程零发射(on 档);③流式大事务 PREPARE 以
+ * StreamPrepare 收尾、COMMIT PREPARED 后 500 行全达(<b>parallel 档端到端验收</b>——
+ * StreamPrepare 是 PARALLEL×two_phase 独有路径);④prepared 挂起期停机、重启重发
+ * BeginPrepare..Prepare、COMMIT PREPARED 后补齐(offset 推进越过 CommitPrepared 位点)。
+ *
+ * <p>发射语义依据:组装器 {@code preparedByGid} 挂起池——PREPARE 后桶挂起零交付,
+ * CommitPrepared 才交接回放(BEGIN+数据+END),RollbackPrepared 直接弃桶。挂起期"零发射"
+ * 断言以哨兵事务证管道存活(仅凭等若干秒无记录是弱断言)。
+ *
+ * <p>夹具约定:表 t_2pc_ms4(id int PK + payload text)与 publication 预建;独立槽
+ * {@code ms4_twophase} 前后清删;已知 gid 集 @BeforeEach/@AfterEach 双向 ROLLBACK PREPARED
+ * 自愈(用例中途失败留下的未决 prepared 会持锁阻塞下一用例的 TRUNCATE 夹具)。管道目录
+ * @TempDir 绝对路径。需要本机 Docker。
+ */
+class TwoPhaseIT extends StreamITBase {
+
+    /** 本测试类专用复制槽名:@BeforeEach 清残留与 @AfterEach drop 统一引用。 */
+    private static final String SLOT = "ms4_twophase";
+
+    /** 两阶段验收数据表。 */
+    private static final String TABLE = "t_2pc_ms4";
+
+    /** publication 名(单表)。 */
+    private static final String PUB = "pub_2pc_ms4";
+
+    /** 数据记录 topic(DefaultTopicNamingStrategy)。 */
+    private static final String TOPIC = "ms2it.public." + TABLE;
+
+    /** 事务元数据 topic(&lt;prefix&gt;.transaction)。 */
+    private static final String TX_TOPIC = "ms2it" + TX_TOPIC_SUFFIX;
+
+    /** 哨兵行 id 起始(prepared 事务数据行用 1..N 小 id 空间,哨兵用 900+ 隔离)。 */
+    private static final int SENTINEL_ID_FROM = 901;
+
+    /** 本类跨用例可能出现的全部 gid(夹具自愈与用例尾清理的统一清单)。 */
+    private static final String[] ALL_GIDS = { "gid_c1", "gid_rb", "gid_big", "gid_restart" };
+
+    /** 每用例独立的管道目录(瞬态工作区,引擎启动 wipe-on-open)。 */
+    @TempDir
+    Path pipeDir;
+
+    /**
+     * 每用例前自愈:①清残留槽(上次异常退出留下的同名槽从旧 confirmed_flush_lsn 续传,
+     * 静默吞掉建流前的写入使记录断言失真);②回滚残留未决 prepared(JVM 中途被杀时留下,
+     * 持有的表锁会阻塞本用例夹具的 TRUNCATE)。均幂等。
+     */
+    @BeforeEach
+    void cleanResidualSlotAndPrepared() {
+        rollbackPreparedQuietly(ALL_GIDS);
+        StreamPgTestEnv.dropSlotQuietly(SLOT);
+    }
+
+    /**
+     * 每用例后清理:先回滚本用例可能残留的未决 prepared(中途断言失败的兜底),再先停引擎
+     * 后删槽(次序见基类 {@link #stopEngineAndDropSlot})。
+     */
+    @AfterEach
+    void rollbackPreparedAndDropSlot() {
+        rollbackPreparedQuietly(ALL_GIDS);
+        stopEngineAndDropSlot(SLOT);
+    }
+
+    /**
+     * 夹具:建表、建 publication(单表)、清空历史数据。DDL/TRUNCATE 先于建槽执行——不产生
+     * 解码输出,不污染记录计数;publication 预建是 start 的边界(无自动建,缺失即建流报错)。
+     */
+    private void createFixture() throws SQLException {
+        StreamPgTestEnv.execSql(
+                "CREATE TABLE IF NOT EXISTS " + TABLE + "(id int PRIMARY KEY, payload text)",
+                "DROP PUBLICATION IF EXISTS " + PUB,
+                "CREATE PUBLICATION " + PUB + " FOR TABLE " + TABLE,
+                "TRUNCATE " + TABLE);
+    }
+
+    /**
+     * 单事务插 rows 行后 PREPARE TRANSACTION(两阶段挂起构造):裸语句管理事务
+     * (autocommit 连接上 BEGIN..PREPARE,引擎 TwoPhaseTransactionTest 同款——PREPARE
+     * TRANSACTION 不能在 JDBC 显式事务内执行)。载荷 "前缀-id" 可预期。
+     *
+     * @param gid    两阶段事务名
+     * @param idFrom 起始 id(含),逐行 +1
+     * @param rows   行数
+     * @param prefix 载荷前缀(实际载荷 "前缀-id")
+     * @throws SQLException SQL 失败原样上抛
+     */
+    private static void prepareRows(String gid, int idFrom, int rows, String prefix) throws SQLException {
+        try (Connection c = StreamPgTestEnv.newSqlConnection()) {
+            try (Statement st = c.createStatement()) {
+                st.execute("BEGIN");
+                for (int i = 0; i < rows; i++) {
+                    st.execute("INSERT INTO " + TABLE + " VALUES (" + (idFrom + i) + ", '" + prefix + "-" + (idFrom + i) + "')");
+                }
+                st.execute("PREPARE TRANSACTION '" + gid + "'");
+            }
+        }
+    }
+
+    /**
+     * 自动提交单行哨兵插入(挂起期"零发射"断言的管道存活证据):普通小事务,立即提交立即可消费。
+     *
+     * @param id 哨兵行 id(用 900+ 空间与 prepared 数据行隔离)
+     * @throws SQLException SQL 失败原样上抛
+     */
+    private static void insertSentinelRow(int id) throws SQLException {
+        StreamPgTestEnv.execSql("INSERT INTO " + TABLE + " VALUES (" + id + ", 'sentinel-" + id + "')");
+    }
+
+    /**
+     * 静默回滚未决 prepared(夹具自愈):该 gid 已无未决事务(已 COMMIT/ROLLBACK PREPARED
+     * 或从未创建)时 SQL 报 42704,吞掉属预期——"quietly" 习语,不打日志不失败。
+     *
+     * @param gids 待清理的 gid 清单
+     */
+    private static void rollbackPreparedQuietly(String... gids) {
+        for (String gid : gids) {
+            try {
+                StreamPgTestEnv.execSql("ROLLBACK PREPARED '" + gid + "'");
+            }
+            catch (SQLException e) {
+                // gid 无未决 prepared 事务——静默跳过
+            }
+        }
+    }
+
+    /**
+     * 从数据 topic 记录提取 id 集(after 为 null 的防御跳过):零发射/全集断言的收集面。
+     *
+     * @param records 全部到达记录(跨轮次)
+     * @return 出现过的 id 集(重复收敛为单值)
+     */
+    private static Set<Integer> dataIds(List<SourceRecord> records) {
+        Set<Integer> ids = new HashSet<>();
+        for (SourceRecord r : recordsForTopic(records, TOPIC)) {
+            Struct after = ((Struct) r.value()).getStruct("after");
+            if (after != null) {
+                ids.add(after.getInt32("id"));
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * 场景①(on 档):PREPARE 挂起期零发射、COMMIT PREPARED 后全量落 Kafka。关键步骤:
+     * start(slot.streaming=on 覆盖 baseConfig 的 parallel 默认)→ PREPARE 3 行('gid_c1')
+     * → 哨兵行 901 消费 3 条(BEGIN+1 数据+END,证明管道活着)且恰无 prepared 数据行
+     * → COMMIT PREPARED → 消费 5 条(BEGIN+3 数据+END)→ 断言 ids 恰 {1,2,3}、payload
+     * 全文相等、END event_count=3。
+     * 边界:挂起期若凑不齐哨兵 3 条即 fail(管道死与零发射的区分是本场景的断言核心)。
+     */
+    @Test
+    void prepareThenCommitPreparedEmitsOnlyAfterCommitPrepared() throws Exception {
+        createFixture();
+        start(PostgresStreamConnector.class,
+                baseConfig(SLOT, PUB, pipeDir).with("slot.streaming", "on").build());
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        prepareRows("gid_c1", 1, 3, "c1");
+        insertSentinelRow(SENTINEL_ID_FROM);
+        List<SourceRecord> duringPending = consumeRecordsUnchecked(3);
+        assertEquals(3, duringPending.size(), "挂起期哨兵事务 BEGIN+1 数据+END 应到达: " + describe(duringPending));
+        assertEquals(Set.of(SENTINEL_ID_FROM), dataIds(duringPending),
+                "PREPARE 挂起期应零发射(prepared 数据行不得早于 COMMIT PREPARED 出现)");
+
+        StreamPgTestEnv.execSql("COMMIT PREPARED 'gid_c1'");
+        List<SourceRecord> emitted = consumeRecordsUnchecked(5);
+        assertEquals(5, emitted.size(), "COMMIT PREPARED 后 BEGIN+3 数据+END 共 5 条应到达: " + describe(emitted));
+        assertEquals(Set.of(1, 2, 3), dataIds(emitted), "prepared 事务 3 行应全量到达");
+        for (SourceRecord r : recordsForTopic(emitted, TOPIC)) {
+            Struct after = ((Struct) r.value()).getStruct("after");
+            assertEquals("c1-" + after.getInt32("id"), after.getString("payload"), "payload 应全文相等");
+        }
+        assertTrue(hasEndWithEventCount(emitted, 3), "事务 topic 应有 event_count=3 的 END: " + describe(emitted));
+    }
+
+    /**
+     * 场景②(on 档):ROLLBACK PREPARED 弃桶全程零发射。关键步骤:start(on 档)→ PREPARE
+     * 2 行('gid_rb')→ 哨兵 902 消费 3 条且恰无 prepared 行 → ROLLBACK PREPARED → 哨兵
+     * 903 消费 3 条 → 断言两轮合计数据 ids 恰 {902,903}(弃桶后也无补发)且不存在
+     * event_count=2 的 END(RollbackPrepared 不驱动事务块)。
+     * 边界:第二轮哨兵证"回滚处理后管道仍活",零发射贯穿挂起期与回滚后两段。
+     */
+    @Test
+    void rollbackPreparedDiscardsBucketWithZeroEmission() throws Exception {
+        createFixture();
+        start(PostgresStreamConnector.class,
+                baseConfig(SLOT, PUB, pipeDir).with("slot.streaming", "on").build());
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        prepareRows("gid_rb", 1, 2, "rb");
+        insertSentinelRow(902);
+        List<SourceRecord> first = consumeRecordsUnchecked(3);
+        assertEquals(Set.of(902), dataIds(first), "挂起期应仅哨兵行到达");
+
+        StreamPgTestEnv.execSql("ROLLBACK PREPARED 'gid_rb'");
+        insertSentinelRow(903);
+        List<SourceRecord> second = consumeRecordsUnchecked(3);
+        assertEquals(3, second.size(), "回滚后哨兵事务应照常到达(管道存活): " + describe(second));
+
+        List<SourceRecord> all = new java.util.ArrayList<>(first);
+        all.addAll(second);
+        assertEquals(Set.of(902, 903), dataIds(all), "弃桶语义:prepared 两行全程零发射(挂起期与回滚后均无)");
+        assertTrue(!hasEndWithEventCount(all, 2), "RollbackPrepared 弃桶不得产生 event_count=2 的事务 END");
+    }
+
+    /**
+     * 场景③(<b>parallel 档端到端验收</b>):流式大事务 PREPARE 以 StreamPrepare 收尾、
+     * COMMIT PREPARED 后 500 行全达。关键步骤:start(baseConfig 默认 parallel + two_phase,
+     * 不覆盖——StreamPrepare 是 PARALLEL×two_phase 独有路径,引擎 TwoPhaseTransactionTest
+     * 场景三的翻译)→ 单事务 500 行×repeat('z',4096)(2MB,远超 64kB work_mem 必触发流式)
+     * PREPARE('gid_big')→ 立即 COMMIT PREPARED → 消费 502 条(BEGIN+500 数据+END)→
+     * 断言数据 ids 恰 1000..1499、END event_count=500。
+     * 边界:载荷可压缩但 2MB 总量靠 rb->size 全局记账必触发流式驱逐(引擎同款方案实测);
+     * 断言面是黑盒记录(StreamPrepare 消息路径由全量到达间接验收),不逐字节验载荷。
+     */
+    @Test
+    void largePreparedTransactionStreamsUnderParallelAndEmitsOnCommitPrepared() throws Exception {
+        createFixture();
+        start(PostgresStreamConnector.class, baseConfig(SLOT, PUB, pipeDir).build());
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        try (Connection c = StreamPgTestEnv.newSqlConnection()) {
+            try (Statement st = c.createStatement()) {
+                st.execute("BEGIN");
+                for (int i = 0; i < 500; i++) {
+                    st.execute("INSERT INTO " + TABLE + " VALUES (" + (1000 + i) + ", repeat('z', 4096))");
+                }
+                st.execute("PREPARE TRANSACTION 'gid_big'");
+                st.execute("COMMIT PREPARED 'gid_big'");
+            }
+        }
+
+        List<SourceRecord> all = consumeRecordsUnchecked(502);
+        assertEquals(502, all.size(), "BEGIN+500 数据+END 共 502 条应到达: " + describe(all));
+        Set<Integer> expected = new HashSet<>();
+        for (int i = 0; i < 500; i++) {
+            expected.add(1000 + i);
+        }
+        assertEquals(expected, dataIds(all), "流式两阶段事务 500 行应全量落 Kafka(parallel 档端到端)");
+        assertTrue(hasEndWithEventCount(all, 500), "事务 topic 应有 event_count=500 的 END: " + describe(all));
+    }
+
+    /**
+     * 场景④:prepared 挂起期停机 → 重启重发 BeginPrepare..Prepare → COMMIT PREPARED 后
+     * 补齐(offset 推进越过 CommitPrepared 位点)。关键步骤:start(on 档)→ 暖场哨兵 904
+     * 消费 3 条取边界 LSN → PREPARE 3 行('gid_restart')→ 不变量锚点:confirmed_flush ≤
+     * 暖场边界(CommitPrepared 未达 → 前沿钉在暖场 End → 服务端采纳不可能越过——重启重发
+     * 区间必然覆盖整个 prepared 事务,确定性非时序)→ stopConnector → 停机期排空断言零
+     * 残留 → 同一 offset 文件重启 → COMMIT PREPARED → await 轮询:ids 覆盖 {1,2,3}(暖场
+     * 行允许重发重复,并集口径)、END event_count=3。
+     * 边界:重发到达总数不确定(暖场事务是否重发取决于停机前服务端采纳进度),用非阻塞
+     * 排空轮询而非按数消费;preparedByGid 按 gid 匹配幂等吸收重发的 BeginPrepare..Prepare。
+     */
+    @Test
+    void preparedTxSurvivesRestartAndEmitsOnCommitPrepared() throws Exception {
+        createFixture();
+        var config = baseConfig(SLOT, PUB, pipeDir).with("slot.streaming", "on").build();
+        start(PostgresStreamConnector.class, config);
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        insertSentinelRow(904);
+        List<SourceRecord> warm = consumeRecordsUnchecked(3);
+        assertEquals(Set.of(904), dataIds(warm), "暖场哨兵应到达并给前沿一个已推进锚点");
+        long warmBoundary = ((Number) recordsForTopic(warm, TOPIC).get(0)
+                .sourceOffset().get("lsn_commit")).longValue();
+
+        prepareRows("gid_restart", 1, 3, "restart");
+        assertTrue(StreamPgTestEnv.confirmedFlushLsn(SLOT) <= warmBoundary,
+                "prepared 挂起期 confirmed_flush 应被前沿封顶钉在暖场边界之内"
+                        + "(CommitPrepared 未达前沿不推进,重启重发区间必然覆盖整个 prepared 事务)");
+
+        stopConnector();
+        List<SourceRecord> residual = new ArrayList<>();
+        drainArrivedRecords(residual);
+        assertTrue(residual.isEmpty(), "停机期排空应零残留(prepared 桶未交接,零发射): " + describe(residual));
+
+        start(PostgresStreamConnector.class, config);
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+        StreamPgTestEnv.execSql("COMMIT PREPARED 'gid_restart'");
+
+        List<SourceRecord> seen = new ArrayList<>();
+        await("重启后 prepared 事务经 COMMIT PREPARED 补齐")
+                .atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(200))
+                .untilAsserted(() -> {
+                    drainArrivedRecords(seen);
+                    Set<Integer> union = dataIds(seen);
+                    union.add(904); // 暖场行:停机前已见,允许(不强制)由重发补充
+                    assertEquals(Set.of(1, 2, 3, 904), union,
+                            "prepared 3 行必达(重启重发+COMMIT PREPARED 补齐),暖场行允许重发: " + describe(seen));
+                    assertTrue(hasEndWithEventCount(seen, 3),
+                            "prepared 事务应有 END 到达且 event_count=3: " + describe(seen));
+                });
+    }
+
+    /**
+     * 事务 topic 是否存在指定 event_count 的 END 记录(完整事务边界信号;其他事务的 END
+     * 不影响命中)。status 字段缺失的记录(理论不出现)跳过。
+     *
+     * @param records    全部到达记录
+     * @param eventCount 期望的 END 事件计数(数据记录数)
+     * @return 存在为 true
+     */
+    private static boolean hasEndWithEventCount(List<SourceRecord> records, long eventCount) {
+        for (SourceRecord r : recordsForTopic(records, TX_TOPIC)) {
+            Struct value = (Struct) r.value();
+            if ("END".equals(value.getString("status"))
+                    && Long.valueOf(eventCount).equals(value.getInt64("event_count"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

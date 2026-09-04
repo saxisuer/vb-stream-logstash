@@ -29,8 +29,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 复制会话离线单测:引擎 {@code PgReplicationSessionTest}(140 行)的可离线翻译——
  * capFeedback 三态、drainPending 三形态(取尽/空轮/零载荷);外加同形补测四组:
- * Parameters 的 URL 形态、槽选项恰四项、ensureSlot 的 42710 复用语义(JDK 动态代理假
- * Connection,零第三方 mock)、run 循环五步序(假 PGReplicationStream 驱动到 isClosed
+ * Parameters 的 URL 形态、槽选项恰四项、ensureSlot 的 SQL 契约 + R5 预检三分支(JDK 动态
+ * 代理假 Connection,零第三方 mock)、run 循环五步序(假 PGReplicationStream 驱动到 isClosed
  * 守卫退出)。引擎侧需真库的会话行为(open 双连接/start 对真流/ensureSlot 真建槽/close
  * 次序端到端/确认位点被服务端采纳)由引擎 it 包覆盖({@code RawSessionContractTest}/
  * {@code FrontierCapTest}/{@code ReaderThroughputTest}),本模块对应面归 Task 8 的
@@ -161,33 +161,56 @@ class ReplicationSessionTest {
     }
 
     /**
-     * ensureSlot 的 42710 复用语义:SQLState 42710(duplicate_object)吞掉复用既有槽,
-     * 其余 SQLState 原样上抛;建槽 SQL 文本与两个绑定参数固定(第 4 参 twoPhase 随槽声明)。
-     * 引擎原用例经真库覆盖(建槽/复用副作用),归 Task 8 IT;本用例以动态代理假 Connection
-     * 锚定分支语义与 SQL 契约。
+     * ensureSlot 的 SQL 契约与异常语义:建槽 SQL 文本与两个绑定参数固定(第 4 参 twoPhase
+     * 随槽声明);executeQuery 正常返回走成功路径;非 42710 的 SQLException 原样上抛。
+     * 42710 复用语义(含 R5 预检三分支)由 {@link #ensureSlotRejectsExistingSlotWithMismatchedTwoPhase}
+     * 与 {@link #ensureSlotReusesExistingSlotWhenTwoPhaseMatchesOrRowAbsent} 以目录查询脚本假件覆盖。
      */
     @Test
-    void ensureSlotSwallowsDuplicateObjectButRethrowsOtherSqlStates() {
-        List<String> capturedSql = new ArrayList<>();
-        List<Object> capturedParams = new ArrayList<>();
-
-        assertDoesNotThrow(() -> ReplicationSession.ensureSlot(
-                fakeConnection("42710", capturedSql, capturedParams), parameters(StreamingMode.ON, true, 10)),
-                "duplicate_object 表示槽已存在,应 WARN 复用而非失败");
-        assertEquals(List.of("SELECT pg_create_logical_replication_slot(?, 'pgoutput', false, ?)"), capturedSql,
-                "建槽 SQL 文本固定(第 3 参临时槽=false、第 4 参 two_phase 绑定)");
-        assertEquals(Arrays.asList("vb_cdc_slot", Boolean.TRUE), capturedParams,
-                "绑定参数应为槽名与 twoPhase");
-
+    void ensureSlotFollowsSqlContractAndRethrowsNonDuplicateStates() {
         List<String> okSql = new ArrayList<>();
+        List<Object> okParams = new ArrayList<>();
         assertDoesNotThrow(() -> ReplicationSession.ensureSlot(
-                fakeConnection(null, okSql, new ArrayList<>()), parameters(StreamingMode.ON, true, 10)),
+                fakeConnection(null, okSql, okParams), parameters(StreamingMode.ON, true, 10)),
                 "executeQuery 正常返回时应走成功路径(只需副作用)");
+        assertEquals(List.of("SELECT pg_create_logical_replication_slot(?, 'pgoutput', false, ?)"), okSql,
+                "建槽 SQL 文本固定(第 3 参临时槽=false、第 4 参 two_phase 绑定)");
+        assertEquals(Arrays.asList("vb_cdc_slot", Boolean.TRUE), okParams,
+                "绑定参数对固定:第 1 参槽名、第 2 参 twoPhase=true");
 
         SQLException thrown = assertThrows(SQLException.class, () -> ReplicationSession.ensureSlot(
                 fakeConnection("42P01", new ArrayList<>(), new ArrayList<>()), parameters(StreamingMode.ON, true, 10)),
                 "非 42710 的 SQLException 必须原样上抛");
         assertEquals("42P01", thrown.getSQLState(), "上抛的异常不得被吞改");
+    }
+
+    /**
+     * R5 预检:槽已存在(42710)且目录中 two_phase=false 与配置 true 不匹配 → 启动期抛
+     * IllegalStateException,文案须含 DROP SLOT 迁移指引(PG 不允许后改槽属性,重插槽会
+     * 丢确认位点——报错把代价说清,用户自行决策)。
+     */
+    @Test
+    void ensureSlotRejectsExistingSlotWithMismatchedTwoPhase() {
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> ReplicationSession.ensureSlot(
+                slotLookupConnection(false), parameters(StreamingMode.ON, true, 10)),
+                "two_phase 属性与配置不匹配的存量槽必须在启动期拒绝");
+        assertTrue(e.getMessage().contains("DROP SLOT"), "报错应带 DROP SLOT 迁移指引: " + e.getMessage());
+        assertTrue(e.getMessage().contains("vb_cdc_slot"), "报错应点名槽名: " + e.getMessage());
+    }
+
+    /**
+     * R5 预检:两处放行形态——①槽已存在且 two_phase 匹配(true==true)→ WARN 复用不抛;
+     * ②目录查询行不存在(slotTwoPhase=null,42710 与目录可见性之间的竞态兜底)→ 复用不抛,
+     * 极端情况留给 start 时服务端报错。
+     */
+    @Test
+    void ensureSlotReusesExistingSlotWhenTwoPhaseMatchesOrRowAbsent() {
+        assertDoesNotThrow(() -> ReplicationSession.ensureSlot(
+                slotLookupConnection(true), parameters(StreamingMode.ON, true, 10)),
+                "槽已存在且 two_phase 匹配应复用而非失败");
+        assertDoesNotThrow(() -> ReplicationSession.ensureSlot(
+                slotLookupConnection(null), parameters(StreamingMode.ON, true, 10)),
+                "目录行不存在的竞态兜底应复用而非失败");
     }
 
     /**
@@ -291,6 +314,56 @@ class ReplicationSessionTest {
                         return statement;
                     }
                     return fallback(method.getReturnType());
+                });
+    }
+
+    /**
+     * 构造"建槽报 42710 + 目录查询返回脚本行"的假 Connection(R5 预检路径专用,JDK 动态
+     * 代理,零第三方 mock)。关键步骤:prepareStatement 按 SQL 文本分流——含
+     * pg_create_logical_replication_slot 的语句 executeQuery 抛 SQLState 42710(槽已存在),
+     * 含 pg_replication_slots 的语句返回脚本 ResultSet。脚本语义由 slotTwoPhase 驱动:
+     * Boolean.TRUE/FALSE → next()=true 且 getBoolean(1)=该值(槽存在、属性即该值);
+     * null → next()=false(目录行不存在)。其余接口方法经 fallback 回落。
+     *
+     * @param slotTwoPhase 目录查询的脚本返回值;null 表示行不存在
+     * @return 可直接交给 ReplicationSession.ensureSlot 静态接缝的假 Connection
+     */
+    private static Connection slotLookupConnection(Boolean slotTwoPhase) {
+        ResultSet lookupResult = (ResultSet) Proxy.newProxyInstance(
+                ReplicationSessionTest.class.getClassLoader(),
+                new Class<?>[]{ ResultSet.class },
+                (p, m, a) -> switch (m.getName()) {
+                    case "next" -> slotTwoPhase != null;
+                    case "getBoolean" -> Boolean.TRUE.equals(slotTwoPhase);
+                    default -> fallback(m.getReturnType());
+                });
+        PreparedStatement creator = (PreparedStatement) Proxy.newProxyInstance(
+                ReplicationSessionTest.class.getClassLoader(),
+                new Class<?>[]{ PreparedStatement.class },
+                (p, m, a) -> {
+                    if (m.getName().equals("executeQuery")) {
+                        throw new SQLException("fake duplicate_object", "42710");
+                    }
+                    return fallback(m.getReturnType());
+                });
+        PreparedStatement lookup = (PreparedStatement) Proxy.newProxyInstance(
+                ReplicationSessionTest.class.getClassLoader(),
+                new Class<?>[]{ PreparedStatement.class },
+                (p, m, a) -> m.getName().equals("executeQuery") ? lookupResult : fallback(m.getReturnType()));
+        return (Connection) Proxy.newProxyInstance(
+                ReplicationSessionTest.class.getClassLoader(),
+                new Class<?>[]{ Connection.class },
+                (p, m, a) -> {
+                    if (m.getName().equals("prepareStatement")) {
+                        String sql = (String) a[0];
+                        if (sql.contains("pg_create_logical_replication_slot")) {
+                            return creator;
+                        }
+                        if (sql.contains("pg_replication_slots")) {
+                            return lookup;
+                        }
+                    }
+                    return fallback(m.getReturnType());
                 });
     }
 
