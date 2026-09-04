@@ -22,7 +22,7 @@ REST validate 与任务构造器两级拒绝)且 `provide.transaction.metadata` 
 ②管线指标插桩:`StreamThroughputMetrics` 与引擎 `ThroughputMetrics` 逐段同构,四点插桩
 (reader 记 slot 读取/组装器记交接/consumer 记输出与分布),10s INFO 三行
 (吞吐/分布/峰值)与引擎同口径;③MBean 面:`StreamStreamingChangeEventSourceMetrics` 经
-Debezium metrics 体系暴露六速率 + lagBytes(`session.lastReceiveLsn()-前沿`)+ 挂起
+Debezium metrics 体系暴露五速率 + lagBytes(`session.lastReceiveLsn()-前沿`)+ 挂起
 prepared 数 + 管道磁盘占用——`StreamMetricsBridge` 于 execute 填四读源并挂统计 tick
 预计算,JMX 读零锁零计算零 IO;④R2 增量快照交错审计只审不接(档
 `docs/superpowers/specs/2026-09-05-ms5-r2-incremental-snapshot-audit.md`——vanilla 形态

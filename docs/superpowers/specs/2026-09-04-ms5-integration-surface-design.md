@@ -28,7 +28,7 @@ YAGNI 排除项：快照数据抽取（initial/when_needed 等全模式）、增
 
 ## 4. R2 增量快照交错——只审计不接
 
-- 产出：`docs/superpowers/specs/2026-09-04-ms5-r2-incremental-snapshot-audit.md`
+- 产出：`docs/superpowers/specs/2026-09-05-ms5-r2-incremental-snapshot-audit.md`
 - 审计面（若未来接入 vanilla 增量快照，SignalProcessor + IncrementalSnapshot 线程）：
   1. 增量快照会引入**第二个 dispatch 调用线程**——R1 结论"dispatch 仅 consumer 线程"被打破，`PostgresEventDispatcher` 共享可变态需重审
   2. 信号表读取/chunk 读占 main 连接——R3 串行化约束（reader 独占）需扩展分析

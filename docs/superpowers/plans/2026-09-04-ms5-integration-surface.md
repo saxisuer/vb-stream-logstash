@@ -248,7 +248,7 @@ StreamThroughputMetrics metrics = new StreamThroughputMetrics(System.nanoTime())
 ### Task 6: R2 审计文档 + 记档收官
 
 **Files:**
-- Create: `docs/superpowers/specs/2026-09-04-ms5-r2-incremental-snapshot-audit.md`
+- Create: `docs/superpowers/specs/2026-09-05-ms5-r2-incremental-snapshot-audit.md`
 - Modify: `CLAUDE.md`（根,connector 源码结构段 MS5 句 + IT 清单 + 用例计数）；`vb-stream-connector-postgres-stream/src/main/java/org/vastdata/debezium/connector/postgresql/stream/CLAUDE.md`（模块记档）
 
 **审计文档内容骨架**（写前先读 `2026-09-02-ms2-r1-r3-audit.md` 的行文形态）：

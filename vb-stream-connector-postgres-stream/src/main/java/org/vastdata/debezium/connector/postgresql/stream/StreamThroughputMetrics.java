@@ -113,7 +113,9 @@ public final class StreamThroughputMetrics {
     private long peakTxUnits = -1L;
 
     /**
-     * 构造指标器并以当前 nanoTime 为首窗基线（生产路径——组装器构造时调用，首窗自此起算）。
+     * 构造指标器并以当前 nanoTime 为首窗基线（便捷构造链与测试用——生产路径是流式源
+     * execute 显式 {@code new StreamThroughputMetrics(System.nanoTime())} 穿入装配点，
+     * 首窗自此起算）。
      */
     public StreamThroughputMetrics() {
         this(System.nanoTime());

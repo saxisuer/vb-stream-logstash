@@ -313,23 +313,4 @@ class DefaultsAndMetricsIT extends StreamITBase {
         }
         return out;
     }
-
-    /**
-     * 渲染失败回调的完整异常链文本(回调 msg + 沿 cause 链逐层消息拼接):引擎侧失败被
-     * 层层包装,拒绝文案在链尾——单层 getMessage 断言会漏,必须全链拼接(与
-     * SlotTwoPhaseMismatchIT 同形态的本地副本)。
-     *
-     * @param message 回调的消息参数(可能为 null)
-     * @param error   回调的异常参数(可能为 null)
-     * @return msg 与各层 cause 消息以 " | " 连接的文本(null 段跳过)
-     */
-    private static String renderThrowableChain(String message, Throwable error) {
-        StringBuilder sb = new StringBuilder(String.valueOf(message));
-        Throwable t = error;
-        while (t != null) {
-            sb.append(" | ").append(t.getMessage());
-            t = t.getCause();
-        }
-        return sb.toString();
-    }
 }

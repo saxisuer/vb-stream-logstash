@@ -170,8 +170,10 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
-     * 构造<b>异步形态</b>组装器(带指标注入,表解析走默认快照透缝):其余语义同九参公共异步
-     * 构造,吞吐指标实例由调用方创建后穿入(装配点与 Task 4 的 bridge 读源共用同一实例)。
+     * 构造<b>异步形态</b>组装器(带指标注入,表解析走默认快照透缝,包私有——陷阱形状收窄,
+     * 生产装配须走包私有 11 参构造穿同一 tableResolver 实例,本构造留给同包测试):
+     * 其余语义同九参公共异步构造,吞吐指标实例由调用方创建后穿入(装配点与 Task 4 的
+     * bridge 读源共用同一实例)。
      * 注意:listener 侧表解析用<b>默认新实例</b>——listener 若持有自有 tableResolver(如
      * source 的 DispatcherTransactionListener 接线),须改走包私有 11 参构造穿同一实例,
      * 否则 consumer 绑定的与 listener 读的解析器不是同一实例(asOf 查询永远落空)。
@@ -189,12 +191,12 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * @param metrics          吞吐与分布指标(装配点创建;四点插桩共用本实例——slot/组装在
      *                         本类,输出/分布/报告 tick 在 consumer,回放字节在 replayer)
      */
-    public StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
-                                        VersionedRelationRegistry registry, RelationResolver relationResolver,
-                                        Path pipeDir, RollCycle pipeRollCycle,
-                                        BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
-                                        AtomicLong outputFrontier, Runnable onFailure,
-                                        StreamThroughputMetrics metrics) {
+    StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                 Path pipeDir, RollCycle pipeRollCycle,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 AtomicLong outputFrontier, Runnable onFailure,
+                                 StreamThroughputMetrics metrics) {
         this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
                 outputFrontier, onFailure, BucketTableResolver.snapshotBacked(), metrics);
     }
