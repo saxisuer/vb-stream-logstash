@@ -31,10 +31,10 @@ import java.util.Objects;
  */
 public final class TypeRegistryColumnValueMapper implements ColumnValueMapper {
 
-    /** 数组/未知类型列解析需要活连接时的 fail-fast 供给器(见类 javadoc 的限制口径)。 */
+    /** 数组列解析需要活连接时的 fail-fast 供给器(见类 javadoc 的限制口径;未知类型走 asDefault 静默 null,不触达供给器)。 */
     private static final PgConnectionSupplier NO_CONNECTION = () -> {
         throw new DebeziumException(
-                "MS2 不支持数组/未知类型列的回放期类型化转换(需要 consumer 线程不持有的 JDBC 连接)");
+                "MS2 不支持数组列的回放期类型化转换(需要 consumer 线程不持有的 JDBC 连接)");
     };
 
     /** 连库类型注册表(Task.start 经 createTypeRegistry 建立的共享实例)。 */

@@ -219,7 +219,7 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
 
     /**
      * 责任:按 (oid, seq) 解析变更时刻的 asOf Table 并做值相等短路的版本安装(RowChange
-     * 与 TruncateChange 共用路径)。关键步骤:resolve 取 asOr 版本;与已装版本值相等即
+     * 与 TruncateChange 共用路径)。关键步骤:resolve 取 asOf 版本;与已装版本值相等即
      * 短路,变更才 applySchemaChangesForTable 重建 TableSchema(保证 dispatchDataChangeEvent
      * 的 schemaFor 命中)。
      * 边界:oid 未先行到达(resolve 抛 ISE)原样上抛 fail-fast。
