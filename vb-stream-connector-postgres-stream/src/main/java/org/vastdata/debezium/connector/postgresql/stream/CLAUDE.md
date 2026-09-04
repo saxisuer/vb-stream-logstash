@@ -55,7 +55,7 @@ TransactionConsumer(consumer 线程)
 - 配置面六项:`slot.streaming`(OFF/ON/PARALLEL,parallel 强制 two_phase)、`slot.two.phase`、
   `pipe.dir`、`pipe.roll.cycle`(LegacyRollCycles 名)、`slot.feedback.interval.ms`(整除换算秒,
   亚秒值截 0 = 每轮反馈)、`slot.messages`(MS3.5,默认 false——true 才在槽选项加 messages=true,
-  'M' 逻辑消息解析记录(INFO 两时点)且非事务消息经护栏即时推进前沿,不发射下游)。
+  'M' 逻辑消息解析记录(INFO 两时点)且非事务消息经护栏即时推进前沿——全有或全无(L8):无未输出桶才推进到消息位,有则完全静止,不发射下游)。
 
 ## src/test/java — 测试形态
 

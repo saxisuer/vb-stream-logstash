@@ -39,10 +39,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code max_slot_wal_keep_size} 兜底删档)——除非非事务消息即时推进前沿(T1/T2 接线)。
  *
  * <p><b>场景 2+3(crash 注入主验收 + 状态②重复语义,单用例合并,取舍见该用例 javadoc)</b>:
- * 已提交事务 T 停在输出中段时发心跳——护栏(safeMessageAdvance)应把 confirmed_flush
- * 钉进 (暖场边界, T 的 commit 记录结束位) 开区间:下界证明"消息路径确实推进了"(门控
- * 关闭/护栏归零即红),上界证明"推进没越过未输出事务的 commit 位"(护栏退化为直推
- * msgLsn 即红)——随后停机重启,T 整事务重发、尾部不丢(若对 restart_lsn/confirmed_flush
+ * 已提交事务 T 停在输出中段时发心跳——护栏(safeMessageAdvance,L8 全有或全无)应使
+ * confirmed_flush <b>完全静止在暖场边界</b>(等值钉死):存在未输出(pending)桶即一个
+ * 字节都不推进。部分推进形态(旧 min(commitLsn) 语义)会把 confirmed 抬到 T 的 commit
+ * 位(&gt; 暖场边界)→ 等值断言红;直推 msgLsn 形态到消息位 → 同红;"消息路径整体是否
+ * 存在"由场景 1(纯消息流必须推进)承担,两场景合起来钉完整语义——随后停机重启,T 整事务重发、尾部不丢(若对 restart_lsn/confirmed_flush
  * 语义理解有误,重启断言必红——它是 spec §3.4 状态③/②断言的实证,不做纯机制断言)。
  *
  * <p><b>机制依据(spec §3.4 状态枚举,"全发完了"场景)</b>:消息 X 即时推进到
@@ -63,15 +64,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 上一条结束,无页填充时零间隙),故连发 4 条——确认值最终锚<b>末条</b>消息 LSN,末条
  * 记录严格大于首条(记录长度非零),&gt; 边界恒成立,单条消息的 off-by-zero 不影响断言。
  *
- * <p><b>场景 2+3 的锚点取值(保守性论证)</b>:上界锚 = T 的 COMMIT 之后、心跳之前取
- * {@code pg_current_wal_insert_lsn()}——该位是"最后一条 WAL 记录的结束位",无其他 WAL
- * 活动时恰等于 T.endLsn(commit 记录结束位),恒 ≥ T.commitLsn(commit 记录自身的 LSN,
- * 护栏的真实钉点)——故上界断言 {@code confirmed_flush < 锚} 是保守形式(比
- * {@code < commitLsn} 弱一档:放宽了 commit 记录自身那几个字节),但护栏的两个退化形态
- * (直推 msgLsn → confirmed 到消息位 &gt; 锚;不推进 → confirmed 冻在暖场边界,输给下界)
- * 都必然撞红,非恒真;off-by-one 精确语义(commitLsn vs endLsn,设计 L5)不靠此锚钉死,
- * 而由重启后的"尾部不丢"行为级断言承担——confirmed_flush 落在 commit 记录内部时 PG
- * 必须整事务重发,这才是硬验收。
+ * <p><b>场景 2+3 的断言锚点(等值钉死,L8)</b>:暖场边界 = T0 输出完毕后取
+ * {@code pg_current_wal_insert_lsn()}——无其他 WAL 活动时恰等于 T0.endLsn,即护栏冻结
+ * 期间前沿的驻留位。等值断言 {@code confirmed_flush == 暖场边界} 比旧开区间双侧断言更强
+ * (钉死精确值):两个退化形态(部分推进 → confirmed 抬到 pending 桶 commitLsn &gt; 边界;
+ * 直推 msgLsn → 到消息位 &gt; 边界)都必然撞红,非恒真;且断言前先越过两个完整反馈周期
+ * (sleep 3s &gt; 反馈周期 1s),给"会被抬走"的形态留足暴露窗口,瞬时通过不构成假绿。
+ * 上界锚(commit 记录结束位)保留为诊断对照值,不参与断言;历史 off-by-one 论证
+ * (commitLsn vs endLsn,设计 L5→L8)见 spec 决策记录与护栏 javadoc 的"历史决策"段,
+ * 行为级硬验收(重启尾部不丢)不变。
  *
  * <p>夹具:独立槽 {@code logical_msg_it} 前后清删(残留槽续传旧位点破坏"边界后唯一
  * WAL 活动是消息"的前提);表/publication 先于建槽(pgoutput 协议硬性要求
@@ -157,7 +158,7 @@ class LogicalMsgIT extends StreamITBase {
      * {@code pg_current_wal_insert_lsn()} 为暖场边界 → 连发 4 条非事务心跳(间隔 1.5s
      * 走过多个反馈周期,无任何表活动)→ 轮询断言 confirmed_flush &gt; 边界。每条消息的
      * reader 侧路径:'M' 下发 → routeLogicalMsg 无桶非事务分支 INFO 留痕 + 前沿 max
-     * 推进到 min(msgLsn, 无 pending = msgLsn)→ 下轮反馈 capFeedback(min(已收到, 前沿))
+     * 推进到 msgLsn(L8 全有或全无:无 pending 桶 → msgLsn)→ 下轮反馈 capFeedback(min(已收到, 前沿))
      * = msgLsn → 服务端采纳进 confirmed_flush。
      * 边界:边界后无表事务/无 DML——门控关闭时('M' 不下发)前沿冻结在 T0.endLsn ≤ 边界,
      * 断言必红(非恒真;开发期实测证伪过"fresh 槽零事务"形态,见类 javadoc)。
@@ -197,8 +198,8 @@ class LogicalMsgIT extends StreamITBase {
 
     /**
      * 场景 2+3(crash 注入主验收 + 状态②重复语义,<b>单用例合并</b>):已提交事务 T 停在
-     * 输出中段(BEGIN+2 行已到下游,尾部滞留)时发非事务心跳 → 护栏把 confirmed_flush 钉进
-     * (暖场边界, T 的 commit 记录结束位)开区间 → 停机(不排干)→ 同一 offset 文件重启 →
+     * 输出中段(BEGIN+2 行已到下游,尾部滞留)时发非事务心跳 → 护栏(L8 全有或全无:存在 pending 桶即不推进)使 confirmed_flush
+     * 完全静止在暖场边界(等值钉死) → 停机(不排干)→ 同一 offset 文件重启 →
      * T 整事务重发(BEGIN+全行+END,尾部不丢;重复头行允许 Set 口径)。
      * <b>合并取舍(spec §4.2 场景 2/3 → 一流程)</b>:场景 3 的"部分输出后停机重启"与
      * 场景 2 的"crash 注入"共享同一构造(阻塞使 T 停在中段)——独立成两用例只在"是否发
@@ -211,12 +212,11 @@ class LogicalMsgIT extends StreamITBase {
      * {@code pg_current_wal_insert_lsn()} 为暖场边界(双侧断言的下界)→ 40 行单事务 T
      * 提交(小队列装满后 consumer 线程阻塞在 dispatch 的 enqueue 上,End 永不 dispatch,
      * T 滞留未输出完;reader 线程照常收心跳)→ 等 park 信号(全局第 6 条 = T 的第 2 行,
-     * 停机前下游已有 T 的 BEGIN+2 行)→ 取 COMMIT 后、心跳前的 WAL 插入位为上界锚
-     * (保守性见类 javadoc 锚点段)→ 发一条非事务心跳(reader 即时路径:safeMessageAdvance
-     * = min(msgLsn, pending.commitLsn) = T.commitLsn → 前沿从 T0.endLsn 抬到 T.commitLsn)
-     * → 轮询双侧稳态断言 {@code 暖场边界 < confirmed_flush < 上界锚}:下界证明消息路径
-     * 真推进了(护栏归零/门控关闭即红——T0.endLsn = 暖场边界,不大于),上界证明推进
-     * 未越过 T 的 commit 位(护栏退化为直推 msgLsn 即红——confirmed 采纳到消息位 &gt; 锚);
+     * 停机前下游已有 T 的 BEGIN+2 行)→ 取 COMMIT 后、心跳前的 WAL 插入位为诊断对照锚(见类
+     * javadoc 锚点段)→ 发一条非事务心跳(reader 即时路径:safeMessageAdvance 见 pending
+     * 桶 T → 冻结,前沿保持 T0.endLsn 不动——旧部分推进语义会抬到 T.commitLsn,等值断言
+     * 即红)→ 等值稳态断言 {@code confirmed_flush == 暖场边界},且先 sleep 3s(两个反馈
+     * 周期)再钉死——部分推进/直推 msgLsn 两个退化形态都把 confirmed 抬离边界,必红;
      * 稳态即"confirmed 已落库"(T3 实测 walsender 直接采纳 standby flush,轮询到即落库)
      * → <b>crash 注入点</b>:stopConnector(D7 快速停机,不排干;引擎 record 处理线程
      * park 在第 6 条上,由引擎停机的 recordService.shutdownNow 中断收敛)→ finally 放行
@@ -273,20 +273,25 @@ class LogicalMsgIT extends StreamITBase {
                     "停机前部分输出形态:T 的 BEGIN+2 行应在下游(park 在第 6 条): " + describe(sink));
 
             // 双侧断言的上界锚:COMMIT 之后、心跳之前的 WAL 插入位 = commit 记录结束位
-            // (无其他 WAL 活动时 = T.endLsn,恒 >= T.commitLsn——保守性见类 javadoc 锚点段)
+            // (诊断面:等值断言失败时对照 confirmed 是否被抬到此位之上——部分推进形态的去向)
             long commitEndAnchor = StreamPgTestEnv.lsnOf("SELECT pg_current_wal_insert_lsn()");
 
             // 非事务心跳:LSN 在 T 的 commit 之后——护栏可见性的激励(reader 即时推进路径)
             StreamPgTestEnv.execSql("SELECT pg_logical_emit_message(false, 'heartbeat', 'crash-guard')");
 
-            // 双侧稳态断言(护栏可见):下界>暖场边界(消息路径真推进),上界<commit 结束锚
-            // (未越过未输出事务的 commit 位)——两个退化形态(护栏直推 msgLsn/护栏归零)各撞一头
-            await("护栏把 confirmed_flush 钉进 (暖场边界, T.commit 结束位) 开区间")
+            // 先等 confirmed 采纳到暖场边界(T0 输出后的稳态:前沿 = T0.endLsn = 暖场边界,
+            // 反馈周期 1s,等待期远大于它)——随后越过完整反馈周期再钉死<b>等值</b>:
+            // 护栏全有或全无(L8)——存在 pending 桶(T 未输出完)即完全不推进,confirmed_flush
+            // 恒等暖场边界。部分推进形态(旧 min(commitLsn) 语义)会在一个反馈周期内把
+            // confirmed 抬到 T 的 commit 位(> 暖场边界)→ 等值断言红;直推 msgLsn 形态
+            // confirmed 到消息位(≥ commit 结束锚)→ 同红——等值钉死比旧开区间双侧断言更强。
+            await("confirmed_flush 先采纳到暖场边界(T0 稳态)")
                     .atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250))
-                    .until(() -> {
-                        long cf = StreamPgTestEnv.confirmedFlushLsn(SLOT);
-                        return cf > warmBoundary && cf < commitEndAnchor;
-                    });
+                    .until(() -> StreamPgTestEnv.confirmedFlushLsn(SLOT) == warmBoundary);
+            Thread.sleep(3000);   // > 反馈周期(1000ms)×2:给任何"会被抬走"的形态留足暴露窗口
+            assertEquals(warmBoundary, StreamPgTestEnv.confirmedFlushLsn(SLOT),
+                    "护栏冻结:存在 pending 桶(T 未输出完)confirmed_flush 完全静止"
+                            + "(若被抬走即部分推进形态复发;诊断对照 commitEndAnchor=" + commitEndAnchor + ")");
 
             // crash 注入点:输出中段停机(D7 不排干,已提交未输出事务由复制槽重发)。
             // 稳态断言通过即 confirmed 已落库;record 线程 park 由引擎停机中断收敛

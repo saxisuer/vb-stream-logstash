@@ -820,15 +820,16 @@ class StreamedTransactionAssemblerTest {
         }
     }
 
-    // --- 非事务逻辑消息的前沿推进护栏(MS3.5 spec §3.3,safeMessageAdvance 纯函数全分支) --------
+    // --- 非事务逻辑消息的前沿推进护栏(MS3.5 spec §3.3 + L8 全有或全无简化,safeMessageAdvance 纯函数全分支) --
 
     /**
-     * 构造护栏单测用交接桶:只关心 state 与 commitLsn 两个分量——state 手工置位模拟
-     * consumer 的可见性(HANDED_OFF=已交接未回放、OUTPUTTING=回放中,均属 pending;
-     * DONE=已输出完成),commitLsn 模拟 handoff 时写定的冻结字段。段/oidSet 等其余字段
-     * 不参与 safeMessageAdvance 的计算,留默认值。
+     * 构造护栏单测用交接桶:只关心 state 一个分量——state 手工置位模拟 consumer 的可见性
+     * (HANDED_OFF=已交接未回放、OUTPUTTING=回放中,均属 pending;DONE=已输出完成)。
+     * commitLsn 是 L8 简化前的历史计算分量(部分推进时代的 min 参与者),保留赋值并故意
+     * 取<b>会影响旧公式结果</b>的值(如 200/100 与 msgLsn=500 拉开差距)——钉死新语义下
+     * 它不再影响任何结果。段/oidSet 等其余字段不参与计算,留默认值。
      *
-     * @param commitLsn 提交记录 LSN(handoff 时冻结的封箱元数据)
+     * @param commitLsn 提交记录 LSN(handoff 时冻结的封箱元数据;L8 后护栏不再读它)
      * @param state     桶生命周期状态(pending 判定 = state != DONE)
      * @return 可直接塞进 handedOff 记账 deque 的最小桶
      */
@@ -839,56 +840,57 @@ class StreamedTransactionAssemblerTest {
         return bucket;
     }
 
-    /** 分支①无 pending:记账空(全部桶已输出完/被惰性清理)→ msgLsn 本身即安全上限(已输出事务前沿已覆盖、在途事务走 WAL 序论证,spec §3.4)。 */
+    /** 分支①无 pending:记账空(全部桶已输出完/被惰性清理)→ msgLsn 本身即安全上限(已输出事务前沿已覆盖、在途事务走 WAL 序论证,spec §3.4;L8 全有或全无的"全有"臂)。 */
     @Test
     void safeMessageAdvanceReturnsMsgLsnWhenNoPendingBuckets() {
         assertEquals(500L, StreamedTransactionAssembler.safeMessageAdvance(500L, new ArrayDeque<>()),
                 "无 pending 桶时应返回 msgLsn 自身");
     }
 
-    /** 分支②单 pending:唯一未输出桶(HANDED_OFF)时压到其 commitLsn——留出整事务重发空间(确认 < commitLsn 保证重启不跳过该事务)。 */
+    /**
+     * 分支②任一 pending → 完全不推进("全无"臂):只要存在未输出桶(HANDED_OFF 与
+     * OUTPUTTING 均算),返回 Long.MIN_VALUE——经调用点 accumulateAndGet(max) 天然 no-op,
+     * 前沿一个字节都不动。夹具故意保留会左右旧公式的 commitLsn 值(300/100):旧语义
+     * (min(msgLsn, min(commitLsn)))会返回 100,新语义与它们的取值无关。
+     */
     @Test
-    void safeMessageAdvanceDropsToSolePendingCommitLsn() {
-        ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
-        handedOff.add(guardBucket(200L, BucketState.HANDED_OFF));
-        assertEquals(200L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
-                "单 pending 桶应压到其 commitLsn");
-    }
-
-    /** 分支③多 pending:多个未输出桶(HANDED_OFF 与 OUTPUTTING 均算)时取最小 commitLsn——最老未输出事务的重发空间必须保住。 */
-    @Test
-    void safeMessageAdvanceTakesMinimumCommitLsnAcrossPendingBuckets() {
+    void safeMessageAdvanceFreezesWhenAnyPendingBucketExists() {
         ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
         handedOff.add(guardBucket(300L, BucketState.HANDED_OFF));
+        assertEquals(Long.MIN_VALUE, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
+                "任一 pending 桶即完全不推进(全有或全无,commitLsn 不再参与)");
         handedOff.add(guardBucket(100L, BucketState.OUTPUTTING));   // 回放中也属 pending
-        assertEquals(100L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
-                "多 pending 桶应取最小 commitLsn(OUTPUTTING 同样计入)");
-    }
-
-    /** 分支④msgLsn 更小:消息位点先于一切未输出桶的 commitLsn → 返回 msgLsn(min 的另一臂;消息自身的推进即安全上限)。 */
-    @Test
-    void safeMessageAdvanceReturnsMsgLsnWhenItIsSmaller() {
-        ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
-        handedOff.add(guardBucket(200L, BucketState.HANDED_OFF));
-        assertEquals(50L, StreamedTransactionAssembler.safeMessageAdvance(50L, handedOff),
-                "msgLsn 小于全部 pending commitLsn 时应返回 msgLsn");
+        assertEquals(Long.MIN_VALUE, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
+                "多 pending(含 OUTPUTTING)同样冻结");
     }
 
     /**
-     * 分支⑤DONE 桶被排除:已输出完成的桶(consumer 先写前沿后标 DONE——见到 DONE 即前沿
-     * 已覆盖其 endLsn)不再压低护栏;只剩 DONE 桶时等价于无 pending → msgLsn。
-     * spec §3.4 可见性方向单调论证的锚点:看到旧值只多重复不丢。
+     * 分支③msgLsn 低于全部 pending commitLsn 也不推进(全有或全无的钉子):哪怕消息位点
+     * 本身已安全(旧语义会返回 msgLsn=50,推进无损),只要存在未输出桶就不动——简化
+     * 放弃的就是这类"安全的部分推进",换来 commitLsn/endLsn off-by-one 风险类整体消失(L8)。
+     */
+    @Test
+    void safeMessageAdvanceFreezesEvenWhenMsgLsnBelowAllPendingCommitLsn() {
+        ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
+        handedOff.add(guardBucket(200L, BucketState.HANDED_OFF));
+        assertEquals(Long.MIN_VALUE, StreamedTransactionAssembler.safeMessageAdvance(50L, handedOff),
+                "msgLsn 低于全部 pending commitLsn 也不推进(全有或全无,无部分推进)");
+    }
+
+    /**
+     * 分支④DONE 桶不算 pending:已输出完成的桶(consumer 先写前沿后标 DONE——见到 DONE
+     * 即前沿已覆盖其 endLsn)不触发冻结;只剩 DONE 桶时等价于无 pending → msgLsn。
+     * spec §3.4 可见性方向单调论证的锚点:看到旧值只是多余冻结(只多重复不丢)。
      */
     @Test
     void safeMessageAdvanceExcludesDoneBuckets() {
         ArrayDeque<TxBuffer> handedOff = new ArrayDeque<>();
-        handedOff.add(guardBucket(10L, BucketState.DONE));
-        handedOff.add(guardBucket(200L, BucketState.HANDED_OFF));
-        assertEquals(200L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
-                "DONE 桶不得参与取 min(前沿已覆盖)");
-        handedOff.addLast(guardBucket(999L, BucketState.DONE));
-        assertEquals(200L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
-                "多个 DONE 桶同样全部排除");
+        handedOff.add(guardBucket(999L, BucketState.DONE));
+        assertEquals(500L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
+                "只剩 DONE 桶等价于无 pending → msgLsn(前沿已覆盖)");
+        handedOff.addLast(guardBucket(10L, BucketState.DONE));
+        assertEquals(500L, StreamedTransactionAssembler.safeMessageAdvance(500L, handedOff),
+                "多个 DONE 桶同样不触发冻结");
     }
 
     // --- 非事务 'M' 的组装器接线(MS3.5 Task 2:即时 INFO 留痕 + 护栏推进经 outputFrontier 观测) ------
@@ -944,16 +946,16 @@ class StreamedTransactionAssemblerTest {
     }
 
     /**
-     * 有 pending 交接桶时护栏压低推进:异步形态 + listener 阻塞在 Begin 回调,首桶定格
-     * OUTPUTTING(非 DONE,即 pending)滞留交接记账——此刻非事务 'M'(消息 LSN 远大于
-     * 其 commitLsn)的即时推进被压到该 pending 桶 commitLsn:确认值不得超过未输出事务的
-     * commit 记录位,否则重启整桶被服务端跳过、已输出头部的尾部永久丢失(spec §3.3
-     * off-by-one 论证)。形态取舍:同步形态 dispatchHandedOff 直调即 DONE 无法制造
-     * pending,故取异步阻塞(与 {@link #handedOffBucketConstrainsPipeWatermarkWhileConsumerBlocked()}
-     * 同款手法)。
+     * 有 pending 交接桶时护栏完全不推进(L8 全有或全无的"全无"臂):异步形态 + listener
+     * 阻塞在 Begin 回调,首桶定格 OUTPUTTING(非 DONE,即 pending)滞留交接记账——此刻
+     * 非事务 'M'(消息 LSN 远大于其 commitLsn)的即时推进被<b>整体冻结</b>,前沿保持
+     * 初始值 0 一个字节都不动(旧语义会抬到 pending 桶 commitLsn=占位 1——off-by-one
+     * 风险类已随简化消失,不再需要那层计算)。形态取舍:同步形态 dispatchHandedOff
+     * 直调即 DONE 无法制造 pending,故取异步阻塞(与
+     * {@link #handedOffBucketConstrainsPipeWatermarkWhileConsumerBlocked()} 同款手法)。
      */
     @Test
-    void nonTransactionalMsgAdvanceIsPinnedByPendingHandedOffBucket() throws Exception {
+    void nonTransactionalMsgAdvanceIsFrozenWhilePendingHandedOffBucketExists() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch inCallback = new CountDownLatch(1);
         AtomicLong frontier = new AtomicLong();
@@ -972,11 +974,10 @@ class StreamedTransactionAssemblerTest {
             assembler.onRaw(insert("1", "a"));
             assembler.onRaw(PgWire.commit());   // 首桶交接,consumer 进入 Begin 回调并阻塞 → OUTPUTTING(pending)
             assertTrue(inCallback.await(5, TimeUnit.SECONDS));
-            long pendingCommitLsn = assembler.handedOffForTest().get(0).commitLsn;   // PgWire 占位 1
+            long pendingCommitLsn = assembler.handedOffForTest().get(0).commitLsn;   // PgWire 占位 1(旧公式的钉点,现已不参与)
             assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "hb", new byte[]{ 1 }));
-            assertEquals(pendingCommitLsn, frontier.get(),
-                    "推进被压到 pending 桶 commitLsn(不得越过未输出事务的 commit 位)");
-            assertTrue(frontier.get() < MSG_LSN, "消息 LSN 大于 pending commitLsn 时不得推到消息位");
+            assertEquals(0L, frontier.get(),
+                    "存在 pending 桶:前沿完全静止在初始值(全有或全无,不推到 commitLsn=" + pendingCommitLsn + ")");
         } finally {
             release.countDown();
             assembler.close();
