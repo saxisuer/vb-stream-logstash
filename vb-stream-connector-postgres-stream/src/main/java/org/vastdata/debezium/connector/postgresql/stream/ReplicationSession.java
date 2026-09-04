@@ -31,7 +31,8 @@ import java.util.function.LongSupplier;
  *
  * <p>行为红线(ReplicationSessionTest 离线锚定,真库行为归 Task 8 IT):run 循环五步序
  * (isClosed 守卫 → drain → 封顶回写 → 满间隔才 forceUpdateStatus → 空轮 sleep 100ms)、
- * 槽选项恰四项、LSN 确认按输出前沿封顶、close 次序 流→复制连接→SQL 连接。
+ * 槽选项恰四项(messages 门控开时恰五项含 messages=true,MS3.5)、LSN 确认按输出前沿封顶、
+ * close 次序 流→复制连接→SQL 连接。
  *
  * <p>线程约束:open/ensureSlot/start/close 由装配方(监督壳)串行调用,run 由 reader
  * 线程独占执行——会话自身无内部线程(状态回传内联在轮询循环里,见 run 的 javadoc)。
@@ -121,9 +122,9 @@ public final class ReplicationSession implements AutoCloseable {
     }
 
     /**
-     * 启动复制流:unwrap 复制连接取 PGConnection,经 builder 链装配——槽名、恰四项槽选项
-     * ({@link #slotOptions})、起始位 INVALID_LSN(服务端从槽确认位点续发)、状态间隔
-     * = feedbackIntervalSeconds(秒)。成功即 INFO 一行。
+     * 启动复制流:unwrap 复制连接取 PGConnection,经 builder 链装配——槽名、槽选项
+     * (messages 门控关恰四项 / 开恰五项,{@link #slotOptions})、起始位 INVALID_LSN
+     * (服务端从槽确认位点续发)、状态间隔 = feedbackIntervalSeconds(秒)。成功即 INFO 一行。
      *
      * @throws SQLException 复制流启动失败(含槽属性与选项不匹配的服务端拒绝)
      */
@@ -138,17 +139,19 @@ public final class ReplicationSession implements AutoCloseable {
                 .withStartPosition(LogSequenceNumber.INVALID_LSN)
                 .withStatusInterval(config.feedbackIntervalSeconds(), TimeUnit.SECONDS)
                 .start();
-        LOG.info("复制流已启动: 槽={} publication={} proto=v{} streaming={} twoPhase={}",
+        LOG.info("复制流已启动: 槽={} publication={} proto=v{} streaming={} twoPhase={} messages={}",
                 config.slotName(), config.publicationNames(), config.protoVersion(),
-                config.streamingParam(), config.twoPhase());
+                config.streamingParam(), config.twoPhase(), config.messagesEnabled());
     }
 
     /**
      * 责任:组装 START_REPLICATION 的槽选项表(纯函数,供 start 与单测直驱)。
-     * 关键步骤:恰四项——proto_version(pgoutput 协议版本,流式需 ≥2)、publication_names
-     * (pgoutput 协议硬性要求)、streaming(档位参数 off/on/parallel)、two_phase(on/off);
-     * LinkedHashMap 保插入序,拼装可测可复现(pgjdbc 侧存入 Properties,选项到达服务端
-     * 的顺序不由此处决定)。
+     * 关键步骤:基础恰四项——proto_version(pgoutput 协议版本,流式需 ≥2)、
+     * publication_names(pgoutput 协议硬性要求)、streaming(档位参数 off/on/parallel)、
+     * two_phase(on/off);messagesEnabled=true 时追加第 5 项 messages=true
+     * (PG 14+,请求服务端下发 'M' 逻辑消息,MS3.5 的门控开关)——false 时维持恰四项,
+     * 与门控引入前的拼装逐字节一致(PG 不下发 'M',行为不变)。LinkedHashMap 保插入序,
+     * 拼装可测可复现(pgjdbc 侧存入 Properties,选项到达服务端的顺序不由此处决定)。
      * 边界:不校验参数合法性与档位联合约束(PARALLEL×two_phase 已在
      * PostgresStreamConnectorConfig.validateSlotStreaming 启动期 fail-fast),照单映射。
      */
@@ -158,6 +161,9 @@ public final class ReplicationSession implements AutoCloseable {
         options.put("publication_names", config.publicationNames());
         options.put("streaming", config.streamingParam());
         options.put("two_phase", config.twoPhase() ? "on" : "off");
+        if (config.messagesEnabled()) {
+            options.put("messages", "true");
+        }
         return options;
     }
 
@@ -319,14 +325,17 @@ public final class ReplicationSession implements AutoCloseable {
      * 由上层拼好传入);protoVersion——pgoutput 协议版本(流式需 ≥2);streamingMode——
      * OFF/ON/PARALLEL 档位,映射 streaming 槽选项;twoPhase——建槽选项与槽选项同源;
      * feedbackIntervalSeconds——LSN 反馈节流周期(秒,来自
-     * {@link PostgresStreamConnectorConfig#feedbackIntervalSeconds()})。
+     * {@link PostgresStreamConnectorConfig#feedbackIntervalSeconds()});
+     * messagesEnabled——'M' 逻辑消息门控(MS3.5,true 时槽选项追加第 5 项 messages=true,
+     * 来自 {@link PostgresStreamConnectorConfig#messagesEnabled()}),默认关——关闭时
+     * 行为与 MS3 及之前完全一致。
      * 不变量:构造后不可变;无默认值回落与校验(调用方组装时已过配置校验)。
      */
     public record Parameters(
             String host, int port, String database, String user, String password,
             String slotName, String publicationNames,
             int protoVersion, StreamingMode streamingMode, boolean twoPhase,
-            int feedbackIntervalSeconds) {
+            int feedbackIntervalSeconds, boolean messagesEnabled) {
 
         /**
          * 普通 JDBC URL(host:port/database 三段式),供 open() 的 SQL 连接。

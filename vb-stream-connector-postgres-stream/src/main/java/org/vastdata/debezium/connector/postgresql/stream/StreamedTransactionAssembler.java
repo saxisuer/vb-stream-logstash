@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -905,6 +906,42 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     /** 存活桶的 firstIndex 低水位候选(CQ 删除与 registry 剪枝两个低水位共用);桶 null 或空桶返回 Long.MAX_VALUE。 */
     private static long floor(TxBuffer bucket) {
         return (bucket == null || bucket.firstIndex < 0) ? Long.MAX_VALUE : bucket.firstIndex;
+    }
+
+    /**
+     * 责任:非事务逻辑消息('M')的前沿推进护栏纯函数(MS3.5 spec §3.3)——给定消息自身
+     * LSN 与 reader 维护的交接记账,返回可安全写入 {@code outputFrontier} 的推进上限:
+     * {@code min(msgLsn, min(未输出桶的 commitLsn))},无未输出桶时即 msgLsn。
+     * 关键步骤(为何是 commitLsn 而<b>非</b> endLsn——off-by-one):confirmed_flush 的服务端
+     * 语义是"commit 结束位 ≤ 确认值的事务视为已送达,重启跳过"。若护栏在某未输出桶的
+     * <b>endLsn</b> 上取 min,确认值 == 其 endLsn → 该桶被跳过 → 已输出头部还在、未输出
+     * 尾部<b>永久丢失</b>。取 commitLsn(commit 记录自身 LSN,恒 &lt; endLsn)保证该桶
+     * commit 结束位 &gt; 确认值 → 重启<b>整桶重发</b>(头部重复允许,at-least-once,尾部补齐)。
+     * 两条推进路径各用各的值互不越界:End 路径输出完成后写 endLsn(跳过 = 正确,已完成);
+     * 本护栏输出完成前只到 commitLsn(留出整事务重发空间)。同写一个 AtomicLong、同一 max
+     * 语义,证明自洽。
+     * pending 判定 = {@code state != DONE}(HANDED_OFF/OUTPUTTING 均算)。DONE 排除正确性:
+     * consumer 次序"先写前沿后标 DONE",state 是 volatile——读到 DONE 即前沿已覆盖其
+     * endLsn;读到旧值只是护栏保守压低(只多重复不丢),两方向安全无需加锁。
+     * 边界与例外:<b>在途(live)桶刻意不进参数</b>——其安全性由 WAL 序论证承担(spec
+     * §3.4:在途桶的 commit 在 WAL 序上必然晚于消息 X,PG restart_lsn 回放整体重发覆盖);
+     * 且 live 桶尚无 commitLsn(未交接),firstIndex 也不是 LSN,塞进 min 反而引入类型/
+     * 语义混乱。参数只取交接记账({@link #handedOff} 形态的 deque),调用方传入时照抄即可。
+     * 线程约束:纯函数;调用点在 reader 线程(非事务 'M' 的即时推进分支,Task 2 接线),
+     * 读 state 的即时 volatile 值即"此刻仍在途"的语义。
+     *
+     * @param msgLsn    非事务逻辑消息自身的 LSN(消息头 lsn 字段)
+     * @param handedOff 交接记账(pending = state != DONE 的桶;空 deque 即"全发完了"场景)
+     * @return 安全推进上限:min(msgLsn, min(pending.commitLsn));无 pending 时 msgLsn
+     */
+    static long safeMessageAdvance(long msgLsn, Deque<TxBuffer> handedOff) {
+        long safe = msgLsn;
+        for (TxBuffer bucket : handedOff) {
+            if (bucket.state != BucketState.DONE) {
+                safe = Math.min(safe, bucket.commitLsn);
+            }
+        }
+        return safe;
     }
 
     /** 桶存储形态的日志描述(段数 + CQ index 端点)——prepare/回滚的日志留痕用。 */
