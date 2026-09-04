@@ -167,13 +167,16 @@ class ReplicationSessionTest {
      * 与 {@link #ensureSlotReusesExistingSlotWhenTwoPhaseMatchesOrRowAbsent} 以目录查询脚本假件覆盖。
      */
     @Test
-    void ensureSlotSwallowsDuplicateObjectButRethrowsOtherSqlStates() {
+    void ensureSlotFollowsSqlContractAndRethrowsNonDuplicateStates() {
         List<String> okSql = new ArrayList<>();
+        List<Object> okParams = new ArrayList<>();
         assertDoesNotThrow(() -> ReplicationSession.ensureSlot(
-                fakeConnection(null, okSql, new ArrayList<>()), parameters(StreamingMode.ON, true, 10)),
+                fakeConnection(null, okSql, okParams), parameters(StreamingMode.ON, true, 10)),
                 "executeQuery 正常返回时应走成功路径(只需副作用)");
         assertEquals(List.of("SELECT pg_create_logical_replication_slot(?, 'pgoutput', false, ?)"), okSql,
                 "建槽 SQL 文本固定(第 3 参临时槽=false、第 4 参 two_phase 绑定)");
+        assertEquals(Arrays.asList("vb_cdc_slot", Boolean.TRUE), okParams,
+                "绑定参数对固定:第 1 参槽名、第 2 参 twoPhase=true");
 
         SQLException thrown = assertThrows(SQLException.class, () -> ReplicationSession.ensureSlot(
                 fakeConnection("42P01", new ArrayList<>(), new ArrayList<>()), parameters(StreamingMode.ON, true, 10)),

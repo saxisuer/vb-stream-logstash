@@ -1,6 +1,5 @@
 package org.vastdata.debezium.connector.postgresql.stream.it;
 
-import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -41,7 +40,7 @@ class SlotTwoPhaseMismatchIT extends StreamITBase {
     private static final String SLOT = "ms4_slot_mismatch";
 
     /** publication 名:ensureSlot 在建流之前即拒绝,publication 实际不被消费,占位即可。 */
-    private static final String PUB = "pub_2pc_ms4";
+    private static final String PUB = "pub_ms4_mismatch";
 
     /** 每用例独立的管道目录。 */
     @TempDir

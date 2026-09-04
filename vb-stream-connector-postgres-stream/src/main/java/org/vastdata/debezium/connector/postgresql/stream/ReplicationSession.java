@@ -95,7 +95,7 @@ public final class ReplicationSession implements AutoCloseable {
     }
 
     /**
-     * 责任:幂等建槽(ensureSlot 实例形态的静态工作体,行为与引擎逐行一致)。
+     * 责任:幂等建槽(ensureSlot 实例形态的静态工作体,42710 分支转 verifySlotTwoPhaseMatches 预检,引擎侧无此逻辑)。
      * 关键步骤:预编译 {@code pg_create_logical_replication_slot(?, 'pgoutput', false, ?)}
      * ——第 1 参槽名、第 4 参 twoPhase(第 3 参 false=非临时槽);executeQuery 只取副作用;
      * 捕获 SQLException,SQLState 42710 视为"槽已存在"转入 {@link #verifySlotTwoPhaseMatches}
