@@ -366,7 +366,9 @@ class RestartSemanticsIT extends StreamITBase {
      * @param targetLsn 期望追平的目标 LSN(已输出事务边界)
      * @return 追平为 true;超时为 false
      * @throws SQLException           触发表写入/槽查询失败原样上抛
-     * @throws InterruptedException sleep 被中断:恢复中断位上抛(测试放弃)
+     * @throws InterruptedException sleep 被中断:异常原样上抛、中断位不复位
+     *                                (勘误:早先写"恢复中断位上抛"与实际不符——本方法
+     *                                直接传播 Thread.sleep 的异常,无恢复逻辑;测试放弃)
      */
     private boolean awaitConfirmedFlushCaughtUp(long targetLsn) throws SQLException, InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();

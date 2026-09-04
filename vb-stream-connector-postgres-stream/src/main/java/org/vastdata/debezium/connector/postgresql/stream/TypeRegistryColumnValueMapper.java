@@ -14,13 +14,17 @@ import java.util.Objects;
  * 与 {@code UnchangedToastedReplicationMessageColumn} 哨兵构造——两处都是 vanilla
  * pgoutput 解码路径的同一份代码,不另造转换逻辑。
  *
- * <p><b>连接供给器的 fail-fast 口径(MS2 已文档化限制)</b>:vanilla 在流式线程上持有
- * 复制连接,数组/未知类型列的解析会经 {@code PgConnectionSupplier} 取活连接
- * (PgArray 构造等);本连接器的 consumer 线程不持有任何 JDBC 连接(main 连接归
- * reader 线程的 'R' enrich 独占,R3),故供给器直接抛 {@link DebeziumException}
- * (非受检,经供给器的受检签名合法上抛)终止——
- * 数组与未注册类型的实时转换属 MS2 不支持的列族,静默错值比 fail-fast 更糟。
- * Task 8 IT 起按需重议(如 reader 线程旁路代转)。
+ * <p><b>连接供给器的 fail-fast 口径(已知限制,记档见 docs/superpowers/specs/
+ * 2026-09-02-ms2-r1-r3-audit.md 的"已知限制与延期"节)</b>:vanilla 在流式线程上持有
+ * 复制连接,数组列的解析经 {@code PgConnectionSupplier} 取活连接(PgArray 构造,
+ * 惰性解析——转换器 getArray() 时才真用连接);本连接器的 consumer 线程不持有任何
+ * JDBC 连接(main 连接归 reader 线程的 'R' enrich 独占,R3),故供给器直接抛
+ * {@link DebeziumException}(非受检,穿透 vanilla asArray 只捕 SQLException 的
+ * catch,经供给器的受检签名合法上抛)终止 consumer——<b>比 vanilla 的失败静默
+ * null(WARN 后丢值)更安全,维持现状</b>;可行支持路径(reader 线程旁路代转 /
+ * consumer 期短开只读连接)都破坏 R1/R3 单写者假设,真需求出现再议。
+ * 语义钉子:{@code TypeRegistryColumnValueMapperTest}(DebeziumException 穿透
+ * 不静默 null)。
  *
  * <p>线程约束:无状态(仅持不可变注册表与开关),任意线程可调;实际仅 consumer 线程
  * (R1)。真库行为归 Task 8,离线单测经假 {@link ColumnValueMapper} 观察调用面。
@@ -55,7 +59,10 @@ public final class TypeRegistryColumnValueMapper implements ColumnValueMapper {
      * PostgresType 解析(Integer/Long/BigDecimal/Instant/bytea 字节……)。
      * 边界:解析失败(值与类型不符)按 vanilla 异常语义原样上抛——消费路径 fail-fast;
      * oid 未注册时 {@code TypeRegistry#get} 返回 UNKNOWN,由 includeUnknownDatatypes
-     * 决定照发或抛(同 vanilla)。
+     * 决定照发原串或<b>静默返回 null</b>(vanilla asDefault 同款:false 时不抛,仅 DEBUG
+     * 日志后返回 null——勘误:早先 javadoc 写"照发或抛"与 vanilla 不符);
+     * 数组类型列(isArrayType,elementType 非空)在 vanilla 分派进 asArray——经本实现的
+     * fail-fast 供给器终止(见类 javadoc 的已知限制口径)。
      */
     @Override
     public Object text(String columnName, int typeId, String typeExpression, String rawValue) {
