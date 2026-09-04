@@ -45,10 +45,11 @@ import java.util.Objects;
  *       {@code dispatchDataChangeEvent(tableId, TruncateEmitter)}(每表一条记录,op="t"、
  *       key=null、无 before/after);协议选项位(CASCADE/RESTART_IDENTITY)发射时丢弃
  *       对齐 vanilla({@link TruncateChange#options()} 保留属超集)</li>
- *   <li><b>MsgChange</b>:事务性 'M' 的回放期 INFO 留痕(MS3.5 spec §3.2:prefix/content
- *       从事件组件直取,content 走 {@link MessagePreview} 预览;aborted 子事务的消息在过滤
- *       阶段已剔除,天然不记)——<b>不 dispatch、不计入 event_count</b>,LogicalMsg 的下游
- *       映射(dispatchLogicalDecodingMessage)仍延期</li>
+ *   <li><b>MsgChange</b>:'M' 的回放期 INFO 留痕(MS3.5 spec §3.2:prefix/content 从事件
+ *       组件直取,事务性取组件真值——非事务 'M' 搭活跃桶形态也走此分支,内容走
+ *       {@link MessagePreview} 预览;aborted 子事务的消息在过滤阶段已剔除,天然不记)
+ *       ——<b>不 dispatch、不计入 event_count</b>,LogicalMsg 的下游映射
+ *       (dispatchLogicalDecodingMessage)仍延期</li>
  *   <li><b>End</b>:{@code dispatchTransactionCommittedEvent(commitTs)}——时间戳组件
  *       End 事件不带,沿用 Begin 记住的提交时间戳</li>
  * </ul>
@@ -143,12 +144,14 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
             onTruncateChange(change);
         }
         else if (event instanceof MsgChange change) {
-            // 事务性 'M' 的回放期留痕(MS3.5 spec §3.2):INFO 同款格式,事务性恒 true——
-            // 到达此分支的必是随事务输出的消息;aborted 子事务的消息在回放过滤阶段已被剔除,
+            // 事务性 'M' 的回放期留痕(MS3.5 spec §3.2):INFO 同款格式,事务性取<b>组件真值</b>——
+            // 到达此分支的除事务性消息外还有"非事务 'M' 搭活跃桶"形态(组装器 routeLogicalMsg 的
+            // transactional || hasActiveBucket() 分支收入桶中,回放期以 transactional=false 到达,
+            // 硬编码 true 会打错标记——终审修复);aborted 子事务的消息在回放过滤阶段已被剔除,
             // 天然不记(与 CDC 数据语义对齐)。仍不 dispatch、不计入 event_count——发射仍延期
             // (dispatchLogicalDecodingMessage 的映射后续里程碑接)。lsn 位缺省:MsgChange 事件
             // 不携带 lsn 组件(协议解码层有、事件面未带),日志形态对齐 reader 时点但无 lsn 位。
-            LOG.info("逻辑消息: prefix={}, 事务性={}, content={}", change.prefix(), true,
+            LOG.info("逻辑消息: prefix={}, 事务性={}, content={}", change.prefix(), change.transactional(),
                     MessagePreview.preview(change.content()));
         }
         else if (event instanceof TransactionEvent.End end) {
