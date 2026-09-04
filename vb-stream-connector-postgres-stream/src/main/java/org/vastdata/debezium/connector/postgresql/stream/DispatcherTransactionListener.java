@@ -7,6 +7,7 @@ import io.debezium.connector.postgresql.PostgresPartition;
 import io.debezium.connector.postgresql.SourceInfo;
 import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.ReplicationMessage.Operation;
+import io.debezium.data.Envelope;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
@@ -38,8 +39,14 @@ import java.util.Objects;
  *       必须与事务块 id(同为顶层 xid)同源,否则子事务存活的变更使 TransactionMonitor
  *       按"事务变更"补发空 END+BEGIN,事务元数据 topic 分裂)→
  *       {@code dispatchDataChangeEvent(tableId, RowChangeEmitter)}</li>
- *   <li><b>Truncate/MsgChange</b>:MS2 跳过发射(DEBUG 留痕)——Truncate 变更族 MS3 补,
- *       LogicalMsg 映射(dispatchLogicalDecodingMessage)后续里程碑接</li>
+ *   <li><b>TruncateChange</b>:{@code config.getSkippedOperations()} 门控(vanilla 同款,
+ *       默认 "t" = 跳过——TRUNCATE 默认不发;"none" 才发射)——放行时<b>逐表</b>经
+ *       同款 resolve/版本安装/updateWalPosition 后
+ *       {@code dispatchDataChangeEvent(tableId, TruncateEmitter)}(每表一条记录,op="t"、
+ *       key=null、无 before/after);协议选项位(CASCADE/RESTART_IDENTITY)发射时丢弃
+ *       对齐 vanilla({@link TruncateChange#options()} 保留属超集)</li>
+ *   <li><b>MsgChange</b>:DEBUG 跳过留痕——LogicalMsg 映射(dispatchLogicalDecodingMessage)
+ *       后续里程碑接</li>
  *   <li><b>End</b>:{@code dispatchTransactionCommittedEvent(commitTs)}——时间戳组件
  *       End 事件不带,沿用 Begin 记住的提交时间戳</li>
  * </ul>
@@ -117,7 +124,8 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
     /**
      * 责任:消费一个事务事件并映射到 dispatcher。关键步骤:按事件形态分派——Begin 锚定
      * 事务边界 offset 并发事务头;RowChange 解析 asOf 版本、安装、补 source 块、发数据
-     * 事件;Truncate/MsgChange DEBUG 跳过;End 发事务尾。边界:任何异常原样上抛
+     * 事件;TruncateChange 按 skipped.operations 门控(默认跳过,none 才逐表发射);
+     * MsgChange DEBUG 跳过;End 发事务尾。边界:任何异常原样上抛
      * (组装器 fail-fast——End 未达则前沿不推进,事务重发);要求 bind 先于 TxChange
      * (组装器保证,调用序违约由 {@link BucketTableResolver#resolve} 抛 ISE)。
      */
@@ -129,8 +137,11 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
         else if (event instanceof RowChange change) {
             onRowChange(change);
         }
-        else if (event instanceof TruncateChange || event instanceof MsgChange) {
-            LOG.debug("MS2 跳过发射(Truncate 族 MS3 补/LogicalMsg 后续里程碑): {}", event);
+        else if (event instanceof TruncateChange change) {
+            onTruncateChange(change);
+        }
+        else if (event instanceof MsgChange) {
+            LOG.debug("跳过发射(LogicalMsg 后续里程碑接): {}", event);
         }
         else if (event instanceof TransactionEvent.End end) {
             onEnd(end);
@@ -166,11 +177,7 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
      */
     private void onRowChange(RowChange change) {
         int relationOid = change.relation().relationOid();
-        Table table = tableResolver.resolve(relationOid, change.seq()).table();
-        Table installed = schema.tableFor(relationOid);
-        if (!table.equals(installed)) {
-            schema.applySchemaChangesForTable(relationOid, table);
-        }
+        Table table = resolveAndInstall(relationOid, change.seq());
         TableId tableId = table.id();
         // txId 恒取顶层 xid(currentXid),不用流式单元的 streamXid(那是子事务 xid——
         // aborted 过滤正依赖该语义区分):source 块 txId 必须与事务块 id(同为顶层 xid,
@@ -181,6 +188,52 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
                 currentCommitTimestamp, currentXid, null, tableId, envelopeOperation(change.dml()));
         dispatch(() -> dispatcher.dispatchDataChangeEvent(partition, tableId,
                 new RowChangeEmitter(partition, offsetContext, clock, connectorConfig, valueMapper, table, change)));
+    }
+
+    /**
+     * 责任:TRUNCATE 变更——{@code connectorConfig.getSkippedOperations()} 含 TRUNCATE 时
+     * 按 vanilla 默认语义跳过(默认 "t",DEBUG 留痕);放行时逐受影响表发射:每表经同款
+     * {@link #resolveAndInstall} 取 asOf 版本(多表 TRUNCATE 的各表 Relation 已由协议
+     * 消息携带、版本经 'R' 记入桶快照),updateWalPosition 补 source 块(table/messageType
+     * = TRUNCATE,txId 同 RowChange 取顶层 xid)后 dispatch 普通 data topic 事件
+     * ({@link TruncateEmitter}:op="t"、key=null、无 before/after)。一条语句多表 =
+     * 多条记录,每表一个 dataEvent(TransactionMonitor 自动计数);协议选项位
+     * (CASCADE/RESTART_IDENTITY)发射时丢弃对齐 vanilla(TruncateChange.options 保留属超集)。
+     * 边界:oid 未先行到达(resolve 抛 ISE)或 emitter 抛出 → 原样上抛 fail-fast;
+     * dispatch 返回 false(表被过滤器排除)不算异常,属过滤语义(vanilla dispatcher 同款)。
+     */
+    private void onTruncateChange(TruncateChange change) {
+        if (connectorConfig.getSkippedOperations().contains(Envelope.Operation.TRUNCATE)) {
+            LOG.debug("TRUNCATE 变更按 skipped.operations 门控跳过(默认跳过,none 才发): {}", change);
+            return;
+        }
+        for (var relation : change.relations()) {
+            int relationOid = relation.relationOid();
+            TableId tableId = resolveAndInstall(relationOid, change.seq()).id();
+            offsetContext.updateWalPosition(Lsn.valueOf(currentEndLsn), Lsn.valueOf(currentEndLsn),
+                    currentCommitTimestamp, currentXid, null, tableId, Operation.TRUNCATE);
+            dispatch(() -> dispatcher.dispatchDataChangeEvent(partition, tableId,
+                    new TruncateEmitter(partition, offsetContext, clock, connectorConfig)));
+        }
+    }
+
+    /**
+     * 责任:按 (oid, seq) 解析变更时刻的 asOf Table 并做值相等短路的版本安装(RowChange
+     * 与 TruncateChange 共用路径)。关键步骤:resolve 取 asOf 版本;与已装版本值相等即
+     * 短路,变更才 applySchemaChangesForTable 重建 TableSchema(保证 dispatchDataChangeEvent
+     * 的 schemaFor 命中)。
+     * 边界:oid 未先行到达(resolve 抛 ISE)原样上抛 fail-fast。
+     *
+     * @param relationOid 目标表 oid
+     * @param asOfSeq     变更消息序号(版本窗口的 asOf 点)
+     * @return 变更时刻生效的表定义
+     */
+    private Table resolveAndInstall(int relationOid, long asOfSeq) {
+        Table table = tableResolver.resolve(relationOid, asOfSeq).table();
+        if (!table.equals(schema.tableFor(relationOid))) {
+            schema.applySchemaChangesForTable(relationOid, table);
+        }
+        return table;
     }
 
     /**

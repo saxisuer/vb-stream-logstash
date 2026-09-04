@@ -109,12 +109,12 @@ Javadoc 写清三情况各自的机制依据(前沿封顶/confirmed_flush candid
 
 ## 验收汇总(对照 spec §10 MS3)
 
-- [ ] aborted 过滤端到端(SAVEPOINT 回滚行不进 Kafka)
-- [ ] DDL asOf(同事务前后段列数分界正确)
-- [ ] 重启三情况(半事务 D7/offset 落后重复/无缝续传)
-- [ ] Truncate 发射(`skipped.operations` 门控,默认跳过对齐 vanilla)
-- [ ] 数组/未知类型限制记档 + LogicalMsg 延期记档
-- [ ] 全量绿;零引擎 import
+- [x] aborted 过滤端到端(SAVEPOINT 回滚行不进 Kafka)
+- [x] DDL asOf(同事务前后段列数分界正确)
+- [x] 重启三情况(半事务 D7/offset 落后重复/无缝续传)
+- [x] Truncate 发射(`skipped.operations` 门控,默认跳过对齐 vanilla)
+- [x] 数组/未知类型限制记档 + LogicalMsg 延期记档
+- [x] 全量绿;零引擎 import
 
 ## 备注
 

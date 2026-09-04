@@ -1,8 +1,18 @@
 # org.vastdata.debezium.connector.postgresql.stream — Debezium 流式连接器(MS2 形态)
 
 零 `org.vastdata.vbstream` import(模块边界 D2,与引擎文字参照非依赖)。MS1 落协议层
-(`protocol/` 子包,见其 CLAUDE.md)与三件套骨架;**MS2 落管道与接线**;MS3+ 见设计文档
-(Truncate 族/LogicalMsg/指标/快照)。
+(`protocol/` 子包,见其 CLAUDE.md)与三件套骨架;**MS2 落管道与接线**;**MS3 落 Truncate
+发射**(`DispatcherTransactionListener` 的 TruncateChange 分支——`skipped.operations` 门控
+照 vanilla 3.6.1:默认 "t" 跳过(连接器默认不发)、`none` 才逐表 `dispatchDataChangeEvent`,
+每表一条 op="t"/key=null/无 before/after 的普通 data topic 记录(`TruncateEmitter`),
+协议选项位发射时丢弃对齐;门控只吞 'T' 数据消息,BEGIN/COMMIT 照常驱动事务块——被
+门控的事务留一对空 BEGIN/END,vanilla 同款);LogicalMsg/指标/快照后续里程碑。
+**MS3 三情况 IT**:`StreamAbortFilterIT`(SAVEPOINT 回滚行不进 Kafka、存活行完整、END 计数=
+实付)、`InTxnDdlAsOfIT`(同事务 DDL 前后段各按变更时刻表结构渲染、列数分界正确)、
+`RestartSemanticsIT` 三用例(半事务停机 D7 shutdownFast→槽重发补齐;offset 落后重启
+重复段取并集;无缝续传)。**已知限制与延期**记档于 R1/R3 审计文档「已知限制与延期」节
+(数组列 fail-fast 不静默 null、未知类型静默 null、LogicalMsg 延期设计要点、Truncate
+选项位超集)。
 
 ## MS2 组件图(自建会话 + 双线程管道 + Debezium 接线)
 
