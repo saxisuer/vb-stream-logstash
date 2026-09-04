@@ -19,9 +19,9 @@ MS3 记档了 LogicalMsg('M')延期(见 `2026-09-02-ms2-r1-r3-audit.md` "已知�
 
 ## 3. 设计
 
-### 3.1 槽选项(1 行)
+### 3.1 槽选项(配置门控)
 
-`ReplicationSession` 槽选项 4→5 项:加 `messages=true`(PG 14+;既有 streaming/two_phase 选项已隐含更高版本假设,无条件加)。
+新增配置 Field `slot.messages`(BOOLEAN,默认 **false**——不开则槽选项维持 4 项、PG 不下发 'M',行为与 MS3 及之前完全一致)。置 true 时 `ReplicationSession` 槽选项 4→5 项,加 `messages=true`(PG 14+;既有 streaming/two_phase 选项已隐含更高版本假设)。四件套齐备(Field/ALL_FIELDS.with/ConfigDef.define/getter `messagesEnabled()`),Field javadoc 写明:开启后 'M' 会被解析记录并参与前沿推进(不发射下游)。
 
 ### 3.2 日志两时点
 
@@ -66,7 +66,7 @@ reader 单线程按 WAL 序处理,消息 X 到达时每个事务必居其一:
 
 ### 3.5 不动的面
 
-offset/Connect 链路(log-only 无记录无 offset,确认走既有前沿→reader 回传路径)、事件族、发射路径、配置面(日志级别固定 INFO,messages=true 无条件,均不加配置项)。
+offset/Connect 链路(log-only 无记录无 offset,确认走既有前沿→reader 回传路径)、事件族、发射路径。配置面**仅新增一项** `slot.messages`(§3.1);日志级别固定 INFO 不做配置。
 
 ## 4. 测试面
 
@@ -89,9 +89,9 @@ MS3.5,独立分支(**MS3 PR 合并后**从新 main 拉),约 5 任务:
 
 | 任务 | 内容 |
 |---|---|
-| T1 | 槽选项 messages=true + 日志两时点 + 护栏纯函数(TDD 全分支单测) |
+| T1 | 配置项 `slot.messages`(四件套)+ 门控槽选项 + 日志两时点 + 护栏纯函数(TDD 全分支单测) |
 | T2 | 组装器接线(routeLogicalMsg 分支改造)+ listener MsgChange 分支 |
-| T3 | IT 心跳推进场景 |
+| T3 | IT 心跳推进场景(config 开 slot.messages=true) |
 | T4 | IT crash 注入主验收 + 状态②重复语义 |
 | T5 | 记档更新(audit 文档 LogicalMsg 条目"延期"→"部分实现:记录+安全推进已落地;发射仍延期")+ 收官 |
 
@@ -105,3 +105,4 @@ MS3.5,独立分支(**MS3 PR 合并后**从新 main 拉),约 5 任务:
 | L4 | 护栏 = min(msgLsn, min(未输出桶 commitLsn));方案 A(reader 即时推进+纯函数),否决微型事务包装(过重/心跳被积压阻塞)与不推进(WAL 兜底反而制造丢失) | 设计评审;用户确认 |
 | L5 | off-by-one 修正:commitLsn 而非 endLsn(确认 AT endLsn = 跳过未输出事务 = 尾部丢失) | 用户质询暴露,评审确认 |
 | L6 | 独立里程碑 MS3.5,MS3 合并后开工 | 用户裁定 |
+| L7 | 槽选项 messages=true **经配置门控**(新 Field `slot.messages`,默认 false),不强制——关闭时行为与 MS3 完全一致 | 用户审阅裁定 |
