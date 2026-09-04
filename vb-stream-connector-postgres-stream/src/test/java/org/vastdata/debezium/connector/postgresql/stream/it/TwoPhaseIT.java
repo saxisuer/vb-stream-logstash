@@ -1,6 +1,5 @@
 package org.vastdata.debezium.connector.postgresql.stream.it;
 
-import io.debezium.config.Configuration;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
@@ -194,6 +193,36 @@ class TwoPhaseIT extends StreamITBase {
             assertEquals("c1-" + after.getInt32("id"), after.getString("payload"), "payload 应全文相等");
         }
         assertTrue(hasEndWithEventCount(emitted, 3), "事务 topic 应有 event_count=3 的 END: " + describe(emitted));
+    }
+
+    /**
+     * 场景②(on 档):ROLLBACK PREPARED 弃桶全程零发射。关键步骤:start(on 档)→ PREPARE
+     * 2 行('gid_rb')→ 哨兵 902 消费 3 条且恰无 prepared 行 → ROLLBACK PREPARED → 哨兵
+     * 903 消费 3 条 → 断言两轮合计数据 ids 恰 {902,903}(弃桶后也无补发)且不存在
+     * event_count=2 的 END(RollbackPrepared 不驱动事务块)。
+     * 边界:第二轮哨兵证"回滚处理后管道仍活",零发射贯穿挂起期与回滚后两段。
+     */
+    @Test
+    void rollbackPreparedDiscardsBucketWithZeroEmission() throws Exception {
+        createFixture();
+        start(PostgresStreamConnector.class,
+                baseConfig(SLOT, PUB, pipeDir).with("slot.streaming", "on").build());
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        prepareRows("gid_rb", 1, 2, "rb");
+        insertSentinelRow(902);
+        List<SourceRecord> first = consumeRecordsUnchecked(3);
+        assertEquals(Set.of(902), dataIds(first), "挂起期应仅哨兵行到达");
+
+        StreamPgTestEnv.execSql("ROLLBACK PREPARED 'gid_rb'");
+        insertSentinelRow(903);
+        List<SourceRecord> second = consumeRecordsUnchecked(3);
+        assertEquals(3, second.size(), "回滚后哨兵事务应照常到达(管道存活): " + describe(second));
+
+        List<SourceRecord> all = new java.util.ArrayList<>(first);
+        all.addAll(second);
+        assertEquals(Set.of(902, 903), dataIds(all), "弃桶语义:prepared 两行全程零发射(挂起期与回滚后均无)");
+        assertTrue(!hasEndWithEventCount(all, 2), "RollbackPrepared 弃桶不得产生 event_count=2 的事务 END");
     }
 
     /**
