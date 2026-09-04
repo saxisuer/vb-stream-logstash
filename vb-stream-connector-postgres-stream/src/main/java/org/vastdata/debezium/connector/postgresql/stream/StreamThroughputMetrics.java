@@ -44,9 +44,10 @@ import java.util.function.LongSupplier;
  * <p>线程约束（设计 §5）：速率计数器是 {@link LongAdder}——slot 侧 reader 单写、输出侧
  * consumer 单写、报告时 consumer 读，弱一致读对统计语义足够；两个 Recorder 由 consumer
  * 线程**单写**（record 与报告同线程）。指标永不向业务热路径抛异常（越界样本钳制到上界），
- * 无可关闭资源、停机无需收尾。与引擎的差异仅三处：包名与类名；{@link #totals()} 为公开
- * 只读访问器（本连接器侧它另有 MBean 窗口差分读源的职责——LongAdder sum 快照，任意线程
- * 可读）；其余逻辑与引擎逐段同构。
+ * 无可关闭资源、停机无需收尾。与引擎的差异四处：包名；类名；可见性全面公开（引擎为包私有
+ * ——跨包装配点接线所需，{@link #totals()} 为公开只读访问器，本连接器侧它另有 MBean 窗口
+ * 差分读源的职责——LongAdder sum 快照，任意线程可读）；{@link #statsTickHook(Runnable)}
+ * 统计 tick 钩子（引擎无——10s 报告 tick 后回调，供 MBean 面零锁预计算）。其余逻辑与引擎逐段同构。
  */
 public final class StreamThroughputMetrics {
 
