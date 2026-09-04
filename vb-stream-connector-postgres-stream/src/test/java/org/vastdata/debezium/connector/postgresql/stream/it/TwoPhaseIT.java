@@ -12,10 +12,13 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -260,6 +263,58 @@ class TwoPhaseIT extends StreamITBase {
         }
         assertEquals(expected, dataIds(all), "流式两阶段事务 500 行应全量落 Kafka(parallel 档端到端)");
         assertTrue(hasEndWithEventCount(all, 500), "事务 topic 应有 event_count=500 的 END: " + describe(all));
+    }
+
+    /**
+     * 场景④:prepared 挂起期停机 → 重启重发 BeginPrepare..Prepare → COMMIT PREPARED 后
+     * 补齐(offset 推进越过 CommitPrepared 位点)。关键步骤:start(on 档)→ 暖场哨兵 904
+     * 消费 3 条取边界 LSN → PREPARE 3 行('gid_restart')→ 不变量锚点:confirmed_flush ≤
+     * 暖场边界(CommitPrepared 未达 → 前沿钉在暖场 End → 服务端采纳不可能越过——重启重发
+     * 区间必然覆盖整个 prepared 事务,确定性非时序)→ stopConnector → 停机期排空断言零
+     * 残留 → 同一 offset 文件重启 → COMMIT PREPARED → await 轮询:ids 覆盖 {1,2,3}(暖场
+     * 行允许重发重复,并集口径)、END event_count=3。
+     * 边界:重发到达总数不确定(暖场事务是否重发取决于停机前服务端采纳进度),用非阻塞
+     * 排空轮询而非按数消费;preparedByGid 按 gid 匹配幂等吸收重发的 BeginPrepare..Prepare。
+     */
+    @Test
+    void preparedTxSurvivesRestartAndEmitsOnCommitPrepared() throws Exception {
+        createFixture();
+        var config = baseConfig(SLOT, PUB, pipeDir).with("slot.streaming", "on").build();
+        start(PostgresStreamConnector.class, config);
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+
+        insertSentinelRow(904);
+        List<SourceRecord> warm = consumeRecordsUnchecked(3);
+        assertEquals(Set.of(904), dataIds(warm), "暖场哨兵应到达并给前沿一个已推进锚点");
+        long warmBoundary = ((Number) recordsForTopic(warm, TOPIC).get(0)
+                .sourceOffset().get("lsn_commit")).longValue();
+
+        prepareRows("gid_restart", 1, 3, "restart");
+        assertTrue(StreamPgTestEnv.confirmedFlushLsn(SLOT) <= warmBoundary,
+                "prepared 挂起期 confirmed_flush 应被前沿封顶钉在暖场边界之内"
+                        + "(CommitPrepared 未达前沿不推进,重启重发区间必然覆盖整个 prepared 事务)");
+
+        stopConnector();
+        List<SourceRecord> residual = new ArrayList<>();
+        drainArrivedRecords(residual);
+        assertTrue(residual.isEmpty(), "停机期排空应零残留(prepared 桶未交接,零发射): " + describe(residual));
+
+        start(PostgresStreamConnector.class, config);
+        StreamPgTestEnv.awaitWalsender(SLOT, 20_000);
+        StreamPgTestEnv.execSql("COMMIT PREPARED 'gid_restart'");
+
+        List<SourceRecord> seen = new ArrayList<>();
+        await("重启后 prepared 事务经 COMMIT PREPARED 补齐")
+                .atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(200))
+                .untilAsserted(() -> {
+                    drainArrivedRecords(seen);
+                    Set<Integer> union = dataIds(seen);
+                    union.add(904); // 暖场行:停机前已见,允许(不强制)由重发补充
+                    assertEquals(Set.of(1, 2, 3, 904), union,
+                            "prepared 3 行必达(重启重发+COMMIT PREPARED 补齐),暖场行允许重发: " + describe(seen));
+                    assertTrue(hasEndWithEventCount(seen, 3),
+                            "prepared 事务应有 END 到达且 event_count=3: " + describe(seen));
+                });
     }
 
     /**
