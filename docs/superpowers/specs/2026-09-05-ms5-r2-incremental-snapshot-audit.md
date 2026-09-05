@@ -170,3 +170,5 @@ TransactionConsumer :36-38/:172),LSN 反馈按前沿封顶(`ReplicationSession.c
 vanilla `isReadOnlyConnection` 前提下的 experimental 形态)。工作量主体:前置条件 1+2 的
 串行化设计与三项 IT(chunk 期前沿静止/lagBytes 上升、重启 chunk 重读 dedup 取并集、
 signal 表 DML 可见性)。
+
+> MS6 裁定（2026-09-05）：v1 不接 signal-based 增量快照——需要时按本档前置条件五项路线图实施。
