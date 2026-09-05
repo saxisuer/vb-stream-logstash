@@ -147,6 +147,15 @@
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Testcontainers kafka 模块(TC 2.x 更名坐标):ConnectPluginIT 用
+             ConfluentKafkaContainer 起单容器 KRaft broker——为 cp-kafka-connect 容器
+             提供同网络引导点与 test 侧消费端点,与 postgresql 同 BOM 版本管理 -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-kafka</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.awaitility</groupId>
             <artifactId>awaitility</artifactId>
