@@ -5,7 +5,7 @@
 - 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 两模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）与 `vb-stream-connector-postgres-stream`（Debezium 流式连接器骨架）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 连接器模块 `vb-stream-connector-postgres-stream`（Debezium 流式 PG 连接器插件，MS1–MS6 收官）：配置面/打包安装/at-least-once 语义/已知限制一档全，见 [vb-stream-connector-postgres-stream/README.md](vb-stream-connector-postgres-stream/README.md)
-- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），158 个测试全绿（单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段）
+- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），437 个测试全绿（引擎 177 + 连接器 260，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段）
 
 ## PostgreSQL 18 前置要求
 
@@ -106,7 +106,7 @@ DML 统一带 `BEFORE=`/`AFTER=` 镜像（缺失侧为 `-`）。注意 BEFORE �
 ## 测试
 
 ```bash
-mvn test                # 全部：协议/组装单元测试 + Testcontainers 集成测试（158 用例）
+mvn test                # 全部：两模块协议/组装单元测试 + Testcontainers 集成测试（437 用例：引擎 177 + 连接器 260）
 mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 

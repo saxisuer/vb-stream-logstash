@@ -11,7 +11,7 @@
 | 配置项 | 默认 | 语义与约束 |
 |---|---|---|
 | `slot.streaming` | `on` | 流式档位：`off`（提交后整体回放）/ `on`（进行中大事务边收边发）/ `parallel`（流式+并行），大小写宽容。`parallel` 必须搭配 `slot.two.phase=true`，否则启动期校验拒绝（PG 侧 parallel 流式解码以 two_phase 为前置） |
-| `slot.two.phase` | `true` | 建槽带 `two_phase` 选项（建槽后不可更改；存量槽 two_phase 不匹配时启动期拒绝并附 DROP SLOT 迁移指引）。`parallel` 档的前置 |
+| `slot.two.phase` | `true` | 建槽带 `two_phase` 选项（建槽后不可更改；存量槽 two_phase 不匹配时启动期拒绝并附 DROP SLOT 迁移指引）。`parallel` 档的前置（PG 15+） |
 | `pipe.dir` | `pg-stream-pipe-queue` | Chronicle Queue 管道工作目录（瞬态工作区，**重启自动清空属预期**——真源是复制槽，PG 从确认位点重发未输出事务）。相对路径按 worker 进程工作目录解析，**真 Connect 部署建议显式配绝对路径**（容器/服务形态下 worker CWD 不确定） |
 | `pipe.roll.cycle` | `MINUTELY` | 管道滚动周期，`LegacyRollCycles` 枚举名（大小写宽容）；未知值启动期校验拒绝并附可用值清单（残余到建管道才炸会拖垮 reader 线程） |
 | `slot.feedback.interval.ms` | `10000`（=10 秒） | 复制会话 LSN 反馈节流周期（毫秒，正整数；确认值经输出前沿封顶）。整除换算为秒——亚秒值（如 500）截断为 0 即每轮都反馈，不会静默翻倍 |
@@ -36,8 +36,8 @@ mvn -pl vb-stream-connector-postgres-stream clean package -DskipTests
 target/
 ├── vb-stream-connector-postgres-stream-plugin/        # 安装即拷此目录
 │   ├── vb-stream-connector-postgres-stream-1.0-SNAPSHOT.jar   # 连接器自身 jar（带 SourceConnector ServiceLoader 清单）
-│   └── lib/                                           # 34 个 runtime 依赖 jar（pgjdbc/chronicle-queue/debezium 3.6.1 等）
-└── vb-stream-connector-postgres-stream-plugin.zip     # 同构分发物（~16MB）
+│   └── lib/                                           # 全部 runtime 依赖 jar（pgjdbc/chronicle-queue/debezium 等，个数以实际构建为准）
+└── vb-stream-connector-postgres-stream-plugin.zip     # 同构分发物（数十 MB 级）
 ```
 
 Connect runtime 已提供的坐标**显式排除**在清单外（plugin.path 隔离类加载器下插件自包含、两连接器并存不互扰——重复类会让 Connect 启动即炸）：`connect-api`、`kafka-clients`、`slf4j-api` 及其独占子件 `zstd-jni`/`lz4-java`/`snappy-java`/`jakarta.ws.rs-api`；test 依赖被 scope 过滤天然排除。
