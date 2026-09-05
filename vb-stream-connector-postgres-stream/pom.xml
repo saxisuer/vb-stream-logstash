@@ -173,6 +173,32 @@
                     </includes>
                 </configuration>
             </plugin>
+            <!-- maven-assembly:plugin 目录清单打包(R4 两连接器并存的打包形态)——
+                 runtime scope 集画依赖边界:连接器自身 jar 落插件根,provided(connect-api/
+                 slf4j-api,Connect runtime 已提供)与 test 依赖被 scope 过滤天然排除,
+                 其余 runtime 依赖全落 lib/;descriptor 见 src/main/assembly/plugin.xml -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>${maven-assembly-plugin.version}</version>
+                <configuration>
+                    <descriptors>
+                        <descriptor>src/main/assembly/plugin.xml</descriptor>
+                    </descriptors>
+                    <appendAssemblyId>false</appendAssemblyId>
+                    <finalName>vb-stream-connector-postgres-stream-plugin</finalName>
+                    <!-- finalName 形态：vb-stream-connector-postgres-stream-plugin——dir/zip 产物路径的确定性锚点 -->
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-plugin</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 

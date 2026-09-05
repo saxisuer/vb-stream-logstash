@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.2.0 http://maven.apache.org/xsd/assembly-2.2.0.xsd">
+    <id>plugin</id>
+    <formats>
+        <format>dir</format>
+        <format>zip</format>
+    </formats>
+    <includeBaseDirectory>false</includeBaseDirectory>
+
+    <!-- 责任:依赖集只取 runtime scope——connect-api/slf4j-api(provided,Connect runtime 已提供)
+         与测试依赖(test)被 scope 过滤天然排除,R4 两连接器并存的清单边界由此钉死;
+         全部落 lib/(连接器自身 jar 由 useProjectArtifact 输出到插件根,官方插件包同构布局)。 -->
+    <dependencySets>
+        <dependencySet>
+            <useProjectArtifact>true</useProjectArtifact>
+            <outputDirectory>/</outputDirectory>
+            <includes>
+                <include>org.vastdata:vb-stream-connector-postgres-stream</include>
+            </includes>
+        </dependencySet>
+        <dependencySet>
+            <useProjectArtifact>false</useProjectArtifact>
+            <outputDirectory>/lib</outputDirectory>
+            <scope>runtime</scope>
+            <!-- scope 过滤只挡住本 pom 直陈的 provided——connect-api/slf4j-api 还会经
+                 debezium-connector-postgres 以 compile 传递混入(runtime 集含 compile),
+                 kafka-clients 又随 connect-api 传递;三者 Connect runtime 均已提供,
+                 显式排除钉死 R4 清单边界(R4 两连接器并存时重复类必炸) -->
+            <excludes>
+                <exclude>org.apache.kafka:connect-api</exclude>
+                <exclude>org.apache.kafka:kafka-clients</exclude>
+                <exclude>org.slf4j:slf4j-api</exclude>
+            </excludes>
+        </dependencySet>
+    </dependencySets>
+</assembly>
