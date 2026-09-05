@@ -69,7 +69,9 @@ import net.openhft.chronicle.queue.RollCycle;
  * 前沿与 onFailure 由调用方穿入)。停机两形态:{@link #close()}(毒丸排干——join 60s,
  * 已提交未输出的事务不丢,测试确定性断言用)与 {@link #shutdownFast()}(D7 快速停机——
  * 毒丸 + interrupt + 不 join,连接器 source 停机序用)。相对引擎的另三处接缝偏差:吞吐指标
- * (引擎构造穿 ThroughputMetrics)整体删除,MS5 以监听器形态加回;'R' 路由经
+ * MS2 接缝期曾整体删除,MS5 Task 3 以<b>构造参数传导</b>形态加回(指标实例由装配点 source
+ * 的 execute 建后穿入本组装器,consumer/replayer 经构造链转传,四点插桩口径与引擎逐字节
+ * 同构;便捷构造自建默认实例);'R' 路由经
  * {@link RelationResolver}(见上);listener 侧 asOf 表解析经 {@link BucketTableResolver}
  * (消费器每桶绑定快照,Task 7 注入真实现)。
  *
@@ -111,6 +113,11 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     /** consumer 线程(异步形态非 null,名 {@code transaction-consumer} 非守护——未排干的交接桶
      *  在 JVM 退出前必须有机会输出);同步形态为 null——dispatch 直调 processBucket。 */
     private final Thread consumerThread;
+    /** 吞吐与分布指标(MS5):本组装器记 slot 读取/组装两计数(onRaw 入口与交接点),同一实例
+     *  经构造链传导给 consumer(输出计数 + 两分布 + 10s 报告 tick)与 replayer(回放字节)
+     *  ——四点共用,与引擎"组装器自建、全链单实例"同构;连接器侧改为装配点(source 的
+     *  execute)创建后穿入,便捷构造自建默认实例。 */
+    private final StreamThroughputMetrics throughputMetrics;
     /** 交接队列(reader 投入 → consumer 取出,异步形态):无界 LinkedBlockingQueue,
      *  FIFO 保证交接序即提交序;同步形态恒空(dispatch 直调 processBucket 不经队列)。 */
     private final BlockingQueue<TxBuffer> handoffQueue = new LinkedBlockingQueue<>();
@@ -163,8 +170,41 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     }
 
     /**
+     * 构造<b>异步形态</b>组装器(带指标注入,表解析走默认快照透缝,包私有——陷阱形状收窄,
+     * 生产装配须走包私有 11 参构造穿同一 tableResolver 实例,本构造留给同包测试):
+     * 其余语义同九参公共异步构造,吞吐指标实例由调用方创建后穿入(装配点与 Task 4 的
+     * bridge 读源共用同一实例)。
+     * 注意:listener 侧表解析用<b>默认新实例</b>——listener 若持有自有 tableResolver(如
+     * source 的 DispatcherTransactionListener 接线),须改走包私有 11 参构造穿同一实例,
+     * 否则 consumer 绑定的与 listener 读的解析器不是同一实例(asOf 查询永远落空)。
+     *
+     * @param listener         事务事件流回调(Begin/TxChange/End 按序流式交付,consumer 线程同步调用)
+     * @param mode             流式模式(仅影响 decoder 对 StreamAbort 附加字段的解析,须与
+     *                         START_REPLICATION 的 streaming 参数一致,否则 abort 解析错位 fail-fast)
+     * @param registry         Relation 版本日志('R' 路由与交接快照共用,本组装器独占写入)
+     * @param relationResolver 'R' → ResolvedRelation 解析接缝(测试假实现 / Task 7 真实现)
+     * @param pipeDir          管道目录(瞬态工作区,打开即整体清空)
+     * @param pipeRollCycle    管道滚动周期(决定低水位删除的档位粒度)
+     * @param decodedObserver  每个解码点回调(控制消息 + 'R' + 回放单元;Y/O 不解码不回调)
+     * @param outputFrontier   输出前沿载体(调用方持有以便反馈封顶;本实例只做单调 max 累加)
+     * @param onFailure        consumer 回放失败的逃生回调(consumer 线程调用,如通知停机;不得再抛)
+     * @param metrics          吞吐与分布指标(装配点创建;四点插桩共用本实例——slot/组装在
+     *                         本类,输出/分布/报告 tick 在 consumer,回放字节在 replayer)
+     */
+    StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                 Path pipeDir, RollCycle pipeRollCycle,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 AtomicLong outputFrontier, Runnable onFailure,
+                                 StreamThroughputMetrics metrics) {
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                outputFrontier, onFailure, BucketTableResolver.snapshotBacked(), metrics);
+    }
+
+    /**
      * 构造<b>异步形态</b>组装器(全量,包私有——{@link BucketTableResolver} 是包内接缝,留给
-     * 同包装配点注入 listener 侧表解析的真实现,Task 7 的接线用):其余语义同九参公共异步构造。
+     * 同包装配点注入 listener 侧表解析的真实现,Task 7 的接线用):其余语义同九参公共异步构造,
+     * 指标自建默认实例。
      *
      * @param listener         事务事件流回调(consumer 线程调用;listener 侧经 tableResolver 取 asOf 表)
      * @param mode             流式模式
@@ -184,7 +224,33 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
                                  AtomicLong outputFrontier, Runnable onFailure,
                                  BucketTableResolver tableResolver) {
         this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
-                outputFrontier, onFailure, tableResolver, true);
+                outputFrontier, onFailure, tableResolver, new StreamThroughputMetrics());
+    }
+
+    /**
+     * 构造<b>异步形态</b>组装器(全量含指标,包私有):其余语义同上,吞吐指标实例显式穿入
+     * (便捷构造链最终汇入本构造)。
+     *
+     * @param listener         事务事件流回调(consumer 线程调用)
+     * @param mode             流式模式
+     * @param registry         Relation 版本日志
+     * @param relationResolver 'R' → ResolvedRelation 解析接缝
+     * @param pipeDir          管道目录(瞬态工作区,打开即整体清空)
+     * @param pipeRollCycle    管道滚动周期(决定低水位删除的档位粒度)
+     * @param decodedObserver  每个解码点回调
+     * @param outputFrontier   输出前沿载体(调用方持有;本实例只做单调 max 累加)
+     * @param onFailure        回放失败的逃生回调(consumer 线程调用)
+     * @param tableResolver    listener 侧按 (oid, seq) 解析 asOf 表定义的接缝(每个桶回放前由消费器绑定快照)
+     * @param metrics          吞吐与分布指标(四点插桩共用的单实例)
+     */
+    StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                 Path pipeDir, RollCycle pipeRollCycle,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 AtomicLong outputFrontier, Runnable onFailure,
+                                 BucketTableResolver tableResolver, StreamThroughputMetrics metrics) {
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                outputFrontier, onFailure, tableResolver, metrics, true);
     }
 
     /**
@@ -215,7 +281,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
 
     /**
      * 构造<b>同步形态</b>组装器(全量,包私有——{@link BucketTableResolver} 是包内接缝,留给
-     * 同包装配点注入 listener 侧表解析的真实现,Task 7 的接线用):其余语义同七参公共构造。
+     * 同包装配点注入 listener 侧表解析的真实现,Task 7 的接线用):其余语义同七参公共构造,
+     * 指标自建默认实例。
      *
      * @param listener         事务事件流回调(交接时同步调用;listener 侧经 tableResolver 取 asOf 表)
      * @param mode             流式模式
@@ -232,7 +299,30 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
                                  BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
                                  BucketTableResolver tableResolver) {
         this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
-                new AtomicLong(), () -> { }, tableResolver, false);
+                tableResolver, new StreamThroughputMetrics());
+    }
+
+    /**
+     * 构造<b>同步形态</b>组装器(全量含指标,包私有):其余语义同上,吞吐指标实例显式穿入
+     * (接线测试用它注入自有实例以断言四点插桩——与生产路径仅实例来源不同,口径无差)。
+     *
+     * @param listener         事务事件流回调(交接时同步调用;listener 侧经 tableResolver 取 asOf 表)
+     * @param mode             流式模式
+     * @param registry         Relation 版本日志
+     * @param relationResolver 'R' → ResolvedRelation 解析接缝
+     * @param pipeDir          管道目录(瞬态工作区,打开即整体清空)
+     * @param pipeRollCycle    管道滚动周期
+     * @param decodedObserver  每个解码点回调
+     * @param tableResolver    listener 侧按 (oid, seq) 解析 asOf 表定义的接缝(每个桶回放前由消费器绑定快照)
+     * @param metrics          吞吐与分布指标(四点插桩共用的单实例)
+     */
+    StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
+                                 VersionedRelationRegistry registry, RelationResolver relationResolver,
+                                 Path pipeDir, RollCycle pipeRollCycle,
+                                 BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
+                                 BucketTableResolver tableResolver, StreamThroughputMetrics metrics) {
+        this(listener, mode, registry, relationResolver, pipeDir, pipeRollCycle, decodedObserver,
+                new AtomicLong(), () -> { }, tableResolver, metrics, false);
     }
 
     /**
@@ -253,7 +343,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
 
     /**
      * 全量构造(两形态公共初始化,引擎私有全量构造的 1:1 对位):字段赋值 + 建管道 + 建消费器
-     * (交接队列、前沿、onFailure 随消费器落位);async=true 时另起并启动非守护
+     * (交接队列、前沿、onFailure、吞吐指标随消费器落位——指标再经消费器转传回放器,四点
+     * 共用同一实例);async=true 时另起并启动非守护
      * {@code transaction-consumer} 线程立即消费交接队列。管道建立失败原样上抛
      * (fail-fast,同上——此时 consumer 线程尚未创建,无线程泄漏)。
      */
@@ -262,7 +353,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
                                          Path pipeDir, RollCycle pipeRollCycle,
                                          BiConsumer<PgOutputMessage, RelationLookup> decodedObserver,
                                          AtomicLong outputFrontier, Runnable onFailure,
-                                         BucketTableResolver tableResolver, boolean async) {
+                                         BucketTableResolver tableResolver, StreamThroughputMetrics metrics,
+                                         boolean async) {
         this.decoder = new PgOutputStreamDecoder(Objects.requireNonNull(mode, "mode"));
         this.registry = Objects.requireNonNull(registry, "registry");
         this.relationResolver = Objects.requireNonNull(relationResolver, "relationResolver");
@@ -271,9 +363,11 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
         this.pipe = new MessagePipe(pipeDir, pipeRollCycle);
         this.decodedObserver = Objects.requireNonNull(decodedObserver, "decodedObserver");
         this.outputFrontier = Objects.requireNonNull(outputFrontier, "outputFrontier");
+        this.throughputMetrics = Objects.requireNonNull(metrics, "metrics");
         this.consumer = new TransactionConsumer(Objects.requireNonNull(listener, "listener"), mode,
                 this.pipe, handoffQueue, this.outputFrontier, Objects.requireNonNull(onFailure, "onFailure"),
-                this.decodedObserver, Objects.requireNonNull(tableResolver, "tableResolver"));
+                this.decodedObserver, Objects.requireNonNull(tableResolver, "tableResolver"),
+                this.throughputMetrics);
         if (async) {
             this.consumerThread = new Thread(consumer, "transaction-consumer");
             this.consumerThread.setDaemon(false);
@@ -312,6 +406,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     @Override
     public void onRaw(byte[] raw) {
         Objects.requireNonNull(raw, "raw");
+        throughputMetrics.onSlotMessage(raw);   // slot 读取记账:收到即记(含控制消息与 'R',字节=raw.length)
         long seq = pipe.append(raw);
         maxAppendedIndex = seq;
         char type = (char) raw[0];
@@ -702,7 +797,8 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     /**
      * Prepare:活动两阶段桶转挂起池(gid 已存在 → fail-fast)。
      * 事务自此挂起,等待 CommitPrepared(输出)或 RollbackPrepared(丢弃),可能长期等待甚至跨重启
-     * (持久化非目标)。
+     * (持久化非目标)。挂起池变更在 {@code synchronized(preparedByGid)} 内——与跨线程读
+     * {@link #pendingPreparedCount()}(consumer 统计 tick)建立 happens-before(MS5 Task 4)。
      */
     private void prepare(PgOutputMessage.Prepare m) {
         if (currentPrepareTx == null || currentPrepareTx.xid != m.xid()
@@ -711,28 +807,41 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
         }
         TxBuffer bucket = currentPrepareTx;
         currentPrepareTx = null;
-        if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
-            throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+        synchronized (preparedByGid) {
+            if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
+                throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+            }
+            LOG.debug("两阶段事务 PREPARE 入挂起池: gid={} storage={} pending={}",
+                    bucket.gid, storageOf(bucket), preparedByGid.size());
         }
-        LOG.debug("两阶段事务 PREPARE 入挂起池: gid={} storage={} pending={}",
-                bucket.gid, storageOf(bucket), preparedByGid.size());
     }
 
     /**
      * CommitPrepared:挂起池取桶(miss → fail-fast)交接封箱 TWO_PHASE 输出(gid 随桶冻结;
-     * 用户确认的输出时机)。交接后桶完结(低水位维护 + 剪枝)。
+     * 用户确认的输出时机)。交接后桶完结(低水位维护 + 剪枝)。挂起池变更在
+     * {@code synchronized(preparedByGid)} 内(见 prepare 的并发注记)。
      */
     private void commitPrepared(PgOutputMessage.CommitPrepared m) {
-        TxBuffer bucket = preparedByGid.remove(m.gid());
+        TxBuffer bucket;
+        synchronized (preparedByGid) {
+            bucket = preparedByGid.remove(m.gid());
+        }
         if (bucket == null) {
             throw new IllegalStateException("CommitPrepared 对应 gid 不存在: " + m.gid());
         }
         handoff(bucket, TransactionKind.TWO_PHASE, m.commitLsn(), m.endLsn(), m.commitTimestamp());
     }
 
-    /** RollbackPrepared:挂起池取桶(miss → fail-fast)静默丢弃,不回调(用户确认的回滚语义);丢弃后低水位候选推进。 */
+    /**
+     * RollbackPrepared:挂起池取桶(miss → fail-fast)静默丢弃,不回调(用户确认的回滚语义);
+     * 丢弃后低水位候选推进。挂起池变更在 {@code synchronized(preparedByGid)} 内(见 prepare
+     * 的并发注记)。
+     */
     private void rollbackPrepared(PgOutputMessage.RollbackPrepared m) {
-        TxBuffer bucket = preparedByGid.remove(m.gid());
+        TxBuffer bucket;
+        synchronized (preparedByGid) {
+            bucket = preparedByGid.remove(m.gid());
+        }
         if (bucket == null) {
             throw new IllegalStateException("RollbackPrepared 对应 gid 不存在: " + m.gid());
         }
@@ -755,11 +864,13 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
             throw new IllegalStateException("StreamPrepare 对应流式事务桶不存在: xid=" + m.xid());
         }
         bucket.gid = m.gid();
-        if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
-            throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+        synchronized (preparedByGid) {
+            if (preparedByGid.putIfAbsent(bucket.gid, bucket) != null) {
+                throw new IllegalStateException("挂起池已存在同 gid 事务: " + bucket.gid);
+            }
+            LOG.debug("流式两阶段事务 StreamPrepare 入挂起池: gid={} storage={} pending={}",
+                    bucket.gid, storageOf(bucket), preparedByGid.size());
         }
-        LOG.debug("流式两阶段事务 StreamPrepare 入挂起池: gid={} storage={} pending={}",
-                bucket.gid, storageOf(bucket), preparedByGid.size());
     }
 
     /**
@@ -779,6 +890,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
         bucket.handoffNanos = System.nanoTime();
         handedOff.add(bucket);
         liveCount.decrementAndGet();
+        throughputMetrics.onTxHandedOff();   // 组装完成记账:提交交接的事务才计(回滚丢弃不计)
         dispatchHandedOff(bucket);   // Task 5:同步直调 consumer.processBucket;Task 6:分流入队
         maintainWatermarks();
     }
@@ -824,6 +936,35 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
     private TxBuffer newBucket(long xid) {
         liveCount.incrementAndGet();
         return new TxBuffer(xid);
+    }
+
+    /**
+     * 责任:两阶段挂起池的当前事务数只读访问器(MS5 Task 4 的 MBean 读源——未决 2PC
+     * 事务数,长期挂起会钉住 WAL 保留,运维观测面)。
+     * 关键步骤:读在 {@code synchronized(preparedByGid)} 内——与全部写路径(prepare/
+     * streamPrepare 的 putIfAbsent、commitPrepared/rollbackPrepared 的 remove,均在
+     * reader 线程)同锁,跨线程(consumer 统计 tick)读到的是锁定边界的即时值。
+     * 边界:弱一致快照(读到后 reader 可能立即变更),统计语义足够。
+     * 线程约束:任意线程可调(读锁不与 reader 热路径长争用——挂起池操作频率 = 2PC 事件率)。
+     *
+     * @return 挂起池当前 gid 数(PREPARE 到 COMMIT/ROLLBACK PREPARED 之间的未决事务数)
+     */
+    public int pendingPreparedCount() {
+        synchronized (preparedByGid) {
+            return preparedByGid.size();
+        }
+    }
+
+    /**
+     * 责任:管道目录当前磁盘占用只读访问器(MS5 Task 4 的 MBean 读源)——薄委派
+     * {@link MessagePipe#diskUsageBytes()}(包私有管道不外泄,本类作转发面)。
+     * 边界:目录遍历失败返回 -1(未知哨兵,语义见 MessagePipe)。
+     * 线程约束:任意线程可调;生产调用点是 consumer 统计 tick(MBean 读路径不碰 IO)。
+     *
+     * @return 管道目录字节占用;遍历失败 -1
+     */
+    public long pipeDiskUsageBytes() {
+        return pipe.diskUsageBytes();
     }
 
     /**

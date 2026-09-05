@@ -1,8 +1,10 @@
-package org.vastdata.vbstream.replication;
+package org.vastdata.debezium.connector.postgresql.stream;
 
 // 注：Maven 坐标是小写 org.hdrhistogram，Java 包名却是大写 H 的 org.HdrHistogram（上游历史命名）
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.SingleWriterRecorder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Locale;
@@ -12,14 +14,18 @@ import java.util.function.LongFunction;
 import java.util.function.LongSupplier;
 
 /**
- * 管线吞吐与分布指标（2026-08-31 设计，spec docs/superpowers/specs/2026-08-31-throughput-metrics-design.md）：
- * reader/consumer 双线程管线的**本地周期日志行**观测面——六项速率计数（slot 读取 bytes/msg、
- * 组装 tx、输出 bytes/rec/tx）+ 两项分位数分布（事务回放耗时、事务大小，P90/P95/max）。
+ * 连接器管线吞吐与分布指标——引擎 ThroughputMetrics 的文字参照重写（口径与输出格式
+ * 逐字节一致，零引擎 import，模块边界硬约束；引擎版见 vb-stream-engine
+ * .../replication/ThroughputMetrics.java，设计 docs/superpowers/specs/2026-08-31-throughput-metrics-design.md）：
+ * reader/consumer 双线程管线的**本地周期日志行**观测面——六项速率计数（slot 读取
+ * bytes/msg、组装 tx、输出 bytes/rec/tx）+ 两项分位数分布（事务回放耗时、事务大小，
+ * P90/P95/max）。
  *
- * <p>实现取向（设计 §1 选型）：计数与窗口差分手写（消费通道仅日志行，Micrometer/Dropwizard
- * 的速率算法与输出格式都对本场景无净值）；分位数用 {@link SingleWriterRecorder}
- * （HdrHistogram，零传递依赖）——每次报告 {@code getIntervalHistogram()} 取走上一区间，
- * 窗口外样本不稀释当前值。全部计量收在本类后面，未来接监控系统只换实现、埋点点位不动。
+ * <p>实现取向（设计 §1 选型，与引擎同款）：计数与窗口差分手写（消费通道仅日志行，
+ * Micrometer/Dropwizard 的速率算法与输出格式都对本场景无净值）；分位数用
+ * {@link SingleWriterRecorder}（HdrHistogram，零传递依赖）——每次报告
+ * {@code getIntervalHistogram()} 取走上一区间，窗口外样本不稀释当前值。全部计量收在
+ * 本类后面，未来接监控系统只换实现、埋点点位不动。
  *
  * <p>会话峰值行（2026-08-31 峰值 spec，同日第二份；速率口径修订见同日秒桶 spec 第三份）：
  * 窗口隔离报告使峰值转瞬即逝——负载只占一个窗口，下一窗口速率归零、分布变 n/a。报告增补
@@ -28,18 +34,24 @@ import java.util.function.LongSupplier;
  * 显示为 1/10 速率，故峰值行改秒级分桶），两项分布 max 不受摊薄影响取区间 max 峰值；空载
  * 窗口峰值行也常驻输出——峰值不随窗口翻页消失；从未有过记录打 n/a。
  *
- * <p>口径（设计 §2）：slot 侧含全部 pgoutput 消息（控制消息与 Relation——"从槽读到什么"的
- * 诚实口径，与输出侧 records 不可直接对照，bytes 才是两端口径一致的对照对）；组装 tx 仅计
- * 提交交接（回滚丢弃不计）；输出 bytes 为回放重读的管道原始字节（aborted 过滤在重读之后，
- * 被剔除单元的字节也计入——它确实从管道读回了）；输出 records 为 aborted 过滤后实付的
- * TxChange 数；两项分布只收**完整交付**的事务（End 发出，fail-fast 截断的不入）。
+ * <p>口径（设计 §2，与引擎同款）：slot 侧含全部 pgoutput 消息（控制消息与 Relation——
+ * "从槽读到什么"的诚实口径，与输出侧 records 不可直接对照，bytes 才是两端口径一致的
+ * 对照对）；组装 tx 仅计提交交接（回滚丢弃不计）；输出 bytes 为回放重读的管道原始字节
+ * （aborted 过滤在重读之后，被剔除单元的字节也计入——它确实从管道读回了）；输出 records
+ * 为 aborted 过滤后实付的记录数；两项分布只收**完整交付**的事务（事务尾事件发出，
+ * fail-fast 截断的不入）。
  *
  * <p>线程约束（设计 §5）：速率计数器是 {@link LongAdder}——slot 侧 reader 单写、输出侧
  * consumer 单写、报告时 consumer 读，弱一致读对统计语义足够；两个 Recorder 由 consumer
  * 线程**单写**（record 与报告同线程）。指标永不向业务热路径抛异常（越界样本钳制到上界），
- * 无可关闭资源、停机无需收尾。
+ * 无可关闭资源、停机无需收尾。与引擎的差异四处：包名；类名；可见性全面公开（引擎为包私有
+ * ——跨包装配点接线所需，{@link #totals()} 为公开只读访问器，本连接器侧它另有 MBean 窗口
+ * 差分读源的职责——LongAdder sum 快照，任意线程可读）；{@link #statsTickHook(Runnable)}
+ * 统计 tick 钩子（引擎无——10s 报告 tick 后回调，供 MBean 面零锁预计算）。其余逻辑与引擎逐段同构。
  */
-final class ThroughputMetrics {
+public final class StreamThroughputMetrics {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StreamThroughputMetrics.class);
 
     /** 回放耗时可追踪上界：1h（ns）——正常负载远不可达，钳到上界本身即"病态慢"的信号。 */
     private static final long MAX_TRACKED_DURATION_NANOS = 3_600_000_000_000L;
@@ -56,10 +68,10 @@ final class ThroughputMetrics {
 
     /**
      * 六项速率计数的累计快照（只增不清零——窗口语义在 {@link #reportLines} 的差分里，
-     * 本 record 是接线测试断言全链路插桩正确性的观测面）。
+     * 本 record 兼作 MBean 窗口差分的读源与接线测试断言全链路插桩正确性的观测面）。
      */
-    record Totals(long slotBytes, long slotMessages, long assembledTxs,
-                  long outputBytes, long outputRecords, long outputTxs) { }
+    public record Totals(long slotBytes, long slotMessages, long assembledTxs,
+                         long outputBytes, long outputRecords, long outputTxs) { }
 
     private final LongAdder slotBytes = new LongAdder();
     private final LongAdder slotMessages = new LongAdder();
@@ -78,6 +90,14 @@ final class ThroughputMetrics {
     /** 上次报告的计数快照——速率差分的分子（当前累计 - 本值）。 */
     private Totals lastTotals;
 
+    /**
+     * 统计 tick 钩子（MS5 Task 4）：装配点（流式源 execute）在管线建好后注册，consumer 的
+     * 10s 统计 tick（reportLines 同一处）触发一次——{@link StreamMetricsBridge} 的速率预计算
+     * 与 lagBytes/管道磁盘占用采样挂在这里，与三行报告共用窗口边界。volatile——coordinator
+     * 写一次、consumer 读（注册晚于 consumer 线程启动的窗口内最坏错过首个 tick，无害）。
+     */
+    private volatile Runnable statsTickHook;
+
     // 会话峰值（2026-08-31 峰值 spec + 同日秒桶 spec 修订）：六项速率峰值 = 秒桶
     // （SecondBucket，见类尾——埋点单写者线程内分桶结算，报告侧弱一致读 max(已结算峰,
     // 当前桶)）；两项分布区间 max 峰值（long，reportLines 里更新——空窗零速率不构成峰值，
@@ -93,9 +113,11 @@ final class ThroughputMetrics {
     private long peakTxUnits = -1L;
 
     /**
-     * 构造指标器并以当前 nanoTime 为首窗基线（生产路径——组装器构造时调用，首窗自此起算）。
+     * 构造指标器并以当前 nanoTime 为首窗基线（便捷构造链与测试用——生产路径是流式源
+     * execute 显式 {@code new StreamThroughputMetrics(System.nanoTime())} 穿入装配点，
+     * 首窗自此起算）。
      */
-    ThroughputMetrics() {
+    public StreamThroughputMetrics() {
         this(System.nanoTime());
     }
 
@@ -105,7 +127,7 @@ final class ThroughputMetrics {
      *
      * @param baselineNanos 首窗基线（System.nanoTime 时域）
      */
-    ThroughputMetrics(long baselineNanos) {
+    public StreamThroughputMetrics(long baselineNanos) {
         this(baselineNanos, System::nanoTime);
     }
 
@@ -116,7 +138,7 @@ final class ThroughputMetrics {
      * @param baselineNanos 首窗基线（与 clock 同一时域即可，窗口差分用）
      * @param clock         秒桶时钟（生产为 System::nanoTime）
      */
-    ThroughputMetrics(long baselineNanos, LongSupplier clock) {
+    public StreamThroughputMetrics(long baselineNanos, LongSupplier clock) {
         this.lastReportNanos = baselineNanos;
         this.lastTotals = new Totals(0, 0, 0, 0, 0, 0);
         this.clock = clock;
@@ -128,7 +150,7 @@ final class ThroughputMetrics {
      *
      * @param raw 完整单条消息字节（含类型字节与可选流式 xid 前缀）
      */
-    void onSlotMessage(byte[] raw) {
+    public void onSlotMessage(byte[] raw) {
         long now = clock.getAsLong();
         slotBytes.add(raw.length);
         slotMessages.increment();
@@ -140,7 +162,7 @@ final class ThroughputMetrics {
      * 责任：组装完成记账——一个桶提交交接（Commit/StreamCommit/CommitPrepared；回滚丢弃不计）。
      * 线程：reader 线程（组装器 handoff）。
      */
-    void onTxHandedOff() {
+    public void onTxHandedOff() {
         assembledTxs.increment();
         assembledTxSec.bump(clock.getAsLong(), 1L);
     }
@@ -151,7 +173,7 @@ final class ThroughputMetrics {
      *
      * @param payloadLength 单元载荷字节数
      */
-    void onReplayedUnit(int payloadLength) {
+    public void onReplayedUnit(int payloadLength) {
         outputBytes.add(payloadLength);
         outputBytesSec.bump(clock.getAsLong(), payloadLength);
     }
@@ -160,13 +182,13 @@ final class ThroughputMetrics {
      * 责任：一个事务完整交付的合并记账——输出 tx +1、实付 records 累加，耗时与事务大小
      * （unitCount，aborted 过滤前）各入一个分布样本。边界：越上界的样本钳制到上界（热路径
      * 防御——指标永不抛异常进业务路径，钳到上界本身已是病态值的信号）；仅完整交付的事务
-     * 调用本方法（End 发出后），fail-fast 截断的不入分布。线程：consumer 线程。
+     * 调用本方法（事务尾事件发出后），fail-fast 截断的不入分布。线程：consumer 线程。
      *
      * @param durationNanos   本事务回放全程耗时（processBucket 起止，含下游回调）
-     * @param unitCount       桶记账的数据单元数（Begin.expectedChanges 同源，过滤前）
-     * @param emittedRecords  实付 TxChange 数（aborted 过滤后）
+     * @param unitCount       桶记账的数据单元数（头事件 expected 同源，过滤前）
+     * @param emittedRecords  实付记录数（aborted 过滤后）
      */
-    void onTxOutput(long durationNanos, long unitCount, long emittedRecords) {
+    public void onTxOutput(long durationNanos, long unitCount, long emittedRecords) {
         long now = clock.getAsLong();
         replayNanos.recordValue(Math.min(durationNanos, MAX_TRACKED_DURATION_NANOS));
         txSizes.recordValue(Math.min(unitCount, MAX_TRACKED_TX_UNITS));
@@ -177,11 +199,11 @@ final class ThroughputMetrics {
     }
 
     /**
-     * 责任：生成报告窗口的三行 INFO 文案（吞吐行 + 分布行 + 峰值行），并把计数/时间基线推进到本次
-     * 报告时刻——**每次调用都是一个窗口边界**，速率 = 六计数窗口内 delta ÷ 实际流逝秒数
-     * （nanoTime 差，非固定周期除法）；分布 = Recorder 取走的上一区间（窗口外样本不进本次）；
-     * 峰值 = 八项会话历史最高的留存快照（窗口速率 &gt; 0 才刷新速率峰值、区间 max 顺手留存
-     * 分布峰值——空窗不稀释、零速率不构成峰值，见类 javadoc 峰值段）。
+     * 责任：生成报告窗口的三行 INFO 文案（吞吐行 + 分品行 + 峰值行），并把计数/时间基线
+     * 推进到本次报告时刻——**每次调用都是一个窗口边界**，速率 = 六计数窗口内 delta ÷
+     * 实际流逝秒数（nanoTime 差，非固定周期除法）；分布 = Recorder 取走的上一区间（窗口外
+     * 样本不进本次）；峰值 = 八项会话历史最高的留存快照（窗口速率 &gt; 0 才刷新速率峰值、
+     * 区间 max 顺手留存分布峰值——空窗不稀释、零速率不构成峰值，见类 javadoc 峰值段）。
      * 关键步骤：累计快照 → 差分与格式化 → 取两个区间直方图（同时更新分布峰值）→ 刷新六项
      * 速率峰值并格式化峰值行 → 推进基线。边界：elapsed ≤ 0
      * （时钟异常/测试注入失序）钳为 1ns 防除零；分布段零样本打 n/a；返回的直方图是 Recorder
@@ -191,7 +213,7 @@ final class ThroughputMetrics {
      * @param nowNanos 报告时刻（System.nanoTime 时域；调用方持有以便与其余统计共用同一戳）
      * @return 三行文案（下标 0 = 吞吐行，1 = 分支行，2 = 峰值行）；格式即契约，单测整行断言
      */
-    List<String> reportLines(long nowNanos) {
+    public List<String> reportLines(long nowNanos) {
         Totals now = totals();
         long elapsedNanos = Math.max(1L, nowNanos - lastReportNanos);
         double seconds = elapsedNanos / 1_000_000_000.0;
@@ -207,7 +229,7 @@ final class ThroughputMetrics {
                 + " | 输出=" + formatBytesPerSec(outputBytesRate)
                 + " (" + formatCountPerSec(outputRecRate) + " rec/s, " + formatCountPerSec(outputTxRate) + " tx/s)";
         String distribution = "分布: 回放耗时 "
-                + intervalPart(replayNanos, ThroughputMetrics::formatNanos,
+                + intervalPart(replayNanos, StreamThroughputMetrics::formatNanos,
                         v -> peakReplayNanos = Math.max(peakReplayNanos, v))
                 + " | 事务大小 "
                 + intervalPart(txSizes, v -> grouped(v) + " rec",
@@ -227,13 +249,45 @@ final class ThroughputMetrics {
     }
 
     /**
-     * 责任：六项速率计数的累计快照（只增不清零，窗口差分归 reportLines 自理）——接线测试
-     * 断言组装器→消费器全链路插桩正确性的观测面。边界：LongAdder 弱一致读（统计语义足够）。
-     * 线程：任意（各 Adder 并发安全）。
+     * 责任：六项速率计数的累计快照（只增不清零，窗口差分归 reportLines 自理）——本连接器侧
+     * 的公开只读访问器（MBean 窗口差分的读源）与接线测试断言插桩正确性的观测面。
+     * 边界：LongAdder 弱一致读（统计语义足够）。线程：任意（各 Adder 并发安全）。
      */
-    Totals totals() {
+    public Totals totals() {
         return new Totals(slotBytes.sum(), slotMessages.sum(), assembledTxs.sum(),
                 outputBytes.sum(), outputRecords.sum(), outputTxs.sum());
+    }
+
+    /**
+     * 责任：注册统计 tick 钩子（MS5 Task 4）——consumer 的每个 10s 统计窗口边界触发一次，
+     * 与 {@link #reportLines} 同 tick（装配点用 {@code metrics.statsTickHook(bridge::onStatsTick)}
+     * 把指标桥的预计算挂上既有周期，不动组装器构造链）。
+     * 边界：null 抛 NPE（装配期 fail-fast）；重复注册后写覆盖先写（生产只注册一次）。
+     * 线程：coordinator（execute）写一次；consumer（统计 tick）volatile 读。
+     *
+     * @param hook 每个 10s 统计 tick 触发的回调（须廉价或可容忍的采样成本，不得抛异常进业务路径）
+     */
+    public void statsTickHook(Runnable hook) {
+        this.statsTickHook = java.util.Objects.requireNonNull(hook, "hook");
+    }
+
+    /**
+     * 责任：触发已注册的统计 tick 钩子（consumer 统计 tick 的收尾步骤，包私有——仅
+     * {@code TransactionConsumer.maybeStats} 调用）。未注册时 no-op；钩子抛出的任何
+     * Throwable 记 WARN 吞掉——指标观测面（MBean 预计算）永不向 consumer 业务路径抛异常。
+     * 线程：仅 consumer 线程。
+     */
+    void fireStatsTickHook() {
+        Runnable hook = statsTickHook;
+        if (hook == null) {
+            return;
+        }
+        try {
+            hook.run();
+        }
+        catch (Throwable t) {
+            LOG.warn("统计 tick 钩子执行失败(指标桥保留上一次观测值)", t);
+        }
     }
 
     /**

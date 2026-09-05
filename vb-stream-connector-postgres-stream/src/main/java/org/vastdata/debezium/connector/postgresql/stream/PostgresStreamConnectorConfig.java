@@ -12,6 +12,7 @@ import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
 
 /**
  * 流式连接器配置:在父类 {@link PostgresConnectorConfig} 的完整配置面之上追加
@@ -19,7 +20,10 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
  * pipe.dir / pipe.roll.cycle(reader 与 consumer 之间的 Chronicle Queue 管道参数,
  * 对应引擎侧 {@code vb.pipe.dir} / {@code vb.pipe.rollCycle})、slot.feedback.interval.ms
  * (复制会话的 LSN 反馈节流周期,对应引擎侧 {@code vb.pg.feedbackSeconds},默认 10 秒)、
- * slot.messages('M' 逻辑消息门控,MS3.5,默认 false)。
+ * slot.messages('M' 逻辑消息门控,MS3.5,默认 false);并把 snapshot.mode <b>同名替换</b>
+ * 为仅支持 no_data 的新 Field(MS5:本连接器流式-only,不做快照数据抽取——默认 no_data +
+ * {@link #validateSnapshotMode} 仅-no_data 校验 + 构造器 fail-fast 三层防线,"缺省 =
+ * no_data"由 {@link PostgresStreamConnector#taskConfigs(int)} 注入保证,见其 javadoc)。
  *
  * <p>校验语义(spec §5.1 启动期 fail-fast):slot.streaming 只接受
  * OFF/ON/PARALLEL(大小写宽容);PARALLEL 档必须搭配 slot.two.phase=true,
@@ -28,14 +32,25 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
  * pipe.roll.cycle 只接受 {@link LegacyRollCycles} 枚举名(大小写宽容,引擎
  * PipeConfig.parseRollCycle 同语义),未知值由 {@link #validateRollCycle} 记 1 条
  * 附可用值清单的问题——拼写错误残余到建管道才炸会拖垮 reader 线程,且管道目录可能已被 wipe。
+ * snapshot.mode 只接受 no_data(大小写宽容),其余值(initial/always/when_needed/
+ * initial_only/custom 等)由 {@link #validateSnapshotMode} 记 1 条问题——快照数据抽取
+ * 职能属 vanilla postgresql-connector,误配到运行期才失败代价过高。
  *
- * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 扩展 6 新 Field(floor 语义,父类必填项、
- * 校验器全部保留),供任务侧配置完整性校验;Connect REST 暴露面见
- * {@link PostgresStreamConnector#config()}。
+ * <p>{@link #ALL_FIELDS} = 父 ALL_FIELDS 先 filtered 挖掉同名 snapshot.mode 再扩展
+ * 6 新 Field(floor 语义,父类必填项、校验器全部保留——{@code Field.Set.with} 同名
+ * 保留旧 Field 弃新 Field,同名覆盖必须先挖后补),供任务侧配置完整性校验;
+ * Connect REST 暴露面见 {@link PostgresStreamConnector#config()}。
  *
  * <p>构造后不可变;getter 均为无副作用读取,任意线程可并发调用。
  */
 public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
+
+    /** snapshot.mode 的本连接器声明:同名替换父 Field(filtered 挖旧再补新——Set.with 同名保旧弃新),默认 no_data + 仅 no_data 校验。 */
+    public static final Field SNAPSHOT_MODE_NO_DATA = Field.create("snapshot.mode")
+            .withDisplayName("Snapshot mode (no_data only)")
+            .withType(Type.STRING)
+            .withDefault("no_data")
+            .withValidation(PostgresStreamConnectorConfig::validateSnapshotMode);
 
     /** 流式档位:OFF(提交后整体回放)/ ON(进行中大事务边收边发)/ PARALLEL(流式+并行),默认 ON,大小写宽容。 */
     public static final Field SLOT_STREAMING = Field.create("slot.streaming")
@@ -86,20 +101,58 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
             .withDefault(false)
             .withValidation(Field::isBoolean);
 
-    /** 本连接器的完整配置面:父 ALL_FIELDS + 6 新 Field(新 Set,不改父类静态集合)。 */
-    public static final Field.Set ALL_FIELDS = PostgresConnectorConfig.ALL_FIELDS.with(SLOT_STREAMING, SLOT_TWO_PHASE, PIPE_DIR, PIPE_ROLL_CYCLE,
-            SLOT_FEEDBACK_INTERVAL_MS, SLOT_MESSAGES);
+    /**
+     * 本连接器的完整配置面:父 ALL_FIELDS 先 filtered 挖掉同名 snapshot.mode 再扩展
+     * 6 新 Field(新 Set,不改父类静态集合)——{@code Field.Set.with} 内部是
+     * LinkedHashSet.add,同名字段保留旧 Field 弃新 Field,同名替换必须先挖后补。
+     */
+    public static final Field.Set ALL_FIELDS = PostgresConnectorConfig.ALL_FIELDS
+            .filtered(f -> !"snapshot.mode".equals(f.name()))
+            .with(SNAPSHOT_MODE_NO_DATA, SLOT_STREAMING, SLOT_TWO_PHASE, PIPE_DIR, PIPE_ROLL_CYCLE,
+                    SLOT_FEEDBACK_INTERVAL_MS, SLOT_MESSAGES);
 
     /**
      * 以给定的不可变配置构造:单行 super 委派父构造器(public,负责快照模式、
      * 处理模式等既有配置项的解析与默认值回落);本类不新增构造期解析——5 个新项
      * 均由 getter 惰性读取,校验责任在 {@link #validateSlotStreaming} 与各 Field
-     * 声明的校验器。
+     * 声明的校验器。MS5 起追加快照模式 fail-fast 兜底:REST 校验被绕过或直构造
+     * 路径上非 no_data 的快照模式在此抛 {@link org.apache.kafka.connect.errors.ConnectException}
+     * ——注意 {@code getSnapshotMode()} 经<b>父 Field 引用</b>回落到默认 initial,
+     * 故"缺省 = no_data"必须由 {@link PostgresStreamConnector#taskConfigs(int)} 注入
+     * 保证;直构造未注入缺省配置时抛错属 fail-fast 预期。
      *
-     * @param config 连接器配置;应已通过 ALL_FIELDS 校验(未校验也能构造,行为按默认值回落)
+     * @param config 连接器配置;应已通过 ALL_FIELDS 校验且 snapshot.mode=no_data
+     *               (或经 taskConfigs 注入;未注入缺省配置将抛 ConnectException)
      */
     public PostgresStreamConnectorConfig(Configuration config) {
         super(config);
+        if (getSnapshotMode() != SnapshotMode.NO_DATA) {
+            throw new org.apache.kafka.connect.errors.ConnectException(
+                    "snapshot.mode='" + getSnapshotMode() + "' is not supported: this connector supports "
+                            + "snapshot.mode=no_data only (streaming-only, no snapshot data extraction)");
+        }
+    }
+
+    /**
+     * snapshot.mode 的仅-no_data 校验器(Field.ValidationOutput 三元契约):值为 no_data
+     * (大小写宽容)返回 0;其余值(initial/always/when_needed/initial_only/custom 等)向
+     * problems 记 1 条说明定位的消息并返回 1——本连接器不做快照数据抽取,该职能属
+     * vanilla postgresql-connector。
+     *
+     * @param config   待校验的完整配置
+     * @param field    被校验字段(恒为 SNAPSHOT_MODE_NO_DATA)
+     * @param problems 问题接收器;校验失败时恰好 accept 一次
+     * @return 0 表示通过,1 表示发现 1 个问题
+     */
+    static int validateSnapshotMode(Configuration config, Field field, Field.ValidationOutput problems) {
+        String value = config.getString(field);
+        if (!"no_data".equalsIgnoreCase(value)) {
+            problems.accept(field, value,
+                    "Invalid value '" + value + "': this connector supports snapshot.mode=no_data only "
+                            + "(streaming-only connector, no snapshot data extraction — use the vanilla postgresql-connector for snapshots)");
+            return 1;
+        }
+        return 0;
     }
 
     /**

@@ -21,8 +21,9 @@ class PostgresStreamConnectorTaskTest {
 
     /**
      * 构造最小可用的 PG 连接配置:Debezium 必填四件套(hostname/port/user/database,
-     * 缺省 localhost/5432/postgres/postgres)。任务骨架不连库,这些值只用于走通
-     * {@code PostgresStreamConnectorConfig} 构造链。
+     * 缺省 localhost/5432/postgres/postgres)+ snapshot.mode=no_data(镜像 taskConfigs
+     * 注入后的直接构造最小合法面——MS5 起构造器对非 no_data 快照模式 fail-fast)。
+     * 任务骨架不连库,这些值只用于走通 {@code PostgresStreamConnectorConfig} 构造链。
      *
      * @return 可交给 preStart 的最小 {@link Configuration}
      */
@@ -32,6 +33,7 @@ class PostgresStreamConnectorTaskTest {
         props.put("port", "5432");
         props.put("user", "postgres");
         props.put("database", "postgres");
+        props.put("snapshot.mode", "no_data");
         return Configuration.from(props);
     }
 

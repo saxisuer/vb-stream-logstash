@@ -37,7 +37,6 @@ import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.ChangeEventSourceCoordinator;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.ErrorHandler;
-import io.debezium.pipeline.metrics.DefaultChangeEventSourceMetricsFactory;
 import io.debezium.pipeline.notification.NotificationService;
 import io.debezium.pipeline.signal.SignalProcessor;
 import io.debezium.pipeline.spi.OffsetContext;
@@ -263,6 +262,10 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
             NotificationService<PostgresPartition, PostgresOffsetContext> notificationService = new NotificationService<>(
                     getNotificationChannels(), connectorConfig, SchemaFactory.get(), dispatcher::enqueueNotification);
 
+            // 管线指标桥(MS5 Task 4):单一实例两路分叉——metrics 工厂(streaming 指标读)与
+            // 源工厂(流式源 execute 填充读源)持有同一 bridge,MBean 面与运行管线单向衔接
+            StreamMetricsBridge metricsBridge = new StreamMetricsBridge();
+
             ChangeEventSourceCoordinator<PostgresPartition, PostgresOffsetContext> coordinator =
                     new ChangeEventSourceCoordinator<>(
                             previousOffsets,
@@ -270,8 +273,9 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
                             PostgresStreamConnector.class,
                             connectorConfig,
                             new StreamChangeEventSourceFactory(
-                                    connectorConfig, dispatcher, errorHandler, clock, schema, jdbcConnection, typeRegistry),
-                            new DefaultChangeEventSourceMetricsFactory<>(),
+                                    connectorConfig, dispatcher, errorHandler, clock, schema, jdbcConnection,
+                                    typeRegistry, metricsBridge),
+                            new StreamChangeEventSourceMetricsFactory<>(metricsBridge),
                             dispatcher,
                             schema,
                             signalProcessor,

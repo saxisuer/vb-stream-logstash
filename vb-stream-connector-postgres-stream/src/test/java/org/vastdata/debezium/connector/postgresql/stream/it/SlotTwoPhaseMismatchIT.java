@@ -124,23 +124,4 @@ class SlotTwoPhaseMismatchIT extends StreamITBase {
             throw new AssertionError("pg_replication_slots 目录查询失败", e);
         }
     }
-
-    /**
-     * 渲染失败回调的完整异常链文本(回调 msg + 沿 cause 链逐层消息拼接):引擎侧失败被
-     * 层层包装(ConnectException → IllegalStateException 原文),槽名与 DROP SLOT 指引
-     * 在链尾——单层 getMessage 断言会漏,必须全链拼接。
-     *
-     * @param message 回调的消息参数(可能为 null)
-     * @param error   回调的异常参数(可能为 null)
-     * @return msg 与各层 cause 消息以 " | " 连接的文本(null 段跳过)
-     */
-    private static String renderThrowableChain(String message, Throwable error) {
-        StringBuilder sb = new StringBuilder(String.valueOf(message));
-        Throwable t = error;
-        while (t != null) {
-            sb.append(" | ").append(t.getMessage());
-            t = t.getCause();
-        }
-        return sb.toString();
-    }
 }

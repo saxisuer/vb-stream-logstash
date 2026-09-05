@@ -49,6 +49,11 @@ public class StreamChangeEventSourceFactory
     /** main JDBC 连接(初始 offset 上下文与 'R' enrich 的元数据源)。 */
     private final PostgresConnection mainConnection;
     private final TypeRegistry typeRegistry;
+    /**
+     * 管线指标桥(MS5 Task 4:与 metrics 工厂共享的同一实例,经构造链传给流式源——
+     * execute 装配管线后填充读源。单向依赖:Task.start 建桥 → 双工厂各持引用)。
+     */
+    private final StreamMetricsBridge metricsBridge;
 
     /**
      * 构造工厂(Task.start 装配点调用一次)。
@@ -60,13 +65,15 @@ public class StreamChangeEventSourceFactory
      * @param schema          schema 组件(listener 版本安装目标)
      * @param mainConnection  main JDBC 连接
      * @param typeRegistry    共享类型注册表
+     * @param metricsBridge   管线指标桥(与 metrics 工厂同一实例)
      */
     public StreamChangeEventSourceFactory(PostgresStreamConnectorConfig connectorConfig,
                                           PostgresEventDispatcher<TableId> dispatcher,
                                           ErrorHandler errorHandler, Clock clock,
                                           StreamPostgresSchema schema,
                                           PostgresConnection mainConnection,
-                                          TypeRegistry typeRegistry) {
+                                          TypeRegistry typeRegistry,
+                                          StreamMetricsBridge metricsBridge) {
         this.connectorConfig = Objects.requireNonNull(connectorConfig, "connectorConfig");
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.errorHandler = Objects.requireNonNull(errorHandler, "errorHandler");
@@ -74,6 +81,7 @@ public class StreamChangeEventSourceFactory
         this.schema = Objects.requireNonNull(schema, "schema");
         this.mainConnection = Objects.requireNonNull(mainConnection, "mainConnection");
         this.typeRegistry = Objects.requireNonNull(typeRegistry, "typeRegistry");
+        this.metricsBridge = Objects.requireNonNull(metricsBridge, "metricsBridge");
     }
 
     /**
@@ -88,12 +96,13 @@ public class StreamChangeEventSourceFactory
     }
 
     /**
-     * 责任:提供流式源(监督壳 + MS2 管道;每次 streaming 阶段开始时调用一次)。
+     * 责任:提供流式源(监督壳 + MS2 管道;每次 streaming 阶段开始时调用一次)——metricsBridge
+     * 随构造链穿入(MS5 Task 4:execute 装配管线后经它填充 MBean 读源)。
      */
     @Override
     public StreamingChangeEventSource<PostgresPartition, PostgresOffsetContext> getStreamingChangeEventSource() {
         return new PostgresStreamStreamingChangeEventSource(connectorConfig, dispatcher, errorHandler,
-                clock, schema, mainConnection, typeRegistry);
+                clock, schema, mainConnection, typeRegistry, metricsBridge);
     }
 
     /**
