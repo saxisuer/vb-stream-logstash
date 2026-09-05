@@ -28,6 +28,7 @@ prepared 数 + 管道磁盘占用——`StreamMetricsBridge` 于 execute 填四�
 `docs/superpowers/specs/2026-09-05-ms5-r2-incremental-snapshot-audit.md`——vanilla 形态
 三个交错面逐项打破点 + 接入前置条件五项;结论:建议 MS6 接 signal-based 形态、
 不接 read-only 变体)。
+**MS6 打包与文档收官**——①maven-assembly plugin 目录清单打包(descriptor `src/main/assembly/plugin.xml` + pom `finalName` 钉死产物路径:连接器自身 jar 落插件根(带 SourceConnector ServiceLoader 清单)+ runtime 依赖落 `lib/`;connect-api/kafka-clients/slf4j-api 及其独占子件四件(zstd-jni/lz4-java/snappy-java/jakarta.ws.rs-api)显式排除——excludes 不下传传递闭包,独占子件须点名,R4 两连接器并存的清单边界),产物 `target/vb-stream-connector-postgres-stream-plugin/` 目录 + 同名 zip;②`ConnectPluginIT` 真 Kafka Connect 验收(cp-kafka 8.3.0 + cp-kafka-connect 8.3.0=AK 4.3.0 容器组,plugin.path 挂插件目录副本——镜像 JVM Java 25,Chronicle mmap 的 --add-opens 经 KAFKA_OPTS 注入;REST `PUT /connectors/{name}/config` **扁平 config map** 请求体建连接器——包装体在 Connect 4.3 该端点报 500;产物结构断言前置 @BeforeAll,缺产物 fail-fast 文案指向先 package);③R2 裁定记档 v1 不接 signal-based 增量快照(审计文档结论节裁定行);④模块 README(定位/配置面/打包安装/at-least-once 语义/已知限制五节一档全,配置表逐项对照 `PostgresStreamConnectorConfig` javadoc 防两处漂移)。
 **已知限制与延期**记档于 R1/R3 审计文档「已知限制与延期」节
 (数组列 fail-fast 不静默 null、未知类型静默 null、LogicalMsg 延期设计要点、Truncate
 选项位超集)。
@@ -92,4 +93,5 @@ TransactionConsumer(consumer 线程)
   - embedded tests jar 根部自带 logback-test.xml(只给 io.debezium 开 INFO)——测试资源
     自带一份覆盖(logback-test.xml 于 src/test/resources);
   - `AbstractConnectorTest` 需要 assertj(基座 start() 直调,需显式测试依赖)。
+  `ConnectPluginIT` 独立于此形态(不挂基座:真 Kafka Connect 容器装 assembly 插件跑,验收面与坑位见上 MS6 段)。
   IT 明细与断言清单见 `.superpowers/sdd/2026-09-01-ms2-pipeline-and-session/task-8-report.md`。
