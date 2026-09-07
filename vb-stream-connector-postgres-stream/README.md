@@ -2,7 +2,86 @@
 
 ## 定位与架构
 
-流式专用的 PostgreSQL 逻辑解码 Kafka Connect 连接器插件（`connector.class = org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector`）：适配 pgoutput **stream 模式**（`proto_version=4` + `streaming` + `two_phase`），进行中的大事务边收边发而非提交后整体回放；不做快照数据抽取（`snapshot.mode` 仅 `no_data`，该职能属 vanilla `postgresql-connector`——两者可并存于同一 Connect 集群）。架构上是引擎 `vb-stream-engine` 解耦形态的 1:1 接线（零引擎 import，代码文字参照非依赖）：reader 线程（`vb-pgoutput-reader`）raw drain 并把每条消息落 Chronicle Queue 主缓冲管道、桶只记 index 段（组装期堆内零字节引用），提交事务交接给 consumer 线程（`transaction-consumer`）逐条回放解码、按变更时刻的表结构版本（asOf）渲染、经 Debezium dispatcher 发进 Kafka——大事务回放再慢也不阻塞读取，代价转移到磁盘（管道目录与 PG 侧 WAL 保留增长，`max_slot_wal_keep_size` 兜底）。组件图与线程约束详见包内 `src/main/java/.../stream/CLAUDE.md`。
+流式专用的 PostgreSQL 逻辑解码 Kafka Connect 连接器插件（`connector.class = org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector`）：适配 pgoutput **stream 模式**（`proto_version=4` + `streaming` + `two_phase`），进行中的大事务边收边发而非提交后整体回放；不做快照数据抽取（`snapshot.mode` 仅 `no_data`，该职能属 vanilla `postgresql-connector`——两者可并存于同一 Connect 集群）。架构上是引擎 `vb-stream-engine` 解耦形态的 1:1 接线（零引擎 import，代码文字参照非依赖）：reader 线程（`vb-pgoutput-reader`）raw drain 并把每条消息落 Chronicle Queue 主缓冲管道、桶只记 index 段（组装期堆内零字节引用），提交事务交接给 consumer 线程（`transaction-consumer`）逐条回放解码、按变更时刻的表结构版本（asOf）渲染、经 Debezium dispatcher 发进 Kafka——大事务回放再慢也不阻塞读取，代价转移到磁盘（管道目录与 PG 侧 WAL 保留增长，`max_slot_wal_keep_size` 兜底）。组件图与线程约束详见包内 `src/main/java/.../stream/CLAUDE.md`；端到端数据流与逐层讲解见下节。
+
+## 端到端数据流与组件分层
+
+数据流自上而下贯穿三级线程上下文（Connect runtime → reader/consumer 双线程 → Kafka 出口）：
+
+```
+Kafka Connect runtime
+  │ PostgresStreamConnectorTask.start()        ← 全链路装配（vanilla PostgresConnectorTask:101-284 同序替换）
+  ▼
+PostgresStreamStreamingChangeEventSource.execute()   ← 监督壳（coordinator 线程）
+  │  装配 ReplicationSession + StreamedTransactionAssembler（构造即起 consumer 线程）
+  │  起 vb-pgoutput-reader 线程跑 session.run(assembler, frontier::get)；200ms 心跳监督
+  ▼
+PostgreSQL（walsender：pgoutput v4 + streaming + two_phase）
+  │ CopyData/'w' 帧（pgjdbc 已剥复制协议封装）
+  ▼ ┌────────────────── reader 线程 ──────────────────┐
+ReplicationSession.run()
+  │  每轮五步：isClosed 守卫 → readPending drain（取尽缓冲，空轮才睡 100ms）
+  │          → 确认值 = min(已收到, 输出前沿) → 满间隔才 forceUpdateStatus → 续转
+  │ RawMessageListener.onRaw(byte[])
+StreamedTransactionAssembler.onRaw()
+  │  每条消息先 pipe.append 落盘取 CQ index 作 seq
+  │  控制消息（B/C/S/E/c/A/b/P/K/r/p）+ 'R'：当场解码，驱动桶状态机
+  │  I/U/D/T/M：不解码——只窥 oid，把 index 记入桶的连续段
+  │  Commit/StreamCommit/CommitPrepared = 交接：拷 Relation 快照冻结桶 → 入队 → 立即返回
+  ▼ （交接队列，FIFO = 提交序）
+  │ ┌────────────────── consumer 线程 ────────────────┐
+TransactionConsumer
+  │  BucketReplayer 逐段 readRange（数据落盘后仅此一读）→ decodeSingle → 按桶快照 asOf 渲染
+  │  逐条回调 DispatcherTransactionListener.onEvent(Begin → TxChange* → End)
+  │    Begin：锚定事务边界 offset + 发事务块 BEGIN
+  │    RowChange：resolve asOf Table → 安装 schema → dispatchDataChangeEvent
+  │    End：发事务块 COMMIT → 返回 = 确认完整消费 → 前沿 AtomicLong ← endLsn
+  │ └─────────────────────────────────────────────────┘
+  ▼
+Debezium PostgresEventDispatcher → ChangeEventQueue → Task.doPoll() → Kafka topic
+```
+
+各层职责与关键机制：
+
+### 协议层——`protocol/` 子包
+
+- pgoutput 19 种消息的纯函数解码（sealed interface `PgOutputMessage` + 19 个 record；无 IO、零 Debezium import，可独立移植）
+- `PgOutputStreamDecoder` 双入口：`decode()` 顶层消息入口（内建流块状态机 `inStream`，出口强校验剩余字节 = 0 防错位扩散）；`decodeSingle()` 回放专用入口（白名单只收 M/R/Y/I/D/T 数据消息——回放时桶内消息本身处于流式块语境，免 'S'/'E' 重建上下文）
+- 字节格式第一手总表与两处实测勘误（StreamAbort 类型字节是**大写 'A'**；StreamCommit 在 xid 后有一个被消费不建模的 flags(0) 字节）见 `protocol/CLAUDE.md`
+
+### 复制会话——`ReplicationSession`
+
+- 两条连接（普通 SQL + `replication=database`），生命周期 open → ensureSlot → start → run → close；幂等建槽带 two_phase，撞 SQLState 42710（槽已存在）时转存量槽 two_phase 预检（R5），不匹配启动期拒绝
+- run 循环是吞吐命门：`readPending` **drain**（每轮取尽缓冲——每轮取一条 + 固定睡 100ms 会把读取钉死在 ~10 msg/s）；LSN 反馈确认值 = **min(已收到, 输出前沿)**——前沿只在事务 End 之后推进，crash 时未输出事务 PG 必然重发，这是 at-least-once 的实现机制
+
+### 组装域（reader 线程）——`StreamedTransactionAssembler`
+
+- 桶（`TxBuffer`）模型：普通事务单指针（协议保证 Begin..Commit 串行不嵌套）；流式事务按顶层 xid 多桶并存（并发大事务流段交错）；两阶段 `preparedByGid` 挂起池（PREPARE 后可能长期挂起，等 COMMIT PREPARED 输出 / ROLLBACK PREPARED 丢弃）
+- **组装期不解码数据**：I/U/D/T/M 只窥 relation oid 记 CQ index 连续段（堆占用 = 段数 × long[2]，不随单元数增长）——回滚的大事务从未被解码过
+- **同事务 DDL 正确性**：'R'（表元数据）按到达 seq 记入 `VersionedRelationRegistry` 版本日志；交接时按桶 oidSet 圈定、截止 lastIndex 拷出 `RelationSnapshot` 随桶冻结——回放时每个单元按**自己的 seq** 取"变更那一刻"的表定义，事务中途 DDL 前后段的行各按各的结构解释
+- 两个低水位（勿混）：CQ 删除低水位（删过老滚动文件）与 registry 剪枝低水位（收缩版本日志），都挂在桶完结点，消息热路径零开销
+
+### 回放域（consumer 线程）——`TransactionConsumer` + `BucketReplayer`
+
+交接队列取冻结桶 → 发 Begin 头 → 逐段 `readRange` → `decodeSingle` → asOf 渲染 → **逐条即时回调（回放期堆峰 O(单条)，不攒 List）** → aborted 子事务过滤 → 发 End 尾 → 前沿 ← endLsn。**End 返回 = 下游确认完整消费**，是整条管线的背压点。
+
+### Debezium 接线层
+
+- 三件套：`PostgresStreamConnector`（ServiceLoader 入口）/ `PostgresStreamConnectorConfig`（配置面真源）/ `PostgresStreamConnectorTask`（`start()` 是 vanilla `PostgresConnectorTask:101-284` 的同序替换装配，替换点仅 schema / 元数据提供者 / 源工厂三处）
+- 监督壳 `PostgresStreamStreamingChangeEventSource`：与 vanilla 的本质差异——消息处理不在 coordinator 线程内联，本类只做装配、心跳与停机次序；失败汇聚带"停机期失败忽略"守卫（D7 快速停机会砸中在途回放，属正常收敛，不上报为 FAILED）
+- `DispatcherTransactionListener`：流式事件 → dispatcher 的翻译器，几处踩坑语义——事务 id 必须纯数字且与元数据提供者同源（否则 TransactionMonitor 给每事务补发空 BEGIN/END 对）；source 块 txId 恒取**顶层 xid**（流式单元携带的是子事务 xid，aborted 过滤正依赖该语义区分）；TRUNCATE 按 `skipped.operations` 门控（默认 "t" 跳过）
+- 自死锁防御：初始 offset 读取的 `txid_current()` 会给 autoCommit=false 的 main 连接分配 XID，**读后必须立即 commit**——否则另一条连接上的 CREATE SLOT 为等解码一致点会死等（IT 实测）
+
+### 指标面
+
+- `StreamThroughputMetrics` 四点插桩（reader 记 slot 读取、组装器记交接、consumer 记输出与分布），10s INFO 三行（吞吐/分布/峰值），与引擎 `ThroughputMetrics` 同口径
+- `StreamStreamingChangeEventSourceMetrics` 经 Debezium metrics 体系暴露 JMX：五速率 / lagBytes / 挂起 prepared 数 / 管道磁盘占用；`StreamMetricsBridge` 挂统计 tick **预计算**，JMX 读零锁零计算零 IO
+
+### 贯穿全局的三条设计主线
+
+1. **读取/组装/回放解耦**——reader 永不等待 consumer，consumer 慢/停摆不回压读取，代价转移到磁盘（语义见下文 at-least-once 节）
+2. **End 锚定的输出前沿**——一个 `AtomicLong` 串起整个 at-least-once：LSN 确认按前沿封顶，前沿只在 End 后推进，crash 时未输出事务必然重发，头行重复允许、尾部永不丢
+3. **快照随行**——交接时把表结构版本快照冻结进桶，回放自足不查 registry：换来 registry 可激进剪枝、同事务 DDL 正确、交接桶与版本日志完全解耦
 
 ## 配置面
 
@@ -70,6 +149,12 @@ curl -X PUT http://connect:8083/connectors/pg-stream-1/config \
 - **重启续传锚槽 confirmed_flush**（≤ 输出前沿）：offset 落后于槽确认位时重复段取并集，不丢不静默吞；管道目录重启自动清空属预期（瞬态工作区，真源是复制槽）。
 - **回滚语义**：aborted 子事务（SAVEPOINT 回滚）的变更在回放期剔除、不进 Kafka；整事务回滚与 ROLLBACK PREPARED 只留日志痕迹零发射。
 - **consumer 慢/停摆不回压 reader**：代价转移到磁盘（管道目录 + WAL 保留增长），`max_slot_wal_keep_size` 兜底；lagBytes 等观测面经 JMX MBean 暴露（`StreamStreamingChangeEventSourceMetrics`：五速率/lagBytes/挂起 prepared 数/管道磁盘占用）。
+
+## 开发与测试
+
+- **模块边界**（pom 结构性保证）：零 `org.vastdata.vbstream` import——协议层是引擎 `vb-stream-engine` protocol 包的 1:1 手写重写（文字参照非依赖）；反向复用 Debezium 3.6.1 的 Config/Schema/Emitter/offset 体系，`connect-api` 为 `provided`（运行期由 Connect runtime 提供）
+- **测试形态**（`mvn test` 单命令全跑；surefire 显式补 `**/*IT.java` include——默认模式不含该命名）：离线单测（协议字节级 `MsgBuilder` 手造字节 + 组装/回放状态机假件驱动，零 PG）+ `it` 包集成测试（embedded engine 基座 + Testcontainers 真 PG 18：流式大事务进 Kafka/aborted 子事务过滤/同事务 DDL asOf/重启三情况/两阶段四场景/存量槽 two_phase 拒绝/缺省配置注入）；`ConnectPluginIT` 独立不挂基座——真 Kafka Connect 容器装 assembly 插件跑端到端验收
+- **代码内文档真源**：包内 `src/main/java/.../stream/CLAUDE.md`（组件图、线程审计 R1/R3、配置面与停机次序）与 `protocol/CLAUDE.md`（19 消息字节格式速查与勘误）
 
 ## Known limitations
 
