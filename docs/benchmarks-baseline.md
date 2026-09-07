@@ -447,6 +447,22 @@ embedded 直消费 ChangeEventQueue（Logstash 集成形态的本职）。WSL �
 （41.6~45.6s 噪音带）完全持平——**宿主 Consumer 的渲染不是瓶颈**，~22µs/条归属
 engine 固有路径最终钉死。守卫作为正确性修复保留（生产开 INFO 时省无效参数构造）。
 
+**Arthas 火焰图归因与修复（同日，上两段"engine 固有成本"结论的再修正）**：async-profiler
+collapsed 采样（7758 样本，覆盖读+回放窗口）揭示真凶不在 engine 消费端（`AsyncEmbeddedEngine`
+仅 2.3%）而在 **Debezium 内建 metrics 的事件热路径**（consumer 链 55.5% 的大头）：
+①`CommonEventMeter.onEvent` 无条件执行 `lastEvent = metadataProvider.toSummaryString(...)`
+——EventFormatter 经 SchemaUtil.asDetailedString 逐字段字符串化，内部**每事件 new 一个
+Jackson ObjectMapper**（ObjectMapper.<init> 1.5% + PrivateMaxEntriesCache + ConnectSchema.equals
+等合计 ~5%）；②`StreamingMeter` 的 MeasurementCollector 每事件 LinkedBlockingQueue.offer
+（`pthread_cond_signal` 25%）——两路合计 **~40% 全进程 CPU**（MeasurementCollector 全链
+37.7%）。A/B/C 三组参数实验绕不开它属必然（代码路径深处无条件执行）。**修复**：
+`StreamStreamingChangeEventSourceMetrics.onEvent` 覆写为空（dispatcher 经
+`setEventListener` 持本实例，覆写即整链拦截；事件计数观测由自研 StreamThroughputMetrics
+承担，Debezium 内建 MBean 的 totalNumberOfEventsSeen/lastEvent/milliSecondsBehindSource
+三字段停更属已知取舍）。**修复后 8B×200 万回放 45.6s → 6.5s（4.5 万 → 30.8 万 rec/s，
+快 7 倍）**——输出链与自研管线供给域（37.4 万 msg/s）同量级，Debezium 化的全链上限
+从"engine 消费端平台"修正为"walsender 供给 × 行宽"。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/
