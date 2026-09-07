@@ -134,6 +134,7 @@ final class TransactionConsumer implements Runnable {
             replayer.replay(bucket, pipe, change -> {
                 listener.onEvent(change);   // 先交付后计数：listener 自身抛出时该条不计入"已输出"（多报 1 修复）
                 emitted[0]++;
+                metrics.onRecordDelivered();   // rec 秒桶逐条入桶（2026-09-07 修正：整事务 End 落桶会虚高单大事务峰值；累计仍在 onTxOutput）
             });
         } catch (Throwable t) {
             LOG.error("事务流式输出中断（已输出 {}/{} 条）: xid={} firstIndex={}",

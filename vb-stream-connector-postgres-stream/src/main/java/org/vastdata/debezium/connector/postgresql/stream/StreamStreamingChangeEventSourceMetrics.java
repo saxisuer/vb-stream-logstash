@@ -30,7 +30,7 @@ import org.apache.kafka.connect.data.Struct;
  * LinkedBlockingQueue 唤醒,pthread_cond_signal)。WSL 压测 8B×200 万大事务的 collapsed
  * 火焰图两路合计占全进程 CPU ~40%(MeasurementCollector 37.7% + ObjectMapper 构造 1.5%
  * 及 schema equals 等),是 Debezium 化输出链 ~4.5 万 rec/s 平台的第一大构成。事件计数
- * 观测面由自研 {@link StreamThroughputMetrics} 的四点插桩承担(输出 rec/s 即事件面),
+ * 观测面由自研 {@link StreamThroughputMetrics} 的五点插桩承担(输出 rec/s 即事件面),
  * 故覆写后 Debezium 内建 MBean 的 totalNumberOfEventsSeen/lastEvent/
  * milliSecondsBehindSource 三字段停更属已知取舍(自研 lagBytes 面不受影响)。
  *

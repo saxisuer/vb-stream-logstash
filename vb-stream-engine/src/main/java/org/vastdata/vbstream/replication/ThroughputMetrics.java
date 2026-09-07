@@ -172,8 +172,21 @@ final class ThroughputMetrics {
         txSizes.recordValue(Math.min(unitCount, MAX_TRACKED_TX_UNITS));
         outputRecords.add(emittedRecords);
         outputTxs.increment();
-        outputRecSec.bump(now, emittedRecords);
+        // rec 秒桶不在本方法入桶：整事务 emittedRecords 一次性记进 End 落点的一秒，单大事务
+        // 回放耗时 >1s 时峰值按倍数虚高（2026-09-07 审计发现，见 onRecordDelivered）——逐条入桶
         outputTxSec.bump(now, 1L);
+    }
+
+    /**
+     * 责任：一条记录交付的秒桶记账——回放 sink 内逐条调用（与 slot 侧逐消息入桶对称的口径）。
+     * 存在动机：rec 秒桶若在 {@link #onTxOutput} 以整事务 emittedRecords 一次性入桶，单大事务
+     * 的全部行数会被记进 End 落点的那一秒——回放耗时 &gt;1s 时峰值按倍数虚高、&lt;1s 时低估瞬时
+     * 速率（2026-09-07 审计发现，修正段见 benchmarks-baseline.md）。本方法只动秒桶；累计
+     * outputRecords 与分布样本仍在 onTxOutput 事务尾回填，两路径对同一批记录各记一次、互不重复。
+     * 边界：无异常路径。线程：consumer 线程（回放 sink 调用点，与秒桶单写者假设一致）。
+     */
+    void onRecordDelivered() {
+        outputRecSec.bump(clock.getAsLong(), 1L);
     }
 
     /**

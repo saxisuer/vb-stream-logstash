@@ -70,7 +70,7 @@ import net.openhft.chronicle.queue.RollCycle;
  * 已提交未输出的事务不丢,测试确定性断言用)与 {@link #shutdownFast()}(D7 快速停机——
  * 毒丸 + interrupt + 不 join,连接器 source 停机序用)。相对引擎的另三处接缝偏差:吞吐指标
  * MS2 接缝期曾整体删除,MS5 Task 3 以<b>构造参数传导</b>形态加回(指标实例由装配点 source
- * 的 execute 建后穿入本组装器,consumer/replayer 经构造链转传,四点插桩口径与引擎逐字节
+ * 的 execute 建后穿入本组装器,consumer/replayer 经构造链转传,五点插桩口径与引擎逐字节
  * 同构;便捷构造自建默认实例);'R' 路由经
  * {@link RelationResolver}(见上);listener 侧 asOf 表解析经 {@link BucketTableResolver}
  * (消费器每桶绑定快照,Task 7 注入真实现)。
@@ -188,7 +188,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * @param decodedObserver  每个解码点回调(控制消息 + 'R' + 回放单元;Y/O 不解码不回调)
      * @param outputFrontier   输出前沿载体(调用方持有以便反馈封顶;本实例只做单调 max 累加)
      * @param onFailure        consumer 回放失败的逃生回调(consumer 线程调用,如通知停机;不得再抛)
-     * @param metrics          吞吐与分布指标(装配点创建;四点插桩共用本实例——slot/组装在
+     * @param metrics          吞吐与分布指标(装配点创建;五点插桩共用本实例——slot/组装在
      *                         本类,输出/分布/报告 tick 在 consumer,回放字节在 replayer)
      */
     StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
@@ -241,7 +241,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * @param outputFrontier   输出前沿载体(调用方持有;本实例只做单调 max 累加)
      * @param onFailure        回放失败的逃生回调(consumer 线程调用)
      * @param tableResolver    listener 侧按 (oid, seq) 解析 asOf 表定义的接缝(每个桶回放前由消费器绑定快照)
-     * @param metrics          吞吐与分布指标(四点插桩共用的单实例)
+     * @param metrics          吞吐与分布指标(五点插桩共用的单实例)
      */
     StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
                                  VersionedRelationRegistry registry, RelationResolver relationResolver,
@@ -304,7 +304,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
 
     /**
      * 构造<b>同步形态</b>组装器(全量含指标,包私有):其余语义同上,吞吐指标实例显式穿入
-     * (接线测试用它注入自有实例以断言四点插桩——与生产路径仅实例来源不同,口径无差)。
+     * (接线测试用它注入自有实例以断言五点插桩——与生产路径仅实例来源不同,口径无差)。
      *
      * @param listener         事务事件流回调(交接时同步调用;listener 侧经 tableResolver 取 asOf 表)
      * @param mode             流式模式
@@ -314,7 +314,7 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * @param pipeRollCycle    管道滚动周期
      * @param decodedObserver  每个解码点回调
      * @param tableResolver    listener 侧按 (oid, seq) 解析 asOf 表定义的接缝(每个桶回放前由消费器绑定快照)
-     * @param metrics          吞吐与分布指标(四点插桩共用的单实例)
+     * @param metrics          吞吐与分布指标(五点插桩共用的单实例)
      */
     StreamedTransactionAssembler(StreamingTransactionListener listener, StreamingMode mode,
                                  VersionedRelationRegistry registry, RelationResolver relationResolver,

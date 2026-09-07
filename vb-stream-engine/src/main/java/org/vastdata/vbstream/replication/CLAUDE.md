@@ -152,9 +152,9 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
 
 ## ThroughputMetrics（包私有，吞吐与分布指标）
 
-本地周期日志行观测面（2026-08-31 设计，spec `docs/superpowers/specs/2026-08-31-throughput-metrics-design.md`；同日增补会话峰值行 `...-peak-metrics-design.md`、速率峰值口径修订为秒桶 `...-peak-rate-second-bucket-design.md`）：六项速率计数 + 两项分位数分布 + 八项会话峰值。**选型**：计数与窗口差分手写（消费通道仅日志行，Micrometer/Dropwizard 的速率算法与输出格式对本场景无净值），分位数用 HdrHistogram `SingleWriterRecorder`（零传递依赖；Micrometer `DistributionSummary` 百分位内部同源）——全部计量收在本类后面，未来接监控系统只换实现、四个埋点点位不动。
+本地周期日志行观测面（2026-08-31 设计，spec `docs/superpowers/specs/2026-08-31-throughput-metrics-design.md`；同日增补会话峰值行 `...-peak-metrics-design.md`、速率峰值口径修订为秒桶 `...-peak-rate-second-bucket-design.md`）：六项速率计数 + 两项分位数分布 + 八项会话峰值。**选型**：计数与窗口差分手写（消费通道仅日志行，Micrometer/Dropwizard 的速率算法与输出格式对本场景无净值），分位数用 HdrHistogram `SingleWriterRecorder`（零传递依赖；Micrometer `DistributionSummary` 百分位内部同源）——全部计量收在本类后面，未来接监控系统只换实现、五个埋点点位不动。
 
-- **六计数口径**（LongAdder，只增不清零）：slot bytes/messages 在组装器 `onRaw` 入口记（含控制消息与 'R'——"从槽读到什么"的诚实口径，与输出侧 records **不可对照**，bytes 才是两端口径一致的对照对）；组装 tx 在 `handoff` 记（提交交接才计，回滚丢弃不计）；输出 bytes 在回放器逐单元记（aborted 过滤**前**）；输出 tx/records 在 `processBucket` 尾经 `onTxOutput` 记（实付 TxChange 数，Begin/End 事件不计）
+- **六计数口径**（LongAdder，只增不清零）：slot bytes/messages 在组装器 `onRaw` 入口记（含控制消息与 'R'——"从槽读到什么"的诚实口径，与输出侧 records **不可对照**，bytes 才是两端口径一致的对照对）；组装 tx 在 `handoff` 记（提交交接才计，回滚丢弃不计）；输出 bytes 在回放器逐单元记（aborted 过滤**前**）；输出 tx 与 records 的**累计**在 `processBucket` 尾经 `onTxOutput` 记（实付 TxChange 数，Begin/End 事件不计），而 records 的**秒桶**经 `onRecordDelivered` 在回放 sink 逐条入桶（2026-09-07 输出峰值口径修正：事务尾把整事务 emittedRecords 一次性记进 End 落点的一秒，单大事务回放 >1s 时峰值按回放时长虚高——逐条化后与 slot 侧口径对称，伪影回归锚在 `ThroughputMetricsTest`）
 - **两分布**（`SingleWriterRecorder`，2 位有效数字 ≈1% 精度）：事务回放耗时（processBucket 起止，**含下游回调**）与事务大小（`unitCount`，aborted 过滤前——事务"本相"多大，与输出 records 的差 = 被剔除的子事务量）；**仅完整交付的事务入分布**（fail-fast 截断不入）；越上界（耗时 1h / 大小 10 亿单元）钳制到上界——指标永不向热路径抛异常
 - **报告语义**（`reportLines(nowNanos)`，每次调用即窗口边界，返回**三行**）：吞吐行速率 = 六计数窗口内 delta ÷ 实际流逝秒数（nanoTime 差——**窗口观察面，突发负载会被摊薄**，摊薄倍数 ≈ 窗口时长/突发时长）；分位 = Recorder 取走的上一区间（窗口外样本不稀释当前值，返回的直方图回收复用、读后即弃）；峰值 = 八项**会话历史最高**——速率峰值为**最高单秒速率**（秒桶 spec：埋点内按秒号分桶、秒翻滚结算 max，报告取 max(已结算峰, 未结算当前桶)——悬空桶计数作下界候选；判读突发吞吐以峰值行为准，勿信窗口均值）；分布区间 max 在取走时顺手留存（否则随区间回收丢弃）；空载窗口峰值行也常驻输出；"从未有过记录"打 `n/a`。格式：字节 SI 十进制恒一位小数（`12.4 MB/s`）、耗时 ns→µs→ms→s 千进位（同档 ≥100 取整）、计数速率 <100 一位小数 / ≥100 整数千分位——三行样例：
   - `吞吐: slot=12.4 MB/s (85,231 msg/s) | 组装=42 tx/s | 输出=11.8 MB/s (81,004 rec/s, 41 tx/s)`
@@ -162,7 +162,7 @@ LIVE ──Commit/StreamCommit/CommitPrepared──▶ HANDED_OFF ──consumer
   - `峰值: slot=54.1 MB/s (201,048 msg/s) | 组装=1,820 tx/s | 输出=48.2 MB/s (178,000 rec/s, 1,640 tx/s) | 耗时=1.1s | 大小=200,703 rec`
 - **接线**（Main/公共 API/配置面**零改动**，指标常开）：组装器构造时创建实例 → 自用（slot/组装）→ 穿 `TransactionConsumer` 构造（输出计数 + 分布 + 报告挂 `maybeStats` 统计 tick）→ 穿 `BucketReplayer` 构造（回读字节）。同步测试形态 `run()` 不被调用 → 只计数不打印；`assembler.throughputMetrics()` 是包私有测试观测口
 - **注意**：HDR 的 Maven 坐标小写 `org.hdrhistogram`、Java 包名**大写** `org.HdrHistogram`（上游历史命名，import 别写反）；HDR 按有效数字做桶级量化，读回值可有 ±1% 偏差（3600s 记入读回 3608s 属正常），断言用容差
-- 测试：`ThroughputMetricsTest`（格式化边界/窗口差分/区间隔离/钳制/峰值留存/秒桶突发不摊薄与悬空桶下界——受控时钟注入驱动）+ `ThroughputMetricsWiringTest`（同步组装器走完整业务路径，断言 4 处埋点无一漏挂）
+- 测试：`ThroughputMetricsTest`（格式化边界/窗口差分/区间隔离/钳制/峰值留存/秒桶突发不摊薄与悬空桶下界——受控时钟注入驱动；2026-09-07 增 rec 秒桶逐条入桶的伪影回归锚三用例）+ `ThroughputMetricsWiringTest`（同步组装器走完整业务路径，断言 5 处埋点无一漏挂）
 
 ## PipeConfig（record，不可变）
 

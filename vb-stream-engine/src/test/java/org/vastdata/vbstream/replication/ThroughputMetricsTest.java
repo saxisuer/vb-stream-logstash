@@ -14,7 +14,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 计数速率 &lt;100 一位小数/≥100 整数千分位）；②速率报告的窗口差分语义（计数 delta ÷ 实际流逝
  * 秒数，第二窗口无事件则归零——计数器累计、速率只看窗口）；③分位数报告的区间隔离语义
  * （SingleWriterRecorder 每次报告取走上一区间，窗口外样本不稀释当前值；零样本 n/a；
- * 越界值（超过可追踪上界）钳制到上界不向调用方抛异常）。
+ * 越界值（超过可追踪上界）钳制到上界不向调用方抛异常）；④rec 秒桶逐条入桶语义
+ * （2026-09-07 输出峰值口径修正——onTxOutput 不再整事务落桶、onRecordDelivered 逐条驱动，
+ * 伪影回归锚：单大事务跨多秒回放时峰值不再按回放时长虚高）。
  *
  * <p>夹具约定：全部用例经 {@code new ThroughputMetrics(基准戳)} 注入受控时钟（0 基准 +
  * 显式 nowNanos 报告），不依赖真实睡眠；报告行断言**整行字符串相等**（格式即契约——与
@@ -189,6 +191,9 @@ class ThroughputMetricsTest {
         }
         for (int i = 0; i < 10; i++) {
             metrics.onTxOutput(1_000_000L, 5L, 5L);     // 输出: 10 tx / 50 rec，样本 1ms/5rec
+            for (int j = 0; j < 5; j++) {
+                metrics.onRecordDelivered();            // rec 秒桶逐条入桶（同秒共 50 条——2026-09-07 修正后事务尾不再落 rec 桶）
+            }
         }
         metrics.reportLines(TEN_SECONDS);               // 高窗
         List<String> idle = metrics.reportLines(2 * TEN_SECONDS);   // 空窗：吞吐归零、分布 n/a
@@ -271,5 +276,60 @@ class ThroughputMetricsTest {
         metrics.onSlotMessage(new byte[10]);
         List<String> lines = metrics.reportLines(3 * TEN_SECONDS);
         assertTrue(lines.get(2).contains("(100 msg/s)"), "峰值应为最高单秒 100 而非合计: " + lines.get(2));
+    }
+
+    /**
+     * rec 秒桶逐条入桶（2026-09-07 输出峰值口径修正，伪影回归锚）：修复前 onTxOutput 把整事务
+     * emittedRecords 一次性记进 End 落点的一秒——单大事务跨 3 秒回放 3000 条时峰值行虚高为
+     * 3,000 rec/s（虚高倍数 ≈ 回放时长）。修复后 onTxOutput 不再触碰 rec 秒桶（仅记累计与
+     * 分布），秒桶只由 onRecordDelivered 逐条驱动：峰值如实反映最高单秒 1,000；累计不受影响
+     * （吞吐行窗口差分 3000÷40s=75.0 rec/s 照常可见——逐条化只动峰值口径，不动计数）。
+     */
+    @Test
+    void 峰值行_单大事务rec秒桶逐条入桶不整事务落桶() {
+        long[] clock = {0L};
+        ThroughputMetrics metrics = new ThroughputMetrics(0L, () -> clock[0]);
+        for (int sec = 0; sec < 3; sec++) {
+            clock[0] = sec * 1_000_000_000L + 100_000_000L;   // 每受控秒 1000 条（跨 3 秒回放）
+            for (int i = 0; i < 1000; i++) {
+                metrics.onRecordDelivered();
+            }
+        }
+        metrics.onTxOutput(3_000_000_000L, 3_000L, 3_000L);   // 事务尾：不再触碰 rec 秒桶
+        clock[0] = 3_100_000_000L;                             // 推进触发末秒结算
+        metrics.onSlotMessage(new byte[1]);
+        List<String> lines = metrics.reportLines(4 * TEN_SECONDS);
+        assertTrue(lines.get(2).contains("(1,000 rec/s,"),
+                "rec 峰值应为最高单秒 1000 而非整事务落桶的 3000: " + lines.get(2));
+        assertTrue(lines.get(0).contains("(75.0 rec/s,"),
+                "累计不受逐条化影响（3000÷40s 窗口差分）: " + lines.get(0));
+    }
+
+    /**
+     * onTxOutput 与 rec 秒桶的隔离（同修正的另一半锚定）：仅调用 onTxOutput（无任何
+     * onRecordDelivered）时 rec 峰值保持 n/a——修复前这里会显示事务的 emittedRecords
+     * 整数（100 rec/s），露馅即回归。
+     */
+    @Test
+    void 峰值行_onTxOutput不触碰rec秒桶() {
+        ThroughputMetrics metrics = new ThroughputMetrics(0L);
+        metrics.onTxOutput(1_000_000L, 100L, 100L);
+        List<String> lines = metrics.reportLines(TEN_SECONDS);
+        assertTrue(lines.get(2).contains("(n/a rec/s,"), "无逐条交付时 rec 峰值应为 n/a: " + lines.get(2));
+    }
+
+    /**
+     * rec 悬空桶下界（与 slot 侧同语义）：最后一秒的逐条交付未结算（此后无事件触发结算）时，
+     * 当前桶计数作为该秒速率的下界候选参与峰值——不因秒未走满而丢失，也不会高估。
+     */
+    @Test
+    void 峰值行_rec悬空桶计数作下界候选() {
+        long[] clock = {300_000_000L};                  // 0.3s（秒未走满）
+        ThroughputMetrics metrics = new ThroughputMetrics(0L, () -> clock[0]);
+        for (int i = 0; i < 300; i++) {
+            metrics.onRecordDelivered();
+        }
+        List<String> lines = metrics.reportLines(TEN_SECONDS);
+        assertTrue(lines.get(2).contains("(300 rec/s,"), "悬空桶 300 条应作峰值候选: " + lines.get(2));
     }
 }

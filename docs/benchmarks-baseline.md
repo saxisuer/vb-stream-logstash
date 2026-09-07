@@ -381,7 +381,10 @@ Begin/End 事件对象为每轮 12 组 record，量级可忽略；no-op listener
   对上（93,287/31,096 与 133,026/44,342 均 = 3.0）。
 - **Main 管线全程非瓶颈**：负载高峰期 reader 线程 CPU 仅 ~15%（JFR 线程 CPU + /proc task
   jiffies 差分双口径）；tmpfs pipe 对照（40.1 vs 41.3 MB/s）排除 CQ 磁盘写穿透；consumer 单秒
-  交付 50 万 rec。**不要在这条链上再做 reader 侧微优化**——限制永远在 walsender 条数 × 行宽。
+  交付 50 万 rec（†2026-09-07 审计脚注：该数出自修复前的 rec 秒桶口径——事务 End 整批落进
+  一秒，单事务大 N 行负载下虚高倍数 ≈ 回放时长，见文末「输出峰值口径修正」段；量级结论
+  [consumer 远快于 slot 供给]不受影响，复测以 TXN-BEGIN/END 时序差为准）。
+  **不要在这条链上再做 reader 侧微优化**——限制永远在 walsender 条数 × 行宽。
 - 对照：Docker Desktop（绑定挂载盘、`work_mem=64kB`）同窄行负载仅 10~13 MB/s（walsender
   `ReorderBufferRead/Write` 溢写读回）——环境差可达 3~4 倍，判读吞吐先看环境与行宽。
 
@@ -464,6 +467,33 @@ Jackson ObjectMapper**（ObjectMapper.<init> 1.5% + PrivateMaxEntriesCache + Con
 从"engine 消费端平台"修正为"walsender 供给 × 行宽"。完整剖析（每条事件 21.5µs 的
 实测预算表、叶子 vs 含帧视角修正、JIT 内联抹帧坑、GC 连锁收益、火焰图判读方法论）
 另档 `docs/perf-2026-09-07-debezium-metrics-hotpath.md`。
+
+### 输出峰值口径修正（2026-09-07，rec 秒桶逐条入桶——同日统计审计的产出）
+
+**背景**：对上列全部头条数字做统计口径复核（两指标类实现 + 埋点 + 算术自洽逐项核对），结论：
+头条数字无放大——slot 峰值（37.4 万 msg/s / 419.4 MB/s）由 `onSlotMessage` 逐消息入桶驱动，
+秒桶机制只可能低估（跨秒拆分/悬空桶下界）；输出侧关键数字（4.5 万→30.8 万 rec/s）全部为
+**200 万 ÷ 回放耗时** 的差算、未经过秒桶；3.0 消息/事务两组精确对上是"无重复计数"的内部
+互证。但复核发现一处真实口径缺陷（见下），本文档照实记档并已修复。
+
+**缺陷机理**：`onTxOutput` 原实现把整事务 `emittedRecords` 一次性 `outputRecSec.bump` 进
+End 落点的那一秒——对"单事务大 N 行"形态（吞吐域全部场景恰都是单事务），峰值行的
+"输出 rec/s" = 事务总行数 ÷ 1s：回放耗时 >1s 时按回放时长倍数**虚高**（200 万行事务回放
+6.5s 会显示 ≥200 万 rec/s，真实持续 30.8 万），<1s 时则低估瞬时速率。slot 侧无此问题
+（逐消息入桶）。
+
+**修复**：引擎 `ThroughputMetrics` 与 connector `StreamThroughputMetrics` 同日同构——新增
+`onRecordDelivered()`（回放 sink 内逐条入桶，与 slot 侧口径对称），`onTxOutput` 摘除
+rec 秒桶 bump（累计计数与分布样本不动，两路径对同一批记录各记一次、互不重复）。热路径
+成本 = 每条一次 `nanoTime` + 一次比较（~25ns，按 30 万 rec/s <0.8% 单核，噪音带内）。
+回归锚：两侧 `ThroughputMetricsTest` 各三用例（伪影回归 / onTxOutput 隔离 / 悬空桶下界，
+受控时钟确定性驱动），接线测试埋点断言 4 处 → 5 处。
+
+**受影响面**：引擎基线段"consumer 单秒交付 50 万 rec"一句（上文已加脚注）出自修复前口径、
+单事务负载下可能虚高——量级结论不受影响，精确值留待下次 WSL 复测以 TXN-BEGIN/END 时序差
+重记（复测材料 `~/perf/run/` 仍在）；connector 段全部数字不受影响。判读通则：**输出 rec/s
+的"峰值"只在多小事务负载下逐秒准确，单大事务场景一律用耗时差算**（本文档头条数字恰好
+都是这么算的，故无需改动）。
 
 ## 已知口径限制
 

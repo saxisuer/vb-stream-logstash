@@ -74,7 +74,7 @@ Debezium PostgresEventDispatcher → ChangeEventQueue → Task.doPoll() → Kafk
 
 ### 指标面
 
-- `StreamThroughputMetrics` 四点插桩（reader 记 slot 读取、组装器记交接、consumer 记输出与分布），10s INFO 三行（吞吐/分布/峰值），与引擎 `ThroughputMetrics` 同口径
+- `StreamThroughputMetrics` 五点插桩（reader 记 slot 读取、组装器记交接、consumer 记输出与分布、回放 sink 逐条 rec 秒桶——2026-09-07 修正：整事务 End 落桶会虚高单大事务的输出峰值），10s INFO 三行（吞吐/分布/峰值），与引擎 `ThroughputMetrics` 同口径
 - `StreamStreamingChangeEventSourceMetrics` 经 Debezium metrics 体系暴露 JMX：五速率 / lagBytes / 挂起 prepared 数 / 管道磁盘占用；`StreamMetricsBridge` 挂统计 tick **预计算**，JMX 读零锁零计算零 IO
 
 ### 贯穿全局的三条设计主线

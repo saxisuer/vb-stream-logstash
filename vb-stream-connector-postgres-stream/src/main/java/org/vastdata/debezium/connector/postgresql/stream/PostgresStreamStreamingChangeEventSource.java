@@ -92,7 +92,7 @@ public class PostgresStreamStreamingChangeEventSource
     /** 异步组装器(consumer 线程随构造启动)。 */
     private StreamedTransactionAssembler assembler;
 
-    /** 管线吞吐与分布指标(MS5:execute 装配点创建并注入组装器,四点插桩共用;Task 4 的
+    /** 管线吞吐与分布指标(MS5:execute 装配点创建并注入组装器,五点插桩共用;Task 4 的
      *  bridge 以 {@link #throughputMetrics()} 为读源。volatile——coordinator 写、任意线程读;
      *  execute 前为 null)。 */
     private volatile StreamThroughputMetrics throughputMetrics;
@@ -378,7 +378,7 @@ public class PostgresStreamStreamingChangeEventSource
 
     /**
      * 责任:取管线吞吐与分布指标(MS5,只读访问口——Task 4 的 MBean bridge 读源之一:
-     * 六计数 totals 快照作窗口差分分子)。返回的是组装器构造注入的同一实例,四点插桩
+     * 六计数 totals 快照作窗口差分分子)。返回的是组装器构造注入的同一实例,五点插桩
      * (slot 读取/组装/回放字节/输出+分布)与 consumer 的 10s 报告 tick 全部落在这上面。
      * 边界:execute 装配前为 null(指标随管道一起诞生,调用方须以 execute 完成为前提)。
      */
