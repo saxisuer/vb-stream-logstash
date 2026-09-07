@@ -10,14 +10,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * StreamThroughputMetrics 单测——引擎 ThroughputMetricsTest 的文字参照重写（口径与语义
- * 逐条同构，断言值不变；引擎版见 vb-stream-engine .../replication/ThroughputMetricsTest）：
- * 覆盖三块行为——①单位格式化纯函数（字节速率 SI 千进位一位小数、耗时 ns→µs→ms→s 进位
- * 与 ≥100 取整阈值、计数速率 &lt;100 一位小数/≥100 整数千分位）；②速率报告的窗口差分语义
- * （计数 delta ÷ 实际流逝秒数，第二窗口无事件则归零——计数器累计、速率只看窗口）；
- * ③分位数报告的区间隔离语义（SingleWriterRecorder 每次报告取走上一区间，窗口外样本
- * 不稀释当前值；零样本 n/a；越界值（超过可追踪上界）钳制到上界不向调用方抛异常）；
- * ④rec 秒桶逐条入桶语义（2026-09-07 输出峰值口径修正——onTxOutput 不再整事务落桶、
- * onRecordDelivered 逐条驱动，伪影回归锚：单大事务跨多秒回放时峰值不再按回放时长虚高）。
+ * 逐条同构，断言值不变；引擎版见 vb-stream-engine .../replication/ThroughputMetricsTest），
+ * 四块行为：①格式化纯函数（字节/耗时/计数速率）；②吞吐行窗口差分语义；③分布行区间
+ * 隔离语义；④rec 秒桶逐条入桶语义（2026-09-07 输出峰值口径修正——伪影回归锚：单大事务
+ * 跨多秒回放时峰值不再按回放时长虚高）。
  *
  * <p>夹具约定：全部用例经 {@code new StreamThroughputMetrics(基准戳)} 注入受控时钟
  * （0 基准 + 显式 nowNanos 报告），不依赖真实睡眠；报告行断言**整行字符串相等**（格式即
@@ -29,11 +25,10 @@ class StreamThroughputMetricsTest {
     private static final long TEN_SECONDS = 10_000_000_000L;
 
     /**
-     * 字节速率格式化：SI 十进制千进位，恒一位小数——0 与不足 1000 的值留在 B/s 档，
-     * 每满 1000 进一位档（KB/MB/GB）。
+     * 字节速率格式化：SI 十进制千进位，恒一位小数——值满 1000 进一档（B/s→KB/s→MB/s→GB/s）。
      */
     @Test
-    void 字节速率格式化_SI千进位恒一位小数() {
+    void formatBytesPerSecUsesSiUnitsWithSingleDecimal() {
         assertEquals("0.0 B/s", StreamThroughputMetrics.formatBytesPerSec(0));
         assertEquals("512.0 B/s", StreamThroughputMetrics.formatBytesPerSec(512));
         assertEquals("982.4 B/s", StreamThroughputMetrics.formatBytesPerSec(982.4));
@@ -43,11 +38,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 耗时格式化：ns→µs→ms→s 千进位；同档内值 &lt;100 保留一位小数、≥100 取整
-     * （3.2ms 与 125ms 的观感一致性——大值看数量级、小值看精度）。
+     * 耗时格式化：ns→µs→ms→s 千进位；同档内 <100 保留一位小数、≥100 取整
+     * （大值看量级、小值看精度）。
      */
     @Test
-    void 耗时格式化_单位进位与整数阈值() {
+    void formatNanosStepsUnitsAndRoundsAtHundred() {
         assertEquals("400ns", StreamThroughputMetrics.formatNanos(400));
         assertEquals("852µs", StreamThroughputMetrics.formatNanos(852_000));
         assertEquals("3.2ms", StreamThroughputMetrics.formatNanos(3_200_000));
@@ -56,11 +51,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 计数速率（msg/rec/tx 每秒）格式化：&lt;100 一位小数（"5.0"），≥100 整数千分位
-     * （"100"、"12,346"）——与耗时同阈值规则，报告行内各数读感一致。
+     * 计数速率（msg/rec/tx 每秒）格式化：<100 一位小数（"5.0"），≥100 整数千分位
+     * （"12,346"）——与耗时同阈值规则，报告行内各数读感一致。
      */
     @Test
-    void 计数速率格式化_小数与整数两档() {
+    void formatCountPerSecHasDecimalAndIntegerTiers() {
         assertEquals("4.5", StreamThroughputMetrics.formatCountPerSec(4.5));
         assertEquals("5.0", StreamThroughputMetrics.formatCountPerSec(5));
         assertEquals("100", StreamThroughputMetrics.formatCountPerSec(100));
@@ -68,12 +63,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 速率报告的核心语义：六项速率全部按"窗口内计数 delta ÷ 实际流逝秒数"计算——
-     * 驱动一组已知事件后断言吞吐行**整行相等**；同一实例第二窗口无事件则全零。
-     * 计数器本身累计（totals() 不清零），报告行只反映窗口。
+     * 吞吐行速率 = 窗口内计数 delta ÷ 实际流逝秒数：驱动一组已知事件后断言整行相等；
+     * 同一实例第二窗口无事件则全零——计数器累计（totals() 不清零），报告行只反映窗口。
      */
     @Test
-    void 速率报告_按窗口差分计算且空窗归零() {
+    void rateReportUsesWindowDeltaAndIdleWindowZeroes() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         for (int i = 0; i < 1000; i++) {
             metrics.onSlotMessage(new byte[100]);       // slot: 100,000 B / 1000 msg
@@ -98,12 +92,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 分位数报告的**区间隔离**：每次报告取走上一区间的样本（Recorder 语义），首窗样本
-     * 不得稀释次窗——第二窗口单独一个 5ms/100rec 样本时，p90/p95/max 全部精确等于该样本。
-     * 单值窗口的分位数恒等于该值（无插值歧义），断言可用整行相等。
+     * 分布行区间隔离（Recorder 语义）：每次报告取走上一区间，首窗样本不进次窗——
+     * 次窗单独一个样本时 p90/p95/max 全部精确等于该值（无插值歧义），可整行相等断言。
      */
     @Test
-    void 分布报告_窗口隔离首窗样本不进次窗() {
+    void distributionReportIsolatesWindowSamples() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         metrics.onTxOutput(3_200_000L, 10L, 10L);
         List<String> first = metrics.reportLines(TEN_SECONDS);
@@ -117,14 +110,12 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 越界钳制：回放耗时超过可追踪上界（1h）、事务大小超过上界（10 亿单元）时，样本钳制到
-     * 上界入分布——reportLines 不抛异常，max 落在上界附近。断言用 ±2% 容差而非精确相等：
-     * HDR 按 2 位有效数字做**桶级量化**（记录值本身被舍到最近可表示桶，读回可略越上界，
-     * 如 3600s → 3608s），这是数据结构的文档化行为，不是钳制失灵。
-     * 这是热路径防御：指标永不向业务路径抛异常。
+     * 越界钳制：耗时超 1h、事务大小超 10 亿的样本钳到上界，reportLines 不抛异常。
+     * 断言用 ±2% 容差而非精确相等：HDR 按有效数字做桶级量化，读回值可略越上界
+     * （3600s → 3608s）——数据结构的文档化行为，不是钳制失灵。
      */
     @Test
-    void 分布报告_越界样本钳制到上界不抛() {
+    void distributionReportClampsOutOfRangeSamples() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         metrics.onTxOutput(5L * 3_600_000_000_000L, 2_000_000_000L, 1L);
         List<String> lines = assertDoesNotThrow(() -> metrics.reportLines(TEN_SECONDS));
@@ -140,11 +131,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * totals() 六计数累计语义：跨报告窗口不清零——本连接器侧它是 Task 4 MBean 窗口差分的
-     * 只读读源（任意线程可读，LongAdder sum 快照线程安全）；每处埋点漏挂即在此露馅。
+     * totals() 六计数只增不清零，跨报告窗口累计——本连接器侧它兼作 Task 4 MBean 窗口
+     * 差分的只读读源（任意线程可读，LongAdder sum 快照线程安全）；埋点漏挂在此露馅。
      */
     @Test
-    void totals_跨窗口累计不清零() {
+    void totalsAccumulateAcrossWindows() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         metrics.onSlotMessage(new byte[7]);
         metrics.onSlotMessage(new byte[3]);
@@ -162,12 +153,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 峰值行首窗语义（引擎峰值 spec §2 同构）：从未有过任何记录时八项全部 n/a——
-     * 速率峰值在首个非零窗口出现前为无记录（空窗的零速率不构成峰值），分布峰值沿用
-     * 零样本语义。整行断言（格式即契约）。
+     * 从未有过任何记录时峰值行八项全部 n/a——空窗零速率不构成峰值（引擎峰值 spec §2
+     * 同构）。整行断言（格式即契约）。
      */
     @Test
-    void 峰值行_首窗无记录八项全n_a() {
+    void peakLineIsAllNaBeforeFirstRecord() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         List<String> lines = metrics.reportLines(TEN_SECONDS);
         assertEquals("峰值: slot=n/a (n/a msg/s) | 组装=n/a tx/s | 输出=n/a (n/a rec/s, n/a tx/s) | 耗时=n/a | 大小=n/a",
@@ -175,12 +165,12 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 峰值行的存在理由（引擎 spec §1 同构）：高窗之后空窗，吞吐行归零、分布行变 n/a，
-     * 峰值行完整保留高窗的八项——峰值不随窗口翻页消失。峰值速率口径为**最高单秒**
-     * （秒桶）：事件全部同秒灌入时秒峰值 = 灌入总量，空窗报告取悬空桶候选。
+     * 峰值不随窗口翻页消失：高窗之后空窗，吞吐行归零、分布行 n/a，峰值行完整保留
+     * 高窗的八项会话最高（引擎峰值 spec §1 同构）。速率峰值为最高单秒（秒桶）：事件
+     * 全部同秒灌入时秒峰值 = 灌入总量，空窗报告取悬空桶候选。
      */
     @Test
-    void 峰值行_高窗后空窗八项留存() {
+    void peakLineRetainsEightValuesIntoIdleWindow() {
         long[] clock = {500_000_000L};                  // 固定 0.5s：全部事件钉在同一受控秒内，不依赖真实时钟
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L, () -> clock[0]);
         for (int i = 0; i < 1000; i++) {
@@ -206,11 +196,12 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 峰值与当前窗口的对照（引擎 spec §2 #7/#8 同构）：次窗更小的样本使分布行回落
-     * （区间隔离），峰值行仍取会话最高——两个时点的对照即"窗口报告"与"会话峰值"的语义分界。
+     * 分布峰值取会话最高：次窗更小的样本使分布行回落（区间隔离），峰值行仍保留首窗
+     * max——两个时点的对照即"窗口报告"与"会话峰值"的语义分界（引擎峰值 spec §2 #7/#8
+     * 同构）。
      */
     @Test
-    void 峰值行_分布max会话留存取最高() {
+    void peakLineKeepsSessionMaxDistribution() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         metrics.onTxOutput(5_000_000L, 100L, 100L);
         metrics.reportLines(TEN_SECONDS);
@@ -223,12 +214,12 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 秒桶核心语义（引擎秒桶 spec §4 同构）：突发不被窗口摊薄——受控时钟同秒灌 2000 条后
-     * 推进一秒结算，峰值段如实反映 2,000 msg/s，而吞吐行仍按窗口均值显示摊薄值
-     * （20.0 msg/s）——两行双语义的直接对照锚定（引擎 2026-08-31 WSL 基线实测暴露的失真场景）。
+     * 秒桶核心语义：突发不被窗口摊薄（引擎秒桶 spec §4 同构）——同秒灌 2000 条后推进
+     * 一秒结算，峰值行如实反映 2,000 msg/s，吞吐行按窗口均值显示摊薄值 20.0 msg/s
+     * （引擎 2026-08-31 WSL 基线实测暴露的失真场景）。
      */
     @Test
-    void 峰值行_秒桶突发不摊薄() {
+    void peakLineSecondBucketDoesNotDiluteBurst() {
         long[] clock = {500_000_000L};                  // 从 0.5s 起步（首秒内）
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L, () -> clock[0]);
         for (int i = 0; i < 2000; i++) {
@@ -244,26 +235,27 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * 悬空桶下界（引擎秒桶 spec §2 同构）：当前秒未结算（此后再无消息触发结算）时，
-     * 报告取 max(已结算峰, 当前桶累计)——最后一秒的突发不因秒未走满而丢失；当前桶计数
-     * 是该秒速率的下界，不会高估。
+     * 悬空桶下界：当前秒未结算（此后无事件触发结算）时，报告取 max(已结算峰, 当前桶
+     * 累计)——最后一秒的突发不因秒未走满而丢失；当前桶计数是该秒速率的下界，不会高估
+     * （引擎秒桶 spec §2 同构）。
      */
     @Test
-    void 峰值行_悬空桶计数作下界候选() {
+    void peakLineDanglingBucketCountsAsLowerBound() {
         long[] clock = {300_000_000L};                  // 0.3s（秒未走满）
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L, () -> clock[0]);
         for (int i = 0; i < 300; i++) {
             metrics.onSlotMessage(new byte[10]);
         }
         List<String> lines = metrics.reportLines(TEN_SECONDS);
-        assertTrue(lines.get(2).contains("(300 msg/s)"), "悬空桶 300 条应作峰值候选: " + lines.get(2));
+        assertTrue(lines.get(2).contains("(300 msg/s,") || lines.get(2).contains("(300 msg/s)"),
+                "悬空桶 300 条应作峰值候选: " + lines.get(2));
     }
 
     /**
-     * 秒桶跨秒结算重置：两秒各灌不同量，峰值取最高单秒（100）而非两秒合计（130）。
+     * 跨秒结算重置：两秒各灌不同量，峰值取最高单秒（100）而非两秒合计（130）。
      */
     @Test
-    void 峰值行_跨秒结算峰值取最高单秒() {
+    void peakLineSettlesToBestSingleSecond() {
         long[] clock = {0L};
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L, () -> clock[0]);
         for (int i = 0; i < 100; i++) {
@@ -280,14 +272,14 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * rec 秒桶逐条入桶（2026-09-07 输出峰值口径修正，伪影回归锚——引擎版同日用例的同构）：
-     * 修复前 onTxOutput 把整事务 emittedRecords 一次性记进 End 落点的一秒——单大事务跨 3 秒
-     * 回放 3000 条时峰值行虚高为 3,000 rec/s（虚高倍数 ≈ 回放时长）。修复后 onTxOutput 不再
-     * 触碰 rec 秒桶（仅记累计与分布），秒桶只由 onRecordDelivered 逐条驱动：峰值如实反映
-     * 最高单秒 1,000；累计不受影响（吞吐行窗口差分 3000÷40s=75.0 rec/s 照常可见）。
+     * rec 秒桶逐条入桶——伪影回归锚（2026-09-07 输出峰值口径修正，引擎版同日用例的
+     * 同构）：修复前 onTxOutput 把整事务 emittedRecords 一次性记进 End 落点的一秒，
+     * 跨 3 秒回放 3000 条时峰值虚高为 3,000 rec/s（虚高倍数 ≈ 回放时长）；修复后秒桶
+     * 只由 onRecordDelivered 逐条驱动，峰值如实反映最高单秒 1,000，累计不受影响
+     * （吞吐行 3000÷40s=75.0 rec/s 照常可见）。
      */
     @Test
-    void 峰值行_单大事务rec秒桶逐条入桶不整事务落桶() {
+    void peakLineRecordsSingleLargeTxPerRecordNotPerTx() {
         long[] clock = {0L};
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L, () -> clock[0]);
         for (int sec = 0; sec < 3; sec++) {
@@ -307,12 +299,12 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * onTxOutput 与 rec 秒桶的隔离（同修正的另一半锚定）：仅调用 onTxOutput（无任何
-     * onRecordDelivered）时 rec 峰值保持 n/a——修复前这里会显示事务的 emittedRecords
+     * onTxOutput 与 rec 秒桶隔离（同修正的另一半锚定）：仅调用 onTxOutput（无任何
+     * onRecordDelivered）时 rec 峰值保持 n/a——修复前会显示事务的 emittedRecords
      * 整数（100 rec/s），露馅即回归。
      */
     @Test
-    void 峰值行_onTxOutput不触碰rec秒桶() {
+    void peakLineOnTxOutputDoesNotTouchRecBucket() {
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L);
         metrics.onTxOutput(1_000_000L, 100L, 100L);
         List<String> lines = metrics.reportLines(TEN_SECONDS);
@@ -320,11 +312,11 @@ class StreamThroughputMetricsTest {
     }
 
     /**
-     * rec 悬空桶下界（与 slot 侧同语义）：最后一秒的逐条交付未结算（此后无事件触发结算）时，
-     * 当前桶计数作为该秒速率的下界候选参与峰值——不因秒未走满而丢失，也不会高估。
+     * rec 悬空桶下界（与 slot 侧同语义）：最后一秒的逐条交付未结算时，当前桶计数作
+     * 该秒速率的下界候选——不因秒未走满而丢失，也不会高估。
      */
     @Test
-    void 峰值行_rec悬空桶计数作下界候选() {
+    void peakLineRecDanglingBucketCountsAsLowerBound() {
         long[] clock = {300_000_000L};                  // 0.3s（秒未走满）
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(0L, () -> clock[0]);
         for (int i = 0; i < 300; i++) {
