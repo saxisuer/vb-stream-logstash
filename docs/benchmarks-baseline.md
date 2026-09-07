@@ -495,6 +495,33 @@ rec 秒桶 bump（累计计数与分布样本不动，两路径对同一批记�
 的"峰值"只在多小事务负载下逐秒准确，单大事务场景一律用耗时差算**（本文档头条数字恰好
 都是这么算的，故无需改动）。
 
+### macOS Docker 复测（2026-09-08，vb-stream-reader + Docker Desktop PG，metrics 修复后首跑）
+
+**环境**：macOS 15 · MacBook Pro（Intel i9-8950HK，12 线程，32GB）· Docker Desktop postgres:18.6
+（src/docker compose 环境，端口转发 55432——非 WSL 的 VM 内 loopback）· `logical_decoding_work_mem`
+经 `ALTER SYSTEM` 临时调 512MB（跑后已还原 64kB）· cdc logger OFF（外部 logback）· 负载与判读
+口径和 2026-09-07 WSL 段同构（t_perf(id PK, v_text)；512B = `repeat(md5(g),16)`，实存 516B
+未压缩；写入端耗时 67s/230s 为服务端 generate_series+md5 的 CPU 成本，不计入管线指标）。
+
+| 场景 | 本轮（macOS Docker） | WSL2 基线对照 |
+|---|---|---|
+| 8B×200 万 slot 峰值 | **81,883 msg/s**（2.7 MB/s；窗口稳态 5~6 万） | 374,097 msg/s |
+| 512B×100 万 slot 峰值 | **54.8 MB/s**（101,436 msg/s） | 133.0 MB/s |
+| 8B×200 万大事务回放 | 27.5s ≈ **7.3 万 rec/s** | 6.5s ≈ 30.8 万 rec/s |
+| 512B×100 万大事务回放 | 18.0s ≈ **5.6 万 rec/s**（输出 ~33 MB/s 字节） | 37.7k rec/s / 20.3 MB/s（**修复前**口径） |
+
+**结论**：
+
+- **rec 秒桶逐条化的在线首验**：8B 档峰值行输出 rec = **90,759 rec/s**（真实最高单秒），
+  回放全程均值 7.3 万——峰/均比 1.25 合理；修复前该行会显示 ≥200 万（整事务 End 落桶伪影）。
+  512B 档窗口中段实测 22.6 MB/s（41,808 rec/s）。
+- **环境差距确认（判读先看环境）**：slot 供给域 macOS Docker 比 WSL2 低 4~5×——条数域
+  8.2 万 vs 37.4 万 msg/s，字节域 54.8 vs 133 MB/s（Docker Desktop 端口转发 + VM 开销 +
+  Intel 宿主 CPU）；大事务回放随之 ~4× 慢，瓶颈在 walsender 供给不在自研管线。
+- **输出链与平台无关的侧证**：512B 档回放 5.6 万 rec/s 高于 WSL 修复前的 3.77 万
+  （WSL 修复后只实测过 8B 档）——与 metrics 热路径修复后 ~3.2µs/条的引擎消费预算一致，
+  宽行摊薄逐条固定成本后，macOS 上同样能跑出超过 WSL 修复前的输出速率。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/
