@@ -39,10 +39,13 @@ final class LogChangeConsumer implements ChangeConsumer<ChangeEvent<SourceRecord
 
     /**
      * 责任:消费一批变更事件——逐条渲染 INFO 行并记账,批尾收口。
-     * 关键步骤:循环内 {@code event.value()} 取原始记录 → CDC.info 一行(topic/key/op/txId/
+     * 关键步骤:批头判定 {@code CDC.isInfoEnabled()} 一次(logger 调 OFF/调高级别时整批
+     * <b>短路渲染</b>——slf4j 的参数求值发生在级别判定之前,不守卫的话 value 的
+     * {@code Struct.toString()} 每条都会白构造,压测实测这是消费端最贵的单条操作之一)→
+     * 循环内 {@code event.value()} 取原始记录 → 渲染分支 CDC.info 一行(topic/key/op/txId/
      * lsn/lsn_commit/value 预览)→ {@code committer.markProcessed(event)} 推进 offset 到该条
-     * (返回后引擎视其为已消费);批尾 {@code markBatchFinished()} 触发按提交策略的 offset flush
-     * (offset.flush.interval.ms,默认 1000ms 周期)。
+     * (返回后引擎视其为已消费);批尾 {@code markBatchFinished()} 触发按提交策略的 offset
+     * flush(offset.flush.interval.ms,默认 1000ms 周期)。
      * 边界:记录形态异常(字段缺失)以 {@code -} 占位不抛——渲染层不做协议断言;
      * 空批直接 markBatchFinished(保持引擎批语义完整);InterruptedException 原样上抛
      * (停机请求,吞掉会让引擎无法收敛)。
@@ -55,11 +58,14 @@ final class LogChangeConsumer implements ChangeConsumer<ChangeEvent<SourceRecord
     public void handleBatch(List<ChangeEvent<SourceRecord, SourceRecord>> records,
                             RecordCommitter<ChangeEvent<SourceRecord, SourceRecord>> committer)
             throws InterruptedException {
+        boolean render = CDC.isInfoEnabled();
         for (ChangeEvent<SourceRecord, SourceRecord> event : records) {
-            SourceRecord record = event.value();
-            CDC.info("topic={} key={} op={} txId={} lsn={} lsn_commit={} value={}",
-                    record.topic(), preview(record.key()), opOf(record), txIdOf(record),
-                    offsetValue(record, "lsn"), offsetValue(record, "lsn_commit"), preview(record.value()));
+            if (render) {
+                SourceRecord record = event.value();
+                CDC.info("topic={} key={} op={} txId={} lsn={} lsn_commit={} value={}",
+                        record.topic(), preview(record.key()), opOf(record), txIdOf(record),
+                        offsetValue(record, "lsn"), offsetValue(record, "lsn_commit"), preview(record.value()));
+            }
             committer.markProcessed(event);
         }
         committer.markBatchFinished();

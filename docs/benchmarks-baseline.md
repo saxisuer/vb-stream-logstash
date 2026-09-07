@@ -441,6 +441,12 @@ engine 消费端的逐条固有成本（~22µs/条：Connect 结构化包装 + m
 embedded 直消费 ChangeEventQueue（Logstash 集成形态的本职）。WSL 复测配置中的调参段
 已注释保留作对照。
 
+**消费端渲染排除实验（C 组，同日补测）**：`LogChangeConsumer` 的渲染（value 的
+`Struct.toString()` 预览——slf4j 参数求值先于级别判定，cdc logger OFF 时也在白构造）
+经 `isInfoEnabled()` 批头守卫整批短路后重测：8B×200 万回放 **45.6s**，与守卫前
+（41.6~45.6s 噪音带）完全持平——**宿主 Consumer 的渲染不是瓶颈**，~22µs/条归属
+engine 固有路径最终钉死。守卫作为正确性修复保留（生产开 INFO 时省无效参数构造）。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/
