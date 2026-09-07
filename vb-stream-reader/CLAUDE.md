@@ -62,6 +62,10 @@ Queue 的 mmap 需要，与根 pom surefire argLine 同源。）
   FileOffsetBackingStore（debezium-embedded 传递），只需给
   `offset.storage.file.filename` 路径；`key.converter`/`value.converter` 免传
   （EmbeddedWorkerConfig 自动注入 + Connect 直通不经过）。
+- **FileOffsetBackingStore 不创建父目录**（本地首跑实测）：`data/` 目录不存在时首次
+  offset flush（markBatchFinished → commitOffsets）直接 NoSuchFileException，报错深埋
+  引擎线程栈难归因——Main 启动期 `prepareOffsetStorage` 自动建父目录与空文件（仅文件
+  存储形态处理）；路径已显式进 dbconfig.properties。
 - **重启语义**：续传锚槽确认位（连接器 LSN 反馈按输出前沿封顶），engine offset 文件是
   框架层记录；IT 场景二验证同槽同 offset 文件两轮运行无重发——安全停机前置等
   `pg_stat_replication.flush_lsn` **覆盖已收记录的最大 lsn**（standby status 采纳面；槽目录

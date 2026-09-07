@@ -3,6 +3,9 @@ package org.vastdata.vbstream.reader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Properties;
 
@@ -56,6 +59,7 @@ public final class Main {
                     + "写在 dbconfig.properties 或以 -Dvb.* 传入均可)", missing);
             System.exit(EXIT_USAGE);
         }
+        prepareOffsetStorage(props);
         LOG.info("vb-stream-reader 启动,生效配置: {}", ReaderProperties.masked(props));
 
         EngineLifecycle lifecycle;
@@ -79,5 +83,42 @@ public final class Main {
         boolean failed = lifecycle.shutdown(60_000L);
         LOG.info("vb-stream-reader 已退出{}", failed ? "(失败)" : "");
         System.exit(failed ? EXIT_FAILED : 0);
+    }
+
+    /**
+     * 责任:确保引擎 offset 文件可用(仅文件存储形态)——Kafka 的 FileOffsetBackingStore
+     * <b>不创建父目录</b>,缺失时首次 offset flush(markBatchFinished → commitOffsets)直接
+     * NoSuchFileException(本地首跑实测:data/ 目录不存在即炸,且报错深埋引擎线程栈难归因)。
+     * 关键步骤:取 {@code offset.storage} 判形态——未配置(默认即 FileOffsetBackingStore)
+     * 或以 FileOffsetBackingStore 结尾才处理,MEMORY/KAFKA 存储该键无意义直接返回 →
+     * {@link Files#createDirectories} 建父目录(相对单文件名无目录段跳过)→ 文件不存在则
+     * 建空文件(store 对空文件按无存量 offset 处理,语义等同首启)。
+     * 边界:IO 失败抛 IllegalStateException fail-fast——offset 写不进引擎运行期必炸,
+     * 提前到启动期报因;不改动已存在文件的任何内容(只补目录与占位空文件)。
+     *
+     * @param props 已通过必填校验的完整配置
+     */
+    private static void prepareOffsetStorage(Properties props) {
+        String storage = props.getProperty("offset.storage");
+        if (storage != null && !storage.endsWith("FileOffsetBackingStore")) {
+            return;
+        }
+        String path = props.getProperty("offset.storage.file.filename");
+        if (path == null || path.isBlank()) {
+            return;
+        }
+        Path file = Path.of(path);
+        try {
+            if (file.getParent() != null) {
+                Files.createDirectories(file.getParent());
+            }
+            if (Files.notExists(file)) {
+                Files.createFile(file);
+                LOG.info("offset 文件已创建: {}", file.toAbsolutePath());
+            }
+        }
+        catch (IOException e) {
+            throw new IllegalStateException("offset 存储准备失败(路径 " + path + "): " + e.getMessage(), e);
+        }
     }
 }
