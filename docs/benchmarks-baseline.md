@@ -428,6 +428,19 @@ publication `perf_pub`，槽 `perf_slot`（two_phase=false 对齐基线）。
 外部配置、logback-perf.xml cdc OFF、full-cp.txt classpath）；写入端为 psql 单事务
 `INSERT..SELECT generate_series` 与 4 并发独立语句流。
 
+**Connect 面调参实测（2026-09-07 同环境补测，上条③的证伪）**：输出链瓶颈**不吃 Connect
+参数**——三组对照（8B×200 万大事务回放耗时）：默认参数 41.6s（4.81 万 rec/s）｜A 组
+`max.batch.size=16384`+`max.queue.size=131072`+`offset.flush.interval.ms=60000`+
+`poll.interval.ms=100` 45.6s（4.39 万）｜B 组 A+`record.processing.order=UNORDERED`+
+`record.processing.with.serial.consumer=false` 45.1s（4.43 万，512B 档 22.3s=4.50 万
+rec/s 同证）——全部在 ±10% 噪音带内，A/B 反而略慢。归因：queue 容量 8192→131072 无
+变化证明 dispatch 端能瞬间灌满任何容量（瓶颈不在 queue 满等待），瓶颈是 **embedded
+engine 消费端的逐条固有成本（~22µs/条：Connect 结构化包装 + markProcessed 的 offset
+逐条记账）**，串在同一条反压链上且并行化（UNORDERED）无效。要突破该上限只剩架构级
+杠杆：多 connector 实例分表并行（多 slot，供给域 37 万 msg/s 尚有 ~8 倍富余）或绕过
+embedded 直消费 ChangeEventQueue（Logstash 集成形态的本职）。WSL 复测配置中的调参段
+已注释保留作对照。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/
