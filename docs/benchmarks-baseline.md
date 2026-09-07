@@ -390,6 +390,44 @@ TXN-BEGIN/END 时序差交叉核对）；组装域 DO 块生成速率是下界�
 仅单 slot 单 publication（多 slot 分表并行未测）；cdc OFF 排除了渲染路径（含渲染的综合上限
 更低，渲染成本另见 JMH `replayBucket` 口径）。
 
+### connector 化端到端吞吐（2026-09-07，vb-stream-reader + embedded engine，同 WSL 环境）
+
+**性质**：上节是引擎 Main 直渲染形态；本段把同一条管线换成 **Debezium 连接器形态**
+（`PostgresStreamConnector` 经 `DebeziumEngine.create(Connect.class)` 的 embedded 宿主
+vb-stream-reader 加载）——度量 Debezium 化输出链（dispatcher → ChangeEventQueue →
+engine poll → ChangeConsumer → offset 提交）叠加后的整链上限。**环境与上节同一台 WSL2**
+（PG 18.6 / `logical_decoding_work_mem=512MB` / loopback / cdc logger OFF——`-Dlogback.
+configurationFile` 外部配置压 OFF，统计三行经 root INFO 保留）；判读同为 `StreamThroughputMetrics`
+秒桶峰值口径（与引擎 `ThroughputMetrics` 同构）。负载表 `t_perf(id bigint PK, v_text text)`，
+publication `perf_pub`，槽 `perf_slot`（two_phase=false 对齐基线）。
+
+**吞吐域**（单事务大 N 行，slot 峰值 = 秒桶）：
+
+| v_text 行宽 | 行数 | slot 峰值 | 引擎基线对照 |
+|---|---|---|---|
+| 8B | 200 万 | **374,097 msg/s**（条数域） | 341k——同量级偏上 |
+| 512B | 100 万 | **133.0 MB/s** | 119.2——同量级偏上 |
+| 64KB | 1.5 万 | **419.4 MB/s**（字节域） | 320.3——超 31% |
+
+**输出链（Debezium 化路径）**：大事务回放 8B×200 万耗时 41.6s ≈ **4.8 万 rec/s**；
+512B 档窗口 37.7k rec/s / 20.3 MB/s。对照引擎直渲染（ConsoleRenderer 单秒 50 万 rec）
+低约一个量级——**瓶颈归属 Debezium 输出链**（Connect 结构化/schema/queue/offset 提交），
+非自研管线；slot 供给与输出解耦验证成立（读取不被输出拖慢，reader 独立推进）。
+
+**组装域**（每事务 1 行 × 4 并发 psql 独立语句流 × 40B，`synchronous_commit=off`）：
+组装峰值 **24,628 tx/s** ≈ 输出峰值 **24,743 tx/s**（同步无落差，3.0 消息/事务口径精确
+对上）；写入端仅供给 ~22.7k tx/s（8 万事务 3.5s）——**管线能力 ≥2.46 万 tx/s 属写入受限
+下界**（引擎基线 44k 供给下未测到 connector 上限拐点，遗留项）。回放尾延迟 p90 66µs。
+
+**结论**：①Docker 绑定挂载盘的环境瓶颈确认解除（10~13 MB/s → 419 MB/s，30 倍+）；
+②**walsender 供给上限（条数 37.4 万 msg/s / 字节 419 MB/s）与引擎 Main 同量级或更好——
+自研管线（reader/组装/CQ 管道）在 connector 形态下同样非瓶颈**；③Debezium 化输出链
+~3.8-4.8 万 rec/s 是该形态的真实全链上限（大事务回放域），提速方向在 Connect 面参数
+（max.queue.size / max.batch.size / offset flush 调批）与 ChangeConsumer 批处理形态，
+不动自研管线。复测材料：WSL `~/perf/run/`（start-reader.sh 启动脚本、dbconfig-perf.properties
+外部配置、logback-perf.xml cdc OFF、full-cp.txt classpath）；写入端为 psql 单事务
+`INSERT..SELECT generate_series` 与 4 并发独立语句流。
+
 ## 已知口径限制
 
 - 冒烟档（1 fork、5×2s 迭代）CI 较宽（`replayBucket` 本轮 ±22% 最宽），趋势结论（数量级/
