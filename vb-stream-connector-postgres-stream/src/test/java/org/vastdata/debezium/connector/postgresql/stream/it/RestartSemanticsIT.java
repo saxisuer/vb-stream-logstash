@@ -6,6 +6,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -104,7 +105,7 @@ class RestartSemanticsIT extends StreamITBase {
     private static final int BIG_ROWS = 6;
 
     /** 每用例独立的管道目录(瞬态工作区,引擎启动 wipe-on-open——重启即弃 D7 半事务在途桶)。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /** 场景③驱动 candidate 采纳时的 WAL 触发表自增序号(测试线程独占,单用例内递增)。 */

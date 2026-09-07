@@ -83,6 +83,12 @@ TransactionConsumer(consumer 线程)
 
 ## src/test/java — 测试形态
 
+- **@TempDir 一律 `cleanup = CleanupMode.NEVER`**(2026-09-07 Windows 首跑全量实测的统一规约):
+  Chronicle MappedBytes 的释放依赖 GC/Cleaner,Windows 上 mmap 期间文件不可删——实例级
+  @TempDir + 毫秒级建关 pipe 的用例(如 BucketReplayerTest/DecoupledEquivalenceTest 的
+  shutdownFast 路径)在用例结束的即时删目录会撞文件锁,反噬用例报 "Failed to close
+  extension context"(macOS/Linux 允许 unlink 挂载中文件不受影响,历史全绿故未暴露);
+  NEVER 后临时目录交 OS 清理(%TEMP%),断言面不受影响,详见 BucketReplayerTest 字段 javadoc。
 - 离线单测(零 PG):`protocol` 字节级 + 组装/回放/接缝单测 + 三件套骨架单测 + 解耦等价
   (`DecoupledEquivalenceTest`/`StreamingDeliveryTest`/`SyncDeliveryTest`)。
 - `it/` 子包:embedded engine + Testcontainers 真 PG 的集成测试(`StreamPgTestEnv` 单例

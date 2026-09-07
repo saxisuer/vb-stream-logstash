@@ -5,6 +5,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
@@ -41,7 +42,7 @@ class ReaderThroughputIT extends StreamITBase {
     private static final long CONSUME_TIMEOUT_SECONDS = 35;
 
     /** 每用例独立的管道目录(瞬态工作区)。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /** 每用例前清残留槽:残留槽重放历史流量会扭曲到达计时。幂等。 */

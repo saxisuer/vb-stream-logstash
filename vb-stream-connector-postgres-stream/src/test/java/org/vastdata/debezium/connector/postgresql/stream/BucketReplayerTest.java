@@ -4,6 +4,7 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.PgOutputMessage;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.RelationColumn;
@@ -49,8 +50,16 @@ class BucketReplayerTest {
     /** 被回滚的子事务 xid——aborted 过滤用例的剔除目标。 */
     private static final long SUB = 7003L;
 
-    /** 每用例独立的管道目录(@TempDir):用例间零残留,无需依赖 wipe-on-open 顺序。 */
-    @TempDir
+    /**
+     * 每用例独立的管道目录(@TempDir,清理置 NEVER):用例间零残留,无需依赖 wipe-on-open 顺序。
+     * 清理置 NEVER 的平台性原因(2026-09-07 Windows 首跑全量实测):本类是"实例级 @TempDir +
+     * 每用例建/关 MessagePipe + 毫秒级用例"的组合——用例结束的即时删目录撞上 Chronicle
+     * MappedBytes 的 GC 滞后释放,Windows 上 mmap 期间文件不可删 → TempDir 清理失败反噬用例
+     * (6 例全报 "Failed to close extension context");macOS/Linux 允许 unlink 挂载中文件
+     * 不受影响。静态 @TempDir 的测试类(组装器等)类尾才删、GC 多半已回收,风险同源但未触发。
+     * NEVER 后临时目录交 OS 清理(%TEMP%),断言面不受影响。
+     */
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /** 构造两列 (id int 键列, v text) 的 Relation 样本,仅表名随参数变化(断言读 {@code table()} 区分版本)。 */

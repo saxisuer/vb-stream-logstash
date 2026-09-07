@@ -6,6 +6,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TruncateOption;
@@ -61,7 +62,7 @@ class StreamedTransactionAssemblerTest {
     private static final String GID = "gid-1";
 
     /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
 
     /**

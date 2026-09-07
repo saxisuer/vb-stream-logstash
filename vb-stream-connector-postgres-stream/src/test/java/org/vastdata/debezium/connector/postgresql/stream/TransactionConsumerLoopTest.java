@@ -4,6 +4,7 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.PgOutputMessage;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.RelationColumn;
@@ -40,7 +41,7 @@ class TransactionConsumerLoopTest {
     private static final Instant TS = PgWire.PG_EPOCH;
 
     /** 每用例独立的管道目录(@TempDir):用例间零残留。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /** 构造两列 (id int 键列, v text) 的 wire Relation 样本(与 BucketReplayerTest 同款)。 */

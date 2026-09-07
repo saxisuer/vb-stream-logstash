@@ -6,6 +6,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
@@ -95,7 +96,7 @@ class InTxnDdlAsOfIT extends StreamITBase {
     private static final int TOTAL_ROWS = 5;
 
     /** 每用例独立的管道目录(瞬态工作区,引擎启动 wipe-on-open)。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /**

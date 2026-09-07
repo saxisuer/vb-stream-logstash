@@ -2,6 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -29,7 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class MessagePipeTest {
 
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path dir;
 
     /**

@@ -9,6 +9,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector;
@@ -82,7 +83,7 @@ class DefaultsAndMetricsIT extends StreamITBase {
     private static final String TX_TOPIC_DEFAULTS = PREFIX_DEFAULTS + TX_TOPIC_SUFFIX;
 
     /** 每用例独立的管道目录(瞬态工作区,引擎启动 wipe-on-open)。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /**

@@ -5,6 +5,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
@@ -52,7 +53,7 @@ class FrontierCapIT extends StreamITBase {
     private static final int TOTAL_RECORDS = 3 + (BIG_TX_ROWS + 2);
 
     /** 每用例独立的管道目录(瞬态工作区)。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /**

@@ -2,6 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
@@ -33,7 +34,7 @@ class StreamThroughputMetricsWiringTest {
     private static final int OID = 16384;
 
     /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
 
     /**

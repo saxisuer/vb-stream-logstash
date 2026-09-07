@@ -2,6 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
@@ -44,7 +45,7 @@ class DecoupledEquivalenceTest {
     private static final long SHUTDOWN_FAST_BOUND_MILLIS = 5_000L;
 
     /** 每用例独立的管道目录:两个组装器顺序复用,wipe-on-open 清彼此残留。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path dir;
 
     /** 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},此前为本类私有的逐字重复工厂)。 */

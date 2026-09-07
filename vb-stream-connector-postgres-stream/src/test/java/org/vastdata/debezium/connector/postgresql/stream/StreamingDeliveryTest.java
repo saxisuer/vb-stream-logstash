@@ -2,6 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
@@ -41,7 +42,7 @@ class StreamingDeliveryTest {
     private static final int OID = 16384;
 
     /** 每用例独立的管道目录(构造组装器建管道即 wipe)。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path dir;
 
     /** 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},此前为本类私有的逐字重复工厂)。 */

@@ -3,6 +3,7 @@ package org.vastdata.debezium.connector.postgresql.stream.it;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector;
 
@@ -43,7 +44,7 @@ class SlotTwoPhaseMismatchIT extends StreamITBase {
     private static final String PUB = "pub_ms4_mismatch";
 
     /** 每用例独立的管道目录。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     Path pipeDir;
 
     /**

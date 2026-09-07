@@ -2,6 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
@@ -35,7 +36,7 @@ class SyncDeliveryTest {
     private static final long COMMIT_END_LSN = 2L;
 
     /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
-    @TempDir
+    @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
 
     /** 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},此前为本类私有的逐字重复工厂)。 */
