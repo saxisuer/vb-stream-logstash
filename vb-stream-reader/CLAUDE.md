@@ -10,8 +10,11 @@ vb-stream-connector-postgres-stream，`AsyncEngineBuilder` 构造器包私有故
 
 ## 组件
 
-- `ReaderProperties`：`-Dvb.*` 系统属性剥前缀**零映射透传**为 Debezium 配置（连接器 6 个
-  专属项与 engine 高级项零代码可用，如 `-Dvb.slot.streaming=parallel`）；注入默认
+- `ReaderProperties`：**三层合并**配置面（classpath 的 `dbconfig.properties` 基础值 →
+  `-Dvb.*` 系统属性剥前缀覆盖 → reader 默认兜底；`-Dvb.config=<路径>` 可整份替换为外部
+  文件——路径不存在 fail-fast 拒绝静默回落，且该键是保留键不进 Debezium props）。文件键即
+  Debezium 裸键（文件本身是 reader 专属命名空间）；连接器 6 个专属项与 engine 高级项无论
+  写在文件还是 -D 传入均零代码可用（如 `slot.streaming=parallel`）。注入默认
   `connector.class`（固定不可覆盖）/`name`/`offset.storage.file.filename`（默认
   `data/reader-offsets.dat`，已 gitignore）/`offset.flush.interval.ms`（默认 1000）；必填五项
   hostname/dbname/user/password/topic.prefix 缺失 exit 2；`masked` 打码 password。
@@ -27,6 +30,9 @@ vb-stream-connector-postgres-stream，`AsyncEngineBuilder` 构造器包私有故
 
 ## 运行
 
+配置默认来自 classpath 的 `dbconfig.properties`（src/docker 本地 PG 模板，**零 `-D` 参数即可起**）；
+临时覆盖单项 `-Dvb.<键>=<值>`，整体换文件 `-Dvb.config=<外部文件绝对路径>`（免重编译改配置）：
+
 ```bash
 cd src/docker && docker compose up -d && cd ../..     # 前置 PG(55432)
 mvn -q -pl vb-stream-reader compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
@@ -35,11 +41,10 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
      --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED \
      --add-opens java.base/sun.nio.fs=ALL-UNNAMED \
      --add-opens java.base/java.lang.reflect=ALL-UNNAMED \
-     -Dvb.database.hostname=localhost -Dvb.database.port=55432 \
-     -Dvb.database.dbname=postgres -Dvb.database.user=postgres -Dvb.database.password=postgres \
-     -Dvb.topic.prefix=vbread -Dvb.slot.name=vb_reader -Dvb.publication.name=vb_pub \
      -cp "vb-stream-reader/target/classes;$(cat vb-stream-reader/target/cp.txt)" \
      org.vastdata.vbstream.reader.Main
+# 临时覆盖示例: -Dvb.slot.name=another_slot  -Dvb.topic.prefix=other
+# 整体换文件:   -Dvb.config=/abs/path/my.properties
 ```
 
 （Windows classpath 分隔符 `;`，macOS/Linux 为 `:`；`--add-opens` 必带——连接器内 Chronicle
