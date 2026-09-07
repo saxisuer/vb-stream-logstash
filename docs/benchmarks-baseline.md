@@ -461,7 +461,9 @@ Jackson ObjectMapper**（ObjectMapper.<init> 1.5% + PrivateMaxEntriesCache + Con
 承担，Debezium 内建 MBean 的 totalNumberOfEventsSeen/lastEvent/milliSecondsBehindSource
 三字段停更属已知取舍）。**修复后 8B×200 万回放 45.6s → 6.5s（4.5 万 → 30.8 万 rec/s，
 快 7 倍）**——输出链与自研管线供给域（37.4 万 msg/s）同量级，Debezium 化的全链上限
-从"engine 消费端平台"修正为"walsender 供给 × 行宽"。
+从"engine 消费端平台"修正为"walsender 供给 × 行宽"。完整剖析（每条事件 21.5µs 的
+实测预算表、叶子 vs 含帧视角修正、JIT 内联抹帧坑、GC 连锁收益、火焰图判读方法论）
+另档 `docs/perf-2026-09-07-debezium-metrics-hotpath.md`。
 
 ## 已知口径限制
 
