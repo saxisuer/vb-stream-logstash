@@ -13,39 +13,39 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 吞吐指标**接线**测试(MS5 Task 3,引擎 {@code ThroughputMetricsWiringTest} 的逐字翻译
- * ——观测目标从引擎组装器自建实例改为本侧构造注入实例,埋点点位与口径逐字节同构):经
- * {@link PgWire} 字节驱动同步形态组装器走完整业务路径,断言六项计数与两分布样本恰好在
- * 五个埋点点位被记录——任何一处单行插桩漏挂(raw 消息入口 / handoff / processBucket 尾 /
- * 回放器逐单元 / 回放 sink 逐条 rec 秒桶——第五点 2026-09-07 输出峰值口径修正新增,
- * 引擎侧同日同构)都会在此露馅。
+ * 吞吐指标接线测试（MS5 Task 3，引擎 {@code ThroughputMetricsWiringTest} 的逐字翻译
+ * ——观测目标从引擎组装器自建实例改为本侧构造注入实例，埋点点位与口径逐字节同构）：
+ * PgWire 手造字节驱动同步形态组装器走完整业务路径，断言六项计数、事务大小分布与
+ * rec 峰值在五个埋点点位全部生效——任何一处单行插桩漏挂（raw 消息入口 / handoff /
+ * processBucket 尾 / 回放器逐单元 / 回放 sink 逐条 rec 秒桶）都会在此露馅。
  *
- * <p>两场景:①完整普通事务(Relation + Begin + 2×Insert + Commit)——slot 记 5 条消息
- * 与精确字节和、组装/输出各 1 tx、输出 records=2 与字节=两条 Insert 载荷和、事务大小分布
- * 单样本 2 rec;②两阶段回滚(BeginPrepare + Insert + Prepare + RollbackPrepared)——桶
- * 整体丢弃:组装与输出计数为零、分布零样本 n/a,但 slot 读取照记(字节确实从槽收到了)。
+ * <p>两场景：①完整普通事务（Relation + Begin + 2×Insert + Commit）——slot 记 5 条
+ * 消息与字节和，组装/输出各 1 tx，输出 records=2、字节=两条 Insert 载荷和，事务大小
+ * 分布单样本 2 rec；②两阶段回滚——桶整体丢弃，组装与输出全零，但 slot 照记（字节
+ * 确实从槽收到了）。
  *
- * <p>夹具约定沿 {@code StreamedTransactionAssemblerTest}:类级共享 @TempDir 管道目录
- * (wipe-on-open 顺序清空)、StreamingMode.ON、{@link TransactionRecorder} 作输出端、
- * {@link TestRelations} 假 resolver;指标实例由本测试自建经九参同步构造注入(生产路径由
- * source 的 execute 建同款实例注入,口径无差)。
+ * <p>夹具沿 {@code StreamedTransactionAssemblerTest}：类级共享 @TempDir 管道目录
+ * （wipe-on-open 顺序清空）、StreamingMode.ON、{@link TransactionRecorder} 作输出端、
+ * {@link TestRelations} 假 resolver；指标实例由本测试自建经九参同步构造注入（生产路径
+ * 由 source 的 execute 建同款实例注入，口径无差）。
  */
 class StreamThroughputMetricsWiringTest {
 
     private static final int OID = 16384;
 
-    /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
+    /** 类级共享管道目录：全类一份，用例间由 MessagePipe 的 wipe-on-open 顺序清空（@TempDir NEVER 见模块测试规约）。 */
     @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
 
     /**
-     * 完整普通事务全链路:reader 侧 onRaw 记 slot(5 条消息、字节=全部消息长度和——含
-     * Relation 与控制消息)、handoff 记组装 1 tx;consumer 侧回放器记输出字节(仅两条
-     * Insert 的载荷,Relation/控制消息不回读)、processBucket 尾记输出 1 tx / 2 rec;
-     * 事务大小分布恰一个样本 2 rec(报告行透出)。
+     * 完整普通事务全链路五埋点核对：slot 记 5 条消息与字节和（含 Relation 与控制消息）、
+     * handoff 记组装 1 tx；输出侧记 1 tx / 2 rec、字节仅两条 Insert 载荷（Relation 与
+     * 控制消息不回读）、rec 峰值非 n/a（第五埋点在回放 sink 逐条驱动）。事务大小分布
+     * 恰一个样本 2 rec。
+     * 峰值断言只验"非 n/a"：真实时钟下 2 条记录可能落同秒或跨秒，具体数值不确定。
      */
     @Test
-    void 完整普通事务_六计数与大小分布全对上() {
+    void normalTransactionRecordsAllSixCountersAndRecPeak() {
         TransactionRecorder out = new TransactionRecorder();
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(System.nanoTime());
         try (StreamedTransactionAssembler assembler = new StreamedTransactionAssembler(out, StreamingMode.ON,
@@ -75,20 +75,18 @@ class StreamThroughputMetricsWiringTest {
 
             List<String> lines = metrics.reportLines(System.nanoTime() + 10_000_000_000L);
             assertTrue(lines.get(1).contains("p90=2 rec"), "事务大小分布应见单样本 2 rec: " + lines.get(1));
-            // rec 秒桶第五埋点:回放 sink 逐条驱动(时钟为真实 nanoTime,2 条落同秒或跨秒不定,
-            // 断言"非 n/a"即证明插桩生效——漏挂则 rec 峰值永远 n/a)
             assertTrue(!lines.get(2).contains("n/a rec/s"),
-                    "rec 秒桶应由回放 sink 逐条埋点驱动(峰值非 n/a): " + lines.get(2));
+                    "rec 峰值非 n/a 即证明第五埋点(回放 sink 逐条)已接线: " + lines.get(2));
         }
     }
 
     /**
-     * 两阶段回滚的口径边界:BeginPrepare + Insert + Prepare + RollbackPrepared——桶整体丢弃
-     * (不交接、不回放),组装与输出计数及两分布必须全零(报告行 n/a);slot 计数照记
-     * 5 条消息——回滚的字节确实从复制槽读到了,读取吞吐不该假装没发生。
+     * 两阶段回滚的口径边界：BeginPrepare + Insert + Prepare + RollbackPrepared——桶整体
+     * 丢弃（不交接、不回放），组装与输出计数及两分布全零（报告行 n/a）；slot 照记
+     * 5 条消息——回滚的字节确实从槽读到了，读取吞吐不该假装没发生。
      */
     @Test
-    void 两阶段回滚_组装与输出计数为零但slot照记() {
+    void twoPhaseRollbackSkipsOutputButStillCountsSlotRead() {
         TransactionRecorder out = new TransactionRecorder();
         StreamThroughputMetrics metrics = new StreamThroughputMetrics(System.nanoTime());
         try (StreamedTransactionAssembler assembler = new StreamedTransactionAssembler(out, StreamingMode.ON,
