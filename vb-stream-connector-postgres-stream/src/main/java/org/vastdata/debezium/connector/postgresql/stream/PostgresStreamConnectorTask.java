@@ -153,8 +153,14 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
 
         final TypeRegistry typeRegistry = jdbcConnection.getTypeRegistry();
         final PostgresDefaultValueConverter defaultValueConverter = jdbcConnection.getDefaultValueConverter();
+        // schema 侧转换器二选一(values.as.string):全串模式换 StringValueConverter——所有列
+        // Connect schema 恒 STRING + converter 恒等,值侧配合 StringColumnValueMapper 原文透传
+        // (监督壳 execute 装配);连接工厂的 valueConverterBuilder 保持 vanilla——JDBC 连接
+        // 只服务元数据 enrich('R')与初始 offset,快照恒 no_data 不经连接读值,无需改形
         final io.debezium.connector.postgresql.PostgresValueConverter valueConverter =
-                valueConverterBuilder.build(typeRegistry);
+                connectorConfig.valuesAsString()
+                        ? StringValueConverter.of(connectorConfig, databaseCharset, typeRegistry)
+                        : valueConverterBuilder.build(typeRegistry);
 
         // 服务提供方注册(vanilla 同款集合;QueueProviderService 是 queue 装配的前置)
         registerServiceProviders(connectorConfig.getServiceRegistry());

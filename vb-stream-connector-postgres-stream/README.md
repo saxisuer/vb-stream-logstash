@@ -85,7 +85,7 @@ Debezium PostgresEventDispatcher → ChangeEventQueue → Task.doPoll() → Kafk
 
 ## 配置面
 
-父类 `io.debezium.connector.postgresql.PostgresConnectorConfig` 的完整配置面（`database.*` 四件套、`topic.prefix`、`slot.name`、`publication.name`、`skipped.operations`、转换器等）全部可用；本连接器追加六个专属项并钉死两项默认面。**配置语义真源是 `PostgresStreamConnectorConfig` 的 javadoc**，下表与其逐一对照（改配置先改 javadoc，再同步此处）：
+父类 `io.debezium.connector.postgresql.PostgresConnectorConfig` 的完整配置面（`database.*` 四件套、`topic.prefix`、`slot.name`、`publication.name`、`skipped.operations`、转换器等）全部可用；本连接器追加七个专属项并钉死两项默认面。**配置语义真源是 `PostgresStreamConnectorConfig` 的 javadoc**，下表与其逐一对照（改配置先改 javadoc，再同步此处）：
 
 | 配置项 | 默认 | 语义与约束 |
 |---|---|---|
@@ -95,6 +95,7 @@ Debezium PostgresEventDispatcher → ChangeEventQueue → Task.doPoll() → Kafk
 | `pipe.roll.cycle` | `MINUTELY` | 管道滚动周期，`LegacyRollCycles` 枚举名（大小写宽容）；未知值启动期校验拒绝并附可用值清单（残余到建管道才炸会拖垮 reader 线程） |
 | `slot.feedback.interval.ms` | `10000`（=10 秒） | 复制会话 LSN 反馈节流周期（毫秒，正整数；确认值经输出前沿封顶）。整除换算为秒——亚秒值（如 500）截断为 0 即每轮都反馈，不会静默翻倍 |
 | `slot.messages` | `false` | 'M' 逻辑消息门控（PG 14+）：true 时槽选项追加 `messages=true`，逻辑消息逐条解析记录（INFO 两时点：非事务 reader 即时/事务性 consumer 回放期）且非事务消息经护栏参与输出前沿安全推进（全有或全无：无未输出桶才推进到消息位，有则完全静止）；**不发射下游**。false 时槽选项与行为完全同未开档 |
+| `values.as.string` | `false` | 全串输出开关（值+schema 双轨改形）：true 时所有列（含 key 列）的 Connect schema 恒 STRING、值为 pgoutput 文本原文（`StringValueConverter` + `StringColumnValueMapper` 透传，零类型化）。**收益**：numeric 精度无损、时间保留 PG 文本无 epoch 时区换算、数组列不再需要 vanilla PgArray 活连接（类型化路径的 fail-fast 已知限制在此模式消解）、未知类型原文照发；**代价**：与 Debezium 标准事件形态分叉——下游 JDBC sink 建表全 VARCHAR、布尔呈 `t`/`f`、bytea 呈 `\x...` 文本，类型转换责任移交下游（Logstash `date`/`mutate` filter），`decimal.handling.mode`/`time.precision.mode` 等转换类配置此模式下无效果。Binary 元组形态（槽开 binary）与 STRING schema 不符、不支持（本连接器建槽不开 binary）。TOAST 未变占位沿用 vanilla 的 `unavailable.value.placeholder` 配置 |
 
 两项默认面钉死（非新键，同名替换/注入）：
 
@@ -158,7 +159,7 @@ curl -X PUT http://connect:8083/connectors/pg-stream-1/config \
 
 ## Known limitations
 
-- **数组列 fail-fast**（非 vanilla 的静默 null）：consumer 线程不持 JDBC 连接（R3 线程约束），数组列解析抛 `DebeziumException` 显式停机 + 槽重发——判定比静默丢值安全，维持现状；支持路径与论证见 R1/R3 审计「已知限制与延期」第 1 条。
+- **数组列 fail-fast**（非 vanilla 的静默 null；**仅类型化路径**）：consumer 线程不持 JDBC 连接（R3 线程约束），数组列解析抛 `DebeziumException` 显式停机 + 槽重发——判定比静默丢值安全，维持现状；支持路径与论证见 R1/R3 审计「已知限制与延期」第 1 条。**`values.as.string=true` 下此限制消解**（数组原文透传，不碰 PgArray/活连接，`StringValuesIT` 场景①实证）。
 - **未知类型照 vanilla 静默 null**：`include.unknown.datatypes`（默认 false）为 false 时未知类型返回 null 不抛，true 时照发原串。
 - **LogicalMsg 解析但不发射**：`slot.messages=true` 只开解析记录与前沿安全推进，逻辑消息不进 Kafka topic（发射仍延期，专属 topic `.message` 后缀等设计要点在 R1/R3 审计第 3 条）。
 - **无快照数据抽取**：`snapshot.mode` 仅 `no_data`，初始存量/按需快照请用 vanilla `postgresql-connector`。

@@ -334,4 +334,22 @@ class PostgresStreamConnectorConfigTest {
                 new PostgresStreamConnectorConfig(Configuration.from(taskConfigs.get(0))).getSnapshotMode(),
                 "注入 snapshot.mode=no_data 后应构造成功且解析为 NO_DATA");
     }
+
+    /**
+     * 用例⑰全串输出开关默认面:缺省配置下 valuesAsString() 为 false(vanilla 类型化
+     * 行为不受影响——存量 IT 断言面以此默认为前提);显式 true 生效;ALL_FIELDS 收录
+     * values.as.string(REST validate 与任务侧完整性校验的暴露面)。
+     */
+    @Test
+    void valuesAsStringDefaultsFalseAndJoinsAllFields() {
+        assertFalse(new PostgresStreamConnectorConfig(configWith(Map.of())).valuesAsString(),
+                "缺省应为 false(vanilla 类型化行为)");
+        assertTrue(new PostgresStreamConnectorConfig(configWith(Map.of("values.as.string", "true"))).valuesAsString(),
+                "显式 true 应生效");
+        boolean joined = false;
+        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+            joined |= "values.as.string".equals(field.name());
+        }
+        assertTrue(joined, "ALL_FIELDS 应收录 values.as.string");
+    }
 }

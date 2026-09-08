@@ -74,10 +74,15 @@ TransactionConsumer(consumer 线程)
 - **R1/R3 线程审计**:全部 dispatch/offset/schema 写仅 consumer 线程;心跳仅监督线程
   (跨线程读 effectiveOffset 属已知无害项,心跳缺省关);main 连接 reader 独占(时序证明
   以快照恒 skipped 为前提)——结论档 `docs/superpowers/specs/2026-09-02-ms2-r1-r3-audit.md`。
-- 配置面六项:`slot.streaming`(OFF/ON/PARALLEL,parallel 强制 two_phase)、`slot.two.phase`、
+- 配置面七项:`slot.streaming`(OFF/ON/PARALLEL,parallel 强制 two_phase)、`slot.two.phase`、
   `pipe.dir`、`pipe.roll.cycle`(LegacyRollCycles 名)、`slot.feedback.interval.ms`(整除换算秒,
   亚秒值截 0 = 每轮反馈)、`slot.messages`(MS3.5,默认 false——true 才在槽选项加 messages=true,
-  'M' 逻辑消息解析记录(INFO 两时点)且非事务消息经护栏即时推进前沿——全有或全无(L8):无未输出桶才推进到消息位,有则完全静止,不发射下游)。
+  'M' 逻辑消息解析记录(INFO 两时点)且非事务消息经护栏即时推进前沿——全有或全无(L8):无未输出桶才推进到消息位,有则完全静止,不发射下游)、
+  `values.as.string`(全串输出开关,默认 false——true 时值+schema 双轨改形:Task.start 的 schema
+  转换器换 `StringValueConverter`(所有列 STRING + converter 恒等)、监督壳 execute 的值映射器换
+  `StringColumnValueMapper`(文本原文透传,TOAST 占位沿用 vanilla `unavailable.value.placeholder`),
+  两处必须同开关切换否则 Struct 层 DataException;数组列 fail-fast 限制与未知类型静默 null 限制
+  在此模式均消解,端到端归 `StringValuesIT`)。
   MS5 另钉死两项默认面(非新键):`snapshot.mode` 同名替换为仅 no_data(默认注入,
   initial 等其余值启动期拒绝)、`provide.transaction.metadata` 默认 true——
   见 `PostgresStreamConnectorConfig` javadoc 与 `DefaultsAndMetricsIT`。

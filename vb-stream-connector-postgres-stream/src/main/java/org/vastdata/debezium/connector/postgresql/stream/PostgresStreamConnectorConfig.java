@@ -16,11 +16,13 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
 
 /**
  * 流式连接器配置:在父类 {@link PostgresConnectorConfig} 的完整配置面之上追加
- * 六个本模块专属配置项——slot.streaming(流式档位)、slot.two.phase(两阶段提交)、
+ * 七个本模块专属配置项——slot.streaming(流式档位)、slot.two.phase(两阶段提交)、
  * pipe.dir / pipe.roll.cycle(reader 与 consumer 之间的 Chronicle Queue 管道参数,
  * 对应引擎侧 {@code vb.pipe.dir} / {@code vb.pipe.rollCycle})、slot.feedback.interval.ms
  * (复制会话的 LSN 反馈节流周期,对应引擎侧 {@code vb.pg.feedbackSeconds},默认 10 秒)、
- * slot.messages('M' 逻辑消息门控,MS3.5,默认 false);并把 snapshot.mode <b>同名替换</b>
+ * slot.messages('M' 逻辑消息门控,MS3.5,默认 false)、values.as.string(全串输出开关,
+ * 默认 false——schema 与值双轨改 STRING 原文,语义见 {@link #VALUES_AS_STRING});
+ * 并把 snapshot.mode <b>同名替换</b>
  * 为仅支持 no_data 的新 Field(MS5:本连接器流式-only,不做快照数据抽取——默认 no_data +
  * {@link #validateSnapshotMode} 仅-no_data 校验 + 构造器 fail-fast 三层防线,"缺省 =
  * no_data"由 {@link PostgresStreamConnector#taskConfigs(int)} 注入保证,见其 javadoc)。
@@ -102,14 +104,33 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
             .withValidation(Field::isBoolean);
 
     /**
+     * 全串输出开关(值与 schema 双轨改形):true 时所有列的 Connect schema 恒为
+     * STRING({@code StringValueConverter})、值恒为 pgoutput 文本原文
+     * ({@code StringColumnValueMapper} 透传)——不做任何类型化转换。收益面:数值/
+     * 时间保留 PG 文本原文(numeric 精度无损、时区语义直读,类型转换责任移交下游
+     * Logstash 侧)、数组列不再需要 vanilla PgArray 的活连接解析(R1/R3 记档的
+     * fail-fast 已知限制在此模式下消解)、未知类型原文照发(includeUnknownDatatypes
+     * 之争消失)。代价面:与 Debezium 标准事件形态显式分叉——下游 JDBC sink 自动
+     * 建表全 VARCHAR、布尔呈 "t"/"f"、bytea 呈 {@code \x...} 文本、key 列同变字符串;
+     * decimal/time.precision/binary.handling.mode 等转换类配置在此模式下无效果。
+     * Binary 元组形态(槽开 binary)与 STRING schema 类型不符,不受支持(本连接器
+     * 建槽不开 binary,防御性记档)。默认 false 保持 vanilla 类型化行为。
+     */
+    public static final Field VALUES_AS_STRING = Field.create("values.as.string")
+            .withDisplayName("Values as string")
+            .withType(Type.BOOLEAN)
+            .withDefault(false)
+            .withValidation(Field::isBoolean);
+
+    /**
      * 本连接器的完整配置面:父 ALL_FIELDS 先 filtered 挖掉同名 snapshot.mode 再扩展
-     * 6 新 Field(新 Set,不改父类静态集合)——{@code Field.Set.with} 内部是
+     * 7 新 Field(新 Set,不改父类静态集合)——{@code Field.Set.with} 内部是
      * LinkedHashSet.add,同名字段保留旧 Field 弃新 Field,同名替换必须先挖后补。
      */
     public static final Field.Set ALL_FIELDS = PostgresConnectorConfig.ALL_FIELDS
             .filtered(f -> !"snapshot.mode".equals(f.name()))
             .with(SNAPSHOT_MODE_NO_DATA, SLOT_STREAMING, SLOT_TWO_PHASE, PIPE_DIR, PIPE_ROLL_CYCLE,
-                    SLOT_FEEDBACK_INTERVAL_MS, SLOT_MESSAGES);
+                    SLOT_FEEDBACK_INTERVAL_MS, SLOT_MESSAGES, VALUES_AS_STRING);
 
     /**
      * 以给定的不可变配置构造:单行 super 委派父构造器(public,负责快照模式、
@@ -312,5 +333,17 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
      */
     public boolean messagesEnabled() {
         return getConfig().getBoolean(SLOT_MESSAGES);
+    }
+
+    /**
+     * 读取全串输出开关:开启后 schema 侧换 {@code StringValueConverter}(所有列
+     * STRING)、值侧换 {@code StringColumnValueMapper}(文本原文透传)——装配点在
+     * {@code PostgresStreamConnectorTask.start} 与流式源 execute 两处,语义细节见
+     * {@link #VALUES_AS_STRING} 的 Field javadoc。
+     *
+     * @return 配置的布尔值;缺省时按 Field 默认值回落为 false(vanilla 类型化行为)
+     */
+    public boolean valuesAsString() {
+        return getConfig().getBoolean(VALUES_AS_STRING);
     }
 }

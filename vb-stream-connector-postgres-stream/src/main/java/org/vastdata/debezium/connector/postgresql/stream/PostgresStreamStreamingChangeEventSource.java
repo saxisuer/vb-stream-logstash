@@ -181,11 +181,17 @@ public class PostgresStreamStreamingChangeEventSource
 
             AtomicLong frontier = new AtomicLong();
             BucketTableResolver tableResolver = BucketTableResolver.snapshotBacked();
+            // 值侧映射器二选一(values.as.string):全串模式原文透传(数组列无需 PgArray 活连接,
+            // R1/R3 记档的 fail-fast 限制消解);schema 侧的对应改形在 Task.start 的
+            // StringValueConverter——两处必须同开关切换,单侧开启会因值/schema 类型不符在
+            // Struct 层 DataException
+            final ColumnValueMapper valueMapper = connectorConfig.valuesAsString()
+                    ? new StringColumnValueMapper(connectorConfig)
+                    : new TypeRegistryColumnValueMapper(typeRegistry,
+                            connectorConfig.getConfig().getBoolean(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES));
             DispatcherTransactionListener listener = new DispatcherTransactionListener(
                     partition, offset, dispatcher, schema, clock, connectorConfig,
-                    new TypeRegistryColumnValueMapper(typeRegistry,
-                            connectorConfig.getConfig().getBoolean(PostgresConnectorConfig.INCLUDE_UNKNOWN_DATATYPES)),
-                    tableResolver);
+                    valueMapper, tableResolver);
             this.throughputMetrics = new StreamThroughputMetrics(System.nanoTime());
             StreamedTransactionAssembler wiredAssembler = new StreamedTransactionAssembler(listener, connectorConfig.streamingMode(),
                     new VersionedRelationRegistry(),
