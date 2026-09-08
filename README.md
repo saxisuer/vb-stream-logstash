@@ -2,10 +2,11 @@
 
 适配 PostgreSQL 逻辑解码 **stream 模式**的 CDC 采集器：基于 pgjdbc `ReplicationConnection` 直连复制流，自研 pgoutput 协议解码器，实时解析普通事务、流式大事务（`streaming=parallel`）、两阶段提交（`two_phase`）与 Truncate，并把原始字节流组装后以**流式事件**输出（`事务头 → 逐变更 → 事务尾`，回放期堆峰 O(单条)；`vb.output.mode=block` 可切回原子事务块语义——读取与组装输出解耦：reader 记账写入 Chronicle Queue 主缓冲管道，独立消费线程回放输出，组装期桶内零字节引用，LSN 确认按输出前沿封顶且前沿锚定事务尾，at-least-once）。
 
-- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 两模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）与 `vb-stream-connector-postgres-stream`（Debezium 流式连接器骨架）
+- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 三模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）、`vb-stream-connector-postgres-stream`（Debezium 流式连接器）与 `vb-stream-reader`（debezium-embedded 宿主冒烟应用）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 连接器模块 `vb-stream-connector-postgres-stream`（Debezium 流式 PG 连接器插件，MS1–MS6 收官）：配置面/打包安装/at-least-once 语义/已知限制一档全，见 [vb-stream-connector-postgres-stream/README.md](vb-stream-connector-postgres-stream/README.md)
-- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），437 个测试全绿（引擎 177 + 连接器 260，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段）
+- 宿主模块 `vb-stream-reader`（debezium-embedded 冒烟入口，`DebeziumEngine.create(Connect.class)` 加载自研连接器，零 `-D` 参数即可起）：三层合并配置面/运行/offset 语义见 [vb-stream-reader/README.md](vb-stream-reader/README.md)
+- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），450 个测试全绿（引擎 180 + 连接器 263 + reader 7，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
 
 ## PostgreSQL 18 前置要求
 
@@ -103,14 +104,32 @@ DML 统一带 `BEFORE=`/`AFTER=` 镜像（缺失侧为 `-`）。注意 BEFORE �
 - **断线续传（at-least-once）**：进程退出后槽保留，重启从最后确认的 LSN 续传（确认值按输出前沿封顶，前沿锚定事务尾——尾事件未达（中途失败/阻塞）则前沿不推进，未输出事务必被整个重发，输出侧可能重复见到已输出事务的头行，不去重）；确认周期即 `feedbackSeconds`
 - 手工清理槽：`SELECT pg_drop_replication_slot('vb_cdc_slot')`（先 `pg_terminate_backend(active_pid)` 若仍活跃）
 
+## 运行 vb-stream-reader（embedded 宿主）
+
+不经 Kafka Connect runtime 的冒烟入口：`DebeziumEngine.create(Connect.class)` 工厂建 async 引擎加载自研连接器 `PostgresStreamConnector`，CDC 记录逐条打 INFO 到专用 logger `org.vastdata.vbstream.reader.cdc`（`op=c` 数据行 + 事务元数据 BEGIN/END 行）。配置默认读 classpath 的 `dbconfig.properties`（src/docker 本地 PG 模板）——**零 `-D` 参数即可起**；临时覆盖单项 `-Dvb.<键>=<值>`（如 `-Dvb.slot.streaming=parallel`），整体换文件 `-Dvb.config=<绝对路径>`（免重编译）。三层合并次序与 offset 语义详见 [vb-stream-reader/README.md](vb-stream-reader/README.md)。
+
+```bash
+cd src/docker && docker compose up -d && cd ../..     # 前置 PG（已起可跳过）
+mvn -q -pl vb-stream-reader compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
+     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
+     --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED \
+     --add-opens java.base/sun.nio.fs=ALL-UNNAMED \
+     --add-opens java.base/java.lang.reflect=ALL-UNNAMED \
+     -cp "vb-stream-reader/target/classes;$(cat vb-stream-reader/target/cp.txt)" \
+     org.vastdata.vbstream.reader.Main
+```
+
+（`--add-opens` 清单同上——连接器内 Chronicle Queue 的 mmap 需要；命令为 Windows 形态——classpath 分隔符 `;`，macOS/Linux 为 `:`。）
+
 ## 测试
 
 ```bash
-mvn test                # 全部：两模块协议/组装单元测试 + Testcontainers 集成测试（437 用例：引擎 177 + 连接器 260）
+mvn test                # 全部：三模块单元测试 + Testcontainers 集成测试（450 用例：引擎 180 + 连接器 263 + reader 7）
 mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 
-集成测试（`org.vastdata.vbstream.it`，11 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
+集成测试（`org.vastdata.vbstream.it`，12 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
 
 JMH 基准在引擎模块的独立源码根 `vb-stream-engine/src/jmh`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）；运行方式与基线数字见 `docs/benchmarks-baseline.md`。
 
