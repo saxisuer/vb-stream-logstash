@@ -1,6 +1,7 @@
 package org.vastdata.vbstream.replication;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.StreamingMode;
@@ -25,14 +26,26 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  *
  * <p>夹具约定（PgWire 实际签名对齐）：commit/streamCommit 不带 LSN 参数（占位 1/2 内建）、
  * relation 无 schema 参（固定 "public"）、streamAbort 为非 parallel 形态——组装器以
- * {@link StreamingMode#ON} 构造。管道目录取用例级 {@code @TempDir}（三个组装器顺序构造，
- * MessagePipe 的 wipe-on-open 保证互不残留）。
+ * {@link StreamingMode#ON} 构造。管道目录取用例级 {@code @TempDir}，三个组装器各用其下
+ * 独立子目录（2026-09-08 起：同目录顺序复用依赖"close 后立即 wipe"，Windows 上 mmap 句柄
+ * 异步释放使第二个组装器的 wipe-on-open 撞句柄翻车——独立子目录互不见对方文件，机理见
+ * {@link PipeDirCleanup}；POSIX 上两种形态等价）。
  */
 class DecoupledEquivalenceTest {
 
-    /** 每用例独立的管道目录：三个组装器顺序复用，wipe-on-open 清彼此残留。 */
+    /** 每用例独立的管道目录：三个组装器各用其下独立子目录（sync/async/block），互不残留。 */
     @TempDir
     Path dir;
+
+    /**
+     * 每用例后清空用例目录（Windows 兜底，机理见 {@link PipeDirCleanup} javadoc：三个子目录
+     * 内的队列文件在收尾删除时仍可撞未释放的 mmap 句柄——递归清空后 @TempDir 收尾只剩删
+     * 空目录树；POSIX 上首轮删除即成、行为无差）。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(dir);
+    }
 
     /**
      * 责任：生成一段多形态字节流（普通事务 + 两阶段 + 流式交错 + 子事务回滚，PgWire 构造，
@@ -83,7 +96,7 @@ class DecoupledEquivalenceTest {
         TransactionRecorder syncCollector = new TransactionRecorder();
         try (TransactionAssembler sync = new TransactionAssembler(
                 dualCapture(syncEvents, syncCollector), StreamingMode.ON,
-                new VersionedRelationRegistry(), pipeCfg())) {
+                new VersionedRelationRegistry(), pipeCfg("sync"))) {
             feed(sync, stream);
         }
         // ② 异步形态：真实双线程管道，同样双收集
@@ -91,7 +104,7 @@ class DecoupledEquivalenceTest {
         TransactionRecorder asyncCollector = new TransactionRecorder();
         AtomicLong frontier = new AtomicLong();
         try (TransactionAssembler async = new TransactionAssembler(dualCapture(asyncEvents, asyncCollector),
-                StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg(),
+                StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg("async"),
                 (msg, view) -> { }, frontier, () -> { })) {
             feed(async, stream);
         }   // close：毒丸 → consumer 排干余桶 → join → pipe 关闭——排干后输出确定
@@ -99,7 +112,7 @@ class DecoupledEquivalenceTest {
         List<Transaction> blockOut = new ArrayList<>();
         AtomicLong blockFrontier = new AtomicLong();
         try (TransactionAssembler block = new TransactionAssembler(new StreamingToBlockAdapter(blockOut::add),
-                StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg(),
+                StreamingMode.ON, new VersionedRelationRegistry(), pipeCfg("block"),
                 (msg, view) -> { }, blockFrontier, () -> { })) {
             feed(block, stream);
         }
@@ -139,8 +152,8 @@ class DecoupledEquivalenceTest {
         }
     }
 
-    /** 组装器统一管道配置（用例级 @TempDir，滚动周期与生产默认同档）。 */
-    private PipeConfig pipeCfg() {
-        return new PipeConfig(dir, LegacyRollCycles.MINUTELY);
+    /** 组装器统一管道配置（用例级 @TempDir 下的形态子目录，滚动周期与生产默认同档）。 */
+    private PipeConfig pipeCfg(String subdir) {
+        return new PipeConfig(dir.resolve(subdir), LegacyRollCycles.MINUTELY);
     }
 }

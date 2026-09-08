@@ -1,6 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
@@ -35,9 +36,20 @@ class SyncDeliveryTest {
     /** PgWire LSN 占位:Commit 消息的 endLsn 恒为 2(前沿推进断言的期望值)。 */
     private static final long COMMIT_END_LSN = 2L;
 
-    /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
+    /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 @AfterEach 兜底清空(wipe-on-open 只作后备)。 */
     @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
+
+    /**
+     * 每用例后清空共享管道目录(Windows 兜底,机理见 {@link PipeDirCleanup} javadoc:close 后
+     * mmap 句柄异步释放,下一用例构造的 wipe-on-open 会撞未释放句柄——同形态的组装器大类
+     * 2026-09-08 本机实测 40/50 翻车,本类当时侥幸未触发;预防性挂靠,POSIX 上首轮删除即成、
+     * 行为无差)。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(PIPE_DIR);
+    }
 
     /** 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},此前为本类私有的逐字重复工厂)。 */
     private static final RelationResolver RESOLVER = TestRelations.RESOLVER;

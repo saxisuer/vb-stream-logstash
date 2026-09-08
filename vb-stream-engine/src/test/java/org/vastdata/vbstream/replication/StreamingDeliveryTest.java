@@ -1,6 +1,7 @@
 package org.vastdata.vbstream.replication;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.StreamingMode;
@@ -38,6 +39,16 @@ class StreamingDeliveryTest {
     /** 每用例独立的管道目录（异步构造器建管道即 wipe，测试收尾 close 排干）。 */
     @TempDir
     Path dir;
+
+    /**
+     * 每用例后清空用例目录（Windows 兜底，机理见 {@link PipeDirCleanup} javadoc：@TempDir
+     * 收尾删除可撞 close 后未释放的 mmap 句柄——同形态类 2026-09-08 本机实测翻车，本类
+     * 当时侥幸未触发；预防性挂靠，POSIX 上首轮删除即成、行为无差）。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(dir);
+    }
 
     /**
      * 责任：流式时序证明本体——consumer 仍阻塞在第 1 条变更回调内时，断言三件套全部成立：

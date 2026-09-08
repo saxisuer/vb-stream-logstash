@@ -138,15 +138,31 @@ class MessagePipeTest {
      * 关键步骤:first 管道写入一条并 close → second 管道同目录重开 → readRange(0, 100)
      * 期望读不到任何消息。
      * 边界:起点 index 0 在新队列中不存在(cycle 0 无滚动文件),读到队尾即空手而归,不抛异常。
+     * Windows 兜底:first close 后 mmap 句柄异步释放(见 {@link PipeDirCleanup}),second 构造
+     * 的 wipe 删 first 的队列文件可撞未释放句柄——System.gc 提示 cleaner 后重试构造
+     * (≤5 次 × 100ms);重试期间**不得预删目录内容**(测试自己清空会架空 wipe 的亲手删除
+     * 路径,退化为空目录重开);构造抛 UncheckedIOException 时队列尚未建立、无资源可泄漏。
      */
     @Test
-    void wipeOnOpenClearsStaleFiles() throws IOException {
+    void wipeOnOpenClearsStaleFiles() throws IOException, InterruptedException {
         try (MessagePipe first = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
             first.append(new byte[]{'B'});
         }
-        try (MessagePipe second = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
+        MessagePipe second = null;
+        for (int attempt = 0; second == null; attempt++) {
+            try {
+                second = new MessagePipe(dir, LegacyRollCycles.MINUTELY);
+            } catch (UncheckedIOException e) {
+                if (attempt == 4) {
+                    throw e;
+                }
+                System.gc();
+                Thread.sleep(100L);
+            }
+        }
+        try (MessagePipe s = second) {
             List<byte[]> seen = new ArrayList<>();
-            second.readRange(0, 100, (idx, p) -> seen.add(p));
+            s.readRange(0, 100, (idx, p) -> seen.add(p));
             assertEquals(List.of(), seen);        // 旧数据整体抹掉,空手而归不抛
         }
     }

@@ -31,8 +31,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * End——与 {@code close()}(排干,join 60s)的语义分叉点。
  *
  * <p>夹具约定:LSN/时间戳按 PgWire 占位约定(全部提交消息 endLsn=2、PG 纪元);'A' 为非
- * parallel 形态,组装器以 {@link StreamingMode#ON} 构造;管道目录取用例级 {@code @TempDir}
- * (两个组装器顺序构造,MessagePipe 的 wipe-on-open 保证互不残留)。
+ * parallel 形态,组装器以 {@link StreamingMode#ON} 构造;管道目录取用例级 {@code @TempDir},
+ * 等价性用例的两个组装器各用其下独立子目录(2026-09-08 起:同目录顺序复用依赖"close 后
+ * 立即 wipe",Windows 上 mmap 句柄异步释放使第二个组装器的 wipe-on-open 撞句柄翻车——
+ * 独立子目录互不见对方文件,机理见 {@link PipeDirCleanup};POSIX 上两种形态等价)。
  */
 class DecoupledEquivalenceTest {
 
@@ -44,7 +46,7 @@ class DecoupledEquivalenceTest {
     /** shutdownFast 立即返回的断言上界(ms):管道关闭的 IO 量级,与 close 的 join 60s 相差一个数量级以上。 */
     private static final long SHUTDOWN_FAST_BOUND_MILLIS = 5_000L;
 
-    /** 每用例独立的管道目录:两个组装器顺序复用,wipe-on-open 清彼此残留。 */
+    /** 每用例独立的管道目录:等价性用例的两个组装器各用其下子目录(sync/async);D7 用例单组装器独用。 */
     @TempDir(cleanup = CleanupMode.NEVER)
     Path dir;
 
@@ -100,7 +102,7 @@ class DecoupledEquivalenceTest {
         TransactionRecorder syncCollector = new TransactionRecorder();
         try (StreamedTransactionAssembler sync = new StreamedTransactionAssembler(
                 dualCapture(syncEvents, syncCollector), StreamingMode.ON, new VersionedRelationRegistry(),
-                RESOLVER, dir, LegacyRollCycles.MINUTELY)) {
+                RESOLVER, dir.resolve("sync"), LegacyRollCycles.MINUTELY)) {
             feed(sync, stream);
         }
         // ② 异步形态:真实双线程管道,同样双收集
@@ -108,7 +110,7 @@ class DecoupledEquivalenceTest {
         TransactionRecorder asyncCollector = new TransactionRecorder();
         AtomicLong frontier = new AtomicLong();
         try (StreamedTransactionAssembler async = new StreamedTransactionAssembler(dualCapture(asyncEvents, asyncCollector),
-                StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER, dir, LegacyRollCycles.MINUTELY,
+                StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER, dir.resolve("async"), LegacyRollCycles.MINUTELY,
                 (msg, view) -> { }, frontier, () -> { })) {
             feed(async, stream);
         }   // close:毒丸 → consumer 排干余桶 → join → pipe 关闭——排干后输出确定

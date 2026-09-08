@@ -1,6 +1,7 @@
 package org.vastdata.vbstream.replication;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.Column;
@@ -46,9 +47,19 @@ class BucketReplayerTest {
     /** 被回滚的子事务 xid——aborted 过滤用例的剔除目标。 */
     private static final long SUB = 7003L;
 
-    /** 每用例独立的管道目录（@TempDir）：用例间零残留，无需依赖 wipe-on-open 顺序。 */
+    /** 每用例独立的管道目录（@TempDir）：用例间零残留；@AfterEach 兜底清空供收尾删空目录。 */
     @TempDir
     Path pipeDir;
+
+    /**
+     * 每用例后清空用例目录（Windows 兜底，机理见 {@link PipeDirCleanup} javadoc：@TempDir 默认
+     * ALWAYS 的收尾删除会撞 pipe.close() 后未释放的 mmap 句柄——2026-09-08 本机实测本类 5/5
+     * 用例在收尾翻车，macOS/WSL 无此约束）。清空后收尾只剩删空目录，不再碰被占用文件。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(pipeDir);
+    }
 
     /** 构造两列 (id int 键列, v text) 的 Relation 样本，仅表名随参数变化（断言读 {@code table()} 区分版本）。 */
     private static PgOutputMessage.Relation rel(String table) {

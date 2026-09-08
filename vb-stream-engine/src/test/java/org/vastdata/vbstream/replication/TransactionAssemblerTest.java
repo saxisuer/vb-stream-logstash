@@ -1,6 +1,7 @@
 package org.vastdata.vbstream.replication;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.StreamingMode;
@@ -59,9 +60,19 @@ class TransactionAssemblerTest {
     /** 两阶段事务全局 id 夹具值。 */
     private static final String GID = "gid-1";
 
-    /** 类级共享管道目录：静态 @TempDir 全类一份，用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
+    /** 类级共享管道目录：静态 @TempDir 全类一份，用例间由 @AfterEach 兜底清空（wipe-on-open 只作后备）。 */
     @TempDir
     static Path PIPE_DIR;
+
+    /**
+     * 每用例后清空共享管道目录（Windows 兜底，机理见 {@link PipeDirCleanup} javadoc：close 后
+     * mmap 句柄异步释放，下一用例构造的 wipe-on-open 会撞未释放句柄——2026-09-08 本机实测
+     * 本类 38/41 用例翻车，macOS/WSL 无此约束）。POSIX 上首轮删除即成，行为无差。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(PIPE_DIR);
+    }
 
     /** 组装器统一管道配置（目录取类级共享 @TempDir，滚动周期与生产默认同档）。 */
     private static PipeConfig pipeCfg() {

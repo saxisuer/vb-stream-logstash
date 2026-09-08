@@ -6,8 +6,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.protocol.StreamingMode;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -42,34 +40,12 @@ class ThroughputMetricsWiringTest {
     }
 
     /**
-     * 每用例后清空共享管道目录（Windows 兜底，同 DecoupledPipelineTest，commit 8863176）。
-     * pipe.close() 后 Chronicle 的 mmap 句柄由 GC/cleaner 异步释放，Windows 不允许删除
-     * 仍被占用的文件（POSIX unlink 无此约束）。System.gc 提示 cleaner 释放，删失败重试
-     * 至多 5 次（100ms 间隔）；重试耗尽则放弃且不判红——残留只占临时目录空间，下一用例
-     * 的 wipe-on-open 真出问题时会抛带路径的 UncheckedIOException 兜底定位。
+     * 每用例后清空共享管道目录（Windows 兜底；2026-09-08 起本类私有实现提炼为
+     * {@link PipeDirCleanup#wipeWithGcRetry(Path)} 共享——机理与尽力而为语义见其 javadoc）。
      */
     @AfterEach
     void wipePipeDirWithGcRetry() {
-        for (int attempt = 0; attempt < 5; attempt++) {
-            try (var files = Files.list(PIPE_DIR)) {
-                List<Path> entries = files.sorted().toList();
-                if (entries.isEmpty()) {
-                    return;
-                }
-                for (Path file : entries) {
-                    Files.deleteIfExists(file);   // 目录项只有队列文件（无子目录），直接删
-                }
-                return;   // 本轮全部删成即清空
-            } catch (IOException e) {
-                System.gc();   // 提示 cleaner 回收 native mmap，句柄释放后下一轮重试可删
-                try {
-                    Thread.sleep(100L);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
+        PipeDirCleanup.wipeWithGcRetry(PIPE_DIR);
     }
 
     /**

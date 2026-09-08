@@ -5,6 +5,7 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
@@ -61,9 +62,20 @@ class StreamedTransactionAssemblerTest {
     /** 两阶段事务全局 id 夹具值。 */
     private static final String GID = "gid-1";
 
-    /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 MessagePipe 的 wipe-on-open 顺序清空。 */
+    /** 类级共享管道目录:静态 @TempDir 全类一份,用例间由 @AfterEach 兜底清空(wipe-on-open 只作后备)。 */
     @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
+
+    /**
+     * 每用例后清空共享管道目录(Windows 兜底,机理见 {@link PipeDirCleanup} javadoc:close 后
+     * mmap 句柄异步释放,下一用例构造的 wipe-on-open 会撞未释放句柄——2026-09-08 本机实测
+     * 本类 40/50 用例翻车,NEVER 只免收尾删除救不了用例间,macOS/WSL 无此约束)。POSIX 上
+     * 首轮删除即成,行为无差。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(PIPE_DIR);
+    }
 
     /**
      * 测试用 RelationResolver 假实现(Task 3 账本回收项起收拢进共享夹具 {@link TestRelations},

@@ -1,6 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
@@ -33,9 +34,19 @@ class StreamThroughputMetricsWiringTest {
 
     private static final int OID = 16384;
 
-    /** 类级共享管道目录：全类一份，用例间由 MessagePipe 的 wipe-on-open 顺序清空（@TempDir NEVER 见模块测试规约）。 */
+    /** 类级共享管道目录：全类一份，用例间由 @AfterEach 兜底清空（wipe-on-open 只作后备；@TempDir NEVER 见模块测试规约）。 */
     @TempDir(cleanup = CleanupMode.NEVER)
     static Path PIPE_DIR;
+
+    /**
+     * 每用例后清空共享管道目录(Windows 兜底,机理见 {@link PipeDirCleanup} javadoc:NEVER 只免收尾
+     * 删除,救不了用例间——下一用例构造的 wipe-on-open 会撞上一用例 close 后未释放的 mmap 句柄,
+     * 2026-09-08 本机实测本类 1/2 用例翻车,macOS/WSL 无此约束)。POSIX 上首轮删除即成,行为无差。
+     */
+    @AfterEach
+    void wipePipeDirWithGcRetry() {
+        PipeDirCleanup.wipeWithGcRetry(PIPE_DIR);
+    }
 
     /**
      * 完整普通事务全链路五埋点核对：slot 记 5 条消息与字节和（含 Relation 与控制消息）、
