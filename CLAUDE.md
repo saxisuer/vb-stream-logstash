@@ -72,6 +72,7 @@ mvn dependency:tree                  # 查看依赖树
 ## 开发规约
 
 - **方法名一律英文 camelCase**（主代码与测试同规）：**不允许中文方法名**。测试方法名用行为描述式英文命名（如 `peakLineSecondBucketDoesNotDiluteBurst`、`twoPhaseRollbackSkipsOutputButStillCountsSlotRead`）；存量中文方法名已于 2026-09-08 全部迁移完毕
+- **类型引用一律 import 后用简名，禁止全限定类名内联**（主代码与测试同规）：不得写 `io.debezium.util.LoggingContext.PreviousContext ctx = ...` 这类在语句里展开包名的写法——包名经 `import` 引入。嵌套类型用外层类简名（如 `LoggingContext.PreviousContext`、`CommonConnectorConfig.BinaryHandlingMode`）；javadoc `{@link}` 里的类型同样用简名。唯一例外：同文件内两个同名类都需引用（真实命名冲突）时，冲突方之一可保留全限定。存量 FQN 内联已于 2026-09-09 清理完毕（connector 模块 11 文件）
 - **不使用 superpowers 技能**：本项目任务一律直接执行（常规探索/规划/实现/调试流程），不调用 `superpowers:*` 系列技能（brainstorming / writing-plans / test-driven-development / systematic-debugging 等）
 - **日志输出一律走 slf4j**（`private static final Logger LOG = LoggerFactory.getLogger(Xxx.class)`），**禁止 `System.out` / `System.err`**（主代码与测试代码均适用；临时调试打印不得提交）：
   - 级别语义：CDC 数据输出走专用 logger `org.vastdata.vbstream.cdc`（INFO，与系统日志分离、可独立调级）——事务块与**事务生命周期控制消息**（流式 StreamStart/Stop/Commit/Abort/Prepare + 两阶段信号，共 9 种）用 INFO，保证任何事务形态（含回滚/无组装块路径）在 INFO 级至少留一行痕迹；生命周期/状态变更用 INFO，可恢复异常用 WARN，失败/退出路径用 ERROR，行级/元数据逐消息细节用 DEBUG（默认关闭，大事务防刷屏）
