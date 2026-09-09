@@ -42,6 +42,7 @@ class BinaryOutputTest {
     void cleanup() {
         PgTestEnv.dropSlotQuietly("slot_bin");
         PgTestEnv.dropSlotQuietly("slot_bins");
+        PgTestEnv.dropSlotQuietly("slot_binc");
     }
 
     @Test
@@ -96,7 +97,7 @@ class BinaryOutputTest {
                         column + " 应为二进制种类");
             }
 
-            // oracle ①：JDBC getString（原始列 text 传输形态，与 walsender text 模式同源；不含 tstz 与矩阵外两列）
+            // oracle ①：JDBC getString（原始列 text 传输形态，与 walsender text 模式同源；不含 tstz 与矩阵外 jsonb）
             List<String> textOracle;
             try (Connection c = PgTestEnv.newSqlConnection();
                  ResultSet rs = c.createStatement().executeQuery(
@@ -104,14 +105,14 @@ class BinaryOutputTest {
                                  + " c_oid, c_real, c_double, c_num,"
                                  + " c_varchar, c_text, c_char, c_json,"
                                  + " c_bytea, c_date, c_time, c_timetz,"
-                                 + " c_ts, c_uuid FROM t_bin")) {
+                                 + " c_ts, c_uuid, c_interval FROM t_bin")) {
                 assertTrue(rs.next());
                 textOracle = new ArrayList<>();
-                for (int i = 1; i <= 18; i++) {
+                for (int i = 1; i <= 19; i++) {
                     textOracle.add(rs.getString(i));
                 }
             }
-            int[] textColumns = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18};
+            int[] textColumns = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20};
             for (int j = 0; j < textColumns.length; j++) {
                 int i = textColumns[j];
                 String column = relation.columns().get(i).name();
@@ -131,12 +132,9 @@ class BinaryOutputTest {
             assertEquals(expectedTstz, actualTstz,
                     "c_tstz 解码时刻应与 JDBC 读取等价（时区偏移后缀的形态差异之外语义一致）");
 
-            // 矩阵外类型降级：jsonb(3802)/interval(1186) → "0x" 十六进制原文（不抛异常、可观测）
-            for (int i = 19; i < 21; i++) {
-                String column = relation.columns().get(i).name();
-                String decoded = decodeAt(insert, relation, i);
-                assertTrue(decoded.startsWith("0x"), column + " 矩阵外类型应降级十六进制: " + decoded);
-            }
+            // 矩阵外类型降级：jsonb(3802) → "0x" 十六进制原文（不抛异常、可观测）
+            String jsonbDecoded = decodeAt(insert, relation, 19);
+            assertTrue(jsonbDecoded.startsWith("0x"), "c_jsonb 矩阵外类型应降级十六进制: " + jsonbDecoded);
         }
     }
 
@@ -223,6 +221,88 @@ class BinaryOutputTest {
             TupleValue payload = anyStreamed.newTuple().columns().get(1);
             assertInstanceOf(TupleValue.Binary.class, payload, "流块内载荷应为二进制种类");
             assertEquals(1024, ((TupleValue.Binary) payload).value().length, "gen_random_bytes(1024) 载荷长度");
+        }
+    }
+
+    /**
+     * 五类型族专项（时间/数字/字符串/interval/数组）：interval 与 16 种内建数组已入解码矩阵
+     * （2026-09-09 扩），全列 getString 逐列对照——数组覆盖 NULL 元素（varlena -1 前缀 / 定长全零）、
+     * array_out 引号与双写转义、二维嵌套、非零 lowerBound 前缀；bool 数组的 false 与 NULL 在
+     * binary 模式同形（全零字节），以实测结果对照记档。
+     */
+    @Test
+    void fiveTypeFamiliesRoundTripWithCollections() throws Exception {
+        PgTestEnv.execSql(
+                "CREATE TABLE IF NOT EXISTS t_bin_coll ("
+                        + " c_iv interval, c_iv_neg interval,"
+                        + " c_dates date[], c_times time[], c_tss timestamp[],"
+                        + " c_i2s smallint[], c_i4s integer[], c_i8s bigint[],"
+                        + " c_f4s real[], c_f8s double precision[], c_nums numeric(12,4)[],"
+                        + " c_texts text[], c_varchars varchar(16)[], c_bpchars char(8)[],"
+                        + " c_ivs interval[],"
+                        + " c_2d int[][], c_lb int[], c_null_i4 int[], c_bools boolean[],"
+                        + " c_uuids uuid[], c_bytes bytea[])",
+                "DROP PUBLICATION IF EXISTS pub_binc",
+                "CREATE PUBLICATION pub_binc FOR TABLE t_bin_coll",
+                "TRUNCATE t_bin_coll");
+        try (SessionHarness harness = SessionHarness.start(
+                PgTestEnv.newConfig("slot_binc", "pub_binc", true),
+                msg -> msg instanceof PgOutputMessage.Commit)) {
+            PgTestEnv.execSql(
+                    "INSERT INTO t_bin_coll VALUES ("
+                            + " '1 year 2 mons 3 days 04:05:06', '-1 mons -2 days -03:00:00.5',"
+                            + " ARRAY['2026-01-01'::date, '1999-12-31'::date],"
+                            + " ARRAY['12:34:56.789'::time, '23:59:59'::time],"
+                            + " ARRAY['2026-08-27 10:20:30.123456'::timestamp, '2000-01-01 00:00:00'::timestamp],"
+                            + " ARRAY[1::smallint, -2::smallint, NULL],"
+                            + " ARRAY[1, 2, NULL, 4],"
+                            + " ARRAY[9223372036854775807::bigint, -1::bigint],"
+                            + " ARRAY[1.5::real, -2.5::real],"
+                            + " ARRAY[2.718281828459045, -1.41421356],"
+                            + " ARRAY[123.4567, -8.9000, 0],"
+                            + " ARRAY['a', 'b,c', 'd''e', 'NULL', NULL, ' sp ', '', 'q\"r\\s'],"
+                            + " ARRAY['hello', '世界'],"
+                            + " ARRAY['ab', NULL],"
+                            + " ARRAY['1 day'::interval, '2 days 03:04:05'::interval],"
+                            + " ARRAY[[1,2],[3,4]],"
+                            + " '[-2:1]={1,2,3,4}',"
+                            + " ARRAY[1, NULL, 3],"
+                            + " ARRAY[true, false, NULL],"
+                            + " ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid],"
+                            + " ARRAY['\\xDEADBEEF'::bytea, NULL])");
+            harness.awaitTermination(Duration.ofSeconds(30));
+
+            PgOutputMessage.Insert insert = harness.messages().stream()
+                    .filter(m -> m instanceof PgOutputMessage.Insert)
+                    .map(m -> (PgOutputMessage.Insert) m)
+                    .findFirst().orElseThrow(() -> new AssertionError("应出现 Insert 消息"));
+            PgOutputMessage.Relation relation = harness.messages().stream()
+                    .filter(m -> m instanceof PgOutputMessage.Relation r && "t_bin_coll".equals(r.table()))
+                    .map(m -> (PgOutputMessage.Relation) m)
+                    .findFirst().orElseThrow(() -> new AssertionError("应出现 Relation(t_bin_coll)"));
+            int columns = relation.columns().size();
+
+            // 全列 'b' 种类
+            for (int i = 0; i < columns; i++) {
+                String column = relation.columns().get(i).name();
+                assertInstanceOf(TupleValue.Binary.class, insert.newTuple().columns().get(i),
+                        column + " 应为二进制种类");
+            }
+
+            List<String> oracle;
+            try (Connection c = PgTestEnv.newSqlConnection();
+                 ResultSet rs = c.createStatement().executeQuery("SELECT * FROM t_bin_coll")) {
+                assertTrue(rs.next());
+                oracle = new ArrayList<>();
+                for (int i = 1; i <= columns; i++) {
+                    oracle.add(rs.getString(i));
+                }
+            }
+            for (int i = 0; i < columns; i++) {
+                String column = relation.columns().get(i).name();
+                String decoded = decodeAt(insert, relation, i);
+                assertEquals(oracle.get(i), decoded, column + " 解码值应与 PG 文本输出一致");
+            }
         }
     }
 

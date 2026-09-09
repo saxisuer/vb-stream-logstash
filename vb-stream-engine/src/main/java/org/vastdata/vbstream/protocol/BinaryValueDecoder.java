@@ -32,9 +32,17 @@ import java.util.concurrent.ConcurrentHashMap;
  *       墙钟）、timestamptz（同前，按系统默认时区渲染——对齐 pgjdbc 把复制会话时区设为 JVM 默认的
  *       text 模式行为）、timetz（time + i64 秒级时区偏移）</li>
  *   <li>uuid：16 字节 → 小写连字符 36 字符形态</li>
+ *   <li>interval（2026-09-09 扩）：i64 微秒 + i32 天 + i32 月 → interval_out 的 postgres 风格
+ *       （"-1 years -6 mons" / "1 year 2 mons 3 days 04:05:06.5" / 零值 "00:00:00"），见
+ *       {@link #decodeInterval}</li>
+ *   <li>内建数组（2026-09-09 扩，16 种 oid 见常量区）：array_send 格式（维数/hasnull/elemOid 头 +
+ *       递归元素）→ array_out 的 {@code {e1,e2}} 形态——**每个元素一律 i32 长度前缀（NULL = -1）**，
+ *       定长与 varlena 同构（PG 18 实测锚定，bool 的 false 与 NULL 由此无歧义）；剥前缀后经
+ *       {@link #decode} 递归解释、按 array_out 规则引号化（NULL 裸输出、字面 "NULL"/空串/特殊字符
+ *       加引号并双写转义）、非零 lowerBound 打 {@code [lb:ub]=} 前缀，见 {@link #decodeArray}</li>
  * </ul>
  *
- * <p>未覆盖类型（enum/域/数组/interval/jsonb/组合类型等——oid 动态或格式复杂，二期）降级为
+ * <p>未覆盖类型（enum/域/jsonb/组合类型/自定义数组——oid 动态或格式复杂）降级为
  * {@code 0x} + 十六进制原文，每个 oid 仅 WARN 一次（防刷屏）；载荷长度与类型格式不符（流错位的信号）
  * 抛 {@link IllegalStateException} fail-fast。
  *
@@ -66,8 +74,43 @@ public final class BinaryValueDecoder {
     private static final int OID_TIMESTAMP = 1114;
     private static final int OID_TIMESTAMPTZ = 1184;
     private static final int OID_TIMETZ = 1266;
+    private static final int OID_INTERVAL = 1186;
     private static final int OID_NUMERIC = 1700;
     private static final int OID_UUID = 2950;
+
+    // ---- 内建数组 OID（pg_type.dat 硬编码；自定义数组/域数组仍走降级）----
+
+    private static final int OID_BOOL_ARRAY = 1000;
+    private static final int OID_BYTEA_ARRAY = 1001;
+    private static final int OID_INT2_ARRAY = 1005;
+    private static final int OID_INT4_ARRAY = 1007;
+    private static final int OID_TEXT_ARRAY = 1009;
+    private static final int OID_BPCHAR_ARRAY = 1014;
+    private static final int OID_VARCHAR_ARRAY = 1015;
+    private static final int OID_INT8_ARRAY = 1016;
+    private static final int OID_FLOAT4_ARRAY = 1021;
+    private static final int OID_FLOAT8_ARRAY = 1022;
+    private static final int OID_TIMESTAMP_ARRAY = 1115;
+    private static final int OID_DATE_ARRAY = 1182;
+    private static final int OID_TIME_ARRAY = 1183;
+    private static final int OID_TIMESTAMPTZ_ARRAY = 1185;
+    private static final int OID_INTERVAL_ARRAY = 1187;
+    private static final int OID_NUMERIC_ARRAY = 1231;
+    private static final int OID_TIMETZ_ARRAY = 1270;
+    private static final int OID_JSON_ARRAY = 199;
+    private static final int OID_UUID_ARRAY = 2951;
+
+    /**
+     * 数组元素中的已知元素类型集（varlena 与定长统一——array_send 对**所有**元素一律发
+     * {@code i32 长度前缀 + SendFunctionCall 输出字节}，NULL 统一为前缀 -1，定长与变长同构；
+     * PG 18 实测锚定：date[] 定长元素若按无前缀读取会整体错位一位元素）。矩阵外的元素类型
+     * （自定义/域）使整个数组降级。bytea 元素输出 "\x.." 含反斜杠，经 quoteIfNeeded 自动加引号
+     * 并对 \ 与 " 双写（与 array_out 一致）。
+     */
+    private static final Set<Integer> KNOWN_ELEM_OIDS = Set.of(
+            OID_BYTEA, OID_NAME, OID_TEXT, OID_JSON, OID_BPCHAR, OID_VARCHAR, OID_NUMERIC, OID_INTERVAL,
+            OID_BOOL, OID_INT2, OID_INT4, OID_INT8, OID_OID, OID_XID, OID_CID, OID_TIMETZ,
+            OID_FLOAT4, OID_FLOAT8, OID_DATE, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID);
 
     /** date 纪元 2000-01-01 相对 LocalDate 纪元（1970-01-01）的天数。 */
     private static final long PG_EPOCH_DAY = 10957L;
@@ -116,6 +159,12 @@ public final class BinaryValueDecoder {
             case OID_TIMESTAMPTZ -> decodeTimestamp(r, ZoneId.systemDefault());
             case OID_NUMERIC -> decodeNumeric(r);
             case OID_UUID -> decodeUuid(r);
+            case OID_INTERVAL -> decodeInterval(r);
+            case OID_BOOL_ARRAY, OID_BYTEA_ARRAY, OID_INT2_ARRAY, OID_INT4_ARRAY, OID_TEXT_ARRAY,
+                 OID_BPCHAR_ARRAY, OID_VARCHAR_ARRAY, OID_INT8_ARRAY, OID_FLOAT4_ARRAY,
+                 OID_FLOAT8_ARRAY, OID_TIMESTAMP_ARRAY, OID_DATE_ARRAY, OID_TIME_ARRAY,
+                 OID_TIMESTAMPTZ_ARRAY, OID_INTERVAL_ARRAY, OID_NUMERIC_ARRAY, OID_UUID_ARRAY,
+                 OID_TIMETZ_ARRAY, OID_JSON_ARRAY -> decodeArray(typeId, r, raw);
             default -> unknown(typeId, raw);
         };
     }
@@ -298,10 +347,176 @@ public final class BinaryValueDecoder {
                         + "（流可能已错位）");
     }
 
+    /**
+     * interval：i64 微秒（time）+ i32 天（day）+ i32 月（month），此顺序（interval_send）。
+     * 渲染对齐 interval_out 的 postgres 风格：year/mon 由 month 分解（C 向零取整——负 month 各段自带
+     * 负号，如 -18 月 → "-1 years -6 mons"）；单复数按"值 ≠ 1 带复数"（-1 同样带 s）；时间部分非零时
+     * 以 {@code HH:mm:ss[.frac]} 输出（负值前缀 "-"，微秒去尾零），全部为零时输出 "00:00:00"。
+     */
+    private static String decodeInterval(ByteBufferReader r) {
+        if (r.remaining() != 16) {
+            throw malformed(OID_INTERVAL, r.remaining(), "16 字节");
+        }
+        long timeMicros = r.readLong();
+        int day = r.readInt();
+        int month = r.readInt();
+        int year = month / 12;
+        int mon = month % 12;
+        StringBuilder out = new StringBuilder(32);
+        if (year != 0) {
+            out.append(year).append(year != 1 ? " years" : " year");
+        }
+        if (mon != 0) {
+            out.append(out.isEmpty() ? "" : " ").append(mon).append(mon != 1 ? " mons" : " mon");
+        }
+        if (day != 0) {
+            out.append(out.isEmpty() ? "" : " ").append(day).append(day != 1 ? " days" : " day");
+        }
+        // 时间部分：非零时输出；全部分量为零时输出 "00:00:00"（interval_out 对零 interval 的形态）
+        if (timeMicros != 0 || out.isEmpty()) {
+            boolean negative = timeMicros < 0;
+            long abs = Math.abs(timeMicros);
+            long hours = abs / 3_600_000_000L;
+            long minutes = (abs % 3_600_000_000L) / 60_000_000L;
+            long seconds = (abs % 60_000_000L) / 1_000_000L;
+            long micros = abs % 1_000_000L;
+            out.append(out.isEmpty() ? "" : " ")
+                    .append(negative ? "-" : "")
+                    .append("%02d:%02d:%02d".formatted(hours, minutes, seconds));
+            if (micros != 0) {
+                String digits = "%06d".formatted(micros);
+                int end = digits.length();
+                while (end > 0 && digits.charAt(end - 1) == '0') {
+                    end--;
+                }
+                out.append('.').append(digits, 0, end);
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * 数组（array_send 格式）：i32 ndim + i32 hasnull + i32 elemOid + 每维 i32 dim + i32 lowerBound +
+     * 按行序的元素序列。**每个元素一律 i32 长度前缀 + typsend 输出字节，NULL = 前缀 -1**（定长与
+     * varlena 同构——bool 的 false 与 NULL 由此无歧义）。元素值经 {@link #decode} 递归解释（剥前缀后
+     * 恰为元素类型的 typsend 载荷），再按 array_out 规则引号化；任一维 lowerBound ≠ 1 时输出
+     * {@code [lb:ub]=} 前缀。elemOid 不在已知元素集（自定义/域数组）时整个数组降级十六进制。
+     */
+    private static String decodeArray(int typeId, ByteBufferReader r, byte[] raw) {
+        if (r.remaining() < 12) {
+            throw malformed(typeId, r.remaining(), "≥12 字节数组头");
+        }
+        int ndim = r.readInt();
+        boolean hasNull = r.readInt() != 0;
+        int elemOid = r.readInt();
+        if (ndim < 0 || ndim > 6 || r.remaining() < ndim * 8L) {
+            throw malformed(typeId, r.remaining(), "ndim=" + ndim + " 的维数头");
+        }
+        if (!KNOWN_ELEM_OIDS.contains(elemOid)) {
+            return unknownElem(elemOid, raw);
+        }
+        int[] dims = new int[ndim];
+        int[] lbs = new int[ndim];
+        for (int i = 0; i < ndim; i++) {
+            dims[i] = r.readInt();
+            lbs[i] = r.readInt();
+        }
+        StringBuilder out = new StringBuilder(estimateLength(dims));
+        for (int i = 0; i < ndim; i++) {
+            if (lbs[i] != 1) {  // 任一维非 1 才打前缀（array_out 同规则）
+                for (int j = 0; j < ndim; j++) {
+                    out.append('[').append(lbs[j]).append(':').append(lbs[j] + dims[j] - 1).append(']');
+                }
+                out.append('=');
+                break;
+            }
+        }
+        renderDim(r, dims, 0, elemOid, out);
+        return out.toString();
+    }
+
+    /**
+     * 数组某一维的渲染：depth == dims.length 时读单个元素（引号化后追加），否则输出一层花括号并
+     * 递归下一维（元素间逗号分隔）。
+     */
+    private static void renderDim(ByteBufferReader r, int[] dims, int depth, int elemOid, StringBuilder out) {
+        if (depth == dims.length) {
+            renderElem(r, elemOid, out);
+            return;
+        }
+        out.append('{');
+        for (int i = 0; i < dims[depth]; i++) {
+            if (i > 0) {
+                out.append(',');
+            }
+            renderDim(r, dims, depth + 1, elemOid, out);
+        }
+        out.append('}');
+    }
+
+    /** 单个元素读取与渲染：i32 长度前缀（-1 = NULL）剥除后递归 decode + 引号化。 */
+    private static void renderElem(ByteBufferReader r, int elemOid, StringBuilder out) {
+        int len = r.readInt();
+        if (len == -1) {
+            out.append("NULL");
+            return;
+        }
+        out.append(quoteIfNeeded(decode(elemOid, r.readBytes(len))));
+    }
+
+    /**
+     * array_out 的元素引号化：空串、字面 "NULL"、或含 {@code { } , " \ } 任一字符、**任意位置**
+     * 空白（PG isspace 判定——timestamp/interval 文本的内部空格命中，故其数组元素带引号）的输出
+     * 加双引号，引号内 {@code "} 与 {@code \} 以反斜杠转义（{@code \"} / {@code \\}，PG 18 实测）；
+     * 数值类输出不含特殊字符自然免引号。
+     */
+    private static String quoteIfNeeded(String s) {
+        boolean need = s.isEmpty() || "NULL".equals(s);
+        if (!need) {
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c == '{' || c == '}' || c == ',' || c == '"' || c == '\\' || Character.isWhitespace(c)) {
+                    need = true;
+                    break;
+                }
+            }
+        }
+        if (!need) {
+            return s;
+        }
+        StringBuilder quoted = new StringBuilder(s.length() + 4);
+        quoted.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                quoted.append('\\');  // 反斜杠转义
+            }
+            quoted.append(c);
+        }
+        return quoted.append('"').toString();
+    }
+
+    /** 数组元素长度的粗略预估（StringBuilder 初始容量，避免多次扩容）。 */
+    private static int estimateLength(int[] dims) {
+        long total = 1;
+        for (int dim : dims) {
+            total *= Math.max(dim, 1);
+        }
+        return (int) Math.min(total * 8 + 16, 1 << 20);
+    }
+
+    /** 数组元素类型未知（自定义/域数组）：整个数组降级十六进制，每 elemOid WARN 一次。 */
+    private static String unknownElem(int elemOid, byte[] raw) {
+        if (WARNED_UNKNOWN_OIDS.add(-elemOid)) {  // 负号键与标量 unknown 共用去重集不冲突
+            LOG.warn("未覆盖的数组元素类型 oid={}（自定义/域数组），该数组值降级为十六进制原文", elemOid);
+        }
+        return "0x" + HexFormat.of().formatHex(raw);
+    }
+
     /** 未知 oid 降级：十六进制原文；每 oid WARN 一次（观测节流，防大事务刷屏）。 */
     private static String unknown(int typeId, byte[] raw) {
         if (WARNED_UNKNOWN_OIDS.add(typeId)) {
-            LOG.warn("未覆盖的二进制类型 oid={}（enum/数组/interval/jsonb 等动态或复杂格式属二期），"
+            LOG.warn("未覆盖的二进制类型 oid={}（enum/域/jsonb/组合类型等动态或复杂格式），"
                     + "该类型值降级为十六进制原文", typeId);
         }
         return "0x" + HexFormat.of().formatHex(raw);

@@ -16,7 +16,7 @@
 | `StreamedTransactionTest` | 500 行×8KB 单事务触发流式分段（StreamStart firstSegment、分段结构）；parallel 模式 StreamAbort 携带附加字段且后续无错位 |
 | `TwoPhaseTransactionTest` | PREPARE→COMMIT PREPARED（b/变更/P/K 按 gid 匹配）；PREPARE→ROLLBACK PREPARED（r）；大事务 PREPARE 以 StreamPrepare 分段收尾 |
 | `DataTypeTest` | 19 列常见类型（时间/数字/字符串/bool/uuid/jsonb/bytea）文本协议解码端到端一致性——以 PG 自身 JDBC getString 输出为 oracle（同一套类型输出函数），不硬编码期望值 |
-| `BinaryOutputTest` | pgoutput binary 模式（PG 16+ `binary 'on'`）端到端三场景：①21 列类型矩阵全列 'b' 种类 + `BinaryValueDecoder` 解码值与 PG 文本输出逐列对照（timestamptz 走 Instant 语义对照规避时区偏移形态差；jsonb/interval 断言降级十六进制）②REPLICA IDENTITY FULL 旧元组 'b' + 未变 TOAST 列 'u' ③200 行 × 1KB 不可压缩载荷流式大事务（流式外壳不受 binary 模式影响）。oracle 陷阱：bool 的 `::text` cast 输出 "true" 而 bool_out 是 "t"——对照必须用 getString 原始列 |
+| `BinaryOutputTest` | pgoutput binary 模式（PG 16+ `binary 'on'`）端到端四场景：①21 列类型矩阵全列 'b' 种类 + `BinaryValueDecoder` 解码值与 PG 文本输出逐列对照（timestamptz 走 Instant 语义对照规避时区偏移形态差；jsonb 断言降级十六进制）②REPLICA IDENTITY FULL 旧元组 'b' + 未变 TOAST 列 'u' ③200 行 × 1KB 不可压缩载荷流式大事务（流式外壳不受 binary 模式影响）④五类型族专项（时间/数字/字符串/interval/数组）——interval 正负形态 + 18 种数组形态（NULL 元素、引号与反斜杠转义、二维嵌套、非零 lowerBound、bool 三态）。oracle 陷阱：bool 的 `::text` cast 输出 "true" 而 bool_out 是 "t"——对照必须用 getString 原始列 |
 | `TruncateTest` | TRUNCATE 选项位（CASCADE/RESTART_IDENTITY）与多表 oid 列表解码 |
 | `RawSessionContractTest` | raw 接缝契约三角：raw 与解码消息逐条等长、每条 raw 首字节是 19 种合法类型字符之一、全新 `DecodedMessageBridge` 重放 raw 流得 record 值相等序列 |
 | `TransactionAssemblyTest` | 组装器五场景：普通多语句事务 / 流式+子事务回滚剔除 / 2PC 提交与回滚 / 双连接并发大事务多桶交错 / 多类型值 round-trip |

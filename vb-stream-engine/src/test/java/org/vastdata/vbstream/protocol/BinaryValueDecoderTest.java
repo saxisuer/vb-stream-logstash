@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Arrays;
+import java.util.HexFormat;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -243,6 +245,146 @@ class BinaryValueDecoderTest {
     void unknownOidDegradesToHex() {
         assertEquals("0x0102", BinaryValueDecoder.decode(999999, bytes(1, 2)));
         assertEquals("0x", BinaryValueDecoder.decode(44061, new byte[0])); // enum 等 oid 动态类型走降级
+    }
+
+    // ---- interval（interval_out postgres 风格，期望值经 PG 18 实测校准）----
+
+    /** 拼装 interval 载荷（i64 微秒 + i32 天 + i32 月——interval_send 顺序）。 */
+    private static byte[] interval(long micros, int days, int months) {
+        return ByteBuffer.allocate(16).putLong(micros).putInt(days).putInt(months).array();
+    }
+
+    @Test
+    void intervalPostgresStyleForms() {
+        // month 分解 year/mon（C 向零取整），各段自带符号；"值 ≠ 1" 恒带复数（-1 同样）
+        assertEquals("1 year 2 mons 3 days 04:05:06",
+                BinaryValueDecoder.decode(1186, interval((4L * 3600 + 5L * 60 + 6) * 1_000_000L, 3, 14)));
+        assertEquals("-1 years -6 mons", BinaryValueDecoder.decode(1186, interval(0, 0, -18)));
+        assertEquals("-1 mons -2 days", BinaryValueDecoder.decode(1186, interval(0, -2, -1)));
+        assertEquals("-02:03:04", BinaryValueDecoder.decode(1186,
+                interval(-(2L * 3600 + 3L * 60 + 4) * 1_000_000L, 0, 0)));
+        assertEquals("00:00:00", BinaryValueDecoder.decode(1186, interval(0, 0, 0)));
+        assertEquals("1 mon 1 day 00:00:00.5",
+                BinaryValueDecoder.decode(1186, interval(500_000L, 1, 1)));
+        assertEquals("100 years", BinaryValueDecoder.decode(1186, interval(0, 0, 1200)));
+        assertEquals("-1 days -02:03:04.000005", BinaryValueDecoder.decode(1186,
+                interval(-(2L * 3600 + 3L * 60 + 4) * 1_000_000L - 5, -1, 0)));
+        // 累计小时超两位：小时按实际位数输出（%02d 仅最小宽度）
+        assertEquals("100:00:00", BinaryValueDecoder.decode(1186, interval(100L * 3600 * 1_000_000L, 0, 0)));
+    }
+
+    // ---- 数组（array_send/array_out 形态）----
+
+    /** 数组元素字节（varlena）：i32 长度 + 载荷；len=-1 为 NULL。 */
+    private static byte[] elemVarlena(byte[] payload) {
+        return ByteBuffer.allocate(4 + payload.length).putInt(payload.length).put(payload).array();
+    }
+
+    /** 数组元素字节（varlena NULL）：i32 -1。 */
+    private static byte[] elemNull() {
+        return ByteBuffer.allocate(4).putInt(-1).array();
+    }
+
+    /** 拼装 array_send 载荷：i32 ndim + i32 hasnull + i32 elemOid + 每维 (i32 dim + i32 lb) + 元素序列。 */
+    private static byte[] array(int elemOid, boolean hasNull, int[] dims, int[] lbs, byte[]... elems) {
+        ByteBuffer buf = ByteBuffer.allocate(12 + dims.length * 8 + 512);
+        buf.putInt(dims.length).putInt(hasNull ? 1 : 0).putInt(elemOid);
+        for (int i = 0; i < dims.length; i++) {
+            buf.putInt(dims[i]).putInt(lbs[i]);
+        }
+        for (byte[] e : elems) {
+            buf.put(e);
+        }
+        return Arrays.copyOf(buf.array(), buf.position());
+    }
+
+    @Test
+    void intArrayWithNullRendersNullLiteral() {
+        // _int4(1007)：定长元素同样带 i32 长度前缀（array_send 统一形态），NULL = 前缀 -1
+        byte[] arr = array(23, true, new int[]{3}, new int[]{1},
+                elemVarlena(i32(1)), elemNull(), elemVarlena(i32(3)));
+        assertEquals("{1,NULL,3}", BinaryValueDecoder.decode(1007, arr));
+    }
+
+    @Test
+    void textArrayQuotingAndEscaping() {
+        // _text(1009)：varlena 元素，覆盖 array_out 的全部引号规则（含字面 "NULL" 与 NULL 的区分）
+        byte[] arr = array(25, true, new int[]{8}, new int[]{1},
+                elemVarlena("a".getBytes()),
+                elemVarlena("b,c".getBytes()),
+                elemVarlena("d'e".getBytes()),
+                elemVarlena("NULL".getBytes()),
+                elemNull(),
+                elemVarlena(" sp ".getBytes()),
+                elemVarlena(new byte[0]),
+                elemVarlena("q\"r\\s".getBytes()));
+        assertEquals("{a,\"b,c\",d'e,\"NULL\",NULL,\" sp \",\"\",\"q\\\"r\\\\s\"}",
+                BinaryValueDecoder.decode(1009, arr));
+    }
+
+    @Test
+    void twoDimensionalIntArrayRendersNestedBraces() {
+        // _int4(1007) 二维 dims=[2,2] → "{{1,2},{3,4}}"
+        byte[] arr = array(23, false, new int[]{2, 2}, new int[]{1, 1},
+                elemVarlena(i32(1)), elemVarlena(i32(2)), elemVarlena(i32(3)), elemVarlena(i32(4)));
+        assertEquals("{{1,2},{3,4}}", BinaryValueDecoder.decode(1007, arr));
+    }
+
+    @Test
+    void arrayWithNonZeroLowerBoundAppendsPrefix() {
+        // lb=-2 dim=4 → "[-2:1]={1,2,3,4}"（上界 = lb + dim - 1）
+        byte[] arr = array(23, false, new int[]{4}, new int[]{-2},
+                elemVarlena(i32(1)), elemVarlena(i32(2)), elemVarlena(i32(3)), elemVarlena(i32(4)));
+        assertEquals("[-2:1]={1,2,3,4}", BinaryValueDecoder.decode(1007, arr));
+    }
+
+    @Test
+    void boolAndFloat8AndNumericArrays() {
+        // _bool(1000)：定长 1 字节带前缀——false(全零字节) 与 NULL(前缀 -1) 无歧义
+        assertEquals("{t,f,NULL}", BinaryValueDecoder.decode(1000, array(16, true,
+                new int[]{3}, new int[]{1}, elemVarlena(bytes(1)), elemVarlena(bytes(0)), elemNull())));
+        // _float8(1022)：定长 8 字节 → "{1.5,-2.5}"
+        assertEquals("{1.5,-2.5}", BinaryValueDecoder.decode(1022, array(701, false,
+                new int[]{2}, new int[]{1}, elemVarlena(f64(1.5)), elemVarlena(f64(-2.5)))));
+        // _numeric(1231)：varlena 元素，载荷为元素的 typsend 形态（numeric 头+digits）
+        assertEquals("{123.45,-8.9}", BinaryValueDecoder.decode(1231, array(1700, false,
+                new int[]{2}, new int[]{1},
+                elemVarlena(numeric(0x0000, 0, 2, 123, 4500)),
+                elemVarlena(numeric(0x4000, 0, 1, 8, 9000)))));
+    }
+
+    @Test
+    void dateAndTimestampArraysRecurseScalarDecoding() {
+        // _date(1182)：定长 4 字节 i32 天 → "{2000-01-01,1999-12-31}"
+        assertEquals("{2000-01-01,1999-12-31}", BinaryValueDecoder.decode(1182, array(1082, false,
+                new int[]{2}, new int[]{1}, elemVarlena(i32(0)), elemVarlena(i32(-1)))));
+        // _timestamp(1115)：定长 8 字节 i64 微秒 → 时间文本递归（秒为 0 不省略）；文本含空白 → 带引号
+        LocalDateTime ldt = LocalDateTime.of(2026, 1, 1, 10, 20, 0);
+        assertEquals("{\"2026-01-01 10:20:00\"}", BinaryValueDecoder.decode(1115, array(1114, false,
+                new int[]{1}, new int[]{1}, elemVarlena(i64(microsSincePgEpoch(ldt))))));
+    }
+
+    @Test
+    void byteaArrayEscapesBackslashInsideQuotes() {
+        // _bytea(1001)：varlena 元素输出 "\x.." 含反斜杠 → 加引号并反斜杠转义（array_out 的 \\ 形态）
+        byte[] arr = array(17, false, new int[]{1}, new int[]{1},
+                elemVarlena(bytes(0xDE, 0xAD, 0xBE, 0xEF)));
+        assertEquals("{\"\\\\xdeadbeef\"}", BinaryValueDecoder.decode(1001, arr));
+    }
+
+    @Test
+    void intervalArrayRendersQuotedElements() {
+        // _interval(1187)：元素 varlena（interval 头 16 字节），文本含空白 → 引号
+        byte[] oneDay = interval(0, 1, 0);
+        byte[] twoDays = interval((3L * 3600 + 4L * 60 + 5) * 1_000_000L, 2, 0);
+        assertEquals("{\"1 day\",\"2 days 03:04:05\"}", BinaryValueDecoder.decode(1187, array(1186, false,
+                new int[]{2}, new int[]{1}, elemVarlena(oneDay), elemVarlena(twoDays))));
+    }
+
+    @Test
+    void unknownElemOidDegradesWholeArray() {
+        byte[] arr = array(999999, false, new int[]{1}, new int[]{1}, i32(1));
+        assertEquals("0x" + HexFormat.of().formatHex(arr), BinaryValueDecoder.decode(1007, arr));
     }
 
     // ---- fail-fast ----
