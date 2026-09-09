@@ -3,8 +3,10 @@ package org.vastdata.debezium.connector.postgresql.stream;
 import java.nio.charset.Charset;
 import java.time.ZoneOffset;
 
+import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.SchemaBuilder;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.connector.postgresql.PostgresValueConverter;
 import io.debezium.connector.postgresql.TypeRegistry;
@@ -25,7 +27,7 @@ import io.debezium.relational.ValueConverter;
  *   <li>{@link #schemaBuilder(Column)} 恒返回 {@code SchemaBuilder.string()}——
  *       所有列(含 key 列)的 Connect schema 均为 STRING,optionality 仍由
  *       TableSchema 构建侧按列元数据统一施加(vanilla 各类型分支同款契约)</li>
- *   <li>{@link #converter(Column, org.apache.kafka.connect.data.Field)} 恒返回恒等
+ *   <li>{@link #converter(Column, Field)} 恒返回恒等
  *       函数——struct 构建期对已透传的 String 不做二次类型化(否则 vanilla 转换链会对
  *       String 调 {@code ((Number)x).intValue()} 之类,ClassCastException)</li>
  * </ul>
@@ -62,7 +64,7 @@ public class StringValueConverter extends PostgresValueConverter {
                                    BigIntUnsignedMode bigIntUnsignedMode, boolean includeUnknownDatatypes,
                                    TypeRegistry typeRegistry,
                                    PostgresConnectorConfig.HStoreHandlingMode hStoreMode,
-                                   io.debezium.config.CommonConnectorConfig.BinaryHandlingMode binaryMode,
+                                   CommonConnectorConfig.BinaryHandlingMode binaryMode,
                                    PostgresConnectorConfig.IntervalHandlingMode intervalMode,
                                    UnchangedToastedPlaceholder unchangedToastedPlaceholder, int moneyFractionDigits) {
         super(databaseCharset, decimalMode, temporalPrecisionMode, defaultOffset, bigIntUnsignedMode,
@@ -119,7 +121,7 @@ public class StringValueConverter extends PostgresValueConverter {
      * STRING schema 不符在 Struct 层 fail-fast(见类 javadoc 已知边界)。
      */
     @Override
-    public ValueConverter converter(Column column, org.apache.kafka.connect.data.Field fieldDefn) {
+    public ValueConverter converter(Column column, Field fieldDefn) {
         return data -> data;
     }
 }

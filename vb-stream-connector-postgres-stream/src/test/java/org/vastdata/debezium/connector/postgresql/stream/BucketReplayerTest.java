@@ -1,5 +1,6 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
@@ -13,6 +14,7 @@ import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleData;
 import org.vastdata.debezium.connector.postgresql.stream.protocol.TupleValue;
 
 import java.nio.file.Path;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
@@ -76,8 +78,8 @@ class BucketReplayerTest {
     private static ResolvedRelation resolved(PgOutputMessage.Relation wire) {
         var editor = Table.editor().tableId(new TableId(null, wire.schema(), wire.table()));
         for (var col : wire.columns()) {
-            editor.addColumn(io.debezium.relational.Column.editor()
-                    .name(col.name()).jdbcType(java.sql.Types.VARCHAR).type("text").create());
+            editor.addColumn(Column.editor()
+                    .name(col.name()).jdbcType(Types.VARCHAR).type("text").create());
         }
         return new ResolvedRelation(wire, editor.create());
     }

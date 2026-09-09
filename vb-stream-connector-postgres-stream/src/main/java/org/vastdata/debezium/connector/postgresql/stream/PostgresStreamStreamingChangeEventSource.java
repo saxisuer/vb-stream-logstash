@@ -11,10 +11,12 @@ import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -429,8 +431,8 @@ public class PostgresStreamStreamingChangeEventSource
         try {
             mainConnection.commit();
         }
-        catch (java.sql.SQLException e) {
-            throw new org.apache.kafka.connect.errors.ConnectException(
+        catch (SQLException e) {
+            throw new ConnectException(
                     "Failed to commit the initial offset read on the main connection", e);
         }
         return initial;

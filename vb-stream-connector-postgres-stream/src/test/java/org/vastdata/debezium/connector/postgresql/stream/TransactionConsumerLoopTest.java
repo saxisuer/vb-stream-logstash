@@ -1,5 +1,6 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
@@ -58,7 +59,7 @@ class TransactionConsumerLoopTest {
     private static ResolvedRelation resolved(PgOutputMessage.Relation wire) {
         var editor = Table.editor().tableId(new TableId(null, wire.schema(), wire.table()));
         for (var col : wire.columns()) {
-            editor.addColumn(io.debezium.relational.Column.editor()
+            editor.addColumn(Column.editor()
                     .name(col.name()).jdbcType(Types.VARCHAR).type("text").create());
         }
         return new ResolvedRelation(wire, editor.create());

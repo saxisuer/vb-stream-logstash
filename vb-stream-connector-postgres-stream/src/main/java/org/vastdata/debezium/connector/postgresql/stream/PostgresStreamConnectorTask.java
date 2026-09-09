@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.bean.StandardBeanNames;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
@@ -27,6 +28,7 @@ import io.debezium.connector.postgresql.PostgresErrorHandler;
 import io.debezium.connector.postgresql.PostgresEventDispatcher;
 import io.debezium.connector.postgresql.PostgresOffsetContext;
 import io.debezium.connector.postgresql.PostgresPartition;
+import io.debezium.connector.postgresql.PostgresValueConverter;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
@@ -49,6 +51,8 @@ import io.debezium.schema.SchemaFactory;
 import io.debezium.schema.SchemaNameAdjuster;
 import io.debezium.snapshot.SnapshotterService;
 import io.debezium.spi.topic.TopicNamingStrategy;
+import io.debezium.util.Clock;
+import io.debezium.util.LoggingContext;
 
 /**
  * 流式连接器的 Connect 任务(MS2 真装配):泛型对齐 PG 连接器的分区/offset 体系
@@ -135,7 +139,7 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
         final TypeRegistry sharedTypeRegistry = PostgresConnection.createTypeRegistry(connectorConfig.getJdbcConfig());
 
         final PostgresConnection.PostgresValueConverterBuilder valueConverterBuilder = typeRegistry ->
-                io.debezium.connector.postgresql.PostgresValueConverter.of(connectorConfig, databaseCharset, typeRegistry);
+                PostgresValueConverter.of(connectorConfig, databaseCharset, typeRegistry);
 
         MainConnectionProvidingConnectionFactory<PostgresConnection> connectionFactory =
                 new DefaultMainConnectionProvidingConnectionFactory<>(
@@ -157,7 +161,7 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
         // Connect schema 恒 STRING + converter 恒等,值侧配合 StringColumnValueMapper 原文透传
         // (监督壳 execute 装配);连接工厂的 valueConverterBuilder 保持 vanilla——JDBC 连接
         // 只服务元数据 enrich('R')与初始 offset,快照恒 no_data 不经连接读值,无需改形
-        final io.debezium.connector.postgresql.PostgresValueConverter valueConverter =
+        final PostgresValueConverter valueConverter =
                 connectorConfig.valuesAsString()
                         ? StringValueConverter.of(connectorConfig, databaseCharset, typeRegistry)
                         : valueConverterBuilder.build(typeRegistry);
@@ -177,7 +181,7 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
         this.offsetContextLoader = new PostgresOffsetContext.Loader(connectorConfig);
         final Offsets<PostgresPartition, PostgresOffsetContext> previousOffsets =
                 getPreviousOffsets(this.partitionProvider, this.offsetContextLoader);
-        final io.debezium.util.Clock clock = io.debezium.util.Clock.system();
+        final Clock clock = Clock.system();
         final PostgresOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
 
         // 命名豆注册(vanilla :151-159 同款):SnapshotterServiceProvider 等服务供应商经
@@ -185,18 +189,18 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
         // IT 首跑实测的装配缺口)。JDBC_CONNECTION 用 bean registry 专属的独立新连接,
         // 不复用 main 连接(R3:main 连接 execute 后由 reader 线程独占)
         beanRegistryJdbcConnection = connectionFactory.newConnection();
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.CONFIGURATION, config);
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.DATABASE_SCHEMA, schema);
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.JDBC_CONNECTION, beanRegistryJdbcConnection);
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.VALUE_CONVERTER, valueConverter);
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.OFFSETS, previousOffsets);
-        connectorConfig.getBeanRegistry().add(io.debezium.bean.StandardBeanNames.CDC_SOURCE_TASK_CONTEXT, taskContext);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.CONFIGURATION, config);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.CONNECTOR_CONFIG, connectorConfig);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.DATABASE_SCHEMA, schema);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.JDBC_CONNECTION, beanRegistryJdbcConnection);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.VALUE_CONVERTER, valueConverter);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.OFFSETS, previousOffsets);
+        connectorConfig.getBeanRegistry().add(StandardBeanNames.CDC_SOURCE_TASK_CONTEXT, taskContext);
 
         final SnapshotterService snapshotterService = connectorConfig.getServiceRegistry()
                 .tryGetService(SnapshotterService.class);
 
-        io.debezium.util.LoggingContext.PreviousContext previousContext = taskContext.configureLoggingContext(CONTEXT_NAME);
+        LoggingContext.PreviousContext previousContext = taskContext.configureLoggingContext(CONTEXT_NAME);
         if (previousOffset == null) {
             LOGGER.info("No previous offset found");
         }

@@ -6,6 +6,7 @@ import java.util.Locale;
 import net.openhft.chronicle.queue.RollCycle;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.apache.kafka.common.config.ConfigDef.Type;
+import org.apache.kafka.connect.errors.ConnectException;
 
 import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
@@ -148,7 +149,7 @@ public class PostgresStreamConnectorConfig extends PostgresConnectorConfig {
     public PostgresStreamConnectorConfig(Configuration config) {
         super(config);
         if (getSnapshotMode() != SnapshotMode.NO_DATA) {
-            throw new org.apache.kafka.connect.errors.ConnectException(
+            throw new ConnectException(
                     "snapshot.mode='" + getSnapshotMode() + "' is not supported: this connector supports "
                             + "snapshot.mode=no_data only (streaming-only, no snapshot data extraction)");
         }

@@ -1,5 +1,6 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
+import io.debezium.config.Field;
 import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigValue;
@@ -67,7 +68,7 @@ class PostgresStreamConnectorTest {
                 "slot.feedback.interval.ms 的 ConfigDef 默认值应与 Field 声明一致");
 
         Set<String> fieldNames = new HashSet<>();
-        for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
+        for (Field field : new PostgresStreamConnector().getConfigFields()) {
             fieldNames.add(field.name());
         }
         assertTrue(fieldNames.containsAll(expected),

@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
 /**
@@ -288,7 +289,7 @@ public final class ReplicationSession implements AutoCloseable {
      * @param receiveLsnSink 每轮的最近收到 LSN 转发回调(实例形态为 lastReceiveLsn 的 volatile 写)
      */
     static void run(PGReplicationStream stream, Parameters config, RawMessageListener listener, LongSupplier outputFrontier,
-                    java.util.function.LongConsumer receiveLsnSink)
+                    LongConsumer receiveLsnSink)
             throws SQLException, IOException {
         long feedbackIntervalNanos = config.feedbackIntervalSeconds() * 1_000_000_000L;
         long lastFeedbackNanos = System.nanoTime();

@@ -1,8 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.config.Configuration;
+import io.debezium.config.Field;
 import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.Test;
@@ -122,7 +124,7 @@ class PostgresStreamConnectorConfigTest {
     @Test
     void allFieldsExtendParentSetWithFourNewKeys() {
         Set<String> names = new HashSet<>();
-        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+        for (Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
             names.add(field.name());
         }
         assertTrue(names.containsAll(Set.of("slot.streaming", "slot.two.phase", "pipe.dir", "pipe.roll.cycle")),
@@ -179,13 +181,13 @@ class PostgresStreamConnectorConfigTest {
                 .feedbackIntervalSeconds(), "显式 15000ms 应换算为 15 秒");
 
         Set<String> names = new HashSet<>();
-        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+        for (Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
             names.add(field.name());
         }
         assertTrue(names.contains("slot.feedback.interval.ms"), "ALL_FIELDS 应含 slot.feedback.interval.ms");
 
         Set<String> connectorFieldNames = new HashSet<>();
-        for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
+        for (Field field : new PostgresStreamConnector().getConfigFields()) {
             connectorFieldNames.add(field.name());
         }
         assertTrue(connectorFieldNames.contains("slot.feedback.interval.ms"),
@@ -262,18 +264,18 @@ class PostgresStreamConnectorConfigTest {
     @Test
     void messagesFieldJoinsAllFieldsConnectorFieldsAndRestConfigDef() {
         Set<String> names = new HashSet<>();
-        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+        for (Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
             names.add(field.name());
         }
         assertTrue(names.contains("slot.messages"), "ALL_FIELDS 应含 slot.messages");
 
         Set<String> connectorFieldNames = new HashSet<>();
-        for (io.debezium.config.Field field : new PostgresStreamConnector().getConfigFields()) {
+        for (Field field : new PostgresStreamConnector().getConfigFields()) {
             connectorFieldNames.add(field.name());
         }
         assertTrue(connectorFieldNames.contains("slot.messages"), "getConfigFields() 应同含 slot.messages");
 
-        org.apache.kafka.common.config.ConfigDef def = new PostgresStreamConnector().config();
+        ConfigDef def = new PostgresStreamConnector().config();
         assertTrue(def.names().contains("slot.messages"), "Connect REST configDef 应暴露 slot.messages");
         assertEquals(Boolean.FALSE, def.defaultValues().get("slot.messages"),
                 "REST 暴露面默认值应取 Field.defaultValue()(false)");
@@ -347,7 +349,7 @@ class PostgresStreamConnectorConfigTest {
         assertTrue(new PostgresStreamConnectorConfig(configWith(Map.of("values.as.string", "true"))).valuesAsString(),
                 "显式 true 应生效");
         boolean joined = false;
-        for (io.debezium.config.Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
+        for (Field field : PostgresStreamConnectorConfig.ALL_FIELDS) {
             joined |= "values.as.string".equals(field.name());
         }
         assertTrue(joined, "ALL_FIELDS 应收录 values.as.string");

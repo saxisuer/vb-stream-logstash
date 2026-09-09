@@ -7,6 +7,7 @@ import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.signal.actions.snapshotting.SnapshotConfiguration;
 import io.debezium.pipeline.source.SnapshottingTask;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.pipeline.source.spi.ChangeEventSourceFactory;
@@ -162,7 +163,7 @@ public class StreamChangeEventSourceFactory
         @Override
         public SnapshottingTask getBlockingSnapshottingTask(PostgresPartition partition,
                                                             PostgresOffsetContext previousOffset,
-                                                            io.debezium.pipeline.signal.actions.snapshotting.SnapshotConfiguration snapshotConfiguration) {
+                                                            SnapshotConfiguration snapshotConfiguration) {
             return emptyTask();
         }
 

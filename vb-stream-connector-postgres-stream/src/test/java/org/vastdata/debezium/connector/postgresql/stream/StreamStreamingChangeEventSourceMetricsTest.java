@@ -7,8 +7,10 @@ import io.debezium.connector.postgresql.PostgresConnectorConfig;
 import io.debezium.pipeline.metrics.StreamingChangeEventSourceMetrics;
 import io.debezium.pipeline.metrics.CapturedTablesSupplier;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
+import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.pipeline.spi.Partition;
 import io.debezium.spi.schema.DataCollectionId;
+import org.apache.kafka.connect.data.Struct;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -16,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -310,20 +313,20 @@ class StreamStreamingChangeEventSourceMetricsTest {
     private static EventMetadataProvider metadataProvider() {
         return new EventMetadataProvider() {
             @Override
-            public java.time.Instant getEventTimestamp(DataCollectionId source, io.debezium.pipeline.spi.OffsetContext offset,
-                    Object key, org.apache.kafka.connect.data.Struct value) {
+            public Instant getEventTimestamp(DataCollectionId source, OffsetContext offset,
+                    Object key, Struct value) {
                 return null;
             }
 
             @Override
-            public Map<String, String> getEventSourcePosition(DataCollectionId source, io.debezium.pipeline.spi.OffsetContext offset,
-                    Object key, org.apache.kafka.connect.data.Struct value) {
+            public Map<String, String> getEventSourcePosition(DataCollectionId source, OffsetContext offset,
+                    Object key, Struct value) {
                 return Map.of();
             }
 
             @Override
-            public String getTransactionId(DataCollectionId source, io.debezium.pipeline.spi.OffsetContext offset,
-                    Object key, org.apache.kafka.connect.data.Struct value) {
+            public String getTransactionId(DataCollectionId source, OffsetContext offset,
+                    Object key, Struct value) {
                 return null;
             }
         };
