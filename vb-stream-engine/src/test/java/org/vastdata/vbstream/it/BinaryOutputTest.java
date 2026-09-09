@@ -250,7 +250,7 @@ class BinaryOutputTest {
                 msg -> msg instanceof PgOutputMessage.Commit)) {
             PgTestEnv.execSql(
                     "INSERT INTO t_bin_coll VALUES ("
-                            + " '1 year 2 mons 3 days 04:05:06', '-1 mons -2 days -03:00:00.5',"
+                            + " '1 year 2 mons 3 days 04:05:06', '-1 mons +2 days -03:00:00.5',"
                             + " ARRAY['2026-01-01'::date, '1999-12-31'::date],"
                             + " ARRAY['12:34:56.789'::time, '23:59:59'::time],"
                             + " ARRAY['2026-08-27 10:20:30.123456'::timestamp, '2000-01-01 00:00:00'::timestamp],"

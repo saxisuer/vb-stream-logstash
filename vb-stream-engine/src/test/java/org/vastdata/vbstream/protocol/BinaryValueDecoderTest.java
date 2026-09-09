@@ -273,6 +273,20 @@ class BinaryValueDecoderTest {
         assertEquals("100:00:00", BinaryValueDecoder.decode(1186, interval(100L * 3600 * 1_000_000L, 0, 0)));
     }
 
+    @Test
+    void intervalMixedSignsEmitPlusPrefixAfterNegativePart() {
+        // is_before 逐字段传递（AddPostgresIntPart 源码核对 + PG 18 真库校准）：
+        // 正分段紧跟负分段之后输出 "+" 前缀
+        assertEquals("-1 mons +2 days", BinaryValueDecoder.decode(1186, interval(0, 2, -1)));
+        assertEquals("-1 years +02:00:00", BinaryValueDecoder.decode(1186,
+                interval(2L * 3600 * 1_000_000L, 0, -12)));
+        assertEquals("-1 years -2 mons +3 days 04:00:00", BinaryValueDecoder.decode(1186,
+                interval(4L * 3600 * 1_000_000L, 3, -14)));
+        // 正分段之后的负时间段：自带 "-"（无 is_before 翻转）
+        assertEquals("2 days -03:00:00", BinaryValueDecoder.decode(1186,
+                interval(-3L * 3600 * 1_000_000L, 2, 0)));
+    }
+
     // ---- 数组（array_send/array_out 形态）----
 
     /** 数组元素字节（varlena）：i32 长度 + 载荷；len=-1 为 NULL。 */

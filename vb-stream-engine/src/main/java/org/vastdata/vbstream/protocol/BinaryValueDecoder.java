@@ -348,10 +348,12 @@ public final class BinaryValueDecoder {
     }
 
     /**
-     * interval：i64 微秒（time）+ i32 天（day）+ i32 月（month），此顺序（interval_send）。
-     * 渲染对齐 interval_out 的 postgres 风格：year/mon 由 month 分解（C 向零取整——负 month 各段自带
-     * 负号，如 -18 月 → "-1 years -6 mons"）；单复数按"值 ≠ 1 带复数"（-1 同样带 s）；时间部分非零时
-     * 以 {@code HH:mm:ss[.frac]} 输出（负值前缀 "-"，微秒去尾零），全部为零时输出 "00:00:00"。
+     * interval：i64 微秒（time）+ i32 天（day）+ i32 月（month），此顺序（interval_send，PG 18 源码核对）。
+     * 渲染对齐 interval_out 的 postgres 风格（EncodeInterval/AddPostgresIntPart，经 PG 18 真库校准）：
+     * year/mon 由 month 分解（C 向零取整——负 month 各段自带负号，如 -18 月 → "-1 years -6 mons"）；
+     * 单复数按"值 ≠ 1 带复数"（-1 同样带 s）；**is_before 逐字段传递**——正字段紧跟负字段之后输出
+     * {@code +} 前缀（"-1 mons +2 days"，混合符号形态）；时间部分非零时以 {@code HH:mm:ss[.frac]}
+     * 输出（负值前缀 "-"、is_before 且正时前缀 "+"，微秒去尾零），全部为零时输出 "00:00:00"。
      */
     private static String decodeInterval(ByteBufferReader r) {
         if (r.remaining() != 16) {
@@ -363,26 +365,28 @@ public final class BinaryValueDecoder {
         int year = month / 12;
         int mon = month % 12;
         StringBuilder out = new StringBuilder(32);
-        if (year != 0) {
-            out.append(year).append(year != 1 ? " years" : " year");
-        }
-        if (mon != 0) {
-            out.append(out.isEmpty() ? "" : " ").append(mon).append(mon != 1 ? " mons" : " mon");
-        }
-        if (day != 0) {
-            out.append(out.isEmpty() ? "" : " ").append(day).append(day != 1 ? " days" : " day");
-        }
+        // 状态对齐源码：state[0]=is_before（上一非零字段为负），state[1]=is_zero（尚无任何非零字段）
+        boolean[] state = {false, true};
+        appendIntervalPart(out, year, "year", state);
+        appendIntervalPart(out, mon, "mon", state);
+        appendIntervalPart(out, day, "day", state);
         // 时间部分：非零时输出；全部分量为零时输出 "00:00:00"（interval_out 对零 interval 的形态）
-        if (timeMicros != 0 || out.isEmpty()) {
+        if (timeMicros != 0 || state[1]) {
             boolean negative = timeMicros < 0;
             long abs = Math.abs(timeMicros);
             long hours = abs / 3_600_000_000L;
             long minutes = (abs % 3_600_000_000L) / 60_000_000L;
             long seconds = (abs % 60_000_000L) / 1_000_000L;
             long micros = abs % 1_000_000L;
-            out.append(out.isEmpty() ? "" : " ")
-                    .append(negative ? "-" : "")
-                    .append("%02d:%02d:%02d".formatted(hours, minutes, seconds));
+            if (!state[1]) {
+                out.append(' ');
+            }
+            if (negative) {
+                out.append('-');
+            } else if (state[0]) {
+                out.append('+');  // 正时间段紧跟负分段之后（源码 minus/is_before 分支）
+            }
+            out.append("%02d:%02d:%02d".formatted(hours, minutes, seconds));
             if (micros != 0) {
                 String digits = "%06d".formatted(micros);
                 int end = digits.length();
@@ -393,6 +397,29 @@ public final class BinaryValueDecoder {
             }
         }
         return out.toString();
+    }
+
+    /**
+     * interval 单个整数分段的输出（AddPostgresIntPart 同构）：零值跳过；非首字段前置空格；
+     * is_before 且本字段为正时前缀 {@code +}（负值由数字自带负号）；"值 ≠ 1" 恒带复数（-1 亦然）；
+     * 本字段非零即翻转 state——is_before 记录本字段符号、is_zero 清位。
+     */
+    private static void appendIntervalPart(StringBuilder out, long value, String unit, boolean[] state) {
+        if (value == 0) {
+            return;
+        }
+        if (!state[1]) {
+            out.append(' ');
+        }
+        if (state[0] && value > 0) {
+            out.append('+');
+        }
+        out.append(value).append(' ').append(unit);
+        if (value != 1) {
+            out.append('s');
+        }
+        state[0] = value < 0;
+        state[1] = false;
     }
 
     /**
@@ -407,7 +434,7 @@ public final class BinaryValueDecoder {
             throw malformed(typeId, r.remaining(), "≥12 字节数组头");
         }
         int ndim = r.readInt();
-        boolean hasNull = r.readInt() != 0;
+        r.readInt();  // hasnull 标志：仅元数据（NULL 判定走元素级 -1 前缀），消费以推进读取位置
         int elemOid = r.readInt();
         if (ndim < 0 || ndim > 6 || r.remaining() < ndim * 8L) {
             throw malformed(typeId, r.remaining(), "ndim=" + ndim + " 的维数头");
