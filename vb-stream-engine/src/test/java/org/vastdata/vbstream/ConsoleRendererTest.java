@@ -200,4 +200,28 @@ class ConsoleRendererTest {
         long infoCount = appender.list.stream().filter(e -> e.getLevel() == Level.INFO).count();
         assertEquals(9, infoCount, "行级/元数据消息不应追加 INFO: " + appender.list);
     }
+
+    /**
+     * binary 列值按列类型渲染（binary 模式接线）：'b' 种类载荷不再一律十六进制，而是按 Relation 快照的
+     * 列 typeId 经 {@link org.vastdata.vbstream.protocol.BinaryValueDecoder} 解释——int4 字节渲染十进制、
+     * bytea 渲染 "\\x" 十六进制（与该类型 text 模式输出形态对齐）；解码结果与 text 同样受 64 字符截断。
+     */
+    @Test
+    void binaryColumnRendersDecodedValueByColumnType() {
+        PgOutputMessage.Relation rel = new PgOutputMessage.Relation(OptionalLong.empty(), 16384,
+                "public", "t_bin", 'd',
+                List.of(new Column("id", 23, -1, true), new Column("payload", 17, -1, false)));
+        TupleData row = new TupleData(List.of(
+                new TupleValue.Binary(new byte[]{0, 0, 0, 42}),
+                new TupleValue.Binary(new byte[]{(byte) 0xDE, (byte) 0xAD})));
+        RowChange insert = new RowChange(DmlKind.INSERT, rel, Optional.empty(), Optional.of(row),
+                OptionalLong.empty());
+
+        new ConsoleRenderer().onTransaction(new Transaction(506L, TransactionKind.NORMAL, null,
+                1L, 2L, Instant.parse("2026-08-27T08:00:00Z"), List.of(insert)));
+
+        String body = appender.list.get(1).getFormattedMessage();
+        assertTrue(body.contains("id=42"), "int4 binary 应按类型渲染十进制: " + body);
+        assertTrue(body.contains("payload=\\xdead"), "bytea binary 应渲染 \\x 十六进制: " + body);
+    }
 }

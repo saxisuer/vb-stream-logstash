@@ -3,6 +3,7 @@ package org.vastdata.vbstream.replication;
 import org.postgresql.PGConnection;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
+import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,20 +80,25 @@ public final class PgReplicationSession implements AutoCloseable {
 
     public void start() throws SQLException {
         PGConnection pg = replicationConnection.unwrap(PGConnection.class);
-        stream = pg.getReplicationAPI()
+        ChainedLogicalStreamBuilder builder = pg.getReplicationAPI()
                 .replicationStream()
                 .logical()
                 .withSlotName(config.slotName())
                 .withSlotOption("proto_version", Integer.toString(config.protoVersion()))
                 .withSlotOption("publication_names", config.publicationNames())
                 .withSlotOption("streaming", config.streamingParam())
-                .withSlotOption("two_phase", config.twoPhase() ? "on" : "off")
+                .withSlotOption("two_phase", config.twoPhase() ? "on" : "off");
+        // binary 选项仅 PG 16+ 的 pgoutput 识别，低版本传参即报错——false 是服务端默认，不传零兼容风险
+        if (config.binary()) {
+            builder.withSlotOption("binary", "on");
+        }
+        stream = builder
                 .withStartPosition(LogSequenceNumber.INVALID_LSN)
                 .withStatusInterval(config.feedbackIntervalSeconds(), TimeUnit.SECONDS)
                 .start();
-        LOG.info("复制流已启动: 槽={} publication={} proto=v{} streaming={} twoPhase={}",
+        LOG.info("复制流已启动: 槽={} publication={} proto=v{} streaming={} twoPhase={} binary={}",
                 config.slotName(), config.publicationNames(), config.protoVersion(),
-                config.streamingParam(), config.twoPhase());
+                config.streamingParam(), config.twoPhase(), config.binary());
     }
 
     /** 轮询间隔：readPending 非阻塞，空轮 sleep 控 CPU，消息到达延迟上界即此值；搬运过消息的轮不睡（drain，见 {@link #drainPending}）。 */

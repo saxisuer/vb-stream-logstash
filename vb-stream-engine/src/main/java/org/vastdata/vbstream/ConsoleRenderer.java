@@ -2,6 +2,7 @@ package org.vastdata.vbstream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.vastdata.vbstream.protocol.BinaryValueDecoder;
 import org.vastdata.vbstream.protocol.PgOutputMessage;
 import org.vastdata.vbstream.protocol.TupleData;
 import org.vastdata.vbstream.protocol.TupleValue;
@@ -160,18 +161,24 @@ public final class ConsoleRenderer implements PgOutputListener, StreamingTransac
         return relation.schema() + "." + relation.table();
     }
 
-    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationLookup)} 同规则：列名取快照、越界退化为 "#i"，值渲染规则见 {@link #renderValue}）。 */
+    /** 列名=值 打印（基于内嵌快照；与逐消息版 {@link #tupleOf(int, TupleData, RelationLookup)} 同规则：列名取快照、越界退化为 "#i"，typeId 按位取快照列元数据（越界 -1 → binary 走十六进制降级），值渲染规则见 {@link #renderValue}）。 */
     private static String tupleOf(TupleData tuple, PgOutputMessage.Relation relation) {
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < tuple.columns().size(); i++) {
             String column = i < relation.columns().size() ? relation.columns().get(i).name() : "#" + i;
-            parts.add(column + "=" + renderValue(tuple.columns().get(i)));
+            int typeId = i < relation.columns().size() ? relation.columns().get(i).typeId() : -1;
+            parts.add(column + "=" + renderValue(tuple.columns().get(i), typeId));
         }
         return parts.toString();
     }
 
-    /** 单列值渲染规则：NULL / TOAST 未变显式标注，text 截断到 64 字符（超出附原长字节数），binary 走十六进制；未知列值类型抛 {@link IllegalStateException}（fail-fast）。 */
-    private static String renderValue(TupleValue value) {
+    /**
+     * 单列值渲染规则：NULL / TOAST 未变显式标注；text 与 binary 解码结果同样截断到 64 字符（超出附原长
+     * 字节数）。binary 载荷按列 typeId 经 {@link BinaryValueDecoder} 解释（pgoutput binary 模式，
+     * 与 text 模式输出形态对齐）；typeId &lt; 0（Relation 不可得/列越界）或矩阵外类型时退化为十六进制
+     * 原文。未知列值类型抛 {@link IllegalStateException}（fail-fast）。
+     */
+    private static String renderValue(TupleValue value, int typeId) {
         if (value instanceof TupleValue.Null) {
             return "NULL";
         }
@@ -179,13 +186,20 @@ public final class ConsoleRenderer implements PgOutputListener, StreamingTransac
             return "<toast-unchanged>";
         }
         if (value instanceof TupleValue.Text t) {
-            String s = t.value();
-            return s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
+            return truncate(t.value());
         }
         if (value instanceof TupleValue.Binary b) {
-            return "0x" + HexFormat.of().formatHex(b.value());
+            String s = typeId >= 0
+                    ? BinaryValueDecoder.decode(typeId, b.value())
+                    : "0x" + HexFormat.of().formatHex(b.value());
+            return truncate(s);
         }
         throw new IllegalStateException("未知列值类型: " + value.getClass());
+    }
+
+    /** 渲染截断：64 字符以上截断并附原长（text 与 binary 解码结果同规则）。 */
+    private static String truncate(String s) {
+        return s.length() > 64 ? s.substring(0, 64) + "...(" + s.length() + "B)" : s;
     }
 
     /**
@@ -276,7 +290,7 @@ public final class ConsoleRenderer implements PgOutputListener, StreamingTransac
                 .orElse("oid:" + oid);
     }
 
-    /** 列名=值 打印；列名经 registry 解析（miss 或越界退化为 "#i"），值渲染规则见 {@link #renderValue}。 */
+    /** 列名=值 打印；列名与 typeId 经 registry 解析（miss 或越界退化为 "#i" / 十六进制降级），值渲染规则见 {@link #renderValue}。 */
     private static String tupleOf(int oid, TupleData tuple, RelationLookup registry) {
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < tuple.columns().size(); i++) {
@@ -285,7 +299,11 @@ public final class ConsoleRenderer implements PgOutputListener, StreamingTransac
                     .filter(rel -> idx < rel.columns().size())
                     .map(rel -> rel.columns().get(idx).name())
                     .orElse("#" + idx);
-            parts.add(column + "=" + renderValue(tuple.columns().get(i)));
+            int typeId = registry.find(oid)
+                    .filter(rel -> idx < rel.columns().size())
+                    .map(rel -> rel.columns().get(idx).typeId())
+                    .orElse(-1);
+            parts.add(column + "=" + renderValue(tuple.columns().get(i), typeId));
         }
         return parts.toString();
     }

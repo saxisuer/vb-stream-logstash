@@ -37,7 +37,7 @@
 - `delete`：oid 后**必须** `'K'` 或 `'O'`
 - `truncate`：I32 表数 + I8 选项位（bit0=CASCADE、bit1=RESTART_IDENTITY）+ N 个 I32 oid
 - `logicalMsg`：I8 flags（bit0=transactional）+ I64 lsn + prefix + I32 长度 + 字节内容
-- `tupleData`（包级工具，Update/Delete/Insert 共用）：I16 列数；每列种类字节 `'n'` NULL / `'u'` TOAST 未变 / `'t'` 文本（I32 长度 + UTF-8 字节）/ `'b'` 二进制（I32 长度 + 原始字节）
+- `tupleData`（包级工具，Update/Delete/Insert 共用）：I16 列数；每列种类字节 `'n'` NULL / `'u'` TOAST 未变 / `'t'` 文本（I32 长度 + UTF-8 字节）/ `'b'` 二进制（I32 长度 + 原始字节——PG 16 起 START_REPLICATION 传 `binary 'on'` 时数据列全部走此种类，载荷为各类型 `typsend` 的二进制表示，经 `BinaryValueDecoder` 按列 typeId 解释，见下节；`'n'`/`'u'` 语义与外壳不因 binary 模式改变）
 
 ### StreamParsers（S/E/c/A——流式大事务控制）
 - `start`：I32 xid + I8 firstSegment（1 = 首个流段）
@@ -53,6 +53,7 @@
 ## 值类型与工具
 
 - `ByteBufferReader`：big-endian 逐字段读取，**非线程安全、每消息新建**。`readUnsignedInt` 返回 long（xid 无符号语义，避免负数）；`readString` 读到 `\0`；静态 `pgMicrosToInstant` 用 floorDiv/floorMod 换算（正确处理负微秒），纪元偏移 946684800 秒
+- `BinaryValueDecoder`（2026-09-09）：binary 模式 `'b'` 载荷的解释器——`decode(typeId, raw) → String`，产出与 text 模式输出对齐的可读值。矩阵：bool("t"/"f")/int2/4/8（补码十进制）/oid·xid·cid（u32）/float4/8（IEEE 位型，Java 最短表示）/text·varchar(1043)·bpchar·name·json（UTF-8 原文）/bytea（`\x`+小写 hex）/numeric（base-10000：u16 ndigits+i16 weight+u16 sign+u16 dscale+digits，NaN/±Inf 0xC000/0xD000/0xF000，精度无损且永不科学计数法）/date（i32 天）/time（i64 µs）/timetz（i64 µs + **i32** 秒 zone，存储"西经为正"输出取负）/timestamp（i64 µs 墙钟）/timestamptz（同前按系统默认时区渲染——对齐 pgjdbc 会话时区设定）/uuid（小写连字符）。时间文本恒 `HH:mm:ss`（秒为 0 不省略，区别于 java.time 的 ISO 规则）+ 微秒去尾零小数。矩阵外 oid（jsonb/interval/enum/数组——oid 动态或格式复杂属二期）降级 `0x`+hex 且每 oid WARN 一次；定长类型载荷长度不符抛 ISE fail-fast（错位信号）。**调用点在渲染侧**（`ConsoleRenderer` 按位取 Relation 列 typeId）——decoder 本身解 DML 时无 Relation 上下文。线程安全（静态纯函数 + 并发 WARN 去重集合）。IT oracle 注意：`bool::text` cast 输出 "true" 而 bool_out 是 "t"——对照须用 JDBC getString 原始列而非 `::text` cast
 - `TupleData(List<TupleValue>)`：一行的列值序列（record，不可变 List）
 - `TupleValue`（sealed interface）：`Null` / `UnchangedToast`（TOAST 列未变时服务端不发送值——流式大事务高频出现，**值不可得**而非 NULL）/ `Text(String)` / `Binary(byte[])`（Binary 显式值相等）
 - `Column(name, typeId, typeModifier, partOfKey)`：Relation 的单列元数据

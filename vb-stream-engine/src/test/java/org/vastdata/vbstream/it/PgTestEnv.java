@@ -46,11 +46,16 @@ public final class PgTestEnv {
     }
 
     public static ReplicationConfig newConfig(String slotName, String publication) {
+        return newConfig(slotName, publication, false);
+    }
+
+    /** binary=true 形态：pgoutput 二进制值模式（PG 16+ 选项，容器为 PG 18 满足）。 */
+    public static ReplicationConfig newConfig(String slotName, String publication, boolean binary) {
         return new ReplicationConfig(
                 PG.getHost(), PG.getMappedPort(PostgreSQLContainer.POSTGRESQL_PORT),
                 PG.getDatabaseName(), PG.getUsername(), PG.getPassword(),
                 slotName, publication,
-                4, StreamingMode.PARALLEL, true, 2);
+                4, StreamingMode.PARALLEL, true, binary, 2);
     }
 
     public static void execSql(String... statements) throws SQLException {

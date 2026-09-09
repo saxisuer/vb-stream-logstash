@@ -135,6 +135,8 @@ Tuple 前缀语义：`'N'` 新值 / `'K'` 复制键 / `'O'` 旧完整行，分�
 
 TupleData：`I16 ncols;` 每列 `'n'`（NULL，无负载）`| 'u'`（TOAST 未变，无负载）`| 't' I32 len bytes`（text）`| 'b' I32 len bytes`（binary）。
 
+补充（2026-09-09，binary 值模式）：`'b'` 种类来自 PG 16 起 START_REPLICATION 的 `binary 'on'` 选项（proto.c `LOGICALREP_COLUMN_BINARY_VALUE`）——开启后数据列（含 replica identity 的 K/O 旧元组）全部走各类型 `typsend` 的二进制表示，`'n'`/`'u'` 与 TupleData 外壳不变；关闭时（默认）恒为 `'t'`。载荷按列 typeId 的解释归 `protocol/BinaryValueDecoder`（矩阵与降级策略见 protocol 包 CLAUDE.md）。
+
 ## 5. 会话层（replication/ 包）
 
 **`ReplicationConfig`**（record）：

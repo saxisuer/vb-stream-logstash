@@ -33,6 +33,11 @@ public final class ByteBufferReader {
         return buf.getShort() & 0xFFFF;
     }
 
+    /** 读有符号 16 位（numeric 的 weight 等），big-endian。 */
+    public short readShort() {
+        return buf.getShort();
+    }
+
     public int readInt() {
         return buf.getInt();
     }

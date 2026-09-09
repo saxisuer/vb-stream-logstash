@@ -8,7 +8,7 @@
 - **`SessionHarness`**：会话包装 + 双轨录制（raw 字节与解码消息两列表同序一一对应）。停止条件是 countDown latch——列表在 close 前仍会增长，**确定性全量断言必须先 `close()` 再读**。两种生命周期习语：多数用例（以停止条件收尾、块内断言）走 try-with-resources；需 close 后断言/回放的用例（RawSessionContractTest / DecoupledPipelineTest / BenchCorpusRecordTest）用显式 try/finally——harness 出块后仍可引用。机制细节见 replication 包 CLAUDE.md 的 SessionHarness 节
 - **录制→离线回放模式**（组装器类测试通用）：真库录制 raw 字节后把 `rawMessages()` 回放给 `TransactionAssembler`（确定性纯状态机，离线回放与在线组装一致）——随机数据只进录制侧，不进双配置对照断言。回放时点两种：`TransactionAssemblyTest` 五场景在 harness 块内（close 前）回放——停止条件恰在最后一条预期消息触发、尾部无多余流量才安全；`DecoupledPipelineTest`/`BenchCorpusRecordTest` close 后回放（DecoupledPipelineTest 用**异步**组装器 + close 毒丸排干后断言——排干承诺使输出成为确定性终态）——新场景若录制尾部含预期外消息必须用 close-first 形态
 
-## 12 组测试各自验证什么
+## 13 组测试各自验证什么
 
 | 测试类 | 验证场景 |
 |---|---|
@@ -16,6 +16,7 @@
 | `StreamedTransactionTest` | 500 行×8KB 单事务触发流式分段（StreamStart firstSegment、分段结构）；parallel 模式 StreamAbort 携带附加字段且后续无错位 |
 | `TwoPhaseTransactionTest` | PREPARE→COMMIT PREPARED（b/变更/P/K 按 gid 匹配）；PREPARE→ROLLBACK PREPARED（r）；大事务 PREPARE 以 StreamPrepare 分段收尾 |
 | `DataTypeTest` | 19 列常见类型（时间/数字/字符串/bool/uuid/jsonb/bytea）文本协议解码端到端一致性——以 PG 自身 JDBC getString 输出为 oracle（同一套类型输出函数），不硬编码期望值 |
+| `BinaryOutputTest` | pgoutput binary 模式（PG 16+ `binary 'on'`）端到端三场景：①21 列类型矩阵全列 'b' 种类 + `BinaryValueDecoder` 解码值与 PG 文本输出逐列对照（timestamptz 走 Instant 语义对照规避时区偏移形态差；jsonb/interval 断言降级十六进制）②REPLICA IDENTITY FULL 旧元组 'b' + 未变 TOAST 列 'u' ③200 行 × 1KB 不可压缩载荷流式大事务（流式外壳不受 binary 模式影响）。oracle 陷阱：bool 的 `::text` cast 输出 "true" 而 bool_out 是 "t"——对照必须用 getString 原始列 |
 | `TruncateTest` | TRUNCATE 选项位（CASCADE/RESTART_IDENTITY）与多表 oid 列表解码 |
 | `RawSessionContractTest` | raw 接缝契约三角：raw 与解码消息逐条等长、每条 raw 首字节是 19 种合法类型字符之一、全新 `DecodedMessageBridge` 重放 raw 流得 record 值相等序列 |
 | `TransactionAssemblyTest` | 组装器五场景：普通多语句事务 / 流式+子事务回滚剔除 / 2PC 提交与回滚 / 双连接并发大事务多桶交错 / 多类型值 round-trip |

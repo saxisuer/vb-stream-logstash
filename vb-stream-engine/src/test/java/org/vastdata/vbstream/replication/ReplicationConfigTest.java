@@ -28,6 +28,7 @@ class ReplicationConfigTest {
         assertEquals(4, config.protoVersion());
         assertEquals(StreamingMode.PARALLEL, config.streamingMode());
         assertEquals(true, config.twoPhase());
+        assertEquals(false, config.binary());
         assertEquals(10, config.feedbackIntervalSeconds());
     }
 
@@ -37,17 +38,19 @@ class ReplicationConfigTest {
         System.setProperty("vb.pg.port", "6543");
         System.setProperty("vb.pg.slot", "s1");
         System.setProperty("vb.pg.streaming", "on");
+        System.setProperty("vb.pg.binary", "true");
         ReplicationConfig config = ReplicationConfig.fromSystemProperties();
         assertEquals("db.example.com", config.host());
         assertEquals(6543, config.port());
         assertEquals("s1", config.slotName());
         assertEquals(StreamingMode.ON, config.streamingMode());
+        assertEquals(true, config.binary());
     }
 
     @Test
     void buildsJdbcAndReplicationUrls() {
         ReplicationConfig config = new ReplicationConfig("h", 5432, "db", "u", "p",
-                "slot", "pub", 4, StreamingMode.PARALLEL, true, 10);
+                "slot", "pub", 4, StreamingMode.PARALLEL, true, false, 10);
         assertEquals("jdbc:postgresql://h:5432/db", config.jdbcUrl());
         assertEquals("jdbc:postgresql://h:5432/db?replication=database&assumeMinServerVersion=9.4",
                 config.replicationUrl());

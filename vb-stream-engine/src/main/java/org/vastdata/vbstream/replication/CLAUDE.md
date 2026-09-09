@@ -31,7 +31,7 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部创建）
 
 - **`open()`**：建两条连接——普通 `config.jdbcUrl()` 与 `config.replicationUrl()`（带 `replication=database`）。复制连接要求见 ReplicationConfig。
 - **`ensureSlot()`**：`SELECT pg_create_logical_replication_slot(槽名, 'pgoutput', false, twoPhase)` **幂等建槽**；捕获 SQLState `42710`（duplicate_object）视为"已存在，直接复用"并打 WARN（提示槽的 two_phase 属性需与配置一致，不一致将由 start 时服务端报错），其余异常上抛。
-- **`start()`**：经 `PGConnection.getReplicationAPI()` 建 `PGReplicationStream`，slot options **四项**：`proto_version`、`publication_names`、`streaming`（OFF→"off"/ON→"on"/PARALLEL→"parallel"）、`two_phase`（on/off）；另经 `withStartPosition(INVALID_LSN)` 从槽当前确认点续传、`withStatusInterval` 设状态回传周期。
+- **`start()`**：经 `PGConnection.getReplicationAPI()` 建 `PGReplicationStream`，slot options **四项 + 条件第五项**：`proto_version`、`publication_names`、`streaming`（OFF→"off"/ON→"on"/PARALLEL→"parallel"）、`two_phase`（on/off）、`binary`（**仅 config.binary() 为 true 时传**——该选项 PG 16+ 的 pgoutput 才识别，低版本传参即报错，false 是服务端默认不传零兼容风险；开启后数据列以 typsend 二进制走 `'b'` 种类，解释见 protocol/CLAUDE.md 的 BinaryValueDecoder 节）；另经 `withStartPosition(INVALID_LSN)` 从槽当前确认点续传、`withStatusInterval` 设状态回传周期。
 - **`run(RawMessageListener)` / `run(RawMessageListener, LongSupplier outputFrontier)`**：**轮询式消息循环（readPending 非阻塞 drain——每轮经包私有静态 `drainPending` 取尽当前缓冲的全部消息，搬过消息的轮立即续转、空轮才 sleep 100ms），由调用方线程执行**（Main/harness 中是名为 `pgoutput-reader` 的线程）。双参重载（1.7）把 LSN 确认**按输出前沿封顶**：每轮反馈 `capFeedback(received, frontier) = frontier ≤ 0 ? received : min(received, frontier)`——frontier=0 视为无 cap（首个事务输出前与 1.6 行为一致）；单参重载即恒不封顶的兼容形态。**会话只做字节交付**：每条消息的完整字节（含类型字节与流式块内可选 Int32 xid 前缀）拷入**独占新建数组**回调 `listener.onRaw(raw)`（调用方可无复制长期持有）；解码与 Relation 缓存完全移出 session（由组装器或桥承担），自身不触碰协议层。frontier 只在 reader 线程每轮读一次（AtomicLong 读，永不被 consumer 阻塞）。声明 `throws SQLException, IOException`：
   1. 每轮先查 `stream.isClosed()`（断连快速感知，抛描述性 `SQLException`）；随后 `drainPending(stream, listener)` 非阻塞取尽缓冲全部消息——逐条拷入独占数组同步回调 `listener.onRaw(raw)`（回调耗时直接拖慢消息循环——1.7 起回放已不在回调里，onRaw 只做记账；remaining()==0 的载荷防御性跳过不回调）。本轮搬过消息立即续转（onRaw 真实工作量即节流，不空转烧 CPU），**空轮才 sleep 100ms**——旧形态"每轮一条 + 固定 sleep"把读取上限钉死 ~10 msg/s，5 万行大事务 90+ 分钟才收完（2026-08-31 吞吐冒烟实测踩坑，回归锚定 it 包 `ReaderThroughputTest`）
   2. 每轮 `setAppliedLSN/setFlushedLSN(capFeedback(...))`；每满一个反馈周期 `forceUpdateStatus()` 上报确认位点
@@ -53,7 +53,7 @@ consumer 线程（transaction-consumer，TransactionAssembler 内部创建）
 
 ## ReplicationConfig（record，不可变）
 
-11 个分量的配置模型；`fromSystemProperties()` 以 `vb.pg.*` 前缀读取系统属性，默认值对准 `src/docker` compose 环境（localhost:55432 / postgres 库 / 槽 vb_cdc_slot / publication vb_pub / proto 4 / streaming parallel / twoPhase true / 反馈 10s）。
+12 个分量的配置模型；`fromSystemProperties()` 以 `vb.pg.*` 前缀读取系统属性，默认值对准 `src/docker` compose 环境（localhost:55432 / postgres 库 / 槽 vb_cdc_slot / publication vb_pub / proto 4 / streaming parallel / twoPhase true / binary false / 反馈 10s）。
 
 - **`replicationUrl()`**：`jdbcUrl() + "?replication=database&assumeMinServerVersion=9.4"`——pgjdbc 规定 replication 连接必须同时带 `assumeMinServerVersion>=9.4` 才会把 replication 参数放进启动包，否则 `START_REPLICATION` 被服务端按普通 SQL 解析报语法错（真实 PG 18 首跑踩过）
 - **`streamingParam()`**：StreamingMode → START_REPLICATION 参数值字符串
