@@ -40,18 +40,12 @@ vb-cdc-file-transform 仓 cdc-sink 的消费格式互通）。依赖方向 reade
 
 ## file 输出形态（VBFG 落地，2026-09-11 起）
 
-学习自 vb-cdc-file-transform 仓 cdc-capture 的落地链路，两个子包：
+学习自 vb-cdc-file-transform 仓 cdc-capture 的落地链路，一个模块依赖 + 一个子包：
 
-- **`format` 包（VBFG 契约层移植）**：cdc-file-format 模块的写侧 + 读侧完整移植（源码移植
-  而非 Maven 依赖——保持本仓 `mvn test` 单命令独立构建）。文件布局：`[Magic "VBFG"]`
-  [version][seq][sourceDb] 文件头（不进 CRC）+ 记录流（每条 [varint 长度][类型字节+载荷]，
-  全进 CRC32）：TABLE_DEF(1)/BEGIN(2)/EVENT(3)/COMMIT(4)/TRUNCATE(5)/FOOTER(6, recordCount+
-  crc32, 自身不进 CRC)。变长整数 LEB128（无符号=长度/个数，zigzag=txid/lsn/时间戳）。
-  **跨仓同步契约**：字节布局任何不兼容变更须两仓同步递增 `ChangeFileWriter.VERSION`；
-  `TypeCode`/`Op` 枚举只追加、不重排不改名（id 已持久化进文件）。文件名
-  `<task>-<seq 16位零填充>-<yyyyMMddHHmmss>.bin`，**字典序=消费顺序**。Writer 对同表
-  （结构未变）只写一条 TABLE_DEF（defId 文件内作用域从 1 分配，`TableDef` equals 刻意忽略
-  id 做去重键）；Reader 流式迭代、到 FOOTER 才校验记录数/CRC，截断与损坏抛 IOException。
+- **`vb-stream-file-format` 模块（VBFG 契约层，compile 依赖）**：cdc-file-format 的源码
+  移植（写侧+读侧），包 `org.vastdata.vbstream.format`——文件布局、跨仓同步契约、关键
+  不变量见该模块 CLAUDE.md。reader 的 file 包是其首个使用方（EnvelopeParser 解析结果经
+  VbfgEventWriter 写入；ReaderFileSinkIT 经传递依赖读回验收跨模块复用）。
 - **`file` 包（落地链路）**：`EnvelopeParser`（SourceRecord → 精简事件——事务元数据按结构
   特征识别 [status/id 有、op 无]；时间 `io.debezium.time.*` 字符串化、decimal 靠 connector
   `decimal.handling.mode=string`、DELETE 取 before 镜像、TRUNCATE 走独立记录；**移植偏离**：

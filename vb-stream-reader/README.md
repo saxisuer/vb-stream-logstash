@@ -72,7 +72,8 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
   （未 publish 半成品）启动即清——删除安全（offset 未推进，源端重发）
 - **格式**：`[Magic "VBFG"][version][seq][sourceDb]` 文件头 + 记录流（TABLE_DEF/BEGIN/EVENT/
   COMMIT/TRUNCATE + FOOTER 校验和，LEB128 变长整数，null 位图），时间/decimal 统一字符串
-  落地（目标端按列类型转换）——布局细目与跨仓同步契约见模块 CLAUDE.md 的 file 形态节
+  落地（目标端按列类型转换）——契约层在独立模块 `vb-stream-file-format`，布局细目与跨仓
+  同步契约见该模块 CLAUDE.md
 
 | `sink.*` 键 | 默认 | 语义 |
 |---|---|---|
@@ -108,4 +109,4 @@ file 形态下 CDC logger 仍有 INFO 摘要（每事务一行 TXN-END + 落地�
 
 ## 开发与测试
 
-`mvn test` 单命令全跑（surefire 显式补 `**/*IT.java`，与 connector 模块同款）：离线单测 `ReaderPropertiesTest`（三层合并次序 / classpath 模板 / 外部文件替换与 fail-fast / 必填校验与打码 / sink 键合并与剥离，零 PG）+ `format` 包 `VarintTest`/`ChangeFileIOTest`（VBFG 编解码 RoundTrip、null 位图、defId 去重、CRC/截断破坏检测——移植正确性锚定）+ `file` 包 `FileChangeConsumerTest`（offset 与 publish 联动、tombstone、落地文件读回）/`FileRollingWriterTest`（时间切分、seq 恢复、tmp 清理）+ `it` 包（Testcontainers postgres:18，需本机 Docker）`ReaderEndToEndIT` 两场景——①端到端：INSERT 断言数据记录 op=c + 事务元数据 BEGIN/END 对 + 零 op=r（snapshot 钉死 no_data）；②重启无重复：同槽同 offset 文件两轮运行零重发、新写入恰收新记录；`ReaderFileSinkIT` file 形态端到端——六类型列落地 VBFG 文件 → 移植 Reader 读回断言记录序/表定义/值/txid/CRC 完整。每方法独立槽名/publication/表名。
+`mvn test` 单命令全跑（surefire 显式补 `**/*IT.java`，与 connector 模块同款）：离线单测 `ReaderPropertiesTest`（三层合并次序 / classpath 模板 / 外部文件替换与 fail-fast / 必填校验与打码 / sink 键合并与剥离，零 PG）+ `file` 包 `FileChangeConsumerTest`（offset 与 publish 联动、tombstone、落地文件读回）/`FileRollingWriterTest`（时间切分、seq 恢复、tmp 清理）+ `it` 包（Testcontainers postgres:18，需本机 Docker）`ReaderEndToEndIT` 两场景——①端到端：INSERT 断言数据记录 op=c + 事务元数据 BEGIN/END 对 + 零 op=r（snapshot 钉死 no_data）；②重启无重复：同槽同 offset 文件两轮运行零重发、新写入恰收新记录；`ReaderFileSinkIT` file 形态端到端——六类型列落地 VBFG 文件 → 移植 Reader 读回断言记录序/表定义/值/txid/CRC 完整。每方法独立槽名/publication/表名。
