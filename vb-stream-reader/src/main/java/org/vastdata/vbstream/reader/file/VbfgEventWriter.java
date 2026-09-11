@@ -1,7 +1,7 @@
 package org.vastdata.vbstream.reader.file;
 
 import org.apache.kafka.connect.source.SourceRecord;
-import org.vastdata.vbstream.reader.format.ChangeFileWriter;
+import org.vastdata.vbstream.format.ChangeFileWriter;
 
 import java.io.IOException;
 import java.nio.file.Path;

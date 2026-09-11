@@ -3,7 +3,7 @@ package org.vastdata.vbstream.reader.file;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.vastdata.vbstream.reader.format.FileNaming;
+import org.vastdata.vbstream.format.FileNaming;
 
 import java.io.IOException;
 import java.nio.file.Files;

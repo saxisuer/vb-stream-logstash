@@ -1,7 +1,7 @@
 package org.vastdata.vbstream.reader.file;
 
-import org.vastdata.vbstream.reader.format.Op;
-import org.vastdata.vbstream.reader.format.TableDef;
+import org.vastdata.vbstream.format.Op;
+import org.vastdata.vbstream.format.TableDef;
 
 /**
  * envelope 解析结果：写 VBFG 文件所需的表定义 + 操作 + 对齐列值。

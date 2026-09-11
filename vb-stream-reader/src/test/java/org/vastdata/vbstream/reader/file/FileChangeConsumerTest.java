@@ -8,12 +8,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.reader.SinkConfig;
-import org.vastdata.vbstream.reader.format.BeginRecord;
-import org.vastdata.vbstream.reader.format.ChangeFileReader;
-import org.vastdata.vbstream.reader.format.CommitRecord;
-import org.vastdata.vbstream.reader.format.EventRecord;
-import org.vastdata.vbstream.reader.format.Record;
-import org.vastdata.vbstream.reader.format.TableDefRecord;
+import org.vastdata.vbstream.format.BeginRecord;
+import org.vastdata.vbstream.format.ChangeFileReader;
+import org.vastdata.vbstream.format.CommitRecord;
+import org.vastdata.vbstream.format.EventRecord;
+import org.vastdata.vbstream.format.Record;
+import org.vastdata.vbstream.format.TableDefRecord;
 
 import java.io.IOException;
 import java.nio.file.DirectoryStream;

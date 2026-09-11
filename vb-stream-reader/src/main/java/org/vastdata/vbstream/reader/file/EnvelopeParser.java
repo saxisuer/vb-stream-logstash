@@ -4,10 +4,10 @@ import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.vastdata.vbstream.reader.format.ColumnDef;
-import org.vastdata.vbstream.reader.format.Op;
-import org.vastdata.vbstream.reader.format.TableDef;
-import org.vastdata.vbstream.reader.format.TypeCode;
+import org.vastdata.vbstream.format.ColumnDef;
+import org.vastdata.vbstream.format.Op;
+import org.vastdata.vbstream.format.TableDef;
+import org.vastdata.vbstream.format.TypeCode;
 
 import java.nio.ByteBuffer;
 import java.time.LocalDate;
