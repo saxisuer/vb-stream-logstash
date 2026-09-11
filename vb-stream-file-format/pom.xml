@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.vastdata</groupId>
+        <artifactId>vb-stream-logstash</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>vb-stream-file-format</artifactId>
+
+    <!-- 模块定位：VBFG 落地文件格式契约层（模型 + 二进制流式读写 + LEB128 + 文件命名），
+         移植自 vb-cdc-file-transform 的 cdc-file-format（2026-09-11 快照）。零第三方依赖是
+         刻意设计——未来读取/解析侧（file-sink、转换/校验工具）以一个纯 JDK 依赖获得完整
+         契约；跨仓同步契约见模块 CLAUDE.md。 -->
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit-jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

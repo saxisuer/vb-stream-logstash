@@ -8,4 +8,4 @@
  * {@code ChangeFileWriter.VERSION}；{@code TypeCode}/{@code Op} 枚举只追加、不重排不改名。
  * RoundTrip 测试（Writer→Reader）锚定移植正确性。
  */
-package org.vastdata.vbstream.reader.format;
+package org.vastdata.vbstream.format;

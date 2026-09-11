@@ -1,4 +1,4 @@
-package org.vastdata.vbstream.reader.format;
+package org.vastdata.vbstream.format;
 
 /**
  * VBFG 内部精简类型系统。列类型在 TABLE_DEF 中声明一次，事件里只编码值；

@@ -1,4 +1,4 @@
-package org.vastdata.vbstream.reader.format;
+package org.vastdata.vbstream.format;
 
 /**
  * DML 事件。values 与所属 TableDef 的 columns 一一对应，null 表示该列为 NULL。

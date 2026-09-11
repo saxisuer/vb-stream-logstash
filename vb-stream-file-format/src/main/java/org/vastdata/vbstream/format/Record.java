@@ -1,4 +1,4 @@
-package org.vastdata.vbstream.reader.format;
+package org.vastdata.vbstream.format;
 
 /**
  * 落地文件内的记录。文件布局见 {@link ChangeFileWriter}。

@@ -1,4 +1,4 @@
-package org.vastdata.vbstream.reader.format;
+package org.vastdata.vbstream.format;
 
 /**
  * 列定义。类型在 TABLE_DEF 中声明一次，事件记录只编码值。
