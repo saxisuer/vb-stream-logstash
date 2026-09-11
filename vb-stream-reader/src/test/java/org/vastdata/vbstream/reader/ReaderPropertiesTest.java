@@ -11,6 +11,7 @@ import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -32,6 +33,8 @@ class ReaderPropertiesTest {
         System.clearProperty(ReaderProperties.CONFIG_FILE_KEY);
         System.clearProperty("vb.topic.prefix");
         System.clearProperty("vb.slot.name");
+        System.clearProperty("vb.sink.mode");
+        System.clearProperty("vb.sink.data-dir");
     }
 
     /**
@@ -118,6 +121,52 @@ class ReaderPropertiesTest {
         assertFalse(masked.contains("secret"), "password 值不打码不得外泄");
         assertTrue(masked.contains("database.password=********"), "password 以打码占位呈现");
         assertTrue(masked.contains("database.hostname=h"), "其余键原样呈现");
+    }
+
+    /**
+     * 场景:sink 配置默认——mode 缺省 log、task 缺省取 topic.prefix、目录/滚动参数带默认;
+     * 且 -Dvb.sink.* 系统属性不透传进 Debezium props(命名空间剥离)。
+     */
+    @Test
+    void sinkDefaultsToLogWithTaskFromTopicPrefix() {
+        System.setProperty("vb.sink.mode", "file");   // 覆盖默认形态供剥离断言,resolveSink 另行断言
+        System.setProperty("vb.sink.data-dir", "should-not-leak");
+
+        Properties props = ReaderProperties.resolve();
+        assertTrue(props.stringPropertyNames().stream().noneMatch(k -> k.startsWith("sink.")),
+                "vb.sink.* 不透传 Debezium props(sink 命名空间归 reader 自用)");
+
+        SinkConfig sink = ReaderProperties.resolveSink(props);
+        assertEquals(SinkConfig.Mode.FILE, sink.mode(), "-Dvb.sink.mode 覆盖默认 log");
+        assertEquals(Path.of("should-not-leak"), sink.dataDir(), "-Dvb.sink.data-dir 生效");
+        assertEquals("vbread", sink.task(), "task 缺省取 topic.prefix(模板文件的值)");
+        assertEquals(SinkConfig.DEFAULT_ROLL_MAX_RECORDS, sink.rollMaxRecords(), "滚动条数默认");
+        assertEquals(SinkConfig.DEFAULT_ROLL_INTERVAL_MS, sink.rollIntervalMs(), "滚动间隔默认");
+    }
+
+    /**
+     * 场景:外部文件的 sink.* 裸键作基础值、-Dvb.sink.* 覆盖(两层合并次序);非法 mode
+     * 在解析期 fail-fast 抛 IAE。
+     */
+    @Test
+    void externalFileSinkKeysMergedWithSystemOverride() throws Exception {
+        Path external = Files.writeString(tempDir.resolve("sink.properties"),
+                "database.hostname=h\ndatabase.dbname=d\ndatabase.user=u\ndatabase.password=p\n"
+                        + "topic.prefix=fileprefix\n"
+                        + "sink.mode=file\nsink.data-dir=file-dir\nsink.task=file-task\n");
+        System.setProperty(ReaderProperties.CONFIG_FILE_KEY, external.toString());
+        System.setProperty("vb.sink.data-dir", "sys-dir");   // 覆盖文件基础值
+
+        Properties props = ReaderProperties.resolve();
+        SinkConfig sink = ReaderProperties.resolveSink(props);
+        assertEquals(SinkConfig.Mode.FILE, sink.mode(), "文件键 sink.mode 基础值生效");
+        assertEquals(Path.of("sys-dir"), sink.dataDir(), "-Dvb.sink.* 覆盖文件基础值(次序:文件 → -D)");
+        assertEquals("file-task", sink.task(), "文件显式 sink.task 优先于 topic.prefix 兜底");
+
+        System.setProperty("vb.sink.mode", "bogus");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> ReaderProperties.resolveSink(props));
+        assertTrue(e.getMessage().contains("vb.sink.mode"), "非法 mode 的报错指向配置键: " + e.getMessage());
     }
 
     /**

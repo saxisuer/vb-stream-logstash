@@ -45,5 +45,5 @@ src/docker/pgdata/
 pipe-queue/
 pg-stream-pipe-queue/
 
-### vb-stream-reader 引擎 offset（默认 offset.storage.file.filename=data/reader-offsets.dat）###
+### vb-stream-reader 运行时产物（引擎 offset data/reader-offsets.dat + file 形态落地目录 data/cdc-files / data/cdc-tmp）###
 data/

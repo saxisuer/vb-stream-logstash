@@ -43,6 +43,11 @@ public final class ReaderProperties {
     /** 外部配置文件的系统属性键(保留键:剥前缀语义不适用,不进 Debezium props)。 */
     static final String CONFIG_FILE_KEY = "vb.config";
 
+    /** reader 自用 sink 命名空间前缀:文件的 {@code sink.*} 键与系统属性 {@code vb.sink.*}
+     * 均归输出形态配置(见 {@link SinkConfig}),不透传 Debezium。 */
+    static final String SINK_FILE_PREFIX = "sink.";
+    static final String SINK_SYS_PREFIX = "vb.sink.";
+
     /** 固定的连接器类(本宿主只服务自研 PostgresStreamConnector,任何来源的同名项被覆盖)。 */
     public static final String CONNECTOR_CLASS =
             "org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector";
@@ -61,10 +66,11 @@ public final class ReaderProperties {
     /**
      * 责任:组装最终 Debezium props(三层合并,后者覆盖前者)。关键步骤:①{@link #fileProperties}
      * 读配置文件为基础值(默认 classpath 的 {@code dbconfig.properties},{@code vb.config} 指定
-     * 外部文件时整份替换);②遍历系统属性取 {@code vb.} 前缀项剥前缀覆盖(值空串跳过——shell
-     * 传空视为未设;保留键 {@code vb.config} 本身排除);③强制覆盖 {@code connector.class} 为固定值
-     * → putIfAbsent 三项默认({@code name}/{@code offset.storage.file.filename}/
-     * {@code offset.flush.interval.ms})。
+     * 外部文件时整份替换),其中 {@code sink.*} 前缀键剥离(归 {@link #resolveSink} 的输出形态
+     * 命名空间,不透传 Debezium);②遍历系统属性取 {@code vb.} 前缀项剥前缀覆盖(值空串跳过——
+     * shell 传空视为未设;保留键 {@code vb.config} 与 {@code vb.sink.*} 族排除);③强制覆盖
+     * {@code connector.class} 为固定值 → putIfAbsent 三项默认({@code name}/
+     * {@code offset.storage.file.filename}/{@code offset.flush.interval.ms})。
      * 边界:配置文件缺失(classpath 无且未指定 vb.config)按空集处理——纯 -D 形态仍可运行;
      * 指定了 {@code vb.config} 但文件不存在/不可读抛 IllegalStateException(fail-fast,明确指向
      * 错误的路径);同键多来源以系统属性为准。
@@ -73,9 +79,14 @@ public final class ReaderProperties {
      */
     public static Properties resolve() {
         Properties props = new Properties();
-        props.putAll(fileProperties());
+        for (String key : fileProperties().stringPropertyNames()) {
+            if (!key.startsWith(SINK_FILE_PREFIX)) {
+                props.setProperty(key, fileProperties().getProperty(key, ""));
+            }
+        }
         for (String name : System.getProperties().stringPropertyNames()) {
-            if (name.startsWith(PREFIX) && name.length() > PREFIX.length() && !CONFIG_FILE_KEY.equals(name)) {
+            if (name.startsWith(PREFIX) && name.length() > PREFIX.length()
+                    && !CONFIG_FILE_KEY.equals(name) && !name.startsWith(SINK_SYS_PREFIX)) {
                 String value = System.getProperty(name, "");
                 if (!value.isEmpty()) {
                     props.setProperty(name.substring(PREFIX.length()), value);
@@ -87,6 +98,35 @@ public final class ReaderProperties {
         props.putIfAbsent("offset.storage.file.filename", "data/reader-offsets.dat");
         props.putIfAbsent("offset.flush.interval.ms", "1000");
         return props;
+    }
+
+    /**
+     * 责任:组装输出形态配置({@link SinkConfig})。关键步骤:文件键中 {@code sink.*} 前缀项作
+     * 基础值 → 系统属性 {@code vb.sink.*} 剥前缀覆盖(值空串跳过,同 resolve 的空值语义) →
+     * {@link SinkConfig#from} 带默认兜底组装(mode 默认 log,task 缺省取 debeziumProps 的
+     * {@code topic.prefix})。边界:mode 非法/数值键解析失败在 from 内抛 IAE/NumberFormatException
+     * (启动期 fail-fast);与 resolve 共用同一配置文件(fileProperties 幂等重读,启动期一次性成本)。
+     *
+     * @param debeziumProps 已组装的 Debezium 配置(仅读 topic.prefix 作 task 兜底)
+     * @return 输出形态配置
+     */
+    public static SinkConfig resolveSink(Properties debeziumProps) {
+        Map<String, String> sink = new TreeMap<>();
+        Properties file = fileProperties();
+        for (String key : file.stringPropertyNames()) {
+            if (key.startsWith(SINK_FILE_PREFIX)) {
+                sink.put(key, file.getProperty(key, ""));
+            }
+        }
+        for (String name : System.getProperties().stringPropertyNames()) {
+            if (name.startsWith(SINK_SYS_PREFIX) && name.length() > SINK_SYS_PREFIX.length()) {
+                String value = System.getProperty(name, "");
+                if (!value.isEmpty()) {
+                    sink.put(SINK_FILE_PREFIX + name.substring(SINK_SYS_PREFIX.length()), value);
+                }
+            }
+        }
+        return SinkConfig.from(sink, debeziumProps);
     }
 
     /**
