@@ -6,13 +6,13 @@
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 连接器模块 `vb-stream-connector-postgres-stream`（Debezium 流式 PG 连接器插件，MS1–MS6 收官）：配置面/打包安装/at-least-once 语义/已知限制一档全，见 [vb-stream-connector-postgres-stream/README.md](vb-stream-connector-postgres-stream/README.md)
 - 宿主模块 `vb-stream-reader`（debezium-embedded 冒烟入口，`DebeziumEngine.create(Connect.class)` 加载自研连接器，零 `-D` 参数即可起）：三层合并配置面/运行/offset 语义见 [vb-stream-reader/README.md](vb-stream-reader/README.md)
-- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），450 个测试全绿（引擎 180 + 连接器 263 + reader 7，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
+- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），503 个测试全绿（引擎 224 + 连接器 272 + reader 7，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
 
-## PostgreSQL 18 前置要求
+## PostgreSQL 前置要求
 
 | 项 | 要求 | 说明 |
 |---|---|---|
-| 版本 | **PG 14+**，按 PG 18 开发验证 | stream 模式需 PG 14 复制槽 `streaming` 选项；`proto_version=4` |
+| 版本 | **PG 14+**，按 PG 18 开发验证；**PG 17 已实证兼容** | stream 模式需 PG 14 复制槽 `streaming` 选项；`proto_version=4`。PG 17 兼容性双重验证在档（2026-09-11 REL_17/18 内核源码逐文件比对——19 种消息 wire format、binary 值 typsend 矩阵、选项协商逐字节一致 + `Pg17CompatTest` 真 PG 17 容器五场景端到端）；唯一行为差异：PG 17 上 `publication_names` 含不存在的 publication 直接 ERROR 拒绝建流（PG 18 宽容 WARN 跳过），建流前确保 publication 已建 |
 | `wal_level` | `logical` | 逻辑解码必需，默认 `replica` 不行；改后需重启 |
 | `max_replication_slots` | ≥ 1 | 每个采集实例占用 1 个逻辑槽 |
 | `max_wal_senders` | ≥ 1 | 每条复制连接占用 1 个 walsender |
@@ -125,11 +125,11 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 ## 测试
 
 ```bash
-mvn test                # 全部：三模块单元测试 + Testcontainers 集成测试（450 用例：引擎 180 + 连接器 263 + reader 7）
+mvn test                # 全部：三模块单元测试 + Testcontainers 集成测试（503 用例：引擎 224 + 连接器 272 + reader 7）
 mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 
-集成测试（`org.vastdata.vbstream.it`，12 组）经 Testcontainers 自动起 postgres:18 容器（`logical_decoding_work_mem=64kB`），需本机 Docker。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
+集成测试（`org.vastdata.vbstream.it`，14 组）经 Testcontainers 自动起容器（postgres:18 单例 + PG 17 兼容实证专用的 postgres:17 单例），需本机 Docker。`Pg17CompatTest` 跑 PG 17 源库五场景（Relation typmod 对齐 / binary 五类型族 / 流式 binary 大事务 / two_phase / StreamAbort parallel 附加字段），是源码级 PG 17 兼容性审计的真库佐证。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
 
 JMH 基准在引擎模块的独立源码根 `vb-stream-engine/src/jmh`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）；运行方式与基线数字见 `docs/benchmarks-baseline.md`。
 
