@@ -2,7 +2,7 @@
 
 适配 PostgreSQL 逻辑解码 **stream 模式**的 CDC 采集器：基于 pgjdbc `ReplicationConnection` 直连复制流，自研 pgoutput 协议解码器，实时解析普通事务、流式大事务（`streaming=parallel`）、两阶段提交（`two_phase`）与 Truncate，并把原始字节流组装后以**流式事件**输出（`事务头 → 逐变更 → 事务尾`，回放期堆峰 O(单条)；`vb.output.mode=block` 可切回原子事务块语义——读取与组装输出解耦：reader 记账写入 Chronicle Queue 主缓冲管道，独立消费线程回放输出，组装期桶内零字节引用，LSN 确认按输出前沿封顶且前沿锚定事务尾，at-least-once）。
 
-- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 四模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）、`vb-stream-file-format`（VBFG 落地文件契约层——纯 JDK 零依赖）、`vb-stream-connector-postgres-stream`（Debezium 流式连接器）与 `vb-stream-reader`（debezium-embedded 宿主冒烟应用）
+- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 四模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）、`vb-stream-file-format`（VBFG 落地文件契约层——纯 JDK 零依赖，见 vb-stream-file-format/CLAUDE.md）、`vb-stream-connector-postgres-stream`（Debezium 流式连接器）与 `vb-stream-reader`（debezium-embedded 宿主冒烟应用）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 连接器模块 `vb-stream-connector-postgres-stream`（Debezium 流式 PG 连接器插件，MS1–MS6 收官）：配置面/打包安装/at-least-once 语义/已知限制一档全，见 [vb-stream-connector-postgres-stream/README.md](vb-stream-connector-postgres-stream/README.md)
 - 宿主模块 `vb-stream-reader`（debezium-embedded 冒烟入口，`DebeziumEngine.create(Connect.class)` 加载自研连接器，零 `-D` 参数即可起；输出形态 `vb.sink.mode=log|file`——file 落地 VBFG 二进制文件，与 vb-cdc-file-transform 的 cdc-sink 消费端互通）：三层合并配置面/运行/file 落地语义见 [vb-stream-reader/README.md](vb-stream-reader/README.md)

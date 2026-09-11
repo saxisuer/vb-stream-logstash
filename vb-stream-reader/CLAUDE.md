@@ -7,7 +7,7 @@ vb-stream-connector-postgres-stream，`AsyncEngineBuilder` 构造器包私有故
 输出形态二选一（`vb.sink.mode`，2026-09-11 起）：**log**（默认，`ChangeConsumer` 批回调逐条
 渲染 INFO 到专用 logger `org.vastdata.vbstream.reader.cdc`，`markProcessed`/
 `markBatchFinished` 手动 offset 记账）或 **file**（CDC 记录落地 VBFG 二进制文件，与
-vb-cdc-file-transform 仓 cdc-sink 的消费格式互通）。依赖方向 reader → connector（引擎零依赖
+vb-cdc-file-transform 仓 cdc-sink 的消费格式互通）。依赖方向 reader → connector + file-format（引擎零依赖
 不受 D2 约束）。
 
 ## 组件
