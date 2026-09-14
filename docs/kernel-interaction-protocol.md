@@ -192,7 +192,7 @@ binary 选项不改变 'n'/'u' 种类与 TupleData 外壳,只把数据列(含 K/
 STREAM-STOP
 STREAM-COMMIT     xid=10 commitLsn=0/1B9B490
 TXN-BEGIN xid=10 kind=STREAMED gid=null commitLsn=0/1B9B490 commitTs=2026-09-14T03:37:23Z changes=1
-  [1] DDL        xid=10 lsn=0/1B9B488 sql=CREATE TABLE t_ddl_test_2(id int); [streamed xid=10]
+  [1] DDL        xid=10 lsn=0/1B9B488 ddlsql=CREATE TABLE t_ddl_test_2(id int); [streamed xid=10]
 TXN-END   xid=10
 ```
 
