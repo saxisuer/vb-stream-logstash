@@ -1,4 +1,11 @@
-package org.vastdata.vbstream.format;
+package org.vastdata.vbstream.format.binary;
+
+import org.vastdata.vbstream.format.ColumnDef;
+import org.vastdata.vbstream.format.Op;
+import org.vastdata.vbstream.format.TableDef;
+import org.vastdata.vbstream.format.TypeCode;
+import org.vastdata.vbstream.format.binary.io.Values;
+import org.vastdata.vbstream.format.binary.io.Varint;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;

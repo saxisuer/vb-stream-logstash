@@ -1,4 +1,4 @@
-package org.vastdata.vbstream.format;
+package org.vastdata.vbstream.format.binary.io;
 
 import org.junit.jupiter.api.Test;
 

@@ -1,4 +1,6 @@
-package org.vastdata.vbstream.format;
+package org.vastdata.vbstream.format.binary;
+
+import org.vastdata.vbstream.format.Op;
 
 /**
  * DML 事件。values 与所属 TableDef 的 columns 一一对应，null 表示该列为 NULL。

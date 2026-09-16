@@ -1,4 +1,6 @@
-package org.vastdata.vbstream.format;
+package org.vastdata.vbstream.format.binary.io;
+
+import org.vastdata.vbstream.format.TypeCode;
 
 import java.io.DataInput;
 import java.io.DataOutput;

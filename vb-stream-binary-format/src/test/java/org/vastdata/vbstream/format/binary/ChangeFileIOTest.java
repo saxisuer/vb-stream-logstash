@@ -1,8 +1,12 @@
-package org.vastdata.vbstream.format;
+package org.vastdata.vbstream.format.binary;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
+import org.vastdata.vbstream.format.ColumnDef;
+import org.vastdata.vbstream.format.Op;
+import org.vastdata.vbstream.format.TableDef;
+import org.vastdata.vbstream.format.TypeCode;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;

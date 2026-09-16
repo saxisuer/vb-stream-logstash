@@ -24,10 +24,11 @@
             <version>${project.version}</version>
         </dependency>
 
-        <!-- VBFG 契约层:file 输出形态的格式读写(file 包与 ReaderFileSinkIT 经此传递依赖) -->
+        <!-- VBFG 二进制格式:file 输出形态 binary 格式的读写(VbfgEventWriter 与
+             ReaderFileOutputIT 经此传递依赖;基座 IR 经其传递) -->
         <dependency>
             <groupId>org.vastdata</groupId>
-            <artifactId>vb-stream-file-format</artifactId>
+            <artifactId>vb-stream-binary-format</artifactId>
             <version>${project.version}</version>
         </dependency>
 
