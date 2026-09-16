@@ -35,9 +35,9 @@ cdc-sql-file-format 的 SqlRenderer（2026-09-16 快照），**与对方仓的�
 
 1. **BYTES 用 `decode()` 不用 `'\x'::bytea`**：VastBase 的 bytea 解析器不认 `\x` 十六进制
    前缀格式（按字面文本存储，数据损坏）；decode() 双端可用且返回 bytea 无需 cast。
-2. **INTERVAL 分解渲染、不直写 microseconds**：`'429071106000000 microseconds'` 这类
+2. **INTERVAL 分解渲染、不直写 microseconds**：`'-45296789000 microseconds'` 这类
    微秒直写形态 VastBase 服务端拒收，须分解为 days + 时分秒形态（如
-   `'429 days 07:05:06.000000'`）。
+   `'-0 days -12:34:56.789000'`——负值天与时分秒两段都带符号）。
 
 ## 失败语义（不丢数据契约）
 

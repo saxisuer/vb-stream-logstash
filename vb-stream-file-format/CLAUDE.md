@@ -36,5 +36,5 @@ vb-stream-sql-format（compile 依赖）、vb-stream-reader（经两格式模块
 
 ## 测试
 
-`FileNamingTest`：三后缀命名组装 / 三后缀 seq 解析 / nextSeq 跨后缀恢复——拆分时基座
-补上的独立验收面（此前随二进制模块的 ChangeFileIOTest 间接覆盖）。
+`FileNamingTest`：三后缀命名组装 / 三后缀 seq 解析 / nextSeq 跨后缀恢复——拆分时补上的
+基座独立验收面（此前 FileNaming 无专属测试，仅被 reader 侧文件名形态断言间接覆盖）。
