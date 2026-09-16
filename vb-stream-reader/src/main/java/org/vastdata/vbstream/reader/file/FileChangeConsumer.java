@@ -44,7 +44,7 @@ public final class FileChangeConsumer implements ChangeConsumer<ChangeEvent<Sour
      */
     public FileChangeConsumer(OutputConfig config) throws IOException {
         this.writer = new FileRollingWriter(config.task(), config.dataDir(), config.tmpDir(),
-                config.rollMaxRecords(), config.rollIntervalMs(), Clock.systemUTC());
+                config.rollMaxRecords(), config.rollIntervalMs(), config.format(), Clock.systemUTC());
     }
 
     /**

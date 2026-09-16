@@ -4,6 +4,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
+import org.vastdata.vbstream.reader.file.OutputFormat;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -142,6 +143,7 @@ class ReaderPropertiesTest {
         assertEquals("vbread", out.task(), "task 缺省取 topic.prefix(模板文件的值)");
         assertEquals(OutputConfig.DEFAULT_ROLL_MAX_RECORDS, out.rollMaxRecords(), "滚动条数默认");
         assertEquals(OutputConfig.DEFAULT_ROLL_INTERVAL_MS, out.rollIntervalMs(), "滚动间隔默认");
+        assertEquals(OutputFormat.BINARY, out.format(), "reader.format 缺省 binary");
     }
 
     /**
@@ -167,6 +169,23 @@ class ReaderPropertiesTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> ReaderProperties.resolveOutput(props));
         assertTrue(e.getMessage().contains("vb.reader.mode"), "非法 mode 的报错指向配置键: " + e.getMessage());
+    }
+
+    /**
+     * 场景:非法 reader.format 启动期 fail-fast 抛 IAE,报错文案指向配置键(可选 binary/sql)。
+     */
+    @Test
+    void invalidReaderFormatFailsFast() {
+        System.setProperty("vb.reader.format", "bogus");
+        try {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> ReaderProperties.resolveOutput(ReaderProperties.resolve()));
+            assertTrue(e.getMessage().contains("reader.format"),
+                    "非法 format 报错指向配置键: " + e.getMessage());
+        }
+        finally {
+            System.clearProperty("vb.reader.format");
+        }
     }
 
     /**

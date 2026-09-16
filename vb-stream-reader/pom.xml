@@ -32,6 +32,13 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!-- SQL 文本格式:file 输出形态 sql 格式的语句渲染(SqlEventWriter 经此依赖) -->
+        <dependency>
+            <groupId>org.vastdata</groupId>
+            <artifactId>vb-stream-sql-format</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
         <!-- debezium-embedded:async 引擎(3.x 唯一实现,ConvertingAsyncEngineBuilderFactory 经
              ServiceLoader 发现)+ connect-runtime(FileOffsetBackingStore)/connect-json/connect-file
              compile 传递;注意其传递 slf4j-api 是 1.7.36,由下方显式声明压回 2.x -->

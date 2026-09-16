@@ -20,9 +20,10 @@ import java.util.Properties;
  * ({@link OutputConfig.Mode}):
  * <ul>
  *   <li>{@code log}(默认):{@link LogChangeConsumer} 逐条 SourceRecord 渲染 INFO</li>
- *   <li>{@code file}:{@link FileChangeConsumer} 落地为 VBFG 二进制文件——tmp → fsync →
- *       原子 rename,COMMIT 边界切分,offset 与文件 publish 严格联动(格式与 vb-cdc-file-transform
- *       仓的消费端组件互通)</li>
+ *   <li>{@code file}:{@link FileChangeConsumer} 落地为文件——tmp → fsync → 原子 rename,
+ *       COMMIT 边界切分,offset 与文件 publish 严格联动;落地格式经 {@code reader.format} 选
+ *       binary(VBFG 二进制,默认,与 vb-cdc-file-transform 仓的消费端组件互通)或
+ *       sql(可执行语句文本)</li>
  * </ul>
  * Ctrl+C 优雅停机(offset 排干落盘)。生命周期模板对齐 vb-stream-engine 的 Main(系统属性 +
  * latch + hook + 退出码)。
@@ -78,8 +79,8 @@ public final class Main {
         prepareOffsetStorage(props);
         OutputConfig output = ReaderProperties.resolveOutput(props);
         if (output.mode() == OutputConfig.Mode.FILE) {
-            LOG.info("输出形态: file(VBFG 落地) task={} dataDir={} tmpDir={} rollMaxRecords={} rollIntervalMs={}",
-                    output.task(), output.dataDir().toAbsolutePath(), output.tmpDir().toAbsolutePath(),
+            LOG.info("输出形态: file 落地 format={} task={} dataDir={} tmpDir={} rollMaxRecords={} rollIntervalMs={}",
+                    output.format(), output.task(), output.dataDir().toAbsolutePath(), output.tmpDir().toAbsolutePath(),
                     output.rollMaxRecords(), output.rollIntervalMs());
         }
         LOG.info("vb-stream-reader 启动,生效配置: {}", ReaderProperties.masked(props));

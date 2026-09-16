@@ -62,7 +62,7 @@ class FileRollingWriterTest {
     void timeBasedRollPublishesOnCommitAfterInterval() throws IOException {
         MutableClock clock = new MutableClock();
         try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"), dir.resolve("tmp"),
-                1000, 10_000L, clock)) {
+                1000, 10_000L, OutputFormat.BINARY, clock)) {
             // 第一个事务(距启动 0ms,时间未到不切)
             w.onBegin(marker(true, "1"), null);
             w.onEvent(dataRecord(1, "v"));
@@ -89,7 +89,7 @@ class FileRollingWriterTest {
         Files.createDirectories(dataDir);
         Files.writeString(dataDir.resolve("tk-0000000000000042-20260101000000.bin"), "old");
         try (FileRollingWriter w = new FileRollingWriter("tk", dataDir, dir.resolve("tmp"),
-                1, 60_000L, Clock.systemUTC())) {
+                1, 60_000L, OutputFormat.BINARY, Clock.systemUTC())) {
             w.onBegin(marker(true, "1"), null);
             w.onEvent(dataRecord(1, "v"));
             Optional<Path> published = w.onCommit(marker(false, "1"), null);
@@ -109,10 +109,48 @@ class FileRollingWriterTest {
         Files.createDirectories(tmpDir);
         Files.writeString(tmpDir.resolve("tk-0000000000000001-20260101000000.bin.part"), "half");
         try (FileRollingWriter ignored = new FileRollingWriter("tk", dir.resolve("data"), tmpDir,
-                1, 60_000L, Clock.systemUTC())) {
+                1, 60_000L, OutputFormat.BINARY, Clock.systemUTC())) {
             try (DirectoryStream<Path> ls = Files.newDirectoryStream(tmpDir)) {
                 assertFalse(ls.iterator().hasNext(), "构造后 tmp 残留已清");
             }
+        }
+    }
+
+    /**
+     * 场景:格式分派——SQL 格式的 publish 产物后缀 .sql、文件名前段命名规则与 binary 相同
+     * (字典序 = 消费顺序与格式无关)。
+     */
+    @Test
+    void sqlFormatPublishesSqlSuffixFile() throws IOException {
+        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"), dir.resolve("tmp"),
+                1, 60_000L, OutputFormat.SQL, Clock.systemUTC())) {
+            w.onBegin(marker(true, "1"), null);
+            w.onEvent(dataRecord(1, "v"));
+            Optional<Path> published = w.onCommit(marker(false, "1"), null);
+            assertTrue(published.isPresent(), "roll.max-records=1 首 COMMIT 即切分");
+            assertTrue(published.get().getFileName().toString().matches("tk-\\d{16}-\\d{14}\\.sql"),
+                    "SQL 格式文件后缀 .sql: " + published.get().getFileName());
+            assertTrue(Files.exists(published.get()), "已 publish 文件落在数据目录");
+        }
+    }
+
+    /**
+     * 场景:SQL 格式文件内容形态——头注释 + 裸 BEGIN;/COMMIT; 包住语句(publish 后读回)。
+     */
+    @Test
+    void sqlFormatFileContainsBeginStatementCommit() throws IOException {
+        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"), dir.resolve("tmp"),
+                1, 60_000L, OutputFormat.SQL, Clock.systemUTC())) {
+            w.onBegin(marker(true, "1"), null);
+            w.onEvent(dataRecord(1, "v"));
+            w.onCommit(marker(false, "1"), null);
+        }
+        try (DirectoryStream<Path> ls = Files.newDirectoryStream(dir.resolve("data"), "*.sql")) {
+            Path published = ls.iterator().next();
+            String content = Files.readString(published);
+            assertTrue(content.startsWith("-- vb-stream task=tk seq="), "头注释带 task 与 seq: " + content);
+            assertTrue(content.contains("BEGIN;\n"), "事务边界裸 BEGIN;");
+            assertTrue(content.contains("COMMIT;\n"), "事务边界裸 COMMIT;");
         }
     }
 }

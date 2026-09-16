@@ -51,7 +51,8 @@ class FileChangeConsumerTest {
     void publishedBatchAdvancesOffsetAndFileRoundTrips() throws Exception {
         Path dataDir = dir.resolve("data");
         try (FileChangeConsumer consumer = new FileChangeConsumer(
-                new OutputConfig(OutputConfig.Mode.FILE, dataDir, dir.resolve("tmp"), "t", 1, 60_000L))) {
+                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dataDir, dir.resolve("tmp"),
+                        "t", 1, 60_000L))) {
             RecordingCommitter committer = new RecordingCommitter();
             consumer.handleBatch(List.of(
                     event(txRecord("BEGIN", "769")),
@@ -92,7 +93,7 @@ class FileChangeConsumerTest {
         Path dataDir = dir.resolve("data");
         Path tmpDir = dir.resolve("tmp");
         FileChangeConsumer consumer = new FileChangeConsumer(
-                new OutputConfig(OutputConfig.Mode.FILE, dataDir, tmpDir, "t", 1000, 60_000L));
+                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dataDir, tmpDir, "t", 1000, 60_000L));
         RecordingCommitter committer = new RecordingCommitter();
         consumer.handleBatch(List.of(
                 event(txRecord("BEGIN", "770")),
@@ -113,7 +114,8 @@ class FileChangeConsumerTest {
     @Test
     void tombstoneSkipped() throws Exception {
         try (FileChangeConsumer consumer = new FileChangeConsumer(
-                new OutputConfig(OutputConfig.Mode.FILE, dir.resolve("data"), dir.resolve("tmp"), "t", 1, 60_000L))) {
+                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dir.resolve("data"),
+                        dir.resolve("tmp"), "t", 1, 60_000L))) {
             RecordingCommitter committer = new RecordingCommitter();
             consumer.handleBatch(List.of(event(null)), committer);
             assertEquals(0, committer.processed, "tombstone 不记账");

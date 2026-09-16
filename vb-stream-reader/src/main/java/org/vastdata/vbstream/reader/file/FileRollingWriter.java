@@ -26,7 +26,7 @@ import java.util.stream.Stream;
  *   <li>启动时清空 tmp 目录残留（那些数据 offset 未推进，源端会重发——删除是安全的）</li>
  * </ul>
  * 逻辑移植自 vb-cdc-file-transform 仓 cdc-capture 的 FileRollingWriter（2026-09-11 快照，
- * 格式工厂收敛为 VBFG 单形态）。
+ * 格式经 {@link OutputFormat} 注入）。
  */
 final class FileRollingWriter implements AutoCloseable {
 
@@ -37,6 +37,7 @@ final class FileRollingWriter implements AutoCloseable {
     private final Path tmpDir;
     private final int rollMaxRecords;
     private final long rollIntervalMs;
+    private final OutputFormat format;
     private final Clock clock;
 
     private EventFileWriter current;
@@ -51,12 +52,13 @@ final class FileRollingWriter implements AutoCloseable {
      * 边界：目录不可建/不可清抛 IOException（启动期 fail-fast）。
      */
     FileRollingWriter(String task, Path dataDir, Path tmpDir,
-                      int rollMaxRecords, long rollIntervalMs, Clock clock) throws IOException {
+                      int rollMaxRecords, long rollIntervalMs, OutputFormat format, Clock clock) throws IOException {
         this.task = task;
         this.dataDir = dataDir;
         this.tmpDir = tmpDir;
         this.rollMaxRecords = rollMaxRecords;
         this.rollIntervalMs = rollIntervalMs;
+        this.format = format;
         this.clock = clock;
         Files.createDirectories(dataDir);
         Files.createDirectories(tmpDir);
@@ -116,7 +118,7 @@ final class FileRollingWriter implements AutoCloseable {
         current.close();
         current = null;
 
-        Path target = dataDir.resolve(FileNaming.fileName(task, currentSeq, LocalDateTime.now(clock), "bin"));
+        Path target = dataDir.resolve(FileNaming.fileName(task, currentSeq, LocalDateTime.now(clock), format.extension()));
         Files.move(currentTmpPath, target, StandardCopyOption.ATOMIC_MOVE);
         lastPublishMs = clock.millis();
         LOG.info("落地文件已发布: {} (记录数={})", target, crcRecords);
@@ -125,17 +127,17 @@ final class FileRollingWriter implements AutoCloseable {
         return target;
     }
 
-    /** 责任：惰性建当前文件（首个事件/BEGIN 到达才开 tmp .part 文件）。 */
+    /** 责任：惰性建当前文件（首个事件/BEGIN 到达才开 tmp .part 文件,写入器按注入格式分派）。 */
     private EventFileWriter writer() throws IOException {
         if (current == null) {
             currentTmpPath = tmpPath(currentSeq);
-            current = new VbfgEventWriter(currentTmpPath, (int) currentSeq, task);
+            current = format.newWriter(currentTmpPath, (int) currentSeq, task);
         }
         return current;
     }
 
     private Path tmpPath(long seq) {
-        return tmpDir.resolve(FileNaming.fileName(task, seq, LocalDateTime.now(clock), "bin") + ".part");
+        return tmpDir.resolve(FileNaming.fileName(task, seq, LocalDateTime.now(clock), format.extension()) + ".part");
     }
 
     /**

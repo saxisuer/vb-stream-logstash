@@ -8,6 +8,7 @@ import org.vastdata.vbstream.reader.EngineLifecycle;
 import org.vastdata.vbstream.reader.ReaderProperties;
 import org.vastdata.vbstream.reader.OutputConfig;
 import org.vastdata.vbstream.reader.file.FileChangeConsumer;
+import org.vastdata.vbstream.reader.file.OutputFormat;
 import org.vastdata.vbstream.format.ColumnDef;
 import org.vastdata.vbstream.format.Op;
 import org.vastdata.vbstream.format.TableDef;
@@ -77,7 +78,7 @@ class ReaderFileOutputIT {
         Path tmpDir = Files.createTempDirectory(tempDir, "cdc-tmp");
         Path offsetFile = Files.createTempFile(tempDir, "offsets-file", ".dat");
         try (FileChangeConsumer consumer = new FileChangeConsumer(new OutputConfig(OutputConfig.Mode.FILE,
-                dataDir, tmpDir, "readerit", 1, 60_000L))) {
+                OutputFormat.BINARY, dataDir, tmpDir, "readerit", 1, 60_000L))) {
             EngineLifecycle lifecycle = EngineLifecycle.start(
                     baseProps(slotName, "pub_reader_file",
                             Files.createTempDirectory(tempDir, "pipe"), offsetFile),
