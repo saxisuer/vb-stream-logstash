@@ -30,8 +30,9 @@ vb-stream-file-format 经传递依赖到达）。
   task 缺省取 topic.prefix、roll.max-records 默认 1000、roll.interval-ms 默认 10000——滚动默认
   对齐 cdc-capture）。解析入口 `ReaderProperties.resolveOutput(debeziumProps)`：文件
   `reader.*` 基础值 → `-Dvb.reader.*` 覆盖 → 默认兜底。配置键全集：`reader.mode` /
-  `reader.format` / `reader.data-dir` / `reader.tmp-dir` / `reader.roll.max-records` /
-  `reader.roll.interval-ms`（dbconfig.properties 模板有全部键的注释区——配置可见性）。
+  `reader.format` / `reader.data-dir` / `reader.tmp-dir` / `reader.task` /
+  `reader.roll.max-records` / `reader.roll.interval-ms`（dbconfig.properties
+  模板有全部键的注释区——配置可见性）。
 - `LogChangeConsumer`：一条记录一行（topic/key/op/txId/lsn/lsn_commit/value 预览截 512 字符）；
   op/txId 取 value Struct（数据记录 op 顶层 + source 块 txId，事务元数据记录 status/id），
   lsn 取 sourceOffset map（连接器事务边界 offset 双写）。

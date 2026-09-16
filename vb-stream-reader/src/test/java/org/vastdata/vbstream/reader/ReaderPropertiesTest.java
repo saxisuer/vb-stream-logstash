@@ -172,12 +172,21 @@ class ReaderPropertiesTest {
     }
 
     /**
-     * 场景:非法 reader.format 启动期 fail-fast 抛 IAE,报错文案指向配置键(可选 binary/sql)。
+     * 场景:reader.format 解析——正向面大小写宽容("SQL"/"Binary" 各自 resolve 为对应枚举,
+     * 与 mode 的宽容哲学一致);反向面非法值启动期 fail-fast 抛 IAE,报错文案指向配置键
+     * (可选 binary/sql)。
      */
     @Test
     void invalidReaderFormatFailsFast() {
-        System.setProperty("vb.reader.format", "bogus");
+        System.setProperty("vb.reader.format", "SQL");
         try {
+            assertEquals(OutputFormat.SQL, ReaderProperties.resolveOutput(ReaderProperties.resolve()).format(),
+                    "format 解析大小写宽容:SQL → SQL");
+            System.setProperty("vb.reader.format", "Binary");
+            assertEquals(OutputFormat.BINARY, ReaderProperties.resolveOutput(ReaderProperties.resolve()).format(),
+                    "format 解析大小写宽容:Binary → BINARY");
+
+            System.setProperty("vb.reader.format", "bogus");
             IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                     () -> ReaderProperties.resolveOutput(ReaderProperties.resolve()));
             assertTrue(e.getMessage().contains("reader.format"),

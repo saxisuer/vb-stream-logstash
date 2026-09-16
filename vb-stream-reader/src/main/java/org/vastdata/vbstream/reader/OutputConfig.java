@@ -24,7 +24,7 @@ import java.util.Properties;
 public record OutputConfig(Mode mode, OutputFormat format, Path dataDir, Path tmpDir, String task,
                            int rollMaxRecords, long rollIntervalMs) {
 
-    /** 输出形态：LOG（INFO 渲染）/ FILE（VBFG 落地文件）。 */
+    /** 输出形态：LOG（INFO 渲染）/ FILE（落地文件——binary/sql 双格式，由 format 组件选定）。 */
     public enum Mode {LOG, FILE}
 
     /** 条数切分上限的兜底默认（对齐 vb-cdc-file-transform 的 capture.roll.max-records）。 */

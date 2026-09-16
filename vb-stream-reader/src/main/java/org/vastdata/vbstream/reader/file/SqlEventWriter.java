@@ -59,7 +59,8 @@ final class SqlEventWriter implements EventFileWriter {
         out.write("COMMIT;\n".getBytes(StandardCharsets.UTF_8));
     }
 
-    /** 责任:flush + fsync(publish 前的完整性保证,之后由调用方原子 rename)。幂等:重复调用直接返回。 */
+    /** 责任:flush + fsync(publish 前的完整性保证,之后由调用方原子 rename)。重复调用无害
+     *  (重复 flush+fsync,无提前返回守卫;调用方约定只在 publish 前调一次)。 */
     @Override
     public void finish() throws IOException {
         out.flush();
