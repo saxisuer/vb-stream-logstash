@@ -1,52 +1,40 @@
-# vb-stream-file-format — VBFG 落地文件格式契约层
+# vb-stream-file-format — 格式层公共基座
 
-跨模块共享的落地文件契约：精简事件模型 + 二进制流式读写 + LEB128 编解码 + 文件命名。
-移植自 vb-cdc-file-transform 仓的 cdc-file-format 模块（2026-09-11 快照，写侧 + 读侧完整
-移植），目标是本仓产出的落地文件与该项目 cdc-sink 的消费格式**逐字节互通**。
+格式层公共基座：**文件命名契约 + 事件 IR**。包 `org.vastdata.vbstream.format`——
+`FileNaming`（落地文件命名与序号管理，三后缀 bin/json/sql 共用）与事件 IR
+（`TableDef`/`ColumnDef`/`Op`/`TypeCode`/`ParsedEvent`——binary 的 Values 编码与 sql 的
+SqlRenderer 渲染都以同一 IR 为输入）。`vb-stream-binary-format` 与 `vb-stream-sql-format`
+两格式模块依赖本基座（基座不反向依赖任何格式模块）。
+
+沿革：2026-09-11 自 vb-cdc-file-transform 仓 cdc-file-format 全量移植（彼时含二进制读写），
+2026-09-16 对方仓拆分格式层为三模块，本仓同构跟进——基座收缩为 IR + 文件命名
+（`ParsedEvent` 同日自 reader file 包下沉），二进制布局随拆分移入 vb-stream-binary-format。
 
 ## 常用命令
 
-零 Docker、秒级：`mvn test -pl vb-stream-file-format`（12 用例）。
+零 Docker、秒级：`mvn test -pl vb-stream-file-format`（`FileNamingTest` 3 用例）。
 
-## 二进制布局（修改 Writer/Reader 前必读）
+## 枚举持久化警告（跨模块生效）
 
-    [Magic "VBFG"][version][seq][sourceDb]        —— 文件头，不进 CRC
-    记录流，每条 = [varint 长度][类型字节 + 载荷]，全部计入 CRC32：
-      TABLE_DEF(1): defId, db, schema, table, key列下标[], 列[]{name, typeCode}
-      BEGIN(2):     txid, lsn
-      EVENT(3):     defId, op, null位图, 非null值序列（按列序）
-      COMMIT(4):    txid, lsn, ts
-      TRUNCATE(5):  defId
-      FOOTER(6):    recordCount, crc32             —— 最后一条，自身不进 CRC
+`TypeCode.id()`（ordinal+1）与 `Op.id()`（ordinal）**已持久化进 VBFG 落地文件**的
+TABLE_DEF/EVENT 记录——两枚举只能追加，不能重排、改名、删除，否则旧文件无法解码。
+持久化消费方在 vb-stream-binary-format（`ChangeFileWriter`/`ChangeFileReader` 与
+`io.Values`），动枚举前先读该模块 CLAUDE.md 的不变量段。
 
-变长整数（`Varint`）：LEB128 小端序。无符号用于长度/个数/id；zigzag 用于有符号数值
-（txid/lsn/时间戳）。
+## `FileNaming` 不变量
 
-## 关键不变量
+- 命名形态 `<task>-<seq 16位零填充>-<yyyyMMddHHmmss>.{bin|json|sql}`，**文件名字典序 =
+  消费顺序**（滚动写入、按序消费共用此约定；扩展名即消费分派依据）；
+- `nextSeq()` 扫数据目录恢复序号（重启续号，不依赖额外状态文件）——seq 宽度与零填充是
+  排序正确性的基础；`parseSeqOpt` 宽容解析（目录里可能混有其他文件，非法命名返回 empty）。
 
-- **跨仓同步契约**：字节布局任何不兼容变更须在两仓（本模块与 vb-cdc-file-transform）
-  同步递增 `ChangeFileWriter.VERSION`；`TypeCode.id()`（ordinal+1）与 `Op.id()`（ordinal）
-  已持久化进文件——枚举只能追加，不能重排、改名、删除。
-- **TypeCode 值域**：原生六种 + 时间五种；时间类型值一律字符串载荷，布局同 STRING。
-- **defId 文件内作用域**：每份文件从 1 重新分配；`TableDef` 的 equals/hashCode 刻意忽略
-  id——Writer 靠此做文件内 TABLE_DEF 去重，列结构变化（DDL）分配新 id。
-- **FOOTER 不进 CRC、不计 recordCount**；其余每条记录的"长度前缀 + 载荷"都计入 CRC32。
-- **`Values` 不处理 null**：null 由 EVENT 的位图表达，只序列化非 null 值，列序严格对齐。
-- **`FileNaming`**：`<task>-<seq 16位零填充>-<yyyyMMddHHmmss>.bin`，**文件名字典序 = 消费
-  顺序**；`nextSeq()` 扫数据目录恢复序号——seq 宽度与零填充是排序正确性的基础。
-- Reader 流式 `Iterator<Record>` 惰性读、常量内存；迭代到 FOOTER 才校验记录数与 CRC；
-  截断（记录中间 EOF）与 CRC 不一致抛 IOException（迭代侧 UncheckedIOException 包装）。
+## 依赖
 
-## 依赖与使用方
-
-**零第三方依赖是刻意设计**（编译期仅父 pom，测试期 JUnit）——未来读取/解析侧
-（file-sink、转换/校验工具）以纯 JDK 依赖获得完整契约，不要引入任何运行时依赖。
-当前使用方：vb-stream-reader 的 file 输出形态（落地链路在其 `file` 包——依赖 Debezium
-API 属链路不属契约，故留 reader）。落地链路语义（tmp→fsync→原子 rename、COMMIT 边界
-切分、offset 联动）见 vb-stream-reader 模块文档。
+**零第三方依赖是刻意设计**（编译期仅父 pom，测试期 JUnit）——格式层三模块整体以纯 JDK
+依赖提供完整契约，不要引入任何运行时依赖。使用方：vb-stream-binary-format /
+vb-stream-sql-format（compile 依赖）、vb-stream-reader（经两格式模块传递）。
 
 ## 测试
 
-`VarintTest`（roundtrip/边界值/已知字节形态/负值拒绝/超长流拒绝）+
-`ChangeFileIOTest`（全记录类型 RoundTrip、null 位图、多表 defId 去重、CRC 破坏与截断
-检测、非 VBFG 拒绝、列数不匹配 fail-fast）——契约层自包含的验收面，也是移植正确性锚定。
+`FileNamingTest`：三后缀命名组装 / 三后缀 seq 解析 / nextSeq 跨后缀恢复——拆分时基座
+补上的独立验收面（此前随二进制模块的 ChangeFileIOTest 间接覆盖）。
