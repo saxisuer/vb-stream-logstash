@@ -14,7 +14,7 @@ import java.util.stream.Stream;
 /**
  * 落地文件命名与序号管理。
  *
- * <pre>&lt;task&gt;-&lt;seq 16位零填充&gt;-&lt;yyyyMMddHHmmss&gt;.bin</pre>
+ * <pre>&lt;task&gt;-&lt;seq 16位零填充&gt;-&lt;yyyyMMddHHmmss&gt;.{bin|json|sql}</pre>
  *
  * seq 单调递增；16 位零填充保证<b>文件名字典序 = 消费顺序</b>（滚动写入、按序消费共用此约定）。
  * 移植自 vb-cdc-file-transform 仓 cdc-file-format 的 FileNaming（2026-09-11 快照）。
@@ -25,7 +25,7 @@ public final class FileNaming {
     public static final long MAX_SEQ = 9_999_999_999_999_999L;
 
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
-    private static final Pattern NAME = Pattern.compile("(.+)-(\\d{" + SEQ_WIDTH + "})-(\\d{14})\\.(bin|json)");
+    private static final Pattern NAME = Pattern.compile("(.+)-(\\d{" + SEQ_WIDTH + "})-(\\d{14})\\.(bin|json|sql)");
 
     private FileNaming() {
     }

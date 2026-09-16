@@ -6,6 +6,7 @@ import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.vastdata.vbstream.format.ColumnDef;
 import org.vastdata.vbstream.format.Op;
+import org.vastdata.vbstream.format.ParsedEvent;
 import org.vastdata.vbstream.format.TableDef;
 import org.vastdata.vbstream.format.TypeCode;
 
