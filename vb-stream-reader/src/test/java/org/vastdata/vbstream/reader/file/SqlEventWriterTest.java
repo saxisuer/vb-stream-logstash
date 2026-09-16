@@ -44,4 +44,23 @@ class SqlEventWriterTest {
                 + "INSERT INTO \"public\".\"t\" (\"id\", \"payload\") VALUES (1, 'hello');\n"
                 + "COMMIT;\n", content);
     }
+
+    /**
+     * 场景:非 ASCII 载荷的字符集——写入侧必须显式 UTF-8(本机平台默认 GBK 时若 getBytes
+     * 回退默认,中文以 GBK 落盘、Files.readString(恒 UTF-8)读回必乱码,本用例即红——防回归
+     * 锚);中文值原样往返且单引号按 SQL 规则翻倍。
+     *
+     * @throws IOException 文件读写失败上抛
+     */
+    @Test
+    void chinesePayloadRoundTripsAsUtf8() throws IOException {
+        Path file = dir.resolve("out-cn.sql");
+        try (SqlEventWriter w = new SqlEventWriter(file, 1, "tk")) {
+            w.writeEvent(dataRecord(1, "你好'引号"));
+            w.finish();
+        }
+        assertEquals("-- vb-stream task=tk seq=0000000000000001\n"
+                + "INSERT INTO \"public\".\"t\" (\"id\", \"payload\") VALUES (1, '你好''引号');\n",
+                Files.readString(file), "中文载荷按 UTF-8 落盘,读回原值(引号翻倍)");
+    }
 }

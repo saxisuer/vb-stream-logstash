@@ -8,13 +8,16 @@ import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
 /**
  * SQL 文本格式的事件写入器:envelope → IR → {@link SqlRenderer} 渲染语句逐行写文件。
  * 事务边界渲染为裸 {@code BEGIN;}/{@code COMMIT;};文件头一行 {@code --} 注释携带 task/seq
  * (lsn/txid 不落文件)。无 FOOTER/CRC——完整性靠 tmp .part 暂存 + 原子 rename 的 publish
- * 机制(与 binary 同一外壳,约定"数据目录里无 .part 后缀即完整文件")。
+ * 机制(与 binary 同一外壳,约定"数据目录里无 .part 后缀即完整文件")。文件字符集恒
+ * <b>UTF-8</b>(显式指定,不随平台默认——GBK 默认机器上中文载荷才不乱码,读回路径
+ * Files.readString/JDBC 亦恒 UTF-8)。
  * 逻辑移植自 vb-cdc-file-transform 仓 cdc-capture 的 SqlEventWriter(2026-09-16 快照)。
  */
 final class SqlEventWriter implements EventFileWriter {
@@ -30,13 +33,13 @@ final class SqlEventWriter implements EventFileWriter {
     SqlEventWriter(Path file, int seq, String task) throws IOException {
         this.fos = new FileOutputStream(file.toFile());
         this.out = new BufferedOutputStream(fos);
-        out.write(("-- vb-stream task=%s seq=%016d\n".formatted(task, seq)).getBytes());
+        out.write(("-- vb-stream task=%s seq=%016d\n".formatted(task, seq)).getBytes(StandardCharsets.UTF_8));
     }
 
     /** 责任:写裸 BEGIN;(事务外壳语句——多事务共文件时逐事务包裹)。 */
     @Override
     public void writeBegin(TransactionMarker marker, SourceRecord raw) throws IOException {
-        out.write("BEGIN;\n".getBytes());
+        out.write("BEGIN;\n".getBytes(StandardCharsets.UTF_8));
     }
 
     /**
@@ -46,14 +49,14 @@ final class SqlEventWriter implements EventFileWriter {
     @Override
     public void writeEvent(SourceRecord record) throws IOException {
         ParsedEvent event = EnvelopeParser.parse(record);
-        out.write(SqlRenderer.render(event).getBytes());
+        out.write(SqlRenderer.render(event).getBytes(StandardCharsets.UTF_8));
         events++;
     }
 
     /** 责任:写裸 COMMIT;。 */
     @Override
     public void writeCommit(TransactionMarker marker, SourceRecord raw) throws IOException {
-        out.write("COMMIT;\n".getBytes());
+        out.write("COMMIT;\n".getBytes(StandardCharsets.UTF_8));
     }
 
     /** 责任:flush + fsync(publish 前的完整性保证,之后由调用方原子 rename)。幂等:重复调用直接返回。 */
