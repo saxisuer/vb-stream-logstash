@@ -6,7 +6,7 @@ import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.reader.EngineLifecycle;
 import org.vastdata.vbstream.reader.ReaderProperties;
-import org.vastdata.vbstream.reader.SinkConfig;
+import org.vastdata.vbstream.reader.OutputConfig;
 import org.vastdata.vbstream.reader.file.FileChangeConsumer;
 import org.vastdata.vbstream.format.ColumnDef;
 import org.vastdata.vbstream.format.Op;
@@ -37,9 +37,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link ChangeFileReader} 读回断言:记录序 [TABLE_DEF, BEGIN, EVENT, COMMIT] + FOOTER 完整
  * (CRC/记录数通过)、表定义与列类型对齐(含时间类型的字符串化路径)、EVENT 值与写入对齐、
  * BEGIN/COMMIT 的 txid 同源。验收面:落地链路(publish 后才推进 offset)与 VBFG 格式
- * (与 vb-cdc-file-transform 的 cdc-sink 消费端互通)在真库上的闭环。
+ * (与 vb-cdc-file-transform 仓的消费端组件互通)在真库上的闭环。
  */
-class ReaderFileSinkIT {
+class ReaderFileOutputIT {
 
     @TempDir(cleanup = CleanupMode.NEVER)
     static Path tempDir;
@@ -63,7 +63,7 @@ class ReaderFileSinkIT {
      * @throws Exception 环境异常(容器/SQL)或断言超时原样上抛
      */
     @Test
-    void fileSinkProducesVbfgFileReadableBack() throws Exception {
+    void fileOutputProducesVbfgFileReadableBack() throws Exception {
         String table = "t_reader_file";
         slotName = "reader_file_slot";
         ReaderPgEnv.execSql(
@@ -76,7 +76,7 @@ class ReaderFileSinkIT {
         Path dataDir = Files.createTempDirectory(tempDir, "cdc-files");
         Path tmpDir = Files.createTempDirectory(tempDir, "cdc-tmp");
         Path offsetFile = Files.createTempFile(tempDir, "offsets-file", ".dat");
-        try (FileChangeConsumer consumer = new FileChangeConsumer(new SinkConfig(SinkConfig.Mode.FILE,
+        try (FileChangeConsumer consumer = new FileChangeConsumer(new OutputConfig(OutputConfig.Mode.FILE,
                 dataDir, tmpDir, "readerit", 1, 60_000L))) {
             EngineLifecycle lifecycle = EngineLifecycle.start(
                     baseProps(slotName, "pub_reader_file",

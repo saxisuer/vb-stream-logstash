@@ -7,7 +7,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
-import org.vastdata.vbstream.reader.SinkConfig;
+import org.vastdata.vbstream.reader.OutputConfig;
 import org.vastdata.vbstream.format.binary.BeginRecord;
 import org.vastdata.vbstream.format.binary.ChangeFileReader;
 import org.vastdata.vbstream.format.binary.CommitRecord;
@@ -51,7 +51,7 @@ class FileChangeConsumerTest {
     void publishedBatchAdvancesOffsetAndFileRoundTrips() throws Exception {
         Path dataDir = dir.resolve("data");
         try (FileChangeConsumer consumer = new FileChangeConsumer(
-                new SinkConfig(SinkConfig.Mode.FILE, dataDir, dir.resolve("tmp"), "t", 1, 60_000L))) {
+                new OutputConfig(OutputConfig.Mode.FILE, dataDir, dir.resolve("tmp"), "t", 1, 60_000L))) {
             RecordingCommitter committer = new RecordingCommitter();
             consumer.handleBatch(List.of(
                     event(txRecord("BEGIN", "769")),
@@ -92,7 +92,7 @@ class FileChangeConsumerTest {
         Path dataDir = dir.resolve("data");
         Path tmpDir = dir.resolve("tmp");
         FileChangeConsumer consumer = new FileChangeConsumer(
-                new SinkConfig(SinkConfig.Mode.FILE, dataDir, tmpDir, "t", 1000, 60_000L));
+                new OutputConfig(OutputConfig.Mode.FILE, dataDir, tmpDir, "t", 1000, 60_000L));
         RecordingCommitter committer = new RecordingCommitter();
         consumer.handleBatch(List.of(
                 event(txRecord("BEGIN", "770")),
@@ -113,7 +113,7 @@ class FileChangeConsumerTest {
     @Test
     void tombstoneSkipped() throws Exception {
         try (FileChangeConsumer consumer = new FileChangeConsumer(
-                new SinkConfig(SinkConfig.Mode.FILE, dir.resolve("data"), dir.resolve("tmp"), "t", 1, 60_000L))) {
+                new OutputConfig(OutputConfig.Mode.FILE, dir.resolve("data"), dir.resolve("tmp"), "t", 1, 60_000L))) {
             RecordingCommitter committer = new RecordingCommitter();
             consumer.handleBatch(List.of(event(null)), committer);
             assertEquals(0, committer.processed, "tombstone 不记账");

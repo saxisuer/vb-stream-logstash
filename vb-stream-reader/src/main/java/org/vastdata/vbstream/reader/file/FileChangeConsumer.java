@@ -6,7 +6,7 @@ import io.debezium.engine.DebeziumEngine.RecordCommitter;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.vastdata.vbstream.reader.SinkConfig;
+import org.vastdata.vbstream.reader.OutputConfig;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -42,7 +42,7 @@ public final class FileChangeConsumer implements ChangeConsumer<ChangeEvent<Sour
      * 责任：从配置建立滚动写入器（目录/tmp 清理/seq 恢复都在其构造内完成）。
      * 边界：构造抛 IOException（目录不可用）由调用方按启动失败处理。
      */
-    public FileChangeConsumer(SinkConfig config) throws IOException {
+    public FileChangeConsumer(OutputConfig config) throws IOException {
         this.writer = new FileRollingWriter(config.task(), config.dataDir(), config.tmpDir(),
                 config.rollMaxRecords(), config.rollIntervalMs(), Clock.systemUTC());
     }
