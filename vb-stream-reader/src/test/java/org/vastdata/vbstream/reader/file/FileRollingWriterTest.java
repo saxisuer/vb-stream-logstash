@@ -20,9 +20,9 @@ import static org.vastdata.vbstream.reader.file.ConnectTestRecords.marker;
 
 /**
  * {@link FileRollingWriter} 的滚动与 publish 语义单测(零 PG):时间切分(注入时钟推进,
- * 切分评估点只在 COMMIT)、seq 从数据目录恢复(重启续号)、tmp 残留清理(未 publish
- * 半成品删除)。记录手造见 {@link ConnectTestRecords};事务边界记录的 raw 载荷
- * VBFG 写入器不消费(只取 marker 字段),传 null 即可。
+ * 切分评估点只在 COMMIT)、seq 从数据目录恢复(重启续号)、data 目录 .part 残留清理
+ * (只删半成品,非 .part 文件一律不动)。记录手造见 {@link ConnectTestRecords};
+ * 事务边界记录的 raw 载荷 VBFG 写入器不消费(只取 marker 字段),传 null 即可。
  */
 class FileRollingWriterTest {
 
@@ -61,7 +61,7 @@ class FileRollingWriterTest {
     @Test
     void timeBasedRollPublishesOnCommitAfterInterval() throws IOException {
         MutableClock clock = new MutableClock();
-        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"), dir.resolve("tmp"),
+        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"),
                 1000, 10_000L, OutputFormat.BINARY, clock)) {
             // 第一个事务(距启动 0ms,时间未到不切)
             w.onBegin(marker(true, "1"), null);
@@ -88,7 +88,7 @@ class FileRollingWriterTest {
         Path dataDir = dir.resolve("data");
         Files.createDirectories(dataDir);
         Files.writeString(dataDir.resolve("tk-0000000000000042-20260101000000.bin"), "old");
-        try (FileRollingWriter w = new FileRollingWriter("tk", dataDir, dir.resolve("tmp"),
+        try (FileRollingWriter w = new FileRollingWriter("tk", dataDir,
                 1, 60_000L, OutputFormat.BINARY, Clock.systemUTC())) {
             w.onBegin(marker(true, "1"), null);
             w.onEvent(dataRecord(1, "v"));
@@ -100,19 +100,25 @@ class FileRollingWriterTest {
     }
 
     /**
-     * 场景:tmp 残留清理——预置 tmp 半成品(上次异常退出的未 publish 文件),构造即删除
-     * (那些数据 offset 未推进、源端会重发,删除安全)。
+     * 场景:data 目录 .part 残留清理——预置混合目录(上次异常退出的 .part 半成品 + 已发布
+     * 完整文件 + 位点文件 offsets.dat),构造即只删 .part(那些数据 offset 未推进、源端会
+     * 重发,删除安全);完成文件与位点等非 .part 文件一律不动。
      */
     @Test
-    void tmpResidueCleanedOnConstruction() throws IOException {
-        Path tmpDir = dir.resolve("tmp");
-        Files.createDirectories(tmpDir);
-        Files.writeString(tmpDir.resolve("tk-0000000000000001-20260101000000.bin.part"), "half");
-        try (FileRollingWriter ignored = new FileRollingWriter("tk", dir.resolve("data"), tmpDir,
+    void partResidueCleanedWhileOtherFilesKept() throws IOException {
+        Path dataDir = dir.resolve("data");
+        Files.createDirectories(dataDir);
+        Path part = dataDir.resolve("tk-0000000000000001-20260101000000.bin.part");
+        Path published = dataDir.resolve("tk-0000000000000002-20260101000000.bin");
+        Path offsets = dataDir.resolve("offsets.dat");
+        Files.writeString(part, "half");
+        Files.writeString(published, "done");
+        Files.writeString(offsets, "offsets");
+        try (FileRollingWriter ignored = new FileRollingWriter("tk", dataDir,
                 1, 60_000L, OutputFormat.BINARY, Clock.systemUTC())) {
-            try (DirectoryStream<Path> ls = Files.newDirectoryStream(tmpDir)) {
-                assertFalse(ls.iterator().hasNext(), "构造后 tmp 残留已清");
-            }
+            assertFalse(Files.exists(part), "构造后 .part 半成品已清");
+            assertTrue(Files.exists(published), "已发布完成文件不动");
+            assertTrue(Files.exists(offsets), "位点等非 .part 文件不动");
         }
     }
 
@@ -122,7 +128,7 @@ class FileRollingWriterTest {
      */
     @Test
     void sqlFormatPublishesSqlSuffixFile() throws IOException {
-        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"), dir.resolve("tmp"),
+        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"),
                 1, 60_000L, OutputFormat.SQL, Clock.systemUTC())) {
             w.onBegin(marker(true, "1"), null);
             w.onEvent(dataRecord(1, "v"));
@@ -139,7 +145,7 @@ class FileRollingWriterTest {
      */
     @Test
     void sqlFormatFileContainsBeginStatementCommit() throws IOException {
-        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"), dir.resolve("tmp"),
+        try (FileRollingWriter w = new FileRollingWriter("tk", dir.resolve("data"),
                 1, 60_000L, OutputFormat.SQL, Clock.systemUTC())) {
             w.onBegin(marker(true, "1"), null);
             w.onEvent(dataRecord(1, "v"));

@@ -39,11 +39,11 @@ public final class FileChangeConsumer implements ChangeConsumer<ChangeEvent<Sour
     private final FileRollingWriter writer;
 
     /**
-     * 责任：从配置建立滚动写入器（目录/tmp 清理/seq 恢复都在其构造内完成）。
+     * 责任：从配置建立滚动写入器（目录/.part 残留清理/seq 恢复都在其构造内完成）。
      * 边界：构造抛 IOException（目录不可用）由调用方按启动失败处理。
      */
     public FileChangeConsumer(OutputConfig config) throws IOException {
-        this.writer = new FileRollingWriter(config.task(), config.dataDir(), config.tmpDir(),
+        this.writer = new FileRollingWriter(config.task(), config.dataDir(),
                 config.rollMaxRecords(), config.rollIntervalMs(), config.format(), Clock.systemUTC());
     }
 

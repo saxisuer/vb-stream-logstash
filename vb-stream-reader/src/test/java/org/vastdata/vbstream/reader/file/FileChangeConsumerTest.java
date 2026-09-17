@@ -51,7 +51,7 @@ class FileChangeConsumerTest {
     void publishedBatchAdvancesOffsetAndFileRoundTrips() throws Exception {
         Path dataDir = dir.resolve("data");
         try (FileChangeConsumer consumer = new FileChangeConsumer(
-                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dataDir, dir.resolve("tmp"),
+                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dataDir,
                         "t", 1, 60_000L))) {
             RecordingCommitter committer = new RecordingCommitter();
             consumer.handleBatch(List.of(
@@ -85,15 +85,14 @@ class FileChangeConsumerTest {
 
     /**
      * 场景:未达切分阈值不推进 offset——roll 上限大,同批 [BEGIN, event, END] 消费后无文件
-     * 落地、markBatchFinished 不调用(markProcessed 照常——逐条记账不受影响);数据在 tmp
-     * .part 中暂存,close 丢弃(重启后源端重放,不丢数据)。
+     * 落地、markBatchFinished 不调用(markProcessed 照常——逐条记账不受影响);数据在 data
+     * 目录 .part 半成品中暂存,close 丢弃(重启后源端重放,不丢数据)。
      */
     @Test
-    void unpublishedBatchHoldsOffsetAndCloseDiscardsTmp() throws Exception {
+    void unpublishedBatchHoldsOffsetAndCloseDiscardsPart() throws Exception {
         Path dataDir = dir.resolve("data");
-        Path tmpDir = dir.resolve("tmp");
         FileChangeConsumer consumer = new FileChangeConsumer(
-                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dataDir, tmpDir, "t", 1000, 60_000L));
+                new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dataDir, "t", 1000, 60_000L));
         RecordingCommitter committer = new RecordingCommitter();
         consumer.handleBatch(List.of(
                 event(txRecord("BEGIN", "770")),
@@ -104,9 +103,9 @@ class FileChangeConsumerTest {
         assertEquals(0, committer.batchFinished, "无 publish 绝不 markBatchFinished");
         assertTrue(binFiles(dataDir).isEmpty(), "未达阈值不落地数据目录");
         consumer.close();
-        assertTrue(binFiles(dataDir).isEmpty(), "close 丢弃未 publish 的 tmp(不丢数据——offset 未推进)");
-        try (DirectoryStream<Path> ls = Files.newDirectoryStream(tmpDir)) {
-            assertTrue(!ls.iterator().hasNext(), "tmp 目录在 close 后已空");
+        assertTrue(binFiles(dataDir).isEmpty(), "close 丢弃未 publish 的半成品(不丢数据——offset 未推进)");
+        try (DirectoryStream<Path> ls = Files.newDirectoryStream(dataDir, "*.part")) {
+            assertTrue(!ls.iterator().hasNext(), "close 后 data 目录无 .part 残留");
         }
     }
 
@@ -115,7 +114,7 @@ class FileChangeConsumerTest {
     void tombstoneSkipped() throws Exception {
         try (FileChangeConsumer consumer = new FileChangeConsumer(
                 new OutputConfig(OutputConfig.Mode.FILE, OutputFormat.BINARY, dir.resolve("data"),
-                        dir.resolve("tmp"), "t", 1, 60_000L))) {
+                        "t", 1, 60_000L))) {
             RecordingCommitter committer = new RecordingCommitter();
             consumer.handleBatch(List.of(event(null)), committer);
             assertEquals(0, committer.processed, "tombstone 不记账");

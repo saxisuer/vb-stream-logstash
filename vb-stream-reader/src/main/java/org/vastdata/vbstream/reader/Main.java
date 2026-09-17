@@ -79,8 +79,8 @@ public final class Main {
         prepareOffsetStorage(props);
         OutputConfig output = ReaderProperties.resolveOutput(props);
         if (output.mode() == OutputConfig.Mode.FILE) {
-            LOG.info("输出形态: file 落地 format={} task={} dataDir={} tmpDir={} rollMaxRecords={} rollIntervalMs={}",
-                    output.format(), output.task(), output.dataDir().toAbsolutePath(), output.tmpDir().toAbsolutePath(),
+            LOG.info("输出形态: file 落地 format={} task={} dataDir={} rollMaxRecords={} rollIntervalMs={}",
+                    output.format(), output.task(), output.dataDir().toAbsolutePath(),
                     output.rollMaxRecords(), output.rollIntervalMs());
         }
         LOG.info("vb-stream-reader 启动,生效配置: {}", ReaderProperties.masked(props));

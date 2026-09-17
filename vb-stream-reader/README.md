@@ -63,14 +63,16 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 cdc-capture 的落地链路（源码移植，格式与该项目 cdc-sink 消费端**逐字节互通**，跨网闸场景
 可直接对接）；`sql`=可执行 SQL 文本（无需专用消费端，目标库直接执行重放）：
 
-- **不丢数据契约**：文件 publish = `finish()`（FOOTER + CRC32）+ fsync + **原子 rename** 到
-  数据目录；`markBatchFinished()`（推进 offset/slot）只在本批有文件 publish 之后调用——
-  数据完整落地之前 offset 绝不推进，写文件 IO 失败直接停引擎（offset 不动，重启重放）
+- **不丢数据契约**：文件 publish = `finish()`（FOOTER + CRC32）+ fsync + **同目录原子 rename**
+  去掉 `.part` 后缀；`markBatchFinished()`（推进 offset/slot）只在本批有文件 publish 之后
+  调用——数据完整落地之前 offset 绝不推进，写文件 IO 失败直接停引擎（offset 不动，重启重放）
 - **COMMIT 边界切分**：文件只在事务提交后切分（每份文件自包含完整事务）；条数
   （`reader.roll.max-records`，默认 1000）或时长（`reader.roll.interval-ms`，默认 10s）先到先触发
 - **文件命名**：`<task>-<seq 16位零填充>-<yyyyMMddHHmmss>.bin`（task 默认取 `topic.prefix`），
-  **文件名字典序 = 消费顺序**；seq 重启后扫数据目录恢复，不依赖状态文件；tmp 目录残留
-  （未 publish 半成品）启动即清——删除安全（offset 未推进，源端重发）
+  **文件名字典序 = 消费顺序**；seq 重启后扫数据目录恢复，不依赖状态文件；data 目录内
+  `.part` 残留（未 publish 半成品）启动即清且只删 `.part`——非 `.part` 文件（完成文件/
+  位点文件）一律不动；删除安全（offset 未推进，源端重发）。单目录形态（`.part` 同目录
+  暂存，同目录 rename 天然同分区）——旧 `reader.tmp-dir` 键已废弃，残留打 WARN 忽略
 - **格式**：`binary`（默认）=`[Magic "VBFG"][version][seq][sourceDb]` 文件头 + 记录流
   （TABLE_DEF/BEGIN/EVENT/COMMIT/TRUNCATE + FOOTER 校验和，LEB128 变长整数，null 位图），
   时间/decimal 统一字符串落地（目标端按列类型转换）；`sql`=可执行 SQL 文本（语句逐行 +
@@ -82,8 +84,7 @@ cdc-capture 的落地链路（源码移植，格式与该项目 cdc-sink 消费�
 |---|---|---|
 | `reader.mode` | `log` | `log`=逐条 INFO 渲染；`file`=落地文件（非法值启动期报错） |
 | `reader.format` | `binary` | file 形态落地格式：`binary`=VBFG 二进制 / `sql`=可执行 SQL 文本（大小写宽容，非法值启动期报错） |
-| `reader.data-dir` | `data/cdc-files` | 已发布落地文件目录（gitignore 已覆盖） |
-| `reader.tmp-dir` | `data/cdc-tmp` | 写入中的 `.part` 半成品目录（启动清空） |
+| `reader.data-dir` | `data/cdc-files` | 落地文件目录（`.part` 半成品同目录暂存，publish 后去后缀；gitignore 已覆盖） |
 | `reader.task` | `topic.prefix` 值 | 文件名前缀（任务标识） |
 | `reader.roll.max-records` | `1000` | 条数切分阈值（COMMIT 处评估） |
 | `reader.roll.interval-ms` | `10000` | 时长切分阈值（距上次 publish） |
@@ -113,4 +114,4 @@ file 形态下 CDC logger 仍有 INFO 摘要（每事务一行 TXN-END + 落地�
 
 ## 开发与测试
 
-`mvn test` 单命令全跑（surefire 显式补 `**/*IT.java`，与 connector 模块同款）：离线单测 `ReaderPropertiesTest`（三层合并次序 / classpath 模板 / 外部文件替换与 fail-fast / 必填校验与打码 / reader 键合并与剥离 / 输出形态默认值与格式解析，零 PG）+ `file` 包 `FileChangeConsumerTest`（offset 与 publish 联动、tombstone、落地文件读回）/`FileRollingWriterTest`（时间切分、seq 恢复、tmp 清理 + sql 后缀 publish 与文件内容形态）/`SqlEventWriterTest`（头注释 + BEGIN/语句/COMMIT 逐行文本面、中文载荷 UTF-8 往返）+ `it` 包（Testcontainers postgres:18，需本机 Docker）`ReaderEndToEndIT` 两场景——①端到端：INSERT 断言数据记录 op=c + 事务元数据 BEGIN/END 对 + 零 op=r（snapshot 钉死 no_data）；②重启无重复：同槽同 offset 文件两轮运行零重发、新写入恰收新记录；`ReaderFileOutputIT` file 形态端到端两场景（binary/sql）——binary：六类型列落地 VBFG 文件 → 移植 Reader 读回断言记录序/表定义/值/txid/CRC 完整；sql：同链路落地 `.sql` 文本在镜像表整文件重放，六类型列值往返。每方法独立槽名/publication/表名。
+`mvn test` 单命令全跑（surefire 显式补 `**/*IT.java`，与 connector 模块同款）：离线单测 `ReaderPropertiesTest`（三层合并次序 / classpath 模板 / 外部文件替换与 fail-fast / 必填校验与打码 / reader 键合并与剥离 / 输出形态默认值与格式解析，零 PG）+ `file` 包 `FileChangeConsumerTest`（offset 与 publish 联动、tombstone、落地文件读回）/`FileRollingWriterTest`（时间切分、seq 恢复、.part 残留清理[只删半成品] + sql 后缀 publish 与文件内容形态）/`SqlEventWriterTest`（头注释 + BEGIN/语句/COMMIT 逐行文本面、中文载荷 UTF-8 往返）+ `it` 包（Testcontainers postgres:18，需本机 Docker）`ReaderEndToEndIT` 两场景——①端到端：INSERT 断言数据记录 op=c + 事务元数据 BEGIN/END 对 + 零 op=r（snapshot 钉死 no_data）；②重启无重复：同槽同 offset 文件两轮运行零重发、新写入恰收新记录；`ReaderFileOutputIT` file 形态端到端两场景（binary/sql）——binary：六类型列落地 VBFG 文件 → 移植 Reader 读回断言记录序/表定义/值/txid/CRC 完整；sql：同链路落地 `.sql` 文本在镜像表整文件重放，六类型列值往返。每方法独立槽名/publication/表名。

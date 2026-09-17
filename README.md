@@ -6,7 +6,7 @@
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 连接器模块 `vb-stream-connector-postgres-stream`（Debezium 流式 PG 连接器插件，MS1–MS6 收官）：配置面/打包安装/at-least-once 语义/已知限制一档全，见 [vb-stream-connector-postgres-stream/README.md](vb-stream-connector-postgres-stream/README.md)
 - 宿主模块 `vb-stream-reader`（debezium-embedded 冒烟入口，`DebeziumEngine.create(Connect.class)` 加载自研连接器，零 `-D` 参数即可起；输出形态 `vb.reader.mode=log|file`——file 落地文件双格式 `vb.reader.format=binary|sql`：默认 binary=VBFG 二进制，与 vb-cdc-file-transform 的 cdc-sink 消费端互通；sql=可执行 SQL 文本）：三层合并配置面/运行/file 落地语义见 [vb-stream-reader/README.md](vb-stream-reader/README.md)
-- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），543 个测试全绿（引擎 224 + 连接器 272 + file-format 3 + binary-format 12 + sql-format 10 + reader 22，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
+- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），544 个测试全绿（引擎 224 + 连接器 272 + file-format 3 + binary-format 12 + sql-format 10 + reader 23，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
 
 ## PostgreSQL 前置要求
 
@@ -125,7 +125,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 ## 测试
 
 ```bash
-mvn test                # 全部：六模块单元测试 + Testcontainers 集成测试（543 用例：引擎 224 + 连接器 272 + file-format 3 + binary-format 12 + sql-format 10 + reader 22）
+mvn test                # 全部：六模块单元测试 + Testcontainers 集成测试（544 用例：引擎 224 + 连接器 272 + file-format 3 + binary-format 12 + sql-format 10 + reader 23）
 mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 

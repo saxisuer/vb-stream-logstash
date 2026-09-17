@@ -198,6 +198,24 @@ class ReaderPropertiesTest {
     }
 
     /**
+     * 场景:reader.tmp-dir 残留键被忽略——tmp 目录已合并进 data 目录(.part 半成品同目录
+     * 暂存,同目录原子 rename publish),该键不再消费;旧配置残留打 WARN 忽略、不报错,
+     * 且不影响其余输出形态项的解析。
+     */
+    @Test
+    void legacyTmpDirKeyIgnored() {
+        System.setProperty("vb.reader.tmp-dir", "legacy-tmp");
+        try {
+            OutputConfig out = ReaderProperties.resolveOutput(ReaderProperties.resolve());
+            assertEquals(OutputConfig.Mode.LOG, out.mode(), "残留键不影响 mode 默认");
+            assertEquals(Path.of("data/cdc-files"), out.dataDir(), "dataDir 默认不受影响");
+        }
+        finally {
+            System.clearProperty("vb.reader.tmp-dir");
+        }
+    }
+
+    /**
      * 断言抛 IllegalStateException 的便捷包装(两处用例共用,失败信息带实际异常类型)。
      *
      * @return 捕获的异常

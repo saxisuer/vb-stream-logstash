@@ -24,15 +24,16 @@ vb-stream-file-format 经传递依赖到达）。
   `connector.class`（固定不可覆盖）/`name`/`offset.storage.file.filename`（默认
   `data/reader-offsets.dat`，已 gitignore）/`offset.flush.interval.ms`（默认 1000）；必填五项
   hostname/dbname/user/password/topic.prefix 缺失 exit 2；`masked` 打码 password。
-- `OutputConfig`：输出形态配置（record，7 组件）——`mode`（log|file，大小写宽容，非法值启动期
+- `OutputConfig`：输出形态配置（record，6 组件）——`mode`（log|file，大小写宽容，非法值启动期
   IAE）、`format`（file 形态的落地格式 binary|sql，`OutputFormat.parse`，默认 binary，非法值
-  同样 fail-fast）+ file 形态参数（dataDir 默认 `data/cdc-files`、tmpDir 默认 `data/cdc-tmp`、
-  task 缺省取 topic.prefix、roll.max-records 默认 1000、roll.interval-ms 默认 10000——滚动默认
-  对齐 cdc-capture）。解析入口 `ReaderProperties.resolveOutput(debeziumProps)`：文件
-  `reader.*` 基础值 → `-Dvb.reader.*` 覆盖 → 默认兜底。配置键全集：`reader.mode` /
-  `reader.format` / `reader.data-dir` / `reader.tmp-dir` / `reader.task` /
-  `reader.roll.max-records` / `reader.roll.interval-ms`（dbconfig.properties
-  模板有全部键的注释区——配置可见性）。
+  同样 fail-fast）+ file 形态参数（dataDir 默认 `data/cdc-files`——`.part` 半成品同目录暂存，
+  无独立 tmp 目录；task 缺省取 topic.prefix、roll.max-records 默认 1000、roll.interval-ms
+  默认 10000——滚动默认对齐 cdc-capture）。解析入口 `ReaderProperties.resolveOutput(debeziumProps)`：
+  文件 `reader.*` 基础值 → `-Dvb.reader.*` 覆盖 → 默认兜底。配置键全集：`reader.mode` /
+  `reader.format` / `reader.data-dir` / `reader.task` / `reader.roll.max-records` /
+  `reader.roll.interval-ms`（dbconfig.properties 模板有全部键的注释区——配置可见性）；
+  残留的 `reader.tmp-dir` 键打 WARN 忽略（tmp 目录已合并进 data 目录，2026-09-16 对齐
+  对方仓 refactor）。
 - `LogChangeConsumer`：一条记录一行（topic/key/op/txId/lsn/lsn_commit/value 预览截 512 字符）；
   op/txId 取 value Struct（数据记录 op 顶层 + source 块 txId，事务元数据记录 status/id），
   lsn 取 sourceOffset map（连接器事务边界 offset 双写）。
@@ -42,8 +43,8 @@ vb-stream-file-format 经传递依赖到达）。
   （引擎已自行结束则跳过 close，再调抛 ISE）+ ISE 兜底重试（撞 STARTING_TASKS 启动窗口 1s×5）
   + IOException WARN 吸收。Main 与 IT 共用。
 - `Main`：vb-stream-engine Main 同款模式（latch + hook + 退出码 2/1/0）；按 `OutputConfig.Mode`
-  装配 consumer——file 形态的 `FileChangeConsumer` 构造（建目录/清 tmp/恢复 seq）与关闭
-  （停机收敛后，未 publish 的 tmp 丢弃）都归 main 编排。
+  装配 consumer——file 形态的 `FileChangeConsumer` 构造（建目录/清 .part 残留/恢复 seq）与关闭
+  （停机收敛后，未 publish 的 .part 半成品丢弃）都归 main 编排。
 
 ## file 输出形态（落地文件，binary/sql 双格式，2026-09-11 起）
 
@@ -61,14 +62,16 @@ vb-stream-file-format 经传递依赖到达）。
   javadoc 记档）、`OutputFormat`（**格式枚举即工厂**——`BINARY("bin")`/`SQL("sql")`，扩展名
   即消费分派依据，`newWriter` 按格式建写入器，`parse` 大小写宽容、非法值 IAE fail-fast）、
   `EventFileWriter`（写入器接口——事务边界 + 数据事件 + finish/recordCount，格式实现自理
-  tmp 细节）、`VbfgEventWriter`（binary 实现：解析结果写 `ChangeFileWriter`，事务内跟踪
+  `.part` 暂存细节）、`VbfgEventWriter`（binary 实现：解析结果写 `ChangeFileWriter`，事务内跟踪
   lastLsn 供 BEGIN/COMMIT；txid 纯数字直接 parseLong、复合 "a:b" 打包、其余哈希兜底）、
   `SqlEventWriter`（sql 实现：IR 经 `SqlRenderer` 渲染语句逐行写文件，事务边界写裸
   `BEGIN;`/`COMMIT;`，头一行 `--` 注释携带 task/seq；无 FOOTER/CRC、lsn/txid 不落文件——
   完整性靠同一 publish 外壳；**字符集恒 UTF-8**（显式指定不随平台默认——GBK 默认机器上
-  中文载荷不乱码））、`FileRollingWriter`（格式无关外壳：tmp `.part` → COMMIT 边界评估切分
-  [条数/时长] → finish+fsync+**原子 rename** publish，构造注入 `OutputFormat` 决定写入器与
-  文件后缀；启动清 tmp 残留、seq 扫数据目录恢复、close 丢弃未 publish tmp）、
+  中文载荷不乱码））、`FileRollingWriter`（格式无关外壳，**单目录形态**：data 目录内
+  `.part` 同目录暂存 → COMMIT 边界评估切分 [条数/时长] → finish+fsync+**同目录原子 rename**
+  去后缀 publish——同目录 rename 天然同分区，构造注入 `OutputFormat` 决定写入器与文件后缀；
+  启动只清 `.part` 残留半成品 [非 .part 文件一律不动]、seq 扫数据目录恢复、close 丢弃
+  未 publish 的 .part）、
   `FileChangeConsumer`（批回调分流 Begin/Event/Commit；**markBatchFinished 只在本批有
   publish 后调用**——数据完整落地前 offset 绝不推进，IO 失败抛出让引擎停 [offset 不动
   重启重放]；每事务 COMMIT 后 INFO 摘要一行到 CDC logger）。
@@ -123,13 +126,15 @@ Queue 的 mmap 需要，与根 pom surefire argLine 同源。）
 ## 测试形态
 
 `mvn test` 单命令全跑（surefire 显式补 `**/*IT.java`，与 connector 模块同款）。
-离线单测：`ReaderPropertiesTest` 8 用例（三层合并次序/classpath 模板/外部文件替换与
+离线单测：`ReaderPropertiesTest` 9 用例（三层合并次序/classpath 模板/外部文件替换与
 fail-fast/必填校验与打码/`reader.*` 键合并与 Debezium 剥离/输出形态默认值与 task 兜底/
-`reader.format` 非法值 fail-fast）；`file` 包 `FileChangeConsumerTest` 3 用例（publish 后
-才放行 offset/未达阈值不推进且 close 弃 tmp/tombstone 兜底跳过）、`FileRollingWriterTest`
-5 用例（时间切分/seq 恢复/tmp 残留清理 + 双格式扩展——sql 后缀 publish、sql 文件内容形态
-头注释/语句行）、`SqlEventWriterTest` 2 用例（头注释+BEGIN/语句+COMMIT 逐行文本面、
-中文载荷 UTF-8 往返防回归——本机 GBK 默认字符集下的乱码锚）。
+`reader.format` 解析含大小写宽容正向面与非法值 fail-fast/`reader.tmp-dir` 残留键 WARN
+忽略）；`file` 包 `FileChangeConsumerTest` 3 用例（publish 后才放行 offset/未达阈值不推进
+且 close 弃 .part/tombstone 兜底跳过）、`FileRollingWriterTest`
+5 用例（时间切分/seq 恢复/.part 残留清理[只删半成品,非 .part 文件不动] + 双格式扩展——
+sql 后缀 publish、sql 文件内容形态头注释/语句行）、`SqlEventWriterTest` 2 用例
+（头注释+BEGIN/语句+COMMIT 逐行文本面、中文载荷 UTF-8 往返防回归——本机 GBK 默认
+字符集下的乱码锚）。
 `it` 包：`ReaderPgEnv` 单例 postgres:18 容器（连接器 IT 同配方翻译裁剪）+
 `ReaderEndToEndIT` 两场景——①端到端：3 行 INSERT 断言数据记录（op=c、id 齐）+
 事务元数据 BEGIN/END 对 + 零 op=r（snapshot 钉死 no_data）；②重启无重复：offset 文件接线

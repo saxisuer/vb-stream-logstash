@@ -84,10 +84,9 @@ class ReaderFileOutputIT {
                 "CREATE PUBLICATION pub_reader_file FOR TABLE " + table);
 
         Path dataDir = Files.createTempDirectory(tempDir, "cdc-files");
-        Path tmpDir = Files.createTempDirectory(tempDir, "cdc-tmp");
         Path offsetFile = Files.createTempFile(tempDir, "offsets-file", ".dat");
         try (FileChangeConsumer consumer = new FileChangeConsumer(new OutputConfig(OutputConfig.Mode.FILE,
-                OutputFormat.BINARY, dataDir, tmpDir, "readerit", 1, 60_000L))) {
+                OutputFormat.BINARY, dataDir, "readerit", 1, 60_000L))) {
             EngineLifecycle lifecycle = EngineLifecycle.start(
                     baseProps(slotName, "pub_reader_file",
                             Files.createTempDirectory(tempDir, "pipe"), offsetFile),
@@ -167,10 +166,9 @@ class ReaderFileOutputIT {
                 "CREATE PUBLICATION pub_reader_file_sql FOR TABLE " + table);
 
         Path dataDir = Files.createTempDirectory(tempDir, "cdc-sql");
-        Path tmpDir = Files.createTempDirectory(tempDir, "cdc-sql-tmp");
         Path offsetFile = Files.createTempFile(tempDir, "offsets-sql", ".dat");
         try (FileChangeConsumer consumer = new FileChangeConsumer(new OutputConfig(OutputConfig.Mode.FILE,
-                OutputFormat.SQL, dataDir, tmpDir, "readeritsql", 1, 60_000L))) {
+                OutputFormat.SQL, dataDir, "readeritsql", 1, 60_000L))) {
             EngineLifecycle lifecycle = EngineLifecycle.start(
                     baseProps(slotName, "pub_reader_file_sql",
                             Files.createTempDirectory(tempDir, "pipe"), offsetFile),

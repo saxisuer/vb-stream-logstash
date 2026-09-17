@@ -1,5 +1,7 @@
 package org.vastdata.vbstream.reader;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.reader.file.OutputFormat;
 
 import java.nio.file.Path;
@@ -9,10 +11,10 @@ import java.util.Properties;
 
 /**
  * reader 的输出形态配置：{@code vb.reader.mode=log}（默认，逐条 INFO 渲染）或
- * {@code file}（CDC 记录落地为文件——tmp → fsync → 原子 rename，COMMIT 边界
- * 切分，offset 与文件 publish 严格联动，见 file 包）。file 形态的落地格式由
- * {@code vb.reader.format} 选择：{@code binary}（默认，VBFG 二进制）或 {@code sql}
- * （可执行 SQL 文本），见 {@link OutputFormat}。
+ * {@code file}（CDC 记录落地为文件——data 目录内 {@code .part} 同目录暂存 → fsync →
+ * 原子 rename 去后缀，COMMIT 边界切分，offset 与文件 publish 严格联动，见 file 包）。
+ * file 形态的落地格式由 {@code vb.reader.format} 选择：{@code binary}（默认，VBFG
+ * 二进制）或 {@code sql}（可执行 SQL 文本），见 {@link OutputFormat}。
  *
  * <p>键来源两层（与 {@link ReaderProperties} 的三层合并同风格，输出形态层无 Debezium
  * 语义）：配置文件的 {@code reader.*} 裸键（reader 自用输出形态命名空间，不透传
@@ -21,8 +23,11 @@ import java.util.Properties;
  * （落地文件名前缀与任务标识同源）。纯数据 record，解析入口见
  * {@link ReaderProperties#resolveOutput(Properties)}。
  */
-public record OutputConfig(Mode mode, OutputFormat format, Path dataDir, Path tmpDir, String task,
+public record OutputConfig(Mode mode, OutputFormat format, Path dataDir, String task,
                            int rollMaxRecords, long rollIntervalMs) {
+
+    /** 配置解析日志面（残留键容错 WARN 的出口）。 */
+    private static final Logger LOG = LoggerFactory.getLogger(OutputConfig.class);
 
     /** 输出形态：LOG（INFO 渲染）/ FILE（落地文件——binary/sql 双格式，由 format 组件选定）。 */
     public enum Mode {LOG, FILE}
@@ -36,9 +41,11 @@ public record OutputConfig(Mode mode, OutputFormat format, Path dataDir, Path tm
     /**
      * 责任：从已合并的输出形态键集组装 {@link OutputConfig}。关键步骤：mode 解析（大小写宽容，
      * 非法值抛 IAE——启动期 fail-fast，与 {@code vb.output.mode} 同哲学）→ format 解析
-     * （{@link OutputFormat#parse}，缺省 binary，非法值同样 fail-fast）→ 目录/滚动参数
-     * 带默认读取 → task 缺省取 Debezium props 的 {@code topic.prefix}（再兜底
-     * {@code vb-stream-reader}）。边界：数值键非法抛 NumberFormatException（同样启动期暴露）。
+     * （{@link OutputFormat#parse}，缺省 binary，非法值同样 fail-fast）→ 残留的
+     * {@code reader.tmp-dir} 键打 WARN 忽略（tmp 目录已合并进 data 目录，.part 同目录
+     * 暂存——旧配置不报错）→ 目录/滚动参数带默认读取 → task 缺省取 Debezium props 的
+     * {@code topic.prefix}（再兜底 {@code vb-stream-reader}）。边界：数值键非法抛
+     * NumberFormatException（同样启动期暴露）。
      *
      * @param readerProps    已合并的 reader.* 键集（文件基础值被系统属性覆盖后的终态）
      * @param debeziumProps Debezium props（仅读 topic.prefix 作 task 兜底）
@@ -53,6 +60,10 @@ public record OutputConfig(Mode mode, OutputFormat format, Path dataDir, Path tm
                     "未知的 vb.reader.mode: " + modeValue + "（可选 log|file）");
         };
         OutputFormat format = OutputFormat.parse(readerProps.getOrDefault("reader.format", "binary"));
+        if (readerProps.containsKey("reader.tmp-dir")) {
+            LOG.warn("reader.tmp-dir 已废弃(tmp 目录合并进 data 目录,.part 半成品同目录暂存),该键忽略: {}",
+                    readerProps.get("reader.tmp-dir"));
+        }
         String task = readerProps.getOrDefault("reader.task",
                 debeziumProps.getProperty("topic.prefix", "vb-stream-reader"));
         int maxRecords = Integer.parseInt(
@@ -61,7 +72,6 @@ public record OutputConfig(Mode mode, OutputFormat format, Path dataDir, Path tm
                 readerProps.getOrDefault("reader.roll.interval-ms", String.valueOf(DEFAULT_ROLL_INTERVAL_MS)));
         return new OutputConfig(mode, format,
                 Path.of(readerProps.getOrDefault("reader.data-dir", "data/cdc-files")),
-                Path.of(readerProps.getOrDefault("reader.tmp-dir", "data/cdc-tmp")),
                 task, maxRecords, intervalMs);
     }
 }
