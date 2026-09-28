@@ -35,6 +35,10 @@
         <testcontainers.version>2.0.5</testcontainers.version>
         <jmh.version>1.37</jmh.version>
         <maven-build-helper-plugin.version>3.6.0</maven-build-helper-plugin.version>
+
+        <!-- 手动档 IT 开关：Pg17DefaultWorkMemTest（默认 64MB work_mem 档流式回滚实证，单次 ~1-2 分钟），
+             常规 mvn test 跳过，-Dvb.it.pg17.defaultmem=true 才进测试 JVM（经下方 surefire systemPropertyVariables 透传） -->
+        <vb.it.pg17.defaultmem>false</vb.it.pg17.defaultmem>
     </properties>
 
     <build>
@@ -48,6 +52,10 @@
                     <!-- Chronicle Queue 在 Java 17+ 需开放内部包（mmap 经反射调 sun.nio.ch.FileChannelImpl.map0），
                          官方支持说明见 https://chronicle.software/chronicle-support-java-17 -->
                     <argLine>--add-opens java.base/jdk.internal.ref=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED --add-opens java.base/sun.nio.fs=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED</argLine>
+                    <!-- mvn CLI 的 -D 不进 surefire fork 的测试 JVM，手动档开关在此显式透传 -->
+                    <systemPropertyVariables>
+                        <vb.it.pg17.defaultmem>${vb.it.pg17.defaultmem}</vb.it.pg17.defaultmem>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
         </plugins>

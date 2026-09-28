@@ -1,15 +1,16 @@
 # it/ 集成测试——Testcontainers 真 PG 端到端
 
-多数测试类跑真库：共享单例容器 `PgTestEnv.PG`（postgres:18，`wal_level=logical`、`logical_decoding_work_mem=64kB`、`max_prepared_transactions=16`、`max_slot_wal_keep_size=1GB`）；**源库降级 PG 17 的兼容性实证**走平行单例 `Pg17TestEnv.PG`（postgres:17，容器参数逐项相同，仅 `Pg17CompatTest` 引用、运行该类才拉起）。**需要本机 Docker**；`mvn test` 单命令即含本包（与单测同轮）。
+多数测试类跑真库：共享单例容器 `PgTestEnv.PG`（postgres:18，`wal_level=logical`、`logical_decoding_work_mem=64kB`、`max_prepared_transactions=16`、`max_slot_wal_keep_size=1GB`）；**源库降级 PG 17 的兼容性实证**走平行单例 `Pg17TestEnv.PG`（postgres:17，容器参数逐项相同，仅 `Pg17CompatTest` 引用、运行该类才拉起）；**PG 17 出厂默认 work_mem 档（64MB）流式回滚实证**走第三平行单例 `Pg17DefaultMemTestEnv.PG`（postgres:17，唯一差异是不传 `logical_decoding_work_mem`，仅手动档 `Pg17DefaultWorkMemTest` 引用）。**需要本机 Docker**；`mvn test` 单命令即含本包（与单测同轮，手动档除外）。
 
 ## 基建与通用模式
 
 - **`PgTestEnv`**：类加载即启动的单例容器 + 静态工具（`newSqlConnection` / `newConfig(slot, pub)`——固定 proto 4 + PARALLEL + two_phase + 反馈 2s / `execSql` / `dropSlotQuietly`）。容器**跨测试类共享**，故各测试类用独立槽名。残留槽危害：上次异常退出留同名槽会从旧 confirmed_flush_lsn 续传、静默吞掉先于建流写入的事务——组装类（TransactionAssemblyTest/DecoupledPipelineTest）与解耦/frontier 类（ReaderUnblockedTest/FrontierCapTest）因此 `@BeforeEach` 清残留槽；全部类 `@AfterEach` drop（先杀 walsender 再删；`BenchCorpusRecordTest` 例外，槽清理内联在录制路径 finally）
 - **`Pg17TestEnv`**：PG 17 平行基座（2026-09-11 源码审计配套）——工具面是 PgTestEnv 的子集同构（newSqlConnection/newConfig(±binary)/execSql/dropSlotQuietly/majorVersion），与 18 容器互不共享；`Pg17CompatTest` 以 `@BeforeAll` 断言 majorVersion()==17 防镜像漂移假绿
+- **`Pg17DefaultMemTestEnv`**：PG 17 出厂默认 work_mem 档基座（2026-09-28）——与 Pg17TestEnv 逐项相同但**不传 `logical_decoding_work_mem`**（默认 64MB 即验证对象），多一个 `workMemSetting()` 供 @BeforeAll 防漂移断言；仅 `Pg17DefaultWorkMemTest`（`-Dvb.it.pg17.defaultmem=true` 手动档，属性经根 pom surefire `systemPropertyVariables` 透传）引用，常规 mvn test 不拉起
 - **`SessionHarness`**：会话包装 + 双轨录制（raw 字节与解码消息两列表同序一一对应）。停止条件是 countDown latch——列表在 close 前仍会增长，**确定性全量断言必须先 `close()` 再读**。两种生命周期习语：多数用例（以停止条件收尾、块内断言）走 try-with-resources；需 close 后断言/回放的用例（RawSessionContractTest / DecoupledPipelineTest / BenchCorpusRecordTest）用显式 try/finally——harness 出块后仍可引用。机制细节见 replication 包 CLAUDE.md 的 SessionHarness 节
 - **录制→离线回放模式**（组装器类测试通用）：真库录制 raw 字节后把 `rawMessages()` 回放给 `TransactionAssembler`（确定性纯状态机，离线回放与在线组装一致）——随机数据只进录制侧，不进双配置对照断言。回放时点两种：`TransactionAssemblyTest` 五场景在 harness 块内（close 前）回放——停止条件恰在最后一条预期消息触发、尾部无多余流量才安全；`DecoupledPipelineTest`/`BenchCorpusRecordTest` close 后回放（DecoupledPipelineTest 用**异步**组装器 + close 毒丸排干后断言——排干承诺使输出成为确定性终态）——新场景若录制尾部含预期外消息必须用 close-first 形态
 
-## 14 组测试各自验证什么
+## 14 组测试各自验证什么（+1 组手动档）
 
 | 测试类 | 验证场景 |
 |---|---|
@@ -27,6 +28,7 @@
 | `ReaderThroughputTest` | **读取节拍回归**（2026-08-31 吞吐冒烟踩坑）：run 消息取送必须 drain——500 行单事务 35s 内录到提交消息；旧"每轮一条 + 固定 sleep 100ms"节拍 ~10 msg/s 下需 ~50s（硬性 sleep，确定性必红）。停止条件 Commit/StreamCommit 二选一（64kB work_mem 下 500 行小事务可能走流式路径） |
 | `BenchCorpusRecordTest` | JMH 语料生成器：6 场景脚本真库录制 → `corpus.bin` + SHA-256 指纹边车；指纹一致时**只做健康断言、不启容器**（PgTestEnv 引用收缩在录制分支内，常规 mvn test 秒级过）。改 `src/main/resources/sql/` 脚本或 DDL 即触发重录并**改写源码树**（产物须提交回库；无 Docker 环境下重录失败属预期） |
 | `Pg17CompatTest` | **源库降级 PG 17 的端到端兼容实证**（2026-09-11 REL_17/18_STABLE 源码审计配套，跑 Pg17TestEnv 容器）：①Relation 列元数据（name/typeId/typmod）与 pg_attribute 逐列全等（typmod 自 PG 10 即下发，审计纠错点）②binary 五类型族（interval 正负/数组矩阵/numeric/时间/文本）解码值与 getString 全列对照 ③200 行×1KB binary 流式大事务 ④PREPARE→COMMIT PREPARED 按 gid 匹配 ⑤流式子事务回滚 StreamAbort 携带 parallel 附加字段（abortLsn/abortTimestamp 非空）。`@BeforeAll` 断言容器大版本 17 防镜像漂移 |
+| `Pg17DefaultWorkMemTest`（手动档） | **PG 17 出厂默认 `logical_decoding_work_mem=64MB` 档的流式与子事务回滚实证**（`-Dvb.it.pg17.defaultmem=true`，跑 Pg17DefaultMemTestEnv，~80s 不进常规回归）：~200MB 单事务（1KB **不 TOAST** 行 × ~20 万行，分批 1000 行 + 250ms）断言 StreamStart/StreamAbort(parallel 附加字段)/StreamCommit 齐全 + 按 id 区间的到达量（主段/驱动段全量、被回滚子段"先发后弃"部分到达）。**关键领域发现（2026-09-28 四轮实测 + debug2 日志 + REL_17_STABLE 源码定位）**：16KB TOAST 载荷使驱逐恒带 partial 标走 **spill-to-disk 分支**而非 streaming 分支（`ReorderBufferLargestStreamableTopTXN` 跳过 partial 事务），spilled 子事务的补发流撞上 ROLLBACK TO 的 concurrent-abort 检测被中断——StreamAbort 永不发射且该形态跨 PG 17/18 稳定复现（被回滚子事务行部分下发、部分静默丢弃、无 discard 通知，对依赖 StreamAbort 剔除的下游是脏数据风险）；**不 TOAST 行（<2KB）无 partial 标、驱逐回 streaming 分支**，StreamAbort 正常发射。推论：真实负载行宽 >2KB TOAST 且大事务回滚子事务时，PG 17/18 的流式回滚通知链存在此缺口 |
 
 ## 领域注意（不在本包重复）
 
