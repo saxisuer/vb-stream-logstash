@@ -53,6 +53,22 @@
 | 主段 / 驱动段 | 全量到达 ✓ |
 | 被回滚子事务行 | 部分到达（先发后弃，具体量随时序浮动）——剔除语义正确 |
 
+### immediate 强制驱逐 + 16KB TOAST 载荷（恢复形态，2026-09-28 验证）
+
+容器加 `debug_logical_replication_streaming=immediate`，**其余与问题形态完全一致**（16KB TOAST
+行、64MB 默认档、同样的事务结构）：
+
+| 观察项 | 实测值 |
+|---|---|
+| StreamStart / StreamStop | **13801 段（= 行数，每行一个驱逐段）** |
+| **StreamAbort** | **1 ✓（parallel 附加字段 abortLsn/abortTimestamp 齐全）** |
+| StreamCommit | 1 ✓ |
+| spill 日志 | **0 条** |
+| 被回滚子事务行到达量 | **13801/13801 全量**（先发后弃覆盖全部行，剔除语义完整） |
+
+`immediate` 使驱逐检查在每个 change 入队后执行（不等越限）——主表记录入队时刻 partial 恰被
+清除，驱逐稳定走 streaming 分支。机制与代价详见第四节规避方案第 2 条。
+
 ### 对照：64kB 压低阈值档（现有常规测试基线）
 
 `logical_decoding_work_mem=64kB` + 16KB TOAST 行 + 逐行慢写（75ms/行）：StreamAbort 正常
@@ -117,12 +133,21 @@ abort 通知链完整。
 
 1. **行宽控制在 TOAST 阈值内（行总尺寸 < 2KB）**——根治方向，本轮已实测验证（1KB 行：spill
    为 0、StreamAbort 正常）。对宽表可拆列、压缩进单行、或把大字段拆到独立表/独立事务。
-2. **压低 `logical_decoding_work_mem`**（如 64kB~几 MB）——驱逐高频化使检查点必然覆盖
+2. **`debug_logical_replication_streaming=immediate` 强制逐 change 驱逐检查**（2026-09-28
+   实测验证，不改表结构、不动 work_mem）——immediate 模式下 `ReorderBufferCheckMemoryLimit`
+   在每个 change 入队后即执行（`rb->size > 0` 就驱逐，不等越限），主表记录入队时刻 partial
+   恰被清除，驱逐稳定走 streaming 分支。**16KB TOAST + 64MB 默认档实测完全恢复**：spill
+   归零、StreamAbort 正常发射、被回滚子事务行全量先发后弃（剔除语义完整，见第一节对照表）。
+   代价与注意：①驱逐粒度降至行级——实测 StreamStart/Stop 段数 = 行数（13801 段），每段一对
+   控制消息，消息面开销与吞吐代价显著；②参数名带 `debug_` 前缀，GUC 定位为逻辑复制的调试/
+   测试参数（PG 16+ 可用），生产采用需自行评估其稳定性承诺；③服务端参数（walsender 继承
+   容器/库级设置），需 DBA 权限。
+3. **压低 `logical_decoding_work_mem`**（如 64kB~几 MB）——驱逐高频化使检查点必然覆盖
    partial 清除时刻，回到 streaming 分支（64kB 档常规回归长期为绿即此机制）。代价：驱逐/
    落盘更频繁的服务端开销；该缓解在"低阈值 + 批量写"组合下未单独压测，建议先在预发验证。
-3. **业务侧避开组合**：大事务内不用 `SAVEPOINT` 回滚——把需要部分回滚的逻辑挪进小事务，
+4. **业务侧避开组合**：大事务内不用 `SAVEPOINT` 回滚——把需要部分回滚的逻辑挪进小事务，
    或先写临时表确认后再入正式表。
-4. **下游兜底（引擎侧，待办）**：vb-stream 引擎的 `abortedSubxids` 剔除完全依赖 StreamAbort
+5. **下游兜底（引擎侧，待办）**：vb-stream 引擎的 `abortedSubxids` 剔除完全依赖 StreamAbort
    消息，当前无兜底。可评估的缓解：commit 前后按表内实际状态对账，或在文档化前提下接受
    at-least-once 语义中的该脏数据窗口（crash 重发会带来重复，但不会自动修复此脏行）。
 
