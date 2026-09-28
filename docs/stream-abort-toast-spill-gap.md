@@ -209,6 +209,6 @@ mvn test -pl vb-stream-engine -Dtest=Pg17DefaultWorkMemTest -Dvb.it.pg17.default
 - 源码：REL_17_STABLE `src/backend/replication/logical/reorderbuffer.c`（`ReorderBufferCheckMemoryLimit`
   分流、`ReorderBufferMaybeMarkTXNStreamed` 打标、PG_CATCH concurrent-abort 路径）与
   `decode.c`（`DecodeAbort` 发射链）；项目内摘录：`docs/superpowers/specs/2026-08-26-pgoutput-stream-decoder-design.md` 附录 B
-- 相邻已知 bug：[BUG #19616: pgoutput sends stream abort ('A') to clients that did not enable streaming](https://postgrespro.ru/list/thread-id-264549)（PG 19 修复，同一代码区域的标记逻辑问题）
+- 相邻已知 bug：[BUG #19616: pgoutput sends stream abort ('A') to clients that did not enable streaming](https://postgr.es/m/19616-f6153af509910853@postgresql.org)（官方邮件档案短链）——与本报告方向相反的"误发"：子事务从未真正流式下发却被打上 streamed 标、对未启用 streaming 的客户端也发 StreamAbort；由 v18 引入的 abort-discard 路径（072ee847ad4）导致，修复 commit [`aa4c52b8`](https://github.com/postgres/postgres/commit/aa4c52b808f76870f80189757af7217358544d60)（Backpatch 18）把打标收紧为"top 已 streamed 才给子事务打标"。同属 `RBTXN_IS_STREAMED` 标记语义区域，佐证该机制的边界条件在后续版本仍在收敛
 - 官方文档：[Logical Decoding Concepts](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html)（流式与 abort 通知的既有语义）
 - 配套测试与基座：`Pg17DefaultWorkMemTest` / `Pg17DefaultMemTestEnv`（it 包，机制注释完整）
