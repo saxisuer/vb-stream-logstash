@@ -63,11 +63,16 @@
 | StreamStart / StreamStop | **13801 段（= 行数，每行一个驱逐段）** |
 | **StreamAbort** | **1 ✓（parallel 附加字段 abortLsn/abortTimestamp 齐全）** |
 | StreamCommit | 1 ✓ |
-| spill 日志 | **0 条** |
+| spill 日志 | **138000 条（每个 change 一次，每条恰 1 个 change——见下方机制）** |
 | 被回滚子事务行到达量 | **13801/13801 全量**（先发后弃覆盖全部行，剔除语义完整） |
 
-`immediate` 使驱逐检查在每个 change 入队后执行（不等越限）——主表记录入队时刻 partial 恰被
-清除，驱逐稳定走 streaming 分支。机制与代价详见第四节规避方案第 2 条。
+机制（开 `log_min_messages=debug2` 复核实测 + 源码对照）：`immediate` 使 `CheckMemoryLimit`
+的驱逐循环条件变为 `rb->size > 0`（不等越限），但**分支选择逻辑不变**——partial 置位的事务
+仍选不中 streaming 分支。由此形成**逐行节拍**：toast chunk 入队（partial 置位）→ 只能 spill
+落盘（每个 change 一轮，实测 138000 次，副作用是事务打上 serialized 标）；主表记录入队
+（`QueueChange` 内 `ProcessPartialChange` 先于 `CheckMemoryLimit` 执行，partial 恰被清除）→
+驱逐循环选中 streaming 分支 → 从盘读回整行并发送 → `TruncateTXN` 打 `RBTXN_IS_STREAMED`
+标。每行完成"落盘 → 读回 → 发出 → 打标"，abort 通知链逐行加固。机制与代价详见第四节规避方案第 2 条。
 
 ### 对照：64kB 压低阈值档（现有常规测试基线）
 
@@ -135,11 +140,14 @@ abort 通知链完整。
    为 0、StreamAbort 正常）。对宽表可拆列、压缩进单行、或把大字段拆到独立表/独立事务。
 2. **`debug_logical_replication_streaming=immediate` 强制逐 change 驱逐检查**（2026-09-28
    实测验证，不改表结构、不动 work_mem）——immediate 模式下 `ReorderBufferCheckMemoryLimit`
-   在每个 change 入队后即执行（`rb->size > 0` 就驱逐，不等越限），主表记录入队时刻 partial
-   恰被清除，驱逐稳定走 streaming 分支。**16KB TOAST + 64MB 默认档实测完全恢复**：spill
-   归零、StreamAbort 正常发射、被回滚子事务行全量先发后弃（剔除语义完整，见第一节对照表）。
-   代价与注意：①驱逐粒度降至行级——实测 StreamStart/Stop 段数 = 行数（13801 段），每段一对
-   控制消息，消息面开销与吞吐代价显著；②参数名带 `debug_` 前缀，GUC 定位为逻辑复制的调试/
+   在每个 change 入队后即执行（`rb->size > 0` 就驱逐，不等越限）；分支选择逻辑不变，但与
+   partial 标的置位/清除节律配合形成逐行节拍：toast 中段落盘（每 change 一次 spill，实测
+   138000 次）、主表记录时刻读回并流式发出（StreamStart 段数 = 行数 13801）、段尾打标。
+   **16KB TOAST + 64MB 默认档实测完全恢复**：StreamAbort 正常发射、被回滚子事务行全量
+   先发后弃（剔除语义完整，见第一节对照表）。
+   代价与注意：①开销比"驱逐降至行级"更重——TOAST 行下是 **toast chunk 级落盘 + 行级盘读回
+   与流式发送**（实测 spill 138000 次 + StreamStart 13801 段，每行一轮盘写/盘读/网络段），
+   消息面与 IO 开销显著；②参数名带 `debug_` 前缀，GUC 定位为逻辑复制的调试/
    测试参数（PG 16+ 可用），生产采用需自行评估其稳定性承诺；③服务端参数（walsender 继承
    容器/库级设置），需 DBA 权限。
 3. **压低 `logical_decoding_work_mem`**（如 64kB~几 MB）——驱逐高频化使检查点必然覆盖
