@@ -30,7 +30,7 @@ import io.debezium.relational.Tables;
 import org.vastdata.debezium.connector.postgresql.PostgresType;
 import org.vastdata.debezium.connector.postgresql.TypeRegistry;
 
-import io.debezium.connector.postgresql.PostgresValueConverter;
+import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
 
 /**
  * {@link JdbcConnection} connection extension used for connecting to Postgres instances.
@@ -44,11 +44,7 @@ import io.debezium.connector.postgresql.PostgresValueConverter;
  * {@code PostgresConnection(PostgresConnectorConfig, TypeRegistry, String)} 构造器（签名引用排除集 PostgresConnectorConfig）
  * 及其独占常量/成员；{@code FACTORY} 的端口默认由 {@code PostgresConnectorConfig.PORT.defaultValueAsString()}
  * （排除集类）最小适配为字面值 {@code "5432"}（与 vanilla DEFAULT_PORT 等值）。
- * 适配说明（临时桥，Task 4 须翻转）：{@link PostgresValueConverter} 引用暂指 vanilla
- * {@code io.debezium.connector.postgresql.PostgresValueConverter}——本包同名类属 Task 4 产物（其自身又依赖 Task 6 的
- * 本包 Config，见 progress.md 预检表 Task 2 ↔ Task 4 / Task 4 ↔ Task 6 行）；为满足本批次的绿编译门（编排器指令），
- * 该 import 未按模板迁往 org.vastdata 命名空间。Task 4 落地本包 PostgresValueConverter 后须把本文件该 import 翻转为
- * {@code org.vastdata.debezium.connector.postgresql.PostgresValueConverter}（brief Interfaces 块的本意指向）。
+ * 适配说明：{@link PostgresValueConverter} 引用本包 Task 4 复刻版（Task 2 批次的 vanilla 临时桥 import 已翻转）。
  *
  * @author Horia Chiorean
  */

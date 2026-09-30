@@ -27,8 +27,8 @@ import org.postgresql.util.PGmoney;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.debezium.connector.postgresql.PostgresValueConverter;
 import org.vastdata.debezium.connector.postgresql.PostgresType;
+import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
 import org.vastdata.debezium.connector.postgresql.TypeRegistry;
 import org.vastdata.debezium.connector.postgresql.connection.wal2json.DateTimeFormat;
 
@@ -42,7 +42,7 @@ import org.vastdata.debezium.connector.postgresql.connection.wal2json.DateTimeFo
  * 其 {@code get()} 返回本包 {@code PostgresConnection}（vanilla 嵌套接口返回 {@code BaseConnection}）——{@code asArray}
  * 的 {@code PgArray} 构造点按 Task 1 随行裁定改经 {@code connection.get().connection()}（JdbcConnection 暴露的内部
  * 连接访问器）强转 {@code BaseConnection} 取底层 pgjdbc 连接，仍在原 try/catch SQLException 内，异常语义不变；
- * （2）{@link PostgresValueConverter} 的 infinity 常量引用暂桥 vanilla（本包同名类属 Task 4 产物，见各文件适配说明）。
+ * （2）{@link PostgresValueConverter} 的 infinity 常量引用本包 Task 4 复刻版（原 vanilla 桥 import 已翻转）。
  */
 public abstract class AbstractColumnValue<T> implements ReplicationMessage.ColumnValue<T> {
 
