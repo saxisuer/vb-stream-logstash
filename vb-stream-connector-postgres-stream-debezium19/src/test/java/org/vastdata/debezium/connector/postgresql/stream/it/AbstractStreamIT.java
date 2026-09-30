@@ -42,9 +42,12 @@ import io.debezium.engine.DebeziumEngine;
  * {@code markProcessed}/{@code markBatchFinished} 手动 offset 记账;对外暴露与
  * 3.6.1 官方基座同名的最小方法面({@code start}/{@code stopConnector}/
  * {@code consumeRecords}/{@code consumeRecordsByTopic} +
- * {@link #initializeConnectorTestFramework()}),失败信号经 CompletionCallback 捕获、
- * 由 {@link #awaitEngine()}/{@link #assertNoEngineFailure()} 暴露,使后续 IT 翻译
- * 保持 import 级。
+ * {@link #initializeConnectorTestFramework()}),使后续 IT 翻译保持 import 级。
+ * 停机/失败语义三分({@code AbstractStreamITContractTest} 钉子):
+ * <b>stopConnector/awaitEngine 是纯停机等待</b>(未 start 为 no-op、已停幂等、
+ * 卡死 60s 探测,<b>不隐式抛引擎失败</b>);<b>失败断言是显式动作</b>
+ * ({@link #assertNoEngineFailure()},预期失败经 {@link #expectEngineFailure()}
+ * 豁免);<b>失败信号是可读数据</b>({@link #engineFailure()},供用例断言异常链)。
  *
  * <p>引擎属性由基座统一注入(调用方 Configuration 只写连接器配置):{@code name}
  * (EmbeddedConfig 必填)、{@code connector.class}、{@code offset.storage}+
@@ -75,6 +78,15 @@ public abstract class AbstractStreamIT {
 
     /** 引擎失败信号(成功/未启动为 null;经 CompletionCallback 捕获,volatile 供测试线程读)。 */
     private volatile Throwable engineFailure;
+
+    /**
+     * 预期失败标记({@link #expectEngineFailure()} 置位,须先于 start 调用):置位后
+     * {@link #assertNoEngineFailure()}、{@link #consumeRecords(int, Consumer)} 的失败
+     * 快速通道对捕获的失败<b>不再抛出</b>——失败断言权移交用例本身(经
+     * {@link #engineFailure()} 取信号自断异常链);"启动期拒绝"类用例
+     * (SlotTwoPhaseMismatchIT 形态)用例断言通过后 teardown 才能干净收敛。
+     */
+    private volatile boolean failureExpected;
 
     /**
      * 启动连接器:补齐引擎属性后构造 embedded 引擎并在专用线程 run。
@@ -133,15 +145,19 @@ public abstract class AbstractStreamIT {
     /**
      * 请求停机并等待引擎线程退出:{@code close()} 触发优雅停止({@code run()} 从 poll
      * 循环退出走 finally 的 connector stop/offset flush/CompletionCallback),闩到后 join。
-     * <p>幂等:引擎已停(闩已开)时跳过 close 直接返回——测试显式收敛后
-     * {@code @AfterEach} 兜底再调是 no-op。</p>
+     * <p>幂等与零成本路径:引擎已停(闩已开)时跳过 close 直接返回;引擎<b>从未
+     * start</b>(engine 字段 null)时纯 no-op 立即返回(3.6.1 基座同语义——teardown
+     * 对未启动引擎打日志即返回,不等待不抛错)。stopConnector <b>不隐式抛引擎失败</b>
+     * (失败面归 {@link #assertNoEngineFailure()} 显式调用,见其 javadoc)。</p>
      *
-     * <p>边界:等待 60s 仍未停即 AssertionError(引擎卡死属被测缺陷);CompletionCallback
-     * 捕获过失败则连带抛出(失败信号优先于静默"正常"退出)。</p>
+     * <p>边界:等待 60s 仍未停即 AssertionError(引擎卡死属被测缺陷,与失败无关)。</p>
      */
     protected void stopConnector() {
         DebeziumEngine<SourceRecord> current = engine;
-        if (current != null && stopped.getCount() > 0) {
+        if (current == null) {
+            return; // 从未 start:teardown 兜底路径,纯 no-op
+        }
+        if (stopped.getCount() > 0) {
             try {
                 current.close();
             }
@@ -153,11 +169,16 @@ public abstract class AbstractStreamIT {
     }
 
     /**
-     * 等待当前引擎停机:完成闩 60s 截止,未停即 AssertionError;已停且 CompletionCallback
-     * 捕获过失败则抛 AssertionError 携原始异常(引擎侧失败经此暴露——3.6.1 基座由
-     * TestingDebeziumEngine 承担的通道在自建基座的对应物)。中断恢复中断位上抛。
+     * 等待当前引擎停机:<b>纯等待语义,不做失败断言</b>——完成闩 60s 截止,未停即
+     * AssertionError(引擎卡死探测,与失败信号无关);闩开即 join 引擎线程收尾。
+     * 引擎从未 start 时直接返回(无可等)。失败路径用例的标准节奏:
+     * {@code expectEngineFailure(); start(...); awaitEngine(); engineFailure()} 断言链。
+     * 中断恢复中断位上抛。
      */
     protected void awaitEngine() {
+        if (engineThread == null) {
+            return; // 从未 start:无引擎可等
+        }
         try {
             if (!stopped.await(60, TimeUnit.SECONDS)) {
                 throw new AssertionError("engine 60s 内未停机(close 未生效或 run 卡死)");
@@ -177,27 +198,53 @@ public abstract class AbstractStreamIT {
                 throw new IllegalStateException(e);
             }
         }
-        assertNoEngineFailure();
     }
 
     /**
      * 断言引擎未因失败停机(长跑 IT 中途探测用;失败时抛 AssertionError 携原始异常)。
+     * <b>预期失败豁免</b>:先经 {@link #expectEngineFailure()} 置位的用例,本方法对
+     * 捕获到的失败不再抛出(失败断言权已移交用例,经 {@link #engineFailure()} 自取
+     * 信号断异常链)——这是"启动期拒绝"类用例(SlotTwoPhaseMismatchIT 形态)用例
+     * 断言通过后 teardown 干净收敛的前提。
      */
     protected void assertNoEngineFailure() {
-        if (engineFailure != null) {
+        if (engineFailure != null && !failureExpected) {
             throw new AssertionError("engine failed", engineFailure);
         }
     }
 
     /**
+     * 声明本用例预期引擎以失败告终(必须先于 {@code start()} 调用):置位预期失败
+     * 标记——其后 {@link #assertNoEngineFailure()} 与 {@code @AfterEach} 兜底停机对
+     * CompletionCallback 捕获的失败不再连带抛出;失败信号经 {@link #engineFailure()}
+     * 暴露,由用例自行断言(典型:渲染异常链断言槽名/DROP SLOT 迁移指引)。
+     * 标记在 {@link #initializeConnectorTestFramework()} 每用例重置。
+     */
+    protected void expectEngineFailure() {
+        failureExpected = true;
+    }
+
+    /**
+     * 当前引擎失败信号的读取面(CompletionCallback 捕获的原始异常,成功/未启动/尚未
+     * 失败为 null)。失败路径用例经 Awaitility 轮询本方法或在 {@link #awaitEngine()}
+     * 之后直接读取,再自行断言异常链内容。
+     *
+     * @return 捕获的失败异常;无失败信号为 null
+     */
+    protected Throwable engineFailure() {
+        return engineFailure;
+    }
+
+    /**
      * 每用例前清场(与 3.6.1 基座同名同契约,由 {@code StreamITBase} 的
      * {@code @BeforeEach} 调用):清空记录队列、删除旧 offset 文件(残留 offset 会让
-     * 重启类断言跨用例串台)、重置失败通道(下一用例 start 前的干净基线)。
-     * 必须先于 start 调用。
+     * 重启类断言跨用例串台)、重置失败通道(失败信号与预期失败标记,下一用例 start
+     * 前的干净基线)。必须先于 start 调用。
      */
     protected void initializeConnectorTestFramework() {
         records.clear();
         engineFailure = null;
+        failureExpected = false;
         stopped = new CountDownLatch(1);
         try {
             Files.deleteIfExists(offsetFilePath());
@@ -230,7 +277,7 @@ public abstract class AbstractStreamIT {
             else if (System.nanoTime() > deadline) {
                 return consumed;
             }
-            else if (engineFailure != null) {
+            else if (engineFailure != null && !failureExpected) {
                 throw new AssertionError("engine 携失败停机,记录凑不齐(期望 " + minRecords
                         + ",已到 " + consumed + ")", engineFailure);
             }
