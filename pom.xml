@@ -16,6 +16,7 @@
         <module>vb-stream-sql-format</module>
         <module>vb-stream-connector-postgres-stream</module>
         <module>vb-stream-reader</module>
+        <module>vb-stream-connector-postgres-stream-debezium19</module>
     </modules>
 
     <properties>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 覆盖 debezium-embedded tests jar 根部携带的 logback-test.xml(其只给 io.debezium
+     开 INFO,org.vastdata 全被压到 root WARN——IT 排障需要连接器自身日志)。
+     模式对齐该配置(dbz MDC 上下文),加 org.vastdata INFO;root 保持 WARN 防刷屏。 -->
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{ISO8601} %-5p  %X{dbz.connectorType}|%X{dbz.connectorName}|%X{dbz.connectorContext}  %m   [%c]%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="warn">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+    <logger name="io.debezium" level="info" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- 本连接器(含 it 包)生命周期/会话/组装日志 -->
+    <logger name="org.vastdata.debezium" level="info" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- 测试containers 容器生命周期保持 WARN -->
+</configuration>

@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.vastdata</groupId>
+        <artifactId>vb-stream-logstash</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>vb-stream-connector-postgres-stream-debezium19</artifactId>
+
+    <!-- 模块边界（spec D4/§3）：不依赖 vb-stream-engine；1.9.7 专属版本属性全部留模块内，
+         根 pom 不出现双 debezium 版本属性；复用根属性的依赖与本仓其余模块同版本。 -->
+    <properties>
+        <debezium19.version>1.9.7.Final</debezium19.version>
+        <kafka19.version>3.1.0</kafka19.version>
+        <assertj.version>3.27.7</assertj.version>
+        <awaitility.version>4.3.0</awaitility.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit-jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- assertj：自建 IT 基座与 Debezium 1.9.7 传递测试类的断言面（3.x 线兼容） -->
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- pgjdbc：显式 pin 根属性 42.7.13——压掉 Debezium 1.9.7 传递的 42.3.x，
+             复制会话 API 与本仓其余模块同版本 -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+        </dependency>
+
+        <!-- Chronicle Queue：CQ 主缓冲管道（MessagePipe）；照 3.6.1 模块排除 chronicle-analytics -->
+        <dependency>
+            <groupId>net.openhft</groupId>
+            <artifactId>chronicle-queue</artifactId>
+            <version>${chronicle-queue.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>net.openhft</groupId>
+                    <artifactId>chronicle-analytics</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- HdrHistogram：StreamThroughputMetrics 分位数结构 -->
+        <dependency>
+            <groupId>org.hdrhistogram</groupId>
+            <artifactId>HdrHistogram</artifactId>
+            <version>${hdrhistogram.version}</version>
+        </dependency>
+
+        <!-- Debezium PG 连接器 1.9.7：Config/Schema/Emitter/offset 体系（spec D3）；
+             宿主产品亦为同版本，嵌入场景类重复无害（first-win） -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connector-postgres</artifactId>
+            <version>${debezium19.version}</version>
+        </dependency>
+
+        <!-- Kafka Connect API 3.1.0（1.9.7 官方 Kafka 矩阵，spec §3）；
+             运行期由 Connect runtime / 宿主产品提供 -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-api</artifactId>
+            <version>${kafka19.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- slf4j：2.x 与 Debezium 1.9.7（1.7 编译）二进制兼容，ServiceLoader 绑定恢复
+             logback 1.5——同 3.6.1 模块 2026-09-01 用户裁决 -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- 自建 IT 基座（Task 8）的 embedded 引擎与 engine API（1.9.7 同步引擎实现）；
+             注意：与 3.6.1 模块不同，本模块不需要任何 tests classifier 依赖 -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-embedded</artifactId>
+            <version>${debezium19.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-runtime</artifactId>
+            <version>${kafka19.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-json</artifactId>
+            <version>${kafka19.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-kafka</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <version>${awaitility.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/Test*.java</include>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                        <include>**/*TestCase.java</include>
+                        <include>**/*IT.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+            <!-- maven-assembly：plugin 目录清单打包（spec §7）；R4 清单边界同 3.6.1 模块：
+                 connect-api/slf4j-api(kafka-clients 及其独占子件) provided/显式排除 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>${maven-assembly-plugin.version}</version>
+                <configuration>
+                    <descriptors>
+                        <descriptor>src/main/assembly/plugin.xml</descriptor>
+                    </descriptors>
+                    <appendAssemblyId>false</appendAssemblyId>
+                    <finalName>vb-stream-connector-postgres-stream-debezium19-plugin</finalName>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-plugin</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

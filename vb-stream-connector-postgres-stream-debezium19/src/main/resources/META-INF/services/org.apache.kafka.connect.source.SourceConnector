@@ -1,0 +1,4 @@
+# Kafka Connect 插件发现清单(ServiceLoader):真 Connect 运行期扫描 plugin.path 时
+# 逐 jar 读本文件定位连接器类——embedded engine 直传 Class 对象不走此路径,真 Connect
+# (ConnectPluginIT)缺本清单即"插件不可见"(connector class not found)。
+org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector
