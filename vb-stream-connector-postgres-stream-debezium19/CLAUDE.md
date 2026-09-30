@@ -2,11 +2,11 @@
 
 ## 模块定位（1.9.7 宿主嵌入版）
 
-`vb-stream-connector-postgres-stream`（Debezium 3.6.1 版）面向**内置 Debezium 1.9.7.Final 的宿主产品**的同款连接器：**整模块复制 + 接缝层按 1.9.7 API 改写**（用户裁定方案 A，2026-09-30）。四条裁定（spec §1）：D1 嵌入内置 1.9.7 的宿主（API 以宿主全家桶为准，connect-api 走 Kafka 3.1 线）；D2 功能全量对齐 3.6.1 模块的 MS1-MS6（仅 1.9.7 无对应物处替代或裁剪）；D3 宿主 JVM Java 17+（`release 17` 与 record/text block 形态 1:1 保留）；D4 **同包名** `org.vastdata.debezium.connector.postgresql.stream`、版本后缀模块名、**两模块永不同 classpath**。
+`vb-stream-connector-postgres-stream`（Debezium 3.6.1 版）面向**内置 Debezium 1.9.7.Final 的宿主产品**的同款连接器：**整模块复制 + 接缝层按 1.9.7 API 改写**（用户裁定方案 A，2026-09-30），并于 2026-09-30 完成**自含化**——所用 vanilla 连接器类**裁剪复刻进自有命名空间**（`org.vastdata.debezium.connector.postgresql.*`，见桶 D），**pom 零 `debezium-connector-postgres` 依赖**（仅显式 `debezium-core`，spec 自含化篇 §6）。四条裁定（spec §1）：D1 嵌入内置 1.9.7 的宿主（API 以宿主全家桶为准，connect-api 走 Kafka 3.1 线）；D2 功能全量对齐 3.6.1 模块的 MS1-MS6（仅 1.9.7 无对应物处替代或裁剪）；D3 宿主 JVM Java 17+（`release 17` 与 record/text block 形态 1:1 保留）；D4 **同包名** `org.vastdata.debezium.connector.postgresql.stream`、版本后缀模块名、**两模块永不同 classpath**。
 
-设计 spec：`docs/superpowers/specs/2026-09-30-debezium19-connector-design.md`；逐任务实施报告：`.superpowers/sdd/2026-09-30-debezium19-connector/task-{1..12}-report.md`。
+设计 spec：`docs/superpowers/specs/2026-09-30-debezium19-connector-design.md`（D3 行附自含化勘误指针）；自含化 spec：`docs/superpowers/specs/2026-09-30-debezium19-selfcontained-design.md`（含 §11 实施勘误——保留集计数与牵连补件记档）；逐任务实施报告：`.superpowers/sdd/2026-09-30-debezium19-connector/task-{1..12}-report.md` 与 `.superpowers/sdd/2026-09-30-debezium19-selfcontained/task-{1..9}-report.md`。
 
-## 源码三桶（60 主源码文件 + 测试 61 文件）
+## 源码四桶（90 主源码文件 + 测试 62 文件）
 
 分桶依据 = 逐文件对 3.6.1 模块的 Debezium import 统计与逐文件字节比对（`cmp`，2026-09-30 实测）。
 
@@ -40,11 +40,25 @@
 
 `META-INF/services/`（SourceConnector SPI 清单）、`src/main/assembly/plugin.xml`（与 3.6.1 版唯一差异 = include 的本模块坐标；R4 排除边界逐字同款）、`logback-test.xml`。
 
+### 桶 D：vendored 子系统（30 文件，2026-09-30 自含化）
+
+vanilla `debezium-connector-postgres` 1.9.7.Final 所用类的**裁剪复刻**，落自有命名空间 `org.vastdata.debezium.connector.postgresql.*`（与 `.stream` 平级、镜像 vanilla 包结构；类名原样保留便于对照上游）。完整清单与依据 = 自含化 spec §4.2 + §11 实施勘误（保留集 21 → 实际 27 复刻：根包类型矩阵/Schema/offset/dispatcher/SourceInfo/TopicSelector/ErrorHandler/TOAST 哨兵 + `connection/` JDBC 查询包装/默认值转换/Lsn/消息列抽象链 + `connection/pgoutput/` 消息与列值 + `data/Ltree`；另含牵连补件 `PgOutputColumnValue`/`AbstractColumnValue`/`wal2json.DateTimeFormat`/`PostgisGeometry`/struct maker×2、`ServerInfo` 最小面壳（仅 `ReplicaIdentity` 枚举）、收编接口 `PgConnectionSupplier` 与裁剪复刻 `PostgresConnectorConfig`——盘面共 30 文件）。每个文件头保留 Apache 2.0 版权头 + 来源 FQN/复刻日期/裁剪说明。
+
+**自含化实施注记**（对 spec §5 的偏离/细化，行为面均零影响）：
+
+- `PostgresStreamConnector` 改 extends debezium-core `RelationalBaseSourceConnector` 后，原 3.6.1 版对 vanilla `PostgresConnector` 的 taskConfigs 覆写基准失效——注入逻辑**内联进自有实现**（语义严格等价，断言面零改动）
+- `PostgresConnection` 保留的 `CONNECTION_STREAMING`/`SLOT_INFO`/`DROP_SLOT` 常量属已删功能（复制流/槽管理 SQL 面）的**语义残留**——公共常量面零风险，留作对照锚
+- `PostgresConnectorConfig` 裁剪面**含 `getMessageFilter`**（继承链构造期需要的辅助方法，随保留集闭包拉入，非配置面扩张）
+- `SNAPSHOT_MODE` Field 描述文案仍宣传已删的 `custom` 档键（vanilla 原文照抄，custom 档已裁——纯文案残留，无行为影响）
+- 复刻对照勿混基类面：`defaultPort`/`resolveDatabaseContext`/`executeWithAutoCommit` 在 vanilla 1.9.7 `PostgresConnection` 本就不存在（属 `JdbcConnection` 基类）
+
 ### 双线同步约定（spec §7）
 
-**桶 A 内核（protocol/组装/管道/会话/指标）的任何后续改动须双模块同步落地**（文件字节等同，同步 = 复制零改动）；**接缝层（桶 B）豁免**——本就因 Debezium 版本而异，各随各的 API 面。改 3.6.1 模块内核时同步本模块，反之亦然。
+**桶 A 内核（protocol/组装/管道/会话/指标）的任何后续改动须双模块同步落地**（文件字节等同，同步 = 复制零改动）；**接缝层（桶 B）与 vendored 子系统（桶 D）豁免**——本就因 Debezium 版本而异（桶 D 更是本模块独有、3.6.1 模块无对应物），各随各的 API 面。改 3.6.1 模块内核时同步本模块，反之亦然。
 
 ## 1.9.7 API 差异清单（实证，javap/sources 求证记录）
+
+> **已自含（2026-09-30）**：模块不再依赖 `debezium-connector-postgres`——本清单的 vanilla API 事实是**复刻裁剪的历史依据**（桶 D 按此裁定搬什么、裁什么），不再是运行期依赖面的描述；`VanillaBoundaryTest` 钉死字节码边界防回流。
 
 **1.9.7 不存在**（3.6.1 依赖面，接缝改写的根源）：`io.debezium.bean.StandardBeanNames`、`pipeline.notification.NotificationService`、`pipeline.source.SnapshottingTask`、`snapshot.SnapshotterService`、`schema.SchemaFactory`、`pipeline.signal.actions.snapshotting.SnapshotConfiguration`、`jdbc.DefaultMainConnectionProvidingConnectionFactory`/`MainConnectionProvidingConnectionFactory`、`connector.base.QueueProviderService`、`connector.common.DebeziumHeaderProducer`、`io.debezium.spi.schema.DataCollectionId`（在 `io.debezium.schema`，spi 拆分是 2.x 后）、`io.debezium.spi.topic.TopicNamingStrategy`（主题体系是 `TopicSelector<TableId>`，2.0 才切 TopicNamingStrategy）、**`io.debezium.engine.format.Connect`（2.0 才引入——Task 8 勘误：spec §2 事实 3 的"`DebeziumEngine.create(Connect.class)` 可用"不成立，embedded 装配走 `EmbeddedEngine.create()`，记录类型裸 `SourceRecord` 无 `RecordChangeEvent` 包装）**、`ChangeEventQueue` 的 `close()`/Builder 的 `queueProvider`、`BaseSourceTask` 的 `preStart`/`pollRecords`/`performCommit` 钩子。
 
@@ -65,11 +79,11 @@
 
 ## 测试矩阵与容器版本
 
-`mvn test` 单命令 275 用例（surefire 显式含 `**/*IT.java`）：
+`mvn test` 单命令 276 用例（surefire 显式含 `**/*IT.java`）：
 
 | 类别 | 数量 | 说明 |
 |---|---|---|
-| 离线单测（36 类） | 245 | 桶 A 复制件多数**字节等同直过**（含 `RelationTableFactoryTest`/`TypeRegistryColumnValueMapperTest` 整类零改）；接缝类测试按 1.9.7 构造面翻译（配置基础面统一补 `database.server.name` + `snapshot.mode=never`） |
+| 离线单测（37 类） | 246 | 桶 A 复制件多数**字节等同直过**（`RelationTableFactoryTest` 仍整类零改；`TypeRegistryColumnValueMapperTest` 自含化起已分叉——import 切自有命名空间 + javadoc 措辞，测试文件不属双线同步面）；接缝类测试按 1.9.7 构造面翻译（配置基础面统一补 `database.server.name` + `snapshot.mode=never`）；含 `VanillaBoundaryTest` 1 例（扫 `target/classes` 字节码断言无 `io/debezium/connector/postgresql` 常量池引用，防 vanilla 手滑回流，2026-09-30 自含化） |
 | 语义 IT（14 类） | 27 | `SmokeIT` 冒烟 1 + Task 9 七组 12（流式大事务/回滚过滤/DDL asOf/重启三情况/解耦三件）+ Task 10 六组 14（Truncate/全串/逻辑消息/two_phase 四场景/槽预检/缺省指标）——断言面与 3.6.1 版逐字同锚 |
 | 基座契约 | 2 | `AbstractStreamITContractTest`（零 Docker） |
 | Connect 验收 | 1 | `ConnectPluginIT`（真 Kafka Connect 容器，@BeforeAll 产物结构断言前置，缺产物 fail-fast 提示先 `mvn -pl vb-stream-connector-postgres-stream-debezium19 package -DskipTests`） |
@@ -83,6 +97,6 @@
 
 ## 其余
 
-- 模块 pom：1.9.7 专属版本属性全部留模块内（根 pom 零双 debezium 版本属性）；pgjdbc 显式 pin 根属性 42.7.13（压 1.9.7 传递的 42.3.x）；slf4j-api 2.0.17 provided 压制策略与 3.6.1 模块同款；测试域 `debezium-embedded` **无 tests classifier**（自建基座不需官方测试类）
+- 模块 pom：**零 `debezium-connector-postgres` 依赖**（自含化，2026-09-30）——显式 `io.debezium:debezium-core` compile（框架层：EventDispatcher 基类/ChangeEventQueue/relational 体系），vanilla 连接器类全在桶 D；1.9.7 专属版本属性全部留模块内（根 pom 零双 debezium 版本属性）；pgjdbc 显式 pin 根属性 42.7.13（压 1.9.7 传递的 42.3.x）；slf4j-api 2.0.17 provided 压制策略与 3.6.1 模块同款；测试域 `debezium-embedded` **无 tests classifier**（自建基座不需官方测试类）
 - 开发规约（方法名英文 camelCase/import 简名/slf4j/全函数 javadoc）与根 CLAUDE.md 同规；本模块所有新写文件已按规约落地
 - 用户面文档（定位/配置面/打包安装/at-least-once 语义/已知限制/与 3.6.1 模块差异表）见模块 `README.md`——两处文档的差异表条目须同步维护

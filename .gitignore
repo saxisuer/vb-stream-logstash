@@ -46,4 +46,5 @@ pipe-queue/
 pg-stream-pipe-queue/
 
 ### vb-stream-reader 运行时产物（引擎 offset data/reader-offsets.dat + file 形态落地目录 data/cdc-files / data/cdc-tmp）###
-data/
+### 锚定仓库根（debezium19 模块 vendored 源码有 .../postgresql/data/ 包目录，裸 data/ 会吞源码——Task 1 踩坑后收紧）###
+/data/

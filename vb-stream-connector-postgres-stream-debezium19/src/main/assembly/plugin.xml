@@ -27,11 +27,13 @@
             <outputDirectory>/lib</outputDirectory>
             <scope>runtime</scope>
             <!-- scope 过滤只挡住本 pom 直陈的 provided——connect-api/slf4j-api 还会经
-                 debezium-connector-postgres 以 compile 传递混入(runtime 集含 compile),
-                 kafka-clients 又随 connect-api 传递;且 excludes 不下传传递闭包——
-                 kafka-clients 独占子件(zstd-jni/lz4-java/snappy-java)与 connect-api
-                 独占子件(jakarta.ws.rs-api)须各自点名;以上 Connect runtime 均已提供,
-                 显式排除钉死 R4 清单边界(R4 两连接器并存时重复类必炸) -->
+                 框架层依赖(自含化前为 debezium-connector-postgres,现为 debezium-core)
+                 以 compile 传递混入(runtime 集含 compile),kafka-clients 又随 connect-api
+                 传递;且 excludes 不下传传递闭包——kafka-clients 独占子件(zstd-jni/
+                 lz4-java/snappy-java)与 connect-api 独占子件(jakarta.ws.rs-api)须各自
+                 点名;以上 Connect runtime 均已提供,显式排除钉死 R4 清单边界(R4 两连接器
+                 并存时重复类必炸)。自含化后 connector-postgres 消失,其相关排除项转为
+                 防御性冗余,保留(见自含化 spec §6) -->
             <excludes>
                 <exclude>org.apache.kafka:connect-api</exclude>
                 <exclude>org.apache.kafka:kafka-clients</exclude>
