@@ -7,9 +7,9 @@ import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.SchemaBuilder;
 
 import io.debezium.config.CommonConnectorConfig;
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
-import io.debezium.connector.postgresql.PostgresValueConverter;
-import io.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.jdbc.JdbcValueConverters.BigIntUnsignedMode;
 import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
 import io.debezium.jdbc.TemporalPrecisionMode;

@@ -1,7 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresOffsetContext;
-import io.debezium.connector.postgresql.PostgresPartition;
+import org.vastdata.debezium.connector.postgresql.PostgresOffsetContext;
+import org.vastdata.debezium.connector.postgresql.PostgresPartition;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.relational.RelationalChangeRecordEmitter;
 import io.debezium.relational.TableSchema;

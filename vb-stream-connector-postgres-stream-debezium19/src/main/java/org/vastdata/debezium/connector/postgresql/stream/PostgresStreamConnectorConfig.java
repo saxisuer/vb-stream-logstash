@@ -12,8 +12,9 @@ import org.vastdata.debezium.connector.postgresql.stream.protocol.StreamingMode;
 
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
-import io.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
+
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig.SnapshotMode;
 
 /**
  * 流式连接器配置:在父类 {@link PostgresConnectorConfig}(1.9.7)的完整配置面之上追加

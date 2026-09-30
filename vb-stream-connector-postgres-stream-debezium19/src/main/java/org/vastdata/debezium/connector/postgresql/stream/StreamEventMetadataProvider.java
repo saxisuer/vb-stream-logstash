@@ -5,7 +5,7 @@ import java.util.Map;
 
 import org.apache.kafka.connect.data.Struct;
 
-import io.debezium.connector.postgresql.SourceInfo;
+import org.vastdata.debezium.connector.postgresql.SourceInfo;
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
 import io.debezium.pipeline.spi.OffsetContext;
@@ -15,7 +15,7 @@ import io.debezium.util.Collect;
 
 /**
  * 本连接器的事件元数据提取器(指标/事务元数据消费):逐方法重写 vanilla
- * {@code io.debezium.connector.postgresql.PostgresEventMetadataProvider}(DBZ 1.9.7.Final
+ * {@code org.vastdata.debezium.connector.postgresql.PostgresEventMetadataProvider}(DBZ 1.9.7.Final
  * 实测——该类<b>包私有</b>,包外不可 import,故自实现同语义副本;{@link SourceInfo}
  * 的键常量是 public,可直引)。三个抽取器都从事件 value 的 {@code source} 结构块取数,
  * 该块的 lsn/txId/ts_usec 字段由 offsetContext 的 SourceInfo 随事务边界更新填充

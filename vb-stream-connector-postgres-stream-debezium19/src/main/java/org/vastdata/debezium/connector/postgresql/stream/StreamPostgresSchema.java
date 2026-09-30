@@ -1,10 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
-import io.debezium.connector.postgresql.PostgresSchema;
-import io.debezium.connector.postgresql.PostgresValueConverter;
-import io.debezium.connector.postgresql.TypeRegistry;
-import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresSchema;
+import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;

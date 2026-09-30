@@ -2,7 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigValue;
@@ -32,9 +32,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * never 与 no_data 行为等价,spec §5.1)。
  * 纯构造 + {@code Configuration.validate(Field.Set)} 断言,不连库、不起 Connect runtime
  * (taskConfigs 注入面经真实 {@link PostgresStreamConnector#taskConfigs(int)} 驱动)。
- * 1.9.7 译入的两处环境适配:最小配置必含 database.server.name(父构造器对缺失该键
- * NPE,见 {@link #configWith});custom 档的拒收用例须搭非空 snapshot.custom.class
- * 占位(父 SNAPSHOT_MODE_CLASS 校验器对未配置 class 在 custom 档下 NPE,见用例⑮)。
+ * 1.9.7 译入的环境适配:最小配置必含 database.server.name(父构造器对缺失该键
+ * NPE,见 {@link #configWith});custom 档的拒收用例为纯非法值断言(自有化 Config 已删
+ * SNAPSHOT_MODE_CLASS Field,vanilla 该校验器的 custom 档 NPE 缺陷随之消失,见用例⑮)。
  */
 class PostgresStreamConnectorConfigTest {
 
@@ -318,17 +318,14 @@ class PostgresStreamConnectorConfigTest {
      * REST 校验被绕过时构造器 fail-fast 兜底抛 {@link ConnectException}(以 initial 为
      * 代表)——三层防线(REST 校验/注入默认/构造器)缺一不可。注意两点:入参集合按 1.9.7
      * 枚举面收敛——3.6.1 译入时的 when_needed 在本版枚举不存在,exported 存在但属本连接器
-     * 拒收面;custom 档须搭一个非空 snapshot.custom.class 占位值——1.9.7 父 Field 的
-     * SNAPSHOT_MODE_CLASS 校验器在 mode=custom 且 class 未配置时对 null 调 isEmpty()
-     * 直接 NPE(vanilla 缺陷),占位值让该校验器零问题通过、拒收仍由本连接器的
-     * snapshot.mode 校验器完成。
+     * 拒收面;custom 档为纯非法值断言——自有化 Config 已删 SNAPSHOT_MODE_CLASS Field
+     * (snapshotter 裁剪面),vanilla 该校验器在 mode=custom 且 class 未配置时的 NPE 缺陷
+     * 随之消失,拒收恒由本连接器的 snapshot.mode 校验器完成(语义不变)。
      */
     @Test
     void illegalSnapshotModesAreRejected() {
         for (String illegal : new String[]{ "always", "initial", "initial_only", "exported", "custom" }) {
-            Map<String, String> overrides = "custom".equals(illegal)
-                    ? Map.of("snapshot.mode", illegal, "snapshot.custom.class", "io.debezium.connector.postgresql.snapshot.NeverSnapshotter")
-                    : Map.of("snapshot.mode", illegal);
+            Map<String, String> overrides = Map.of("snapshot.mode", illegal);
             Map<String, ConfigValue> problems = configWith(overrides)
                     .validate(PostgresStreamConnectorConfig.ALL_FIELDS);
             assertEquals(1, problems.get("snapshot.mode").errorMessages().size(),

@@ -1,10 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.DebeziumException;
-import io.debezium.connector.postgresql.PostgresEventDispatcher;
-import io.debezium.connector.postgresql.PostgresOffsetContext;
-import io.debezium.connector.postgresql.PostgresPartition;
-import io.debezium.connector.postgresql.connection.Lsn;
+import org.vastdata.debezium.connector.postgresql.PostgresEventDispatcher;
+import org.vastdata.debezium.connector.postgresql.PostgresOffsetContext;
+import org.vastdata.debezium.connector.postgresql.PostgresPartition;
+import org.vastdata.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.data.Envelope;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;

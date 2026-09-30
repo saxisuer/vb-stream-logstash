@@ -1,10 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.DebeziumException;
-import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
-import io.debezium.connector.postgresql.TypeRegistry;
-import io.debezium.connector.postgresql.UnchangedToastedReplicationMessageColumn;
-import io.debezium.connector.postgresql.connection.pgoutput.PgOutputReplicationMessage;
+import org.vastdata.debezium.connector.postgresql.connection.PgConnectionSupplier;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.UnchangedToastedReplicationMessageColumn;
+import org.vastdata.debezium.connector.postgresql.connection.pgoutput.PgOutputReplicationMessage;
 
 import java.util.Objects;
 

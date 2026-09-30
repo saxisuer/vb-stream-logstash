@@ -1,8 +1,8 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.DebeziumException;
-import io.debezium.connector.postgresql.PostgresType;
-import io.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.PostgresType;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
