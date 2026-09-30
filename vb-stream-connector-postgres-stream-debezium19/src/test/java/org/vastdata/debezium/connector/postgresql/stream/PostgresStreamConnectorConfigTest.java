@@ -327,7 +327,7 @@ class PostgresStreamConnectorConfigTest {
     void illegalSnapshotModesAreRejected() {
         for (String illegal : new String[]{ "always", "initial", "initial_only", "exported", "custom" }) {
             Map<String, String> overrides = "custom".equals(illegal)
-                    ? Map.of("snapshot.mode", illegal, "snapshot.custom.class", "io.debezium.connector.postgresql.spi.NeverSnapshotter")
+                    ? Map.of("snapshot.mode", illegal, "snapshot.custom.class", "io.debezium.connector.postgresql.snapshot.NeverSnapshotter")
                     : Map.of("snapshot.mode", illegal);
             Map<String, ConfigValue> problems = configWith(overrides)
                     .validate(PostgresStreamConnectorConfig.ALL_FIELDS);

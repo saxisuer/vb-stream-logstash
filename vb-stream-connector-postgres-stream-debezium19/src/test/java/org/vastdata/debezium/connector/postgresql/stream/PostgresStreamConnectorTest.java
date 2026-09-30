@@ -27,7 +27,8 @@ class PostgresStreamConnectorTest {
 
     /**
      * 用例①taskClass 正确:Connect runtime 据此实例化任务类,指错类型即整条流水线起不来。
-     * 本模块的任务类当前为最小桩(Task 7 落地全文),类引用一致性先行锚定。
+     * 任务类自 Task 7 起为 1.9.7 全装配形态(基类 BaseSourceTask 的真实现),类引用
+     * 一致性锚定不变。
      */
     @Test
     void taskClassIsPostgresStreamConnectorTask() {
