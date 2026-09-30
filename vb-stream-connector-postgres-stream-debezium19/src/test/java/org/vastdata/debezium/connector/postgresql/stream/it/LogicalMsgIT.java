@@ -4,6 +4,7 @@ import org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceConnector;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -76,7 +77,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       使停机调用本身停滞 5 分钟。{@code @BeforeAll} 经该官方系统属性压到 1s,复刻
  *       3.6.1 异步引擎 recordService.shutdownNow 的即时中断收敛语义(JVM 全局副作用:
  *       同 surefire JVM 的其他 IT 引擎停机中断等待同被压短——正常停机的引擎完成闩
- *       毫秒级打开,不受影响)。</li>
+ *       毫秒级打开,不受影响;{@code @AfterAll} 清除属性,作用域收敛到本类)。</li>
  * </ol>
  * 管道目录:场景 2+3 的两次引擎 start 各用独立子目录(engine-a/engine-b)——Windows 下
  * Chronicle mmap 句柄异步释放使同目录立即复用的 wipe-on-open 撞句柄翻车
@@ -183,6 +184,18 @@ class LogicalMsgIT extends StreamITBase {
     @BeforeAll
     static void shortenEngineShutdownInterruptPause() {
         System.setProperty("debezium.embedded.shutdown.pause.before.interrupt.ms", "1000");
+    }
+
+    /**
+     * 本测试类退出时清除压短的停机中断等待属性(clearProperty):{@code @BeforeAll} 的
+     * 覆盖只对本类停机语义必要,残留会让同 JVM 后续测试类的引擎停机中断等待语义继续
+     * 被改写——1.9.7 的取值面是"属性缺省回落 5 分钟常量",clear 即恢复默认(属性在
+     * 本套件无其他写入方,无先值可还原)。JVM 退出前的类卸载顺序不确定,@AfterAll 在
+     * 本类全部用例(含 @AfterEach 清理)之后执行,时序安全。
+     */
+    @AfterAll
+    static void restoreEngineShutdownInterruptPause() {
+        System.clearProperty("debezium.embedded.shutdown.pause.before.interrupt.ms");
     }
 
     /**

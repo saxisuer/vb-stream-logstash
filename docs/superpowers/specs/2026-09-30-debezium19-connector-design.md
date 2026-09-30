@@ -28,7 +28,17 @@
 3. `io.debezium.engine.DebeziumEngine.create(Class<? extends SerializationFormat<T>>)` 在 1.9.7 存在，`Connect.class` 装配形态与 vb-stream-reader 同款可用。
 4. 现有 27 IT 对官方基座的调用面仅 4 方法（`start` 50 处 / `stopConnector` 15 / `consumeRecords` 3 / `consumeRecordsByTopic` 2）+ CompletionCallback 接线 3 文件——自建薄基座可行。
 
-3.6.1 依赖面中 **1.9.7 不存在**的 API（接缝层改写的根源）：`io.debezium.bean.StandardBeanNames`、`pipeline.notification.NotificationService`、`pipeline.source.SnapshottingTask`、`snapshot.SnapshotterService`、`schema.SchemaFactory`、`heartbeat.HeartbeatFactory`、`pipeline.signal.actions.snapshotting.SnapshotConfiguration`、`jdbc.DefaultMainConnectionProvidingConnectionFactory`/`MainConnectionProvidingConnectionFactory`、`connector.base.QueueProviderService`、`connector.common.DebeziumHeaderProducer`。构造器形态完全不同的：`PostgresEventDispatcher`、`PostgresSchema`、`ChangeEventSourceCoordinator`、`PostgresValueConverter`、`PgOutputReplicationMessage`。
+3.6.1 依赖面中 **1.9.7 不存在**的 API（接缝层改写的根源）：`io.debezium.bean.StandardBeanNames`、`pipeline.notification.NotificationService`、`pipeline.source.SnapshottingTask`、`snapshot.SnapshotterService`、`schema.SchemaFactory`、`pipeline.signal.actions.snapshotting.SnapshotConfiguration`、`jdbc.DefaultMainConnectionProvidingConnectionFactory`/`MainConnectionProvidingConnectionFactory`、`connector.base.QueueProviderService`、`connector.common.DebeziumHeaderProducer`。**1.9.7 已有**（勿当缺失处理）：`heartbeat.HeartbeatFactory`（官方 Task 装配即用，5 参构造）、`ChangeEventQueue.Builder`（含 maxQueueSizeInBytes）、`PgConnectionSupplier`（`PostgresStreamingChangeEventSource` 内 static interface）、`SignalProcessor`（基础形态）。
+
+构造器/体系形态差异（已核对 v1.9.7.Final 官方源码）：
+- `PostgresEventDispatcher<TableId>` 11 参巨构造（含 `PostgresChangeRecordEmitter::updateSchema` 与 HeartbeatFactory）
+- `PostgresSchema` 5 参构造（`connectorConfig, typeRegistry, defaultValueConverter, topicSelector, valueConverter`）
+- PG 专属 `PostgresChangeEventSourceCoordinator`（非裸 `ChangeEventSourceCoordinator`，12 参）
+- `PostgresValueConverter.of(config, charset, typeRegistry)` 静态工厂
+- **主题体系是 `TopicSelector<TableId>`（`PostgresTopicSelector.create(config)`），2.0 才切 `TopicNamingStrategy`**——`StreamPostgresSchema`/Task 装配须按 TopicSelector 形态
+- `PgOutputReplicationMessage` 1.9.7 已是 `(Operation, String table, Instant, Long txId, List<Column> old, List<Column> new)` 构造——`RowChangeEmitter` 改写面比预期小
+- `ChangeEventSourceFactory<P,O>` 接口：`getStreamingChangeEventSource()` **零参**、`getSnapshotChangeEventSource(listener)` 单参（3.x 均带 partition/offset 参）
+- metrics 体系结构不同：1.9.7 `DefaultStreamingChangeEventSourceMetrics` 内部为 `ConnectionMeter`/`StreamingMeter` 聚合（3.x 一整块字段），构造器签名不同
 
 ## 3. 模块定位与依赖边界
 
@@ -66,7 +76,7 @@
 | `StreamEventMetadataProvider` | 8 | `OffsetContext` getter 面 1.9.7 差异 |
 | `StreamChangeEventSourceMetricsFactory` | 8 | `DefaultStreamingChangeEventSourceMetrics`/`SnapshotChangeEventSourceMetrics` 旧构造器 |
 | `TruncateEmitter` | 7 | dispatcher/Envelope 面 1.9.7 签名（行为语义不变：默认跳过 t、`none` 才逐表发） |
-| `RowChangeEmitter` | 7 | `PgOutputReplicationMessage` 1.9.7 构造签名（`TypeRegistry` + 列名/类型/oid 三数组 vs 3.x 的 `List<Column>`） |
+| `RowChangeEmitter` | 7 | `PgOutputReplicationMessage` 1.9.7 已是 `List<Column>` 构造（§2 已核实）——仅核对该类对 column 面的其余调用签名 |
 | `RelationTableFactory` | 7 | 'R' 消息 enrich 的 `PostgresConnection` 1.9.7 构造 |
 | `PostgresStreamConnector` | 7 | `validate` 按 1.9.7 `Configuration.validate` 能力；`version()` 从 Module 读 |
 | `RelationMetadataSource` | 6 | 同上 `PostgresConnection` 构造 |

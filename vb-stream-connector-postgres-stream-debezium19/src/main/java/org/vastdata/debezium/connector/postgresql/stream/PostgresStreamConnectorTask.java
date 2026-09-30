@@ -99,9 +99,6 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
     private volatile ErrorHandler errorHandler;
     private volatile StreamPostgresSchema schema;
 
-    private Partition.Provider<PostgresPartition> partitionProvider = null;
-    private OffsetContext.Loader<PostgresOffsetContext> offsetContextLoader = null;
-
     /**
      * 真装配(vanilla 1.9.7 PostgresConnectorTask.start 的同序替换版)。次序:config 解析
      * → topicSelector/schemaNameAdjuster → charset 临时连接(CONNECTION_GENERAL 裸连)→
@@ -164,12 +161,15 @@ public class PostgresStreamConnectorTask extends BaseSourceTask<PostgresPartitio
 
         // vanilla 的 new PostgresPartition.Provider(...) 是包私有类,包外不可构造——
         // 以等价 lambda 提供分区(上报差异);1.9.7 的 PostgresPartition 仅由逻辑名构成
-        // (3.6.1 版另有 database 组件,本版构造器单参)
-        this.partitionProvider = () -> Collections.singleton(
+        // (3.6.1 版另有 database 组件,本版构造器单参)。两者为 start 局部量:装载只在
+        // 启动期发生一次,doStop/commit 均不再触达(1.9.7 的 offset 提交回灌整链在基类
+        // commit() 内自持 coordinator,3.6.1 版靠实例字段供 performCommit 重读的用法消失)
+        final Partition.Provider<PostgresPartition> partitionProvider = () -> Collections.singleton(
                 new PostgresPartition(connectorConfig.getLogicalName()));
-        this.offsetContextLoader = new PostgresOffsetContext.Loader(connectorConfig);
+        final OffsetContext.Loader<PostgresOffsetContext> offsetContextLoader =
+                new PostgresOffsetContext.Loader(connectorConfig);
         final Offsets<PostgresPartition, PostgresOffsetContext> previousOffsets =
-                getPreviousOffsets(this.partitionProvider, this.offsetContextLoader);
+                getPreviousOffsets(partitionProvider, offsetContextLoader);
         final Clock clock = Clock.system();
         final PostgresOffsetContext previousOffset = previousOffsets.getTheOnlyOffset();
 
