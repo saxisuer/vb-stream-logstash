@@ -25,7 +25,7 @@
 
 1. `PostgresConnectorConfig.SnapshotMode` 枚举为 `ALWAYS / INITIAL / NEVER / INITIAL_ONLY / EXPORTED(deprecated) / CUSTOM`——**无 `NO_DATA`**（2.6 才加入）；snapshotter 体系是 PG 专属 `io.debezium.connector.postgresql.spi.Snapshotter`，非 2.x 的通用 `SnapshotterService`。
 2. `debezium-embedded` 的 `AbstractConnectorTest` 是 **JUnit 4 编译**（`org.junit.Before/After/Rule`）——JUnit 6 Jupiter 体系无法继承（vintage 线不可用）。
-3. `io.debezium.engine.DebeziumEngine.create(Class<? extends SerializationFormat<T>>)` 在 1.9.7 存在，`Connect.class` 装配形态与 vb-stream-reader 同款可用。
+3. `io.debezium.engine.DebeziumEngine.create(Class<? extends SerializationFormat<T>>)` 方法在 1.9.7 存在，**但 `io.debezium.engine.format.Connect` 类是 2.0 才引入的**——`Connect.class` 装配形态在 1.9.7 不可用（设计期误判，落地期 Task 8 实证勘误）：自建基座实际走 `EmbeddedEngine.create()`（1.9.7 embedded 即 `DebeziumEngine<SourceRecord>` 同步实现），消费面拿到的是**裸 `SourceRecord`**（无 `RecordChangeEvent` 包装）。
 4. 现有 27 IT 对官方基座的调用面仅 4 方法（`start` 50 处 / `stopConnector` 15 / `consumeRecords` 3 / `consumeRecordsByTopic` 2）+ CompletionCallback 接线 3 文件——自建薄基座可行。
 
 3.6.1 依赖面中 **1.9.7 不存在**的 API（接缝层改写的根源）：`io.debezium.bean.StandardBeanNames`、`pipeline.notification.NotificationService`、`pipeline.source.SnapshottingTask`、`snapshot.SnapshotterService`、`schema.SchemaFactory`、`pipeline.signal.actions.snapshotting.SnapshotConfiguration`、`jdbc.DefaultMainConnectionProvidingConnectionFactory`/`MainConnectionProvidingConnectionFactory`、`connector.base.QueueProviderService`、`connector.common.DebeziumHeaderProducer`。**1.9.7 已有**（勿当缺失处理）：`heartbeat.HeartbeatFactory`（官方 Task 装配即用，5 参构造）、`ChangeEventQueue.Builder`（含 maxQueueSizeInBytes）、`PgConnectionSupplier`（`PostgresStreamingChangeEventSource` 内 static interface）、`SignalProcessor`（基础形态）。
