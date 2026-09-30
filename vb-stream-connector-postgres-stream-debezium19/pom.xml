@@ -19,6 +19,14 @@
         <kafka19.version>3.1.0</kafka19.version>
         <assertj.version>3.27.7</assertj.version>
         <awaitility.version>4.3.0</awaitility.version>
+        <!-- IT classpath 调解修正(Task 8 实测):testcontainers 2.0.5 自带 shaded
+             jackson-databind,但其字节码对 jackson-annotation 的引用未被 shade
+             (JsonFormat$Feature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE 等
+             2.14+ 常量);本模块 test 面 connect-runtime 3.1.0 把 jackson-annotations
+             近路钉在 2.12.3(引擎模块无此依赖故天然解析 2.20 不踩坑),Testcontainers
+             起容器即 NoSuchFieldError。test scope 显式钉 2.20 对齐引擎模块的实测
+             组合;annotations 是纯注解包跨小版本双向兼容,databind 2.12.3 不受影响。 -->
+        <jackson-annotations.it.version>2.20</jackson-annotations.it.version>
     </properties>
 
     <dependencies>
@@ -135,6 +143,16 @@
             <groupId>org.awaitility</groupId>
             <artifactId>awaitility</artifactId>
             <version>${awaitility.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testcontainers 2.0.5 的 shaded jackson 引用未 shade 的 jackson-annotation
+             (需 2.14+ 常量);connect-runtime 3.1.0 的近路 2.12.3 会压掉其三级路径,
+             显式钉高版救回(见 properties 注释),test 面专用不动运行期类路径 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>${jackson-annotations.it.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
