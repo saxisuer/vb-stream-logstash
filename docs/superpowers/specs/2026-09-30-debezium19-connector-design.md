@@ -14,7 +14,7 @@
 |---|---|---|
 | D1 | 嵌入内置 1.9.7 的宿主产品 | API 以宿主全家桶为准；connect-api 跟随 1.9.7 的 Kafka 3.1 线而非 4.3 |
 | D2 | 功能全量对齐 MS1-MS6 | two_phase/metrics/打包/27 IT 全保留；仅 1.9.7 无对应物处替代或裁剪（见 §5） |
-| D3 | 宿主 JVM 为 Java 17+ | 编译目标保持 `release 17`，record/text block 等现有形态 1:1 保留 |
+| D3 | 宿主 JVM 为 Java 17+ | 编译目标保持 `release 17`，record/text block 等现有形态 1:1 保留。**勘误（2026-09-30 自含化）**：依赖面前提已修订——宿主产品不带 debezium-connector-postgres jar，模块已自含（vanilla 类裁剪复刻进自有命名空间、pom 零 connector-postgres 依赖），见 `2026-09-30-debezium19-selfcontained-design.md` |
 | D4 | 版本后缀模块名 + 同包名 | 模块 `vb-stream-connector-postgres-stream-debezium19`，包名保持 `org.vastdata.debezium.connector.postgresql.stream` 不变；两模块永不同 classpath（各嵌各的宿主/插件包） |
 
 移植策略（用户选定方案 A）：**整模块复制 + 接缝层改写**——现有 3.6.1 模块一行不动；新模块独立演进；桶 A 内核（低频改动区）双线同步，接缝层本就因版本而异。

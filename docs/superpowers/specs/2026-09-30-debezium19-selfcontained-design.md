@@ -115,3 +115,11 @@ org.vastdata.debezium.connector.postgresql          ← 新（与 .stream 平级
 - 本模块 `CLAUDE.md`：定位节（依赖面修订）+ 源码三桶（桶 B 增补 vendored 子系统）+ 1.9.7 API 差异清单（加"已自含"前言）
 - 本模块 `README.md`：定位/打包安装节（lib/ 清单变化）+ 与 3.6.1 模块差异表（新增"vanilla 依赖自含化"行）
 - 根 `CLAUDE.md`：模块行一句话同步
+
+## 11. 实施勘误（Task 9 记档，正文不回改）
+
+- **§4.2 保留集计数 21 → 实际 27**：原 21 之外，实施期因编译闭包/构造期强制牵连补件 6 个——`connection/pgoutput/PgOutputColumnValue`（`PgOutputReplicationMessage` 嵌套 Column 的值实现）、`connection/AbstractColumnValue`（其基类）、`connection/wal2json/DateTimeFormat`（`PostgresDefaultValueConverter` 常量面引用）、根包 `PostgisGeometry`（`PostgresValueConverter` 唯一引用方；经裁定**复刻**而非照 `PgProto.Point` 先例裁死分支——裁分支会改 geometry 列行为面且无断言锚）、根包 struct maker×2（`PostgresSourceInfoStructMaker`/`LegacyV1PostgresSourceInfoStructMaker`，core 抽象方法构造期调用强制）。
+- **盘面文件总数 30**（`.../postgresql/` 下非 `stream/` 的 `.java`）= 复刻 27 + `connection/ServerInfo`（§4.3 牵连条款预授权的最小面壳：仅 `ReplicaIdentity` 枚举，`PostgresConnection.readReplicaIdentityInfo` 的唯一使用面）+ `connection/PgConnectionSupplier`（收编接口，vanilla 嵌套形态拆出；**新写非复刻**，`get()` 去 throws 与 vanilla 不等价——Task 1 记档）+ `PostgresConnectorConfig`（§4.2"重写不复制"清单内，按 §5.1 裁剪复刻落地）。
+- **§5.2 逐项核对补充**：brief 点名的 `defaultPort`/`resolveDatabaseContext`/`executeWithAutoCommit` 在 vanilla 1.9.7 `PostgresConnection` 本就不存在（属 `JdbcConnection` 基类面）——裁剪对照时勿按本类成员找。
+- **§5.1 taskConfigs 实现形态**：`PostgresStreamConnector` 改 extends `RelationalBaseSourceConnector` 后，原 3.6.1 版对 vanilla `PostgresConnector` 覆写点的对齐基准失效，taskConfigs 注入逻辑**内联进自有实现**（语义严格等价，断言面零改动）。
+- **§5.1 SnapshotMode 枚举面**：spec 写"SnapshotMode 枚举只留 never 语义所需"，实现按"裁剪复刻忠实照抄"原则**保留 vanilla 全部 6 个枚举值**（never/initial/always/initial_only/exported/custom）——never-only 的 enforcement 在接缝层（`SNAPSHOT_MODE` Field 仅-never 校验器 + 任务构造器 fail-fast 兜底），行为与"只留 never"等价（`DefaultsAndMetricsIT` 场景 2 锚定 initial 档启动期拒绝）。

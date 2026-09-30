@@ -7,9 +7,9 @@ import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.SchemaBuilder;
 
 import io.debezium.config.CommonConnectorConfig;
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
-import io.debezium.connector.postgresql.PostgresValueConverter;
-import io.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.jdbc.JdbcValueConverters.BigIntUnsignedMode;
 import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
 import io.debezium.jdbc.TemporalPrecisionMode;
@@ -18,7 +18,7 @@ import io.debezium.relational.ValueConverter;
 
 /**
  * 全串输出的 schema 侧转换器(values.as.string=true 时装配进
- * {@link StreamPostgresSchema},与 vanilla {@link PostgresValueConverter} 二选一):
+ * {@link StreamPostgresSchema},与本包复刻版 {@link PostgresValueConverter} 二选一):
  * Connect 记录的值与 schema 是<b>双轨</b>的——只透传值({@link StringColumnValueMapper})
  * 不够,schema 声明 INT64 而值是 String 时 Struct 构造/序列化直接抛 DataException。
  * 本类把两条轨一起改形:

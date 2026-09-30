@@ -73,11 +73,13 @@
             <version>${hdrhistogram.version}</version>
         </dependency>
 
-        <!-- Debezium PG 连接器 1.9.7：Config/Schema/Emitter/offset 体系（spec D3）；
-             宿主产品亦为同版本，嵌入场景类重复无害（first-win） -->
+        <!-- Debezium core 1.9.7(框架层:EventDispatcher 基类/ChangeEventQueue/relational 体系);
+             原 vanilla 连接器依赖已自含化(spec 2026-09-30):所用类裁剪复刻进
+             org.vastdata.debezium.connector.postgresql;宿主同版本类重复无害(first-win),
+             ConnectPluginIT 独立 runtime 亦需本件落 lib/ -->
         <dependency>
             <groupId>io.debezium</groupId>
-            <artifactId>debezium-connector-postgres</artifactId>
+            <artifactId>debezium-core</artifactId>
             <version>${debezium19.version}</version>
         </dependency>
 

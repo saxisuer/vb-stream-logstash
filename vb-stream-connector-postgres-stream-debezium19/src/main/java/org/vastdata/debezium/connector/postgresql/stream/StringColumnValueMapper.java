@@ -2,7 +2,7 @@ package org.vastdata.debezium.connector.postgresql.stream;
 
 import java.util.Objects;
 
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
 
 /**
  * {@link ColumnValueMapper} 的全串输出实现(values.as.string=true 时的生产实现,

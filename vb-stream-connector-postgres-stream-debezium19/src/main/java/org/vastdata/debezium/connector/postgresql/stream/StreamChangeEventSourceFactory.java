@@ -1,10 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresEventDispatcher;
-import io.debezium.connector.postgresql.PostgresOffsetContext;
-import io.debezium.connector.postgresql.PostgresPartition;
-import io.debezium.connector.postgresql.TypeRegistry;
-import io.debezium.connector.postgresql.connection.PostgresConnection;
+import org.vastdata.debezium.connector.postgresql.PostgresEventDispatcher;
+import org.vastdata.debezium.connector.postgresql.PostgresOffsetContext;
+import org.vastdata.debezium.connector.postgresql.PostgresPartition;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.pipeline.source.spi.ChangeEventSourceFactory;

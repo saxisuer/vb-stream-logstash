@@ -1,10 +1,10 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresConnectorConfig;
-import io.debezium.connector.postgresql.PostgresSchema;
-import io.debezium.connector.postgresql.PostgresValueConverter;
-import io.debezium.connector.postgresql.TypeRegistry;
-import io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
+import org.vastdata.debezium.connector.postgresql.PostgresConnectorConfig;
+import org.vastdata.debezium.connector.postgresql.PostgresSchema;
+import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.connection.PostgresDefaultValueConverter;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
@@ -30,7 +30,7 @@ import io.debezium.schema.TopicSelector;
 public class StreamPostgresSchema extends PostgresSchema {
 
     /**
-     * 构造 schema 组件(委派父构造器,装配参数语义见 vanilla PostgresSchema)。
+     * 构造 schema 组件(委派父构造器,装配参数语义见本包复刻版 PostgresSchema)。
      *
      * @param connectorConfig       连接器配置(表过滤器/列过滤器/键映射等的真源)
      * @param typeRegistry          连库类型注册表(main 连接产出)

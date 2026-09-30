@@ -1,7 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresOffsetContext;
-import io.debezium.connector.postgresql.PostgresPartition;
+import org.vastdata.debezium.connector.postgresql.PostgresOffsetContext;
+import org.vastdata.debezium.connector.postgresql.PostgresPartition;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.relational.Table;
 import io.debezium.util.Clock;
@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
  * RowChangeEmitter 值映射单测(离线,真库归 Task 8):四种 {@link TupleValue} 形态的
  * Java 值映射面(Text 经 {@link ColumnValueMapper} 接缝、Binary 原样 byte[]、Null 直 null、
  * UnchangedToast 的 before 同列沿用/无 before 走哨兵)+ Operation 映射 + INSERT/UPDATE/DELETE
- * 的 before/after 取舍。类型化转换本体(vanilla {@code PgOutputReplicationMessage.getValue})
+ * 的 before/after 取舍。类型化转换本体(本包复刻版 {@code PgOutputReplicationMessage.getValue})
  * 在 {@code TypeRegistryColumnValueMapper}(生产实现,需真 TypeRegistry),此处经可注入的
  * 假 mapper 观察调用面与结果数组。
  *

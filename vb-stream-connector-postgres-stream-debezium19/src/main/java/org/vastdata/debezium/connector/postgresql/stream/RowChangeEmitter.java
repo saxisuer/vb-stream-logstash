@@ -1,7 +1,7 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresOffsetContext;
-import io.debezium.connector.postgresql.PostgresPartition;
+import org.vastdata.debezium.connector.postgresql.PostgresOffsetContext;
+import org.vastdata.debezium.connector.postgresql.PostgresPartition;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.relational.RelationalChangeRecordEmitter;
 import io.debezium.relational.Table;
@@ -36,7 +36,7 @@ import java.util.Optional;
  *       (RelationTableFactory 在 reader 期已 enrich,listener 已装版本),此处不做库回查</li>
  *   <li>skipEmptyMessages=true 保留(vanilla 1.9.7 同款:无主键表 + 某些 replica identity 下
  *       空元组直接跳过,不发半空记录)</li>
- *   <li>值映射:Text 经 {@link ColumnValueMapper}(生产实现即 vanilla 的类型化解析)、
+ *   <li>值映射:Text 经 {@link ColumnValueMapper}(生产实现委派本包复刻版的类型化解析)、
  *       Binary 原样 byte[](binary publish 场景,类型化反序列化 MS2 未接,Task 8 验证)、
  *       Null 直 null</li>
  *   <li><b>基类构造差异</b>:1.9.7 的 RelationalChangeRecordEmitter 构造为三参

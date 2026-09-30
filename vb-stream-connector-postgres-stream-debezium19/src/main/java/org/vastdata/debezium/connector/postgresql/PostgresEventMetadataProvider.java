@@ -1,11 +1,15 @@
-package org.vastdata.debezium.connector.postgresql.stream;
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package org.vastdata.debezium.connector.postgresql;
 
 import java.time.Instant;
 import java.util.Map;
 
 import org.apache.kafka.connect.data.Struct;
 
-import org.vastdata.debezium.connector.postgresql.SourceInfo;
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
 import io.debezium.pipeline.spi.OffsetContext;
@@ -14,25 +18,16 @@ import io.debezium.time.Conversions;
 import io.debezium.util.Collect;
 
 /**
- * 本连接器的事件元数据提取器(指标/事务元数据消费):逐方法重写 vanilla
- * {@code org.vastdata.debezium.connector.postgresql.PostgresEventMetadataProvider}(DBZ 1.9.7.Final
- * 实测——该类<b>包私有</b>,包外不可 import,故自实现同语义副本;{@link SourceInfo}
- * 的键常量是 public,可直引)。三个抽取器都从事件 value 的 {@code source} 结构块取数,
- * 该块的 lsn/txId/ts_usec 字段由 offsetContext 的 SourceInfo 随事务边界更新填充
- * (Begin 置 lsn=lsn_commit=endLsn,TxChange 补 table/txId)。
- * 1.9.7 译入差异一处:{@code DataCollectionId} 在 {@code io.debezium.schema} 包
- * (spi 包拆分是 2.x 之后的事,Task 5 的 metrics 同此差异)。
- *
- * <p>线程约束:无状态,任意线程(实际为 coordinator 的指标 tick 与 consumer 的
- * 事务元数据路径)。
+ * 事件元数据提供者：从记录 envelope 的 source struct 提取时间戳（两级回落——PG 专属
+ * {@code ts_usec} 微秒键优先，缺则基类毫秒键 {@code ts_ms}）、事件位点（lsn/xmin）与事务 ID，
+ * 供 coordinator 的 lag/指标/事务元数据面消费。复刻自 io.debezium.connector.postgresql.
+ * PostgresEventMetadataProvider（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 复刻），
+ * 无裁剪、逻辑零改动（{@code SourceInfo} 常量面同包直引）。包私有可见性与 vanilla 一致——
+ * 本连接器运行面实际使用 {@code .stream/StreamEventMetadataProvider}（其 PG 专属分支的同构重写），
+ * 本类作为复刻保留集成员维持 vanilla 结构。
  */
-public class StreamEventMetadataProvider implements EventMetadataProvider {
+class PostgresEventMetadataProvider implements EventMetadataProvider {
 
-    /**
-     * 责任:取事件时间戳——source 块的 ts_usec(微秒)优先,老格式 ts_ms(毫秒)兜底
-     * (vanilla 同款两级回落;TIMESTAMP_KEY 常量在 1.9.7 继承自基类,值为 ts_ms)。
-     * 边界:value/source 任一为 null 返回 null(非数据事件)。
-     */
     @Override
     public Instant getEventTimestamp(DataCollectionId source, OffsetContext offset, Object key, Struct value) {
         if (value == null) {
@@ -50,10 +45,6 @@ public class StreamEventMetadataProvider implements EventMetadataProvider {
         return timestamp == null ? null : Instant.ofEpochMilli(timestamp);
     }
 
-    /**
-     * 责任:取事件在事务日志中的唯一定位(lsn,附 xmin 若有)——指标的事务位点展示面。
-     * 边界:value/source 为 null 或 source 块无 lsn 返回 null。
-     */
     @Override
     public Map<String, String> getEventSourcePosition(DataCollectionId source, OffsetContext offset, Object key, Struct value) {
         if (value == null) {
@@ -77,10 +68,6 @@ public class StreamEventMetadataProvider implements EventMetadataProvider {
         return r;
     }
 
-    /**
-     * 责任:取事件所属事务标识(txId 的字符串形态)——事务元数据(事务块 BEGIN/END 事件)
-     * 的归属展示面。边界:value/source 为 null 或无 txId 返回 null。
-     */
     @Override
     public String getTransactionId(DataCollectionId source, OffsetContext offset, Object key, Struct value) {
         if (value == null) {

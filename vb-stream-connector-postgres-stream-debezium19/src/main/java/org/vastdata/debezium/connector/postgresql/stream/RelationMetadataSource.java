@@ -1,8 +1,8 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
-import io.debezium.connector.postgresql.PostgresType;
-import io.debezium.connector.postgresql.TypeRegistry;
-import io.debezium.connector.postgresql.connection.PostgresConnection;
+import org.vastdata.debezium.connector.postgresql.PostgresType;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.ColumnNameFilter;

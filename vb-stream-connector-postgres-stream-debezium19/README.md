@@ -2,9 +2,9 @@
 
 ## 定位与架构
 
-流式专用的 PostgreSQL 逻辑解码 Kafka Connect 连接器插件（`connector.class = org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector`，与 3.6.1 模块同包名同类名）：适配 pgoutput **stream 模式**（`proto_version=4` + `streaming` + `two_phase`），进行中的大事务边收边发而非提交后整体回放。目标宿主 = **内置 Debezium 1.9.7.Final 的产品**（其 Kafka Connect API 线为 3.1.0，非 4.x）——本模块即 `vb-stream-connector-postgres-stream`（Debezium 3.6.1 版）面向该宿主的同款移植：**整模块复制 + 接缝层按 1.9.7 API 改写**（设计 spec `docs/superpowers/specs/2026-09-30-debezium19-connector-design.md`）。
+流式专用的 PostgreSQL 逻辑解码 Kafka Connect 连接器插件（`connector.class = org.vastdata.debezium.connector.postgresql.stream.PostgresStreamConnector`，与 3.6.1 模块同包名同类名）：适配 pgoutput **stream 模式**（`proto_version=4` + `streaming` + `two_phase`），进行中的大事务边收边发而非提交后整体回放。目标宿主 = **内置 Debezium 1.9.7.Final 的产品**（其 Kafka Connect API 线为 3.1.0，非 4.x）——本模块即 `vb-stream-connector-postgres-stream`（Debezium 3.6.1 版）面向该宿主的同款移植：**整模块复制 + 接缝层按 1.9.7 API 改写**（设计 spec `docs/superpowers/specs/2026-09-30-debezium19-connector-design.md`）。**已自含化**（2026-09-30，spec `docs/superpowers/specs/2026-09-30-debezium19-selfcontained-design.md`）：宿主产品不带 `debezium-connector-postgres` jar，模块把所用 vanilla 连接器类**裁剪复刻进自有命名空间**（`org.vastdata.debezium.connector.postgresql.*`，30 个主源码文件），pom 零 `debezium-connector-postgres` 依赖、仅显式 `debezium-core`——插件包自含运行所需全部 PG 连接器类。
 
-架构、端到端数据流、组件分层与 at-least-once 语义与 3.6.1 模块 **1:1 相同**（流式解码/CQ 主缓冲管道/双线程解耦组装回放/事务元数据/two_phase/MBean 指标全保留）——内核层（protocol 解码、组装、管道、复制会话、指标）44 个主源码文件与 3.6.1 模块**字节等同**，仅 16 个 Debezium 接缝文件按 1.9.7 API 改写。逐组件机制见 3.6.1 模块 README 与包内 `src/main/java/.../stream/CLAUDE.md`；本模块与 3.6.1 模块的差异与双线同步约定见下文专节。**两模块永不同 classpath**（各嵌各的宿主/插件包，同包名不构成冲突）。
+架构、端到端数据流、组件分层与 at-least-once 语义与 3.6.1 模块 **1:1 相同**（流式解码/CQ 主缓冲管道/双线程解耦组装回放/事务元数据/two_phase/MBean 指标全保留）——内核层（protocol 解码、组装、管道、复制会话、指标）44 个主源码文件与 3.6.1 模块**字节等同**，16 个 Debezium 接缝文件按 1.9.7 API 改写，另有 30 个 vendored 文件裁剪复刻自 vanilla 1.9.7 连接器（自含化）。逐组件机制见 3.6.1 模块 README 与包内 `src/main/java/.../stream/CLAUDE.md`；本模块与 3.6.1 模块的差异与双线同步约定见下文专节。**两模块永不同 classpath**（各嵌各的宿主/插件包，同包名不构成冲突）。
 
 ## 配置面
 
@@ -28,13 +28,13 @@ mvn -pl vb-stream-connector-postgres-stream-debezium19 clean package -DskipTests
 ```
 target/
 ├── vb-stream-connector-postgres-stream-debezium19-plugin/   # 安装即拷此目录
-│   ├── vb-stream-connector-postgres-stream-debezium19-1.0-SNAPSHOT.jar  # 连接器自身 jar（带 SourceConnector ServiceLoader 清单）
-│   └── lib/                                                 # 32 个 runtime 依赖：debezium-connector-postgres/debezium-core/debezium-api 1.9.7.Final、
-│                                                            #   postgresql-42.7.13、chronicle-*、HdrHistogram 等
+│   ├── vb-stream-connector-postgres-stream-debezium19-1.0-SNAPSHOT.jar  # 连接器自身 jar（带 SourceConnector ServiceLoader 清单 + 30 个 vendored 类）
+│   └── lib/                                                 # 30 个 runtime 依赖：debezium-core/debezium-api 1.9.7.Final（显式）、
+│                                                            #   postgresql-42.7.13、chronicle-*、HdrHistogram 等——无 vanilla connector-postgres
 └── vb-stream-connector-postgres-stream-debezium19-plugin.zip  # 同构分发物
 ```
 
-Connect runtime 已提供的坐标显式排除在清单外（与 3.6.1 模块同款 R4 边界）：`connect-api`、`kafka-clients`、`slf4j-api` 及其独占子件 `zstd-jni`/`lz4-java`/`snappy-java`/`jakarta.ws.rs-api`。**debezium-connector-postgres 1.9.7 落 lib/**：独立 Connect 安装场景自带；嵌入宿主时若宿主已带同版本 Debezium，类重复且同版本无害（插件类加载器 first-win，spec §7）。
+Connect runtime 已提供的坐标显式排除在清单外（与 3.6.1 模块同款 R4 边界）：`connect-api`、`kafka-clients`、`slf4j-api` 及其独占子件 `zstd-jni`/`lz4-java`/`snappy-java`/`jakarta.ws.rs-api`。**自含化后 lib/ 无 `debezium-connector-postgres`**（2026-09-30，spec 自含化篇）：所用 vanilla 连接器类已裁剪复刻进连接器自身 jar 的自有命名空间，`debezium-core`/`debezium-api` 为框架层显式依赖照常落 lib/——插件目录单独挂上 plugin.path 即可跑通（`ConnectPluginIT` 即此形态的端到端实证）。
 
 安装：把 plugin 目录放进 worker 的 `plugin.path` 后 REST 建连接器（**扁平 config map**，`PUT /connectors/{name}/config` 形态；注意逻辑名键是 `database.server.name`）：
 
@@ -70,7 +70,7 @@ curl -X PUT http://connect:8083/connectors/pg-stream-19/config \
 ## 开发与测试
 
 - **模块边界**：零 `org.vastdata.vbstream` import（与 3.6.1 模块同款结构性保证）；不依赖 3.6.1 模块——两模块是独立平行的同包名实现
-- **测试形态**：`mvn test` 单命令全跑，**275 用例** = 离线单测 245（36 类：protocol 字节级 + 组装/回放/接缝/三件套，多数与 3.6.1 版字节等同直过）+ `it` 包 30（27 语义 IT + 基座契约 2 + `ConnectPluginIT` 1）
+- **测试形态**：`mvn test` 单命令全跑，**276 用例** = 离线单测 246（37 类：protocol 字节级 + 组装/回放/接缝/三件套 + 自含化边界 `VanillaBoundaryTest`，多数与 3.6.1 版字节等同直过）+ `it` 包 30（27 语义 IT + 基座契约 2 + `ConnectPluginIT` 1）
 - **自建 IT 基座 `AbstractStreamIT`**：1.9.7 官方 `AbstractConnectorTest` 是 JUnit 4 编译（`org.junit.Before/After`），JUnit 6 Jupiter 无法继承——基座内装 `EmbeddedEngine.create()` 同步引擎 + 记录收集 + 生命周期闩，对外暴露与 3.6.1 基座同名的方法面（start/stopConnector/consumeRecords×2/consumeRecordsByTopic/awaitEngine/assertNoEngineFailure），27 个语义 IT 的断言面与 3.6.1 版逐字同锚（细节见模块 CLAUDE.md）
 - **容器**：`StreamPgTestEnv` postgres:18 单例（与 3.6.1 模块同配方）；`ConnectPluginIT` 用 cp-kafka/cp-kafka-connect 7.1.0 + temurin-17 覆盖层
 - **代码内文档真源**：模块 `CLAUDE.md`（三桶结构/1.9.7 API 差异清单/基座说明）与包内 `src/main/java/.../stream/CLAUDE.md`、`stream/protocol/CLAUDE.md`（与 3.6.1 模块同文，文件头附本模块归属注记）
@@ -92,6 +92,7 @@ curl -X PUT http://connect:8083/connectors/pg-stream-19/config \
 | 9 | embedded 引擎停机等待 | 异步引擎 `shutdownNow` 即时中断 | 1.9.7 `EmbeddedEngine.stop()` 在 interrupt 前先等引擎完成闩，系统属性 `debezium.embedded.shutdown.pause.before.interrupt.ms` **默认 5 分钟**——crash 注入类 IT 须压短（`LogicalMsgIT` `@BeforeAll` 压 1s、`@AfterAll` 清除） |
 | 10 | embedded 引擎装配/记录类型 | `DebeziumEngine.create(Connect.class)`、`RecordChangeEvent<SourceRecord>` 包装 | **`EmbeddedEngine.create()`**（1.9.7 无 `io.debezium.engine.format.Connect` 类，2.0 才引入）、记录类型**裸 `SourceRecord`** |
 | 11 | `ConnectPluginIT` 容器形态 | cp-kafka/cp-kafka-connect 8.3.0（AK 4.3，KRaft 容器组，镜像 JVM 可跑 17 字节码） | **自建 ZooKeeper 单容器（`ZkKafkaContainer`）+ cp-kafka-connect 7.1.0 基座叠 eclipse-temurin:17-jre 覆盖层**——真 Connect 3.1.0 runtime × Java 17（镜像原 JVM Zulu 11 与 release 17 字节码硬冲突；testcontainers 2.x kafka 模块恒以 KRaft 起 Confluent 容器、7.1 拒绝 KRaft 参数面） |
+| 12 | vanilla 连接器依赖 | pom 依赖 `debezium-connector-postgres`（整 jar 落 lib/） | **自含化**（2026-09-30，spec 自含化篇）——pom 零 connector-postgres 依赖，所用 vanilla 类裁剪复刻进自有命名空间 `org.vastdata.debezium.connector.postgresql.*`（30 文件）；lib/ 仅余 debezium-core/api 框架层，`VanillaBoundaryTest` 钉死字节码零 vanilla 引用 |
 
 **双线同步约定**（spec §7）：桶 A 内核——`protocol/` 子包、组装（`StreamedTransactionAssembler`/桶/交接）、管道（`MessagePipe`）、复制会话（`ReplicationSession`）、指标（`StreamThroughputMetrics`/`StreamMetricsBridge`）——的任何后续改动须**双模块同步落地**（这些文件本就字节等同，同步 = 复制后零改动）；接缝层（桶 B 16 文件，Task/Config/Schema/dispatcher/metrics 三件等）**豁免**——本就因 Debezium 版本而异，各随各的 API 面。
 

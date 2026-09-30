@@ -1,8 +1,8 @@
 package org.vastdata.debezium.connector.postgresql.stream;
 
 import io.debezium.DebeziumException;
-import io.debezium.connector.postgresql.PostgresType;
-import io.debezium.connector.postgresql.TypeRegistry;
+import org.vastdata.debezium.connector.postgresql.PostgresType;
+import org.vastdata.debezium.connector.postgresql.TypeRegistry;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 该差异是已记档的已知限制(docs/superpowers/specs/2026-09-02-ms2-r1-r3-audit.md
  * "已知限制与延期"节),本测试钉住"穿透"这一半语义不回退。
  *
- * <p>夹具路线(离线构造 vanilla 连库对象):{@link TypeRegistry} 唯一构造子要求活
+ * <p>夹具路线(离线构造本包复刻版连库对象):{@link TypeRegistry} 唯一构造子要求活
  * {@code PostgresConnection} 且构造即 prime(全量类型查询)——离线经
  * {@code sun.misc.Unsafe#allocateInstance} 越过构造子,再反射注入 {@code oidToType}
  * 映射(字段名与 3.6.1.Final sources 实证一致;升版若改名,本测试以反射失败显式红);
@@ -39,7 +39,7 @@ class TypeRegistryColumnValueMapperTest {
 
     /**
      * 责任:钉住数组列的 fail-fast 语义——数组形态的 PostgresType 经真生产映射器
-     * (text → vanilla getValue → isArray 分派 → asArray 取连接)时,供给器
+     * (text → 复刻版 getValue → isArray 分派 → asArray 取连接)时,供给器
      * {@code NO_CONNECTION} 的 {@link DebeziumException} 必须原样穿透调用方:
      * 步骤①构造 elementType 非空/parentType 空的类型并断言数组前置件成立
      * (isArrayType 且 isRootType——否则测试自身夹具失效);②经注入 oidToType 的
@@ -64,7 +64,7 @@ class TypeRegistryColumnValueMapperTest {
     }
 
     /**
-     * 责任:离线构造数组形态的 PostgresType——反射调 vanilla 私有 7 参构造子
+     * 责任:离线构造数组形态的 PostgresType——反射调本包复刻版的私有 7 参构造子
      * (name, oid, jdbcId, typeInfo, enumValues, parentType, elementType;typeInfo/enumValues
      * 置 null——本路径只触 isArrayType/isRootType/getOid,不触 typeInfo 支撑的
      * length/scale),elementType 置 UNKNOWN(非 null → isArrayType)、parentType 置
