@@ -1,7 +1,5 @@
 package org.vastdata.debezium.connector.postgresql.connection;
 
-import org.vastdata.debezium.connector.postgresql.PostgresConnection;
-
 /**
  * 责任:复制消息解码点按需取 JDBC 连接的供给口。
  * 来源:收编自 io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier
