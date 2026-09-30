@@ -122,7 +122,7 @@ R2 已裁定 v1 不接 signal-based 增量快照（3.6.1 侧同样未接）—�
 
 1.9.7 官方 `AbstractConnectorTest` 为 JUnit 4 编译（§2 事实 2），JUnit 6 无法继承；调用面仅 4 方法 + CompletionCallback（§2 事实 4）。自建 Jupiter 基座：
 
-- 内装 `DebeziumEngine.create(Connect.class)`（1.9.7 工厂形态，§2 事实 3）+ `ChangeConsumer` 记录收集 + 生命周期 latch/hook（参照 vb-stream-reader `EngineLifecycle` 模式）
+- 内装 `EmbeddedEngine.create()`（1.9.7 无 `Connect` format 类——§2 事实 3 勘误版；消费面拿到裸 `SourceRecord`）+ `ChangeConsumer` 记录收集 + 生命周期 latch/hook（参照 vb-stream-reader `EngineLifecycle` 模式）
 - 对外暴露与 3.6.1 基座同名的方法：`start(Class, Configuration)` / `stopConnector()` / `consumeRecords(int[, Consumer])` / `consumeRecordsByTopic(int)` / CompletionCallback 捕获通道
 - 27 IT 的翻译 = 改 import + 个别断言语义微调，不重写用例逻辑
 
