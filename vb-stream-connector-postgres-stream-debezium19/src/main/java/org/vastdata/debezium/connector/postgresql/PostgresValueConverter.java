@@ -52,7 +52,6 @@ import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
 
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
-import io.debezium.connector.postgresql.PostgisGeometry;
 import io.debezium.data.Bits;
 import io.debezium.data.Json;
 import io.debezium.data.SpecialValueDecimal;
@@ -87,8 +86,8 @@ import org.vastdata.debezium.connector.postgresql.data.Ltree;
  * 裁剪说明（唯一一处）：删除 {@code convertPoint} 内 {@code data instanceof PgProto.Point} 分支——该分支只为
  * pgproto 解码插件（decoderbufs）的解码产物存在，属排除集 {@code connection/pgproto/*} 的类型面；本连接器协议层
  * 自建（pgoutput 文本/流式 raw 解码），point 列数据永不以该类型到达，分支运行期不可达（vanilla 行 973-975 实证）。
- * 适配说明：{@code PostgisGeometry}（geometry/geography 列值的 EWKB 十六进制解析）仍引用 vanilla
- * {@code io.debezium.connector.postgresql.PostgisGeometry}——纯静态工具类、无本包类型签名牵连，混合态可用。
+ * 适配说明：{@code PostgisGeometry}（geometry/geography 列值的 EWKB 十六进制解析）已同批复刻进本包
+ * （Task 8 自含化，全量零裁剪），原 vanilla import 已翻转为本包简名。
  *
  * @author Horia Chiorean (hchiorea@redhat.com)
  */
