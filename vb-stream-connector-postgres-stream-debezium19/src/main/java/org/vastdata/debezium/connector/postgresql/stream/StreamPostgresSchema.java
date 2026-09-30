@@ -30,7 +30,7 @@ import io.debezium.schema.TopicSelector;
 public class StreamPostgresSchema extends PostgresSchema {
 
     /**
-     * 构造 schema 组件(委派父构造器,装配参数语义见 vanilla PostgresSchema)。
+     * 构造 schema 组件(委派父构造器,装配参数语义见本包复刻版 PostgresSchema)。
      *
      * @param connectorConfig       连接器配置(表过滤器/列过滤器/键映射等的真源)
      * @param typeRegistry          连库类型注册表(main 连接产出)

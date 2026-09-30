@@ -9,9 +9,9 @@ import org.vastdata.debezium.connector.postgresql.connection.pgoutput.PgOutputRe
 import java.util.Objects;
 
 /**
- * {@link ColumnValueMapper} 的生产实现:类型化转换本体委派 vanilla 的
+ * {@link ColumnValueMapper} 的生产实现:类型化转换本体委派本包复刻版
  * {@code PgOutputReplicationMessage.getValue}(public static,DBZ 1.9.7.Final 实测签名)
- * 与 {@code UnchangedToastedReplicationMessageColumn} 哨兵构造——两处都是 vanilla
+ * 与 {@code UnchangedToastedReplicationMessageColumn} 哨兵构造——两处都复刻自 vanilla
  * pgoutput 解码路径的同一份代码,不另造转换逻辑。
  *
  * <p><b>连接供给器的 fail-fast 口径(已知限制,记档见 docs/superpowers/specs/
@@ -55,7 +55,7 @@ public final class TypeRegistryColumnValueMapper implements ColumnValueMapper {
     }
 
     /**
-     * 责任:文本值经 vanilla {@code PgOutputReplicationMessage.getValue} 按 oid 对应的
+     * 责任:文本值经本包复刻版 {@code PgOutputReplicationMessage.getValue} 按 oid 对应的
      * PostgresType 解析(Integer/Long/BigDecimal/Instant/bytea 字节……)。
      * 边界:解析失败(值与类型不符)按 vanilla 异常语义原样上抛——消费路径 fail-fast;
      * oid 未注册时 {@code TypeRegistry#get} 返回 UNKNOWN,由 includeUnknownDatatypes
@@ -71,7 +71,7 @@ public final class TypeRegistryColumnValueMapper implements ColumnValueMapper {
     }
 
     /**
-     * 责任:构造 vanilla 的未变更 TOAST 哨兵列并取其标记值——1.9.7 的
+     * 责任:构造本包复刻的未变更 TOAST 哨兵列并取其标记值——1.9.7 的
      * {@code getValue} 无视参数恒返回单例 {@code UNCHANGED_TOAST_VALUE}(裸 Object
      * 标记,无 3.x 的类型专属标记族),Debezium 值转换器链按<b>引用等值</b>识别该
      * 标记({@code convertString}/{@code handleUnknownData} 的 if_acmpne 分支)后
