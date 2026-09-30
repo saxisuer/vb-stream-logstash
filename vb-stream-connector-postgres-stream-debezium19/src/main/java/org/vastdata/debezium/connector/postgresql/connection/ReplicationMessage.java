@@ -29,7 +29,7 @@ import org.vastdata.debezium.connector.postgresql.TypeRegistry;
  * is processed by the Debezium PostgreSQL connector.
  * 复刻自 io.debezium.connector.postgresql.connection.ReplicationMessage（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻），
  * 嵌套 Column/ColumnValue/Operation/NoopMessage 随文件，逻辑零改动；{@code PgConnectionSupplier} 引用由排除集宿主
- * {@code PostgresStreamingChangeEventSource} 的嵌套接口切换为本包同名顶层接口（Task 1 收编，同包免 import）。
+ * {@code PostgresStreamingChangeEventSource} 的嵌套接口切换为本包同名顶层接口（自排除集宿主收编而来，同包免 import）。
  *
  * @author Jiri Pechanec
  *

@@ -24,7 +24,7 @@ import org.vastdata.debezium.connector.postgresql.connection.Lsn;
  * Information about the source of information, which for normal events contains information about the transaction id and the
  * LSN position in the server WAL.
  * 复刻自 io.debezium.connector.postgresql.SourceInfo（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 复刻），
- * 无裁剪、逻辑零改动（{@code Lsn} import 切到本包 Task 1 复刻版）。
+ * 无裁剪、逻辑零改动（{@code Lsn} import 已切换为本包复刻版简名）。
  *
  * <p>
  * The {@link #partition() source partition} information describes the database server for which we're streaming changes.

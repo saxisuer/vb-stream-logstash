@@ -38,7 +38,7 @@ import org.vastdata.debezium.connector.postgresql.connection.ServerInfo;
  * {@link PostgresConnectorConfig#COLUMN_EXCLUDE_LIST specified} in the
  * configuration.
  * 复刻自 io.debezium.connector.postgresql.PostgresSchema（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 复刻），
- * 无裁剪；{@code ServerInfo} import 切到本包 Task 2 裁剪版（仅存 {@code ReplicaIdentity}，本类
+ * 无裁剪；{@code ServerInfo} import 已切换为本包裁剪复刻版（仅存 {@code ReplicaIdentity}，本类
  * {@code printReplicaIdentityInfo} 的用法恰在其保留面内）；类 javadoc 首行的连接器指称由 vanilla
  * {@code PostgresConnector} 改为文字表述（本命名空间连接器是 {@code .stream.PostgresStreamConnector}，无根包同名类）。
  *

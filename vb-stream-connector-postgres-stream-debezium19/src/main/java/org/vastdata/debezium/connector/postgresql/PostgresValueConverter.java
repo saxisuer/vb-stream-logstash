@@ -87,7 +87,7 @@ import org.vastdata.debezium.connector.postgresql.data.Ltree;
  * pgproto 解码插件（decoderbufs）的解码产物存在，属排除集 {@code connection/pgproto/*} 的类型面；本连接器协议层
  * 自建（pgoutput 文本/流式 raw 解码），point 列数据永不以该类型到达，分支运行期不可达（vanilla 行 973-975 实证）。
  * 适配说明：{@code PostgisGeometry}（geometry/geography 列值的 EWKB 十六进制解析）已同批复刻进本包
- * （Task 8 自含化，全量零裁剪），原 vanilla import 已翻转为本包简名。
+ * （自含化复刻，全量零裁剪），原 vanilla import 已翻转为本包简名。
  *
  * @author Horia Chiorean (hchiorea@redhat.com)
  */

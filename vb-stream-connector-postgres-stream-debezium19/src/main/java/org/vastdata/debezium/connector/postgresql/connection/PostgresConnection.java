@@ -44,7 +44,7 @@ import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
  * {@code PostgresConnection(PostgresConnectorConfig, TypeRegistry, String)} 构造器（签名引用排除集 PostgresConnectorConfig）
  * 及其独占常量/成员；{@code FACTORY} 的端口默认由 {@code PostgresConnectorConfig.PORT.defaultValueAsString()}
  * （排除集类）最小适配为字面值 {@code "5432"}（与 vanilla DEFAULT_PORT 等值）。
- * 适配说明：{@link PostgresValueConverter} 引用本包 Task 4 复刻版（Task 2 批次的 vanilla 临时桥 import 已翻转）。
+ * 适配说明：{@link PostgresValueConverter} 引用本包复刻版，原 vanilla import 已切换为本包简名。
  *
  * @author Horia Chiorean
  */

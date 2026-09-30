@@ -38,11 +38,11 @@ import org.vastdata.debezium.connector.postgresql.connection.wal2json.DateTimeFo
  * 复刻自 io.debezium.connector.postgresql.connection.AbstractColumnValue（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻）。
  * 保留集闭包缺口补件：spec §4.2 未列本类，但 {@code PgOutputColumnValue}（PgOutputReplicationMessage 强制牵连）
  * 继承之——编译期暴露后随闭包一并复刻（spec §8 风险行）。适配两处：
- * （1）{@code PgConnectionSupplier} 由排除集宿主的嵌套接口切换为本包顶层同名接口（Task 1 收编，同包免 import），
+ * （1）{@code PgConnectionSupplier} 由排除集宿主的嵌套接口切换为本包顶层同名接口（收编形态，同包免 import），
  * 其 {@code get()} 返回本包 {@code PostgresConnection}（vanilla 嵌套接口返回 {@code BaseConnection}）——{@code asArray}
- * 的 {@code PgArray} 构造点按 Task 1 随行裁定改经 {@code connection.get().connection()}（JdbcConnection 暴露的内部
+ * 的 {@code PgArray} 构造点随接口收编改经 {@code connection.get().connection()}（JdbcConnection 暴露的内部
  * 连接访问器）强转 {@code BaseConnection} 取底层 pgjdbc 连接，仍在原 try/catch SQLException 内，异常语义不变；
- * （2）{@link PostgresValueConverter} 的 infinity 常量引用本包 Task 4 复刻版（原 vanilla 桥 import 已翻转）。
+ * （2）{@link PostgresValueConverter} 的 infinity 常量引用本包复刻版，原 vanilla import 已切换为本包简名。
  */
 public abstract class AbstractColumnValue<T> implements ReplicationMessage.ColumnValue<T> {
 
@@ -203,7 +203,7 @@ public abstract class AbstractColumnValue<T> implements ReplicationMessage.Colum
     public Object asArray(String columnName, PostgresType type, String fullType, PgConnectionSupplier connection) {
         try {
             final String dataString = asString();
-            // 复刻适配（Task 1 随行裁定）：供给器返回本包 PostgresConnection，经其内部连接访问器取底层 BaseConnection
+            // 复刻适配（接口收编随行）：供给器返回本包 PostgresConnection，经其内部连接访问器取底层 BaseConnection
             return new PgArray((BaseConnection) connection.get().connection(), type.getOid(), dataString);
         }
         catch (SQLException e) {

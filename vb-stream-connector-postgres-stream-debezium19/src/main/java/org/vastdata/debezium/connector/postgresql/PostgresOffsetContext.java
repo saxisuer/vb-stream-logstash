@@ -40,7 +40,7 @@ import org.vastdata.debezium.connector.postgresql.connection.PostgresConnection;
  * （vanilla 行 255 起）；（2）LOGGER 的类字面量由排除集 {@code PostgresSnapshotChangeEventSource.class}
  * 最小适配为本类 {@code PostgresOffsetContext.class}（仅日志 logger 名变化）；（3）{@code initialContext} 的
  * {@code currentXLogLocation()}/{@code currentTransactionId()} 调用改经 {@code JdbcConnection} 基类的
- * {@code query(...)} 内联同 SQL 同语义查询——两方法在 Task 2 裁剪版 {@code PostgresConnection} 已删
+ * {@code query(...)} 内联同 SQL 同语义查询——两方法在本包裁剪复刻版 {@code PostgresConnection} 已删
  * （“接缝零调用”裁定的对象是 vanilla import 形态；本类复刻后经私有静态方法等价重建，SQL 与返回值语义逐行对照
  * vanilla PostgresConnection 行 423-449）。
  */
@@ -269,7 +269,7 @@ public class PostgresOffsetContext implements OffsetContext {
 
     /**
      * 责任：在 main 连接上查询当前 WAL 位点（{@code initialContext} 的内联适配件，替代 vanilla
-     * {@code PostgresConnection.currentXLogLocation()}——该方法在 Task 2 裁剪版连接已删）。
+     * {@code PostgresConnection.currentXLogLocation()}——该方法在本包裁剪复刻版连接已删）。
      * 关键步骤：按服务端大版本选 {@code pg_current_wal_lsn()}（PG 10+）或 {@code pg_current_xlog_location()}，
      * 结果串经 pgjdbc {@code LogSequenceNumber.valueOf} 换 long——SQL 与换算逐行对照 vanilla
      * PostgresConnection 行 440-449。边界：无结果行抛 ISE（"there should always be a valid xlog position"，
@@ -293,7 +293,7 @@ public class PostgresOffsetContext implements OffsetContext {
 
     /**
      * 责任：在 main 连接上查询当前事务 ID（{@code initialContext} 的内联适配件，替代 vanilla
-     * {@code PostgresConnection.currentTransactionId()}——该方法在 Task 2 裁剪版连接已删）。
+     * {@code PostgresConnection.currentTransactionId()}——该方法在本包裁剪复刻版连接已删）。
      * 关键步骤：执行 {@code select * from txid_current()} 取首行首列 long——SQL 与取值逐行对照 vanilla
      * PostgresConnection 行 423-432（读事务本身未分配 XID 时为 0，由调用方决定语义）。
      * 边界：无行或值为 0 时返回 null（vanilla 同款——本连接器路径上 {@code initialContext} 紧接

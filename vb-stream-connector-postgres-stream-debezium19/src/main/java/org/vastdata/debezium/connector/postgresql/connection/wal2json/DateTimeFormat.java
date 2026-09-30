@@ -32,7 +32,7 @@ import org.vastdata.debezium.connector.postgresql.PostgresValueConverter;
  * 复刻自 io.debezium.connector.postgresql.connection.wal2json.DateTimeFormat（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻），
  * 逻辑零改动。保留集闭包缺口补件：wal2json 排除面只针对两个 decoder，本接口是纯 JDK 日期解析工具（pgoutput 复刻链
  * 经 {@code AbstractColumnValue} 强制牵连——编译期暴露，spec §8 风险行），包路径按模板原位保留。
- * 适配说明：{@code PostgresValueConverter} 的 infinity 常量引用本包 Task 4 复刻版（原 vanilla 桥 import 已翻转）。
+ * 适配说明：{@code PostgresValueConverter} 的 infinity 常量引用本包复刻版，原 vanilla import 已切换为本包简名。
  *
  * @author Jiri Pechanec
  *

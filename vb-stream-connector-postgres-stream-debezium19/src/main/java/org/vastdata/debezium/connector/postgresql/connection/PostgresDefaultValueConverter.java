@@ -37,7 +37,7 @@ import io.debezium.util.Collect;
 /**
  * Parses and converts column default values.
  * 复刻自 io.debezium.connector.postgresql.connection.PostgresDefaultValueConverter（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻），
- * 逻辑零改动。{@link PostgresValueConverter} 引用本包 Task 4 复刻版（Task 2 批次的 vanilla 临时桥 import 已翻转）。
+ * 逻辑零改动。{@link PostgresValueConverter} 引用本包复刻版，原 vanilla import 已切换为本包简名。
  */
 @ThreadSafe
 public class PostgresDefaultValueConverter implements DefaultValueConverter {

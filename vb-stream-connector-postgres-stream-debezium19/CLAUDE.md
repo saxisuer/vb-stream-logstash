@@ -47,7 +47,7 @@ vanilla `debezium-connector-postgres` 1.9.7.Final 所用类的**裁剪复刻**�
 **自含化实施注记**（对 spec §5 的偏离/细化，行为面均零影响）：
 
 - `PostgresStreamConnector` 改 extends debezium-core `RelationalBaseSourceConnector` 后，原 3.6.1 版对 vanilla `PostgresConnector` 的 taskConfigs 覆写基准失效——注入逻辑**内联进自有实现**（语义严格等价，断言面零改动）
-- `PostgresConnection` 保留的 `CONNECTION_STREAMING`/`SLOT_INFO`/`DROP_SLOT` 常量属已删功能（复制流/槽管理 SQL 面）的**语义残留**——公共常量面零风险，留作对照锚
+- `PostgresConnection` 保留的 `CONNECTION_STREAMING`/`CONNECTION_SLOT_INFO`/`CONNECTION_DROP_SLOT` 常量属已删功能（复制流/槽管理 SQL 面）的**语义残留**——公共常量面零风险，留作对照锚
 - `PostgresConnectorConfig` 裁剪面**含 `getMessageFilter`**（继承链构造期需要的辅助方法，随保留集闭包拉入，非配置面扩张）
 - `SNAPSHOT_MODE` Field 描述文案仍宣传已删的 `custom` 档键（vanilla 原文照抄，custom 档已裁——纯文案残留，无行为影响）
 - 复刻对照勿混基类面：`defaultPort`/`resolveDatabaseContext`/`executeWithAutoCommit` 在 vanilla 1.9.7 `PostgresConnection` 本就不存在（属 `JdbcConnection` 基类）

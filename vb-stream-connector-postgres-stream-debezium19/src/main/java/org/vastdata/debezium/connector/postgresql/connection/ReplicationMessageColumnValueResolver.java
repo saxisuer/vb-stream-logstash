@@ -19,7 +19,7 @@ import org.vastdata.debezium.connector.postgresql.connection.ReplicationMessage.
  * 复刻自 io.debezium.connector.postgresql.connection.ReplicationMessageColumnValueResolver
  * （debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻），逻辑零改动；原
  * {@code PostgresStreamingChangeEventSource.PgConnectionSupplier} 嵌套接口引用（排除集宿主）切换为本包顶层
- * {@code PgConnectionSupplier}（Task 1 收编，同包免 import），解析分派逻辑逐字节不变。
+ * {@code PgConnectionSupplier}（自 vanilla 排除集宿主的嵌套接口收编而来，同包免 import），解析分派逻辑逐字节不变。
  */
 public class ReplicationMessageColumnValueResolver {
 

@@ -21,9 +21,9 @@ import org.vastdata.debezium.connector.postgresql.connection.ReplicationMessageC
  *
  * 复刻自 io.debezium.connector.postgresql.connection.pgoutput.PgOutputReplicationMessage
  * （debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻），逻辑零改动；{@code PgConnectionSupplier}
- * 引用由排除集宿主 {@code PostgresStreamingChangeEventSource} 的嵌套接口切换为本包顶层同名接口（Task 1 收编）。
- * static {@code getValue} 是本连接器 typed 模式列值转换的运行期主力（Task 7 切换后
- * {@code .stream/TypeRegistryColumnValueMapper} 的调用面）。
+ * 引用由排除集宿主 {@code PostgresStreamingChangeEventSource} 的嵌套接口切换为本包顶层同名接口（自排除集宿主收编而来）。
+ * static {@code getValue} 是本连接器 typed 模式列值转换的运行期主力（调用面在
+ * {@code .stream/TypeRegistryColumnValueMapper}）。
  */
 public class PgOutputReplicationMessage implements ReplicationMessage {
 

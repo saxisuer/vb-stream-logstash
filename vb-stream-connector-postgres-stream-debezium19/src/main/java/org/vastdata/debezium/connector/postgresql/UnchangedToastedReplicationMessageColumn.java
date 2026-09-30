@@ -16,7 +16,7 @@ import org.vastdata.debezium.connector.postgresql.connection.PgConnectionSupplie
  * a {@link org.vastdata.debezium.connector.postgresql.connection.ReplicationMessage}.
  * 复刻自 io.debezium.connector.postgresql.UnchangedToastedReplicationMessageColumn（debezium-connector-postgres 1.9.7.Final sources，2026-09-30 裁剪复刻），
  * 逻辑零改动；{@code getValue} 参数类型由 {@code PostgresStreamingChangeEventSource.PgConnectionSupplier}（排除集宿主嵌套接口）
- * 切换为本包顶层 {@link PgConnectionSupplier}（Task 1 收编）——实现恒返哨兵值、不触达连接参数，签名切换零行为影响。
+ * 切换为本包顶层 {@link PgConnectionSupplier}（自 vanilla 排除集宿主的嵌套接口收编而来）——实现恒返哨兵值、不触达连接参数，签名切换零行为影响。
  *
  * @author Chris Cranford
  */
