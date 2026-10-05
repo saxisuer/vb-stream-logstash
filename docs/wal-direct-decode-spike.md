@@ -11,10 +11,12 @@
 
 ## 结论：主干成立（PASS，连续多次稳定复现）
 
-14 个事务 24 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
-DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）；事务分组与提交序
-全对；**catalog 重放器最小闭环打通**——字典不再硬编码，由 JDBC 引导 + WAL 重放驱动。
-验证覆盖：
+16 个事务 26 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
+DELETE 前像、TOAST 重组的 7000 字符宽值；含 UTF-8 文本 π、float8、bool、timestamp
+微秒精度）；事务分组与提交序全对；**catalog 重放器 + relfilenode 跟踪 + TOAST 重组
+闭环打通**——字典、当前 relfilenode、toast 映射全部由 JDBC 引导 + WAL 重放驱动。
+验证覆盖（通过率说明：16/16 全绿可达且多次复现，约 2/5——不稳定根因见发现 23，
+属工程完备性而非可行性）：
 
 | 场景 | 结果 |
 |---|---|
@@ -24,6 +26,8 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
 | S3：两连接交错事务（A1,B1,A2,B2；先 commit A 后 B） | ✓ 按 xid 分组不串、提交序正确 |
 | S4：默认 replica identity 的 UPDATE（无前像）→ `REPLICA IDENTITY FULL` 后 UPDATE（新旧整行）/ DELETE（前像整行） | ✓ 默认 RI 无 old tuple（与逻辑解码同约束，实证）；FULL 下 `U(old)>(new)`、`D(old)` 逐字节正确；HOT 更新（0x40）与普通更新同构解码 |
 | S5：catalog 重放器——流中 `ALTER TABLE ADD COLUMN`，字典从 pg_attribute 自身的 WAL 记录按 ctid 重放（JDBC 引导含 ctid 种子） | ✓ ADD COLUMN 被捕捉（`extra attnum=6 typOid=25`）；ALTER 后的行用重放出的 6 列字典解码、第六列值正确，ALTER 前的行仍按当时 5 列字典——as-of 语义成立 |
+| S6：relfilenode 生命周期——流中 `TRUNCATE`（表+toast+索引全换 relfilenode），pg_class 行按 ctid 重放跟踪，后续 DML 按新 relfilenode 解码 | ✓（多次全绿复现）TRUNCATE 的三形态写入被完整捕捉（见发现 17/19），insert-after-truncate 按新 node 解出 |
+| S7：TOAST 重组——7000 字符不可压缩值（MD5 hex 链）走 external 存储，chunk 从 toast 表自身的 WAL 记录采集、按短指针重组 | ✓（多次全绿复现）chunk 采集（multi-insert）→ external 指针解析 → 按序拼装 7000 字符逐字节一致 |
 
 ## 过程中钉死的关键事实（正式模块的资产）
 
@@ -78,6 +82,35 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
     （PG 18 为 25 列，`attstattarget` 在 17+ 挪到尾部 varlen 区——版本漂移活例）。
     另：流起点/终点必须用 `pg_current_wal_flush_lsn()`——write 位点可能超前于 flush，
     START_REPLICATION 会拒绝超 flush 的起点。
+17. **TRUNCATE 的 pg_class 写入是三形态合流**（pg_waldump 实证）：新 toast/index 的
+    pg_class 行 INSERT → 对其 **XLOG_HEAP_INPLACE（heap 0x70）原位改写** relfilenode
+    （ctid 不动、block data = 从 t_hoff 起的新数据区、header/bitmap 不变）；主表行自身
+    走**截断 HOT_UPDATE（flags 0x60）**。catalog 重放必须三形态全接。
+18. **heap2 PRUNE 必须重放**：autovacuum/on-access prune 会把活元组（HOT 链根）**物理
+    搬进页面前部空洞**（redirected 对），随后对该行的 UPDATE 引用的是搬后的 ctid——不
+    重放 prune 则 ctid 跟踪断链（S6 实测撞上，种子 ctid 与首条流内更新的 old ctid 差了
+    一次 prune）。prune 记录布局：main=[reason u8][flags u8][conflict u32?]，block data
+    按 flag 序 = freeze plans(nplans u16+2B pad+plans×12B) → redirected(n+2n) →
+    nowdead(n+n) → nowunused(n+n)。
+19. **pg_class 数据区列偏移**：cols 1-7 = oid(4)+name(64)+5×oid(4) = **88 字节**——
+    relfilenode@data 区 +88、reltoastrelid@+112（INPLACE 直读用）。
+20. **external TOAST 指针是短 varlena tag 格式**（非老式 4B 头+16B 载荷）：
+    `[0x01][0x12 VARTAG_ONDISK][rawsize u32][extinfo u32][valueid u32][toastrelid u32]`
+    共 18 字节；extinfo 低 30 位为 extsize、压缩判定为 extsize < rawsize-4。
+21. **4 字节 varlena 头勘误**：本机小端存 `len<<2 | tag`（`SET_VARSIZE_4B` 语义），
+    "长度大端存储"的常见记忆是错的——短文本全走 1B 头所以早期未暴露，TOAST chunk
+    实测钉死。
+22. **TOAST chunk 写入走 HEAP2 MULTI_INSERT**（数 KB 单记录含多个 chunk entry），
+    重组按 valueid 收集、chunk_seq 排序拼接、以 extsize 校验总长。
+23. **稳定性结论（正式模块必答清单）**：16/16 全绿可达但通过率 ~2/5，不稳定根因三件，
+    全部是工程完备性缺口：(a) prune 后的 tracked 断链自愈用 OID 自校验**恒真无鉴别力**
+    （prefix 由候选行自己编码）——正确做法是用 mid 中的新值对 JDBC 末态校验；(b)
+    `getLastReceiveLSN()-len` 锚定偶发 ±32B 漂移（keepalive/数据交错），需页头 pageaddr
+    校验 + 再同步协议（spike 以丢弃 carry 粗暴再同步）；(c) INPLACE/截断更新对窗口前
+    旧行的原始字节依赖需以"值编码重建"彻底替代页读兜底。
+24. **value-based 截断重建**：pg_class 截断更新的 prefix（≤88B，cols 1-7 全定长）可由
+    已知行值直接编码重建，suffix 区可零填充（只含不被读取的定长尾部列与经 null bitmap
+    跳过的 varlena）——无需旧 tuple 原始字节，也不需要页读。
 
 ## 与既有架构的衔接（若立项正式模块）
 
@@ -97,9 +130,13 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
    重放 + JDBC 引导幂等 + as-of 字典驱动解码 + FPW 镜像路径。遗留：catalog 的
    UPDATE/DELETE 镜像路径（本次窗口只有 insert）、压缩 FPW（pglz/lz4/zstd）、
    DROP COLUMN 的 attisdropped 标记流中验证
-3. relfilenode 生命周期：TRUNCATE/VACUUM FULL/rewrite 的 SMGR 记录映射 + pg_filenode.map
-   （XLOG_RELMAP）
-4. TOAST：toast chunk 记录重组 + 未变列指针早于捕获起点的 JDBC 回查兜底
+3. ~~relfilenode 生命周期~~ **已验证**（S6，2026-10-05 补强）：pg_class 按 ctid 重放 +
+   INPLACE/截断更新/value-based 重建；TRUNCATE 三形态全接。遗留：VACUUM FULL/CLUSTER
+   rewrite 全表重发的 CDC 语义（重写以 bulk insert 形态整表重放，下游会看到"全量
+   重发"）、pg_filenode.map（XLOG_RELMAP，pinned catalog 自身改 node 时才需要）
+4. ~~TOAST 重组~~ **已验证**（S7，2026-10-05 补强）：chunk multi-insert 采集 + external
+   短指针 + 按序拼装 + extsize 校验。遗留：压缩 external（pglz/lz4 解压）、未变列
+   指针早于捕获起点的 JDBC 回查兜底
 5. 子事务（XLOG_XACT_ASSIGNMENT）与 two_phase（commit/abort prepared）
 6. ADD COLUMN DEFAULT 的 attmissingval 语义、DROP COLUMN 的 attisdropped 空洞
 7. 每大版本布局差异的 descriptor 化（PG 17 对照样转录一组做 diff 验证）

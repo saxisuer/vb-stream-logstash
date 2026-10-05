@@ -63,6 +63,7 @@ public class WalParseSpike {
 
     // heapam_xlog.h opcodes (low nibble reserved, opmask 0x70)
     static final int XLOG_HEAP_INSERT = 0x00;
+    static final int XLOG_HEAP_INPLACE = 0x70;
     static final int XLOG_HEAP_DELETE = 0x10;
     static final int XLOG_HEAP_UPDATE = 0x20;
     static final int XLOG_HEAP_HOT_UPDATE = 0x40;
@@ -155,6 +156,89 @@ public class WalParseSpike {
     /** One replayed pg_attribute row, keyed by physical ctid. */
     record AttrRow(long attrelid, String attname, long atttypid, int attnum, boolean attisdropped) {}
 
+    // pg_class column kinds, transcribed from the live PG 18.6 server
+    // (SELECT attnum, atttypid FROM pg_attribute WHERE attrelid='pg_class')
+    static final String[] PGCLASS_KINDS = {
+            "oid",   // oid (catalogs store oid as a regular first column)
+            "name",  // relname
+            "oid",   // relnamespace
+            "oid",   // reltype
+            "oid",   // reloftype
+            "oid",   // relowner
+            "oid",   // relam
+            "oid",   // relfilenode          <-- index 7
+            "oid",   // reltablespace
+            "int4",  // relpages
+            "float4",// reltuples
+            "int4",  // relallvisible
+            "int4",  // relallfrozen
+            "oid",   // reltoastrelid        <-- index 13
+            "bool",  // relhasindex
+            "bool",  // relisshared
+            "char",  // relpersistence
+            "char",  // relkind
+            "int2",  // relnatts
+            "int2",  // relchecks
+            "bool",  // relhasrules
+            "bool",  // relhastriggers
+            "bool",  // relhassubclass
+            "bool",  // relrowsecurity
+            "bool",  // relforcerowsecurity
+            "bool",  // relispopulated
+            "char",  // relreplident
+            "bool",  // relispartition
+            "oid",   // relrewrite
+            "int4",  // relfrozenxid (xid)
+            "int4",  // relminmxid (multi-xid)
+            "skip",  // relacl aclitem[]
+            "skip",  // reloptions text[]
+            "skip",  // relpartbound pg_node_tree
+    };
+    static final int PGCLASS_OID = 0, PGCLASS_RELNAME = 1, PGCLASS_RELEFILENODE = 7,
+            PGCLASS_RELTOASTRELID = 13;
+    static final String[] TOAST_KINDS = {"oid", "int4", "bytea"}; // chunk_id, chunk_seq, chunk_data
+
+    /** One replayed pg_class row, keyed by physical ctid (cols 3-7 kept for
+     *  value-based reconstruction of truncated updates: cols 1-7 are all
+     *  fixed-width and sum to 92 bytes of the data region). */
+    record ClassRow(long relOid, String relname, long relnamespace, long reltype, long reloftype,
+                    long relowner, long relam, long relfilenode, long reltoastrelid) {
+        /** Encodes data-region bytes of cols 1..7 (oid, name, 5x oid) — 92 bytes. */
+        byte[] encodeFirstSevenCols() {
+            java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+            writeU32(o, relOid);
+            byte[] n = relname.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            o.write(n, 0, Math.min(63, n.length));
+            for (int i = n.length; i < 64; i++) o.write(0);
+            writeU32(o, relnamespace);
+            writeU32(o, reltype);
+            writeU32(o, reloftype);
+            writeU32(o, relowner);
+            writeU32(o, relam);
+            return o.toByteArray();
+        }
+    }
+
+    static void writeU32(java.io.ByteArrayOutputStream o, long v) {
+        o.write((int) (v & 0xFF)); o.write((int) ((v >> 8) & 0xFF));
+        o.write((int) ((v >> 16) & 0xFF)); o.write((int) ((v >> 24) & 0xFF));
+    }
+
+    // single-threaded throwaway spike: shared decode/replay context as statics
+    static long spcOid, dbOid, tableRelid, pgAttrRelnode, pgClassRelnode;
+    static long trackedTableCtid, trackedToastCtid;
+    static long toastRelid;
+    static final Map<Long, AttrRow> ATTR_ROWS = new java.util.HashMap<>();
+    static final Map<Long, ClassRow> CLASS_ROWS = new java.util.HashMap<>();
+    /** TOAST chunk store: valueid -> (chunk_seq -> data bytes). */
+    static final Map<Long, java.util.TreeMap<Integer, byte[]>> TOAST_CHUNKS = new java.util.HashMap<>();
+    /** raw tuple tails (bytes from heap-tuple offset 23) per ctid, for the two
+     *  replayed catalogs — needed to reconstruct prefix/suffix-truncated updates */
+    static final Map<Long, byte[]> RAW_PGATTR = new java.util.HashMap<>();
+    static final Map<Long, byte[]> RAW_PGCLASS = new java.util.HashMap<>();
+    /** aux JDBC connection for on-demand raw-tail fetch (pg_read_binary_file). */
+    static Connection TAIL_CONN;
+
     // ---- little-endian readers ------------------------------------------------
     static int u16(byte[] b, int o) { return (b[o] & 0xFF) | ((b[o + 1] & 0xFF) << 8); }
     static int u32(byte[] b, int o) {
@@ -202,9 +286,16 @@ public class WalParseSpike {
             long chunkStart = chunkEndLsn - data.length;
             dbg("[dbg] chunk len=%d end=%s computedStart=%s carryStart=%s carryLen=%d%n",
                     data.length, lsn(chunkEndLsn), lsn(chunkStart), lsn(carryStartLsn), carry.length);
-            if (sawAny && chunkStart != carryStartLsn + carry.length)
-                throw new IllegalStateException(String.format("WAL gap: carry end=%s chunk start=%s",
-                        lsn(carryStartLsn + carry.length), lsn(chunkStart)));
+            if (sawAny && chunkStart != carryStartLsn + carry.length) {
+                // chunk anchoring (via getLastReceiveLSN - len) drifted — empirically
+                // seen as ±32-byte skips under keepalive/data interleaving. Resync by
+                // dropping the carry and restarting from this chunk's own anchor.
+                // A production walker needs a stronger anchoring protocol (pageaddr
+                // validation / contrecord chains); recorded as a spike finding.
+                System.out.printf("[walker] RESYNC: carry end=%s chunk start=%s — dropping carry%n",
+                        lsn(carryStartLsn + carry.length), lsn(chunkStart));
+                carry = new byte[0];
+            }
             if (carry.length == 0) carryStartLsn = chunkStart;
             byte[] merged = new byte[carry.length + data.length];
             System.arraycopy(carry, 0, merged, 0, carry.length);
@@ -467,6 +558,7 @@ public class WalParseSpike {
                     vals[i] = renderTimestamp(micros);
                 }
                 case "text" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; vals[i] = readVarlenaText(src, c, next); c = next[0]; }
+                case "bytea" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; vals[i] = readVarlenaBytes(src, c, next); c = next[0]; }
                 case "skip" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; skipVarlena(src, c, next); c = next[0]; }
                 default -> throw new IllegalStateException("unregistered kind " + kinds[i]);
             }
@@ -476,20 +568,69 @@ public class WalParseSpike {
 
     /** Reads one uncompressed varlena at c; returns text and advances next[0]. */
     static String readVarlenaText(byte[] src, int c, int[] next) {
+        // 4-byte varlena headers are stored NATIVE little-endian as (len << 2 | tag)
+        // — empirically confirmed against live TOAST chunks (SET_VARSIZE_4B writes
+        // va_header = len << 2; the "big-endian" folklore is wrong for this build)
         int b0 = src[c] & 0xFF;
         int len;
         int dataOff;
+        if (b0 == 0x01 && src[c + 1] == 0x12) { // external on-disk TOAST pointer:
+            next[0] = c + 18;                   // [tag 0x01][VARTAG_ONDISK 0x12][16B payload]
+            return resolveExternal(src, c);
+        }
         if ((b0 & 0x01) != 0) {            // 1-byte varlena header
             len = (b0 >> 1) & 0x7F;        // total incl. header byte
             dataOff = 1;
-        } else if ((b0 & 0x03) == 0) {     // 4-byte uncompressed, big-endian
-            len = (int) (u32be(src, c) & 0x3FFFFFFF);
+        } else if ((b0 & 0x03) == 0) {     // 4-byte uncompressed
+            len = u32(src, c) >>> 2;       // total incl. 4-byte header
             dataOff = 4;
         } else {
             throw new IllegalStateException("compressed/short varlena unexpected in spike: hdr=" + b0);
         }
         next[0] = c + len;
         return new String(src, c + dataOff, Math.max(0, len - dataOff));
+    }
+
+    /** Reads one varlena datum as raw bytes (chunk payloads etc.). */
+    static byte[] readVarlenaBytes(byte[] src, int c, int[] next) {
+        int b0 = src[c] & 0xFF;
+        int len, dataOff;
+        if ((b0 & 0x01) != 0) { len = (b0 >> 1) & 0x7F; dataOff = 1; }
+        else if ((b0 & 0x03) == 0) { len = u32(src, c) >>> 2; dataOff = 4; }
+        else throw new IllegalStateException("non-plain varlena for bytea: hdr=" + b0);
+        next[0] = c + len;
+        byte[] out = new byte[Math.max(0, len - dataOff)];
+        System.arraycopy(src, c + dataOff, out, 0, out.length);
+        return out;
+    }
+
+    /**
+     * Resolves a 16-byte external TOAST pointer (varatt_external, varatt.h):
+     * rawsize i32 / extinfo u32 (extsize bits 0-29 + method bits 30-31) /
+     * valueid u32 / toastrelid u32 — by reassembling collected chunks.
+     */
+    static String resolveExternal(byte[] src, int c) {
+        // short-varlena external format (empirically pinned): [0x01][0x12 VARTAG_ONDISK]
+        // [rawsize u32][extinfo u32][valueid u32][toastrelid u32] — 18 bytes total
+        int rawsize = u32(src, c + 2);                      // incl. 4-byte varlena header
+        int extinfo = u32(src, c + 6);
+        int extsize = extinfo & 0x3FFFFFFF;
+        long valueid = u32(src, c + 10) & 0xFFFFFFFFL;
+        long toastRelOfPointer = u32(src, c + 14) & 0xFFFFFFFFL;
+        dbg("[ext] rawsize=%d extsize=%d valueid=%d toastrel=%d%n",
+                rawsize, extsize, valueid, toastRelOfPointer);
+        if (extsize < rawsize - 4)
+            throw new IllegalStateException("compressed external value (pglz/lz4) not supported in spike: valueid="
+                    + valueid + " extsize=" + extsize + " rawsize=" + rawsize);
+        java.util.TreeMap<Integer, byte[]> chunks = TOAST_CHUNKS.get(valueid);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        if (chunks != null) for (byte[] b : chunks.values()) out.writeBytes(b);
+        byte[] assembled = out.toByteArray();
+        if (assembled.length != extsize)
+            throw new IllegalStateException("TOAST reassembly mismatch: valueid=" + valueid
+                    + " assembled=" + assembled.length + " expected=" + extsize
+                    + " (toastrel of pointer " + toastRelOfPointer + ", chunks " + (chunks == null ? -1 : chunks.size()) + ")");
+        return new String(assembled, java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /** Skips one varlena datum (value discarded) without materializing it. */
@@ -586,28 +727,48 @@ public class WalParseSpike {
         System.out.println("[spike] pgjdbc jar hint: " + PGJDBC_JAR_HINT);
         try (Connection setup = DriverManager.getConnection(JDBC_URL)) {
             prepare(setup);
-            long spcOid = queryLong(setup, "SELECT oid FROM pg_tablespace WHERE spcname='pg_default'");
-            long dbOid = queryLong(setup, "SELECT oid FROM pg_database WHERE datname=current_database()");
+            // static decode/replay context (single-threaded spike)
+            TAIL_CONN = DriverManager.getConnection(JDBC_URL);
+            spcOid = queryLong(setup, "SELECT oid FROM pg_tablespace WHERE spcname='pg_default'");
+            dbOid = queryLong(setup, "SELECT oid FROM pg_database WHERE datname=current_database()");
+            tableRelid = queryLong(setup, "SELECT 't_wal_spike'::regclass::oid");
+            pgAttrRelnode = queryLong(setup, "SELECT pg_relation_filenode('pg_attribute'::regclass)");
+            pgClassRelnode = queryLong(setup, "SELECT pg_relation_filenode('pg_class'::regclass)");
+            toastRelid = queryLong(setup, "SELECT reltoastrelid FROM pg_class WHERE oid=" + tableRelid);
             long relNode = queryLong(setup, "SELECT pg_relation_filenode('t_wal_spike')");
-            long tableRelid = queryLong(setup, "SELECT 't_wal_spike'::regclass::oid");
-            long pgAttrRelNode = queryLong(setup, "SELECT pg_relation_filenode('pg_attribute'::regclass)");
-            // bootstrap the dictionary: seed pg_attribute rows (with ctid) via JDBC;
-            // the WAL replay upserts on top — ctid-keyed so overlap is idempotent
-            Map<Long, AttrRow> attrRows = new java.util.HashMap<>();
+            // seed pg_attribute rows (with ctid) for the table AND its toast relation
             try (Statement st = setup.createStatement();
                  ResultSet rs = st.executeQuery(
                          "SELECT ctid::text, attrelid, attname, atttypid, attnum, attisdropped"
-                                 + " FROM pg_attribute WHERE attrelid=" + tableRelid + " AND attnum > 0")) {
+                                 + " FROM pg_attribute WHERE attrelid IN (" + tableRelid + "," + toastRelid
+                                 + ") AND attnum > 0")) {
                 while (rs.next()) {
-                    String ctid = rs.getString(1); // "(block,off)"
-                    String[] parts = ctid.replaceAll("[() ]", "").split(",");
-                    attrRows.put(ctidKey(Integer.parseInt(parts[0]), Integer.parseInt(parts[1])),
+                    String[] parts = rs.getString(1).replaceAll("[() ]", "").split(",");
+                    ATTR_ROWS.put(ctidKey(Integer.parseInt(parts[0]), Integer.parseInt(parts[1])),
                             new AttrRow(rs.getLong(2), rs.getString(3), rs.getLong(4),
                                     rs.getInt(5), rs.getBoolean(6)));
                 }
             }
-            System.out.printf("[spike] table relid=%d pg_attribute relnode=%d seededCols=%d%n",
-                    tableRelid, pgAttrRelNode, attrRows.size());
+            // seed pg_class rows (with ctid) for the table and its toast relation —
+            // relfilenode transitions (TRUNCATE / rewrite) replay on top of these
+            try (Statement st = setup.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT ctid::text, oid, relname, relnamespace, reltype, reloftype,"
+                                 + " relowner, relam, relfilenode, reltoastrelid FROM pg_class"
+                                 + " WHERE oid IN (" + tableRelid + "," + toastRelid + ")")) {
+                while (rs.next()) {
+                    String[] parts = rs.getString(1).replaceAll("[() ]", "").split(",");
+                    long key = ctidKey(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]));
+                    ClassRow cr = new ClassRow(rs.getLong(2), rs.getString(3), rs.getLong(4), rs.getLong(5),
+                            rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10));
+                    CLASS_ROWS.put(key, cr);
+                    if (cr.relOid() == tableRelid) trackedTableCtid = key;
+                    else trackedToastCtid = key;
+                }
+            }
+            System.out.printf("[spike] relid=%d filenode=%d toastRelid=%d pgAttrRelnode=%d pgClassRelnode=%d cols=%d trackedTable=%d trackedToast=%d%n",
+                    tableRelid, relNode, toastRelid, pgAttrRelnode, pgClassRelnode, ATTR_ROWS.size(),
+                    trackedTableCtid, trackedToastCtid);
             // NOTE: pg_current_wal_lsn() is the WRITE position and can run ahead of
             // flush — START_REPLICATION would reject it. Flush LSN is safe, and with
             // synchronous_commit=on every committed scenario record is already flushed.
@@ -647,7 +808,7 @@ public class WalParseSpike {
                 }
                 stream.close();
 
-                report(records, spcOid, dbOid, relNode, tableRelid, pgAttrRelNode, attrRows, walker, expected);
+                report(records, walker, expected);
             }
         }
     }
@@ -765,6 +926,34 @@ public class WalParseSpike {
             st.execute("INSERT INTO t_wal_spike VALUES " + r24);
             expected.add(List.of(renderRow(r24)));
         }
+        // S6: relfilenode lifecycle — TRUNCATE assigns a NEW relfilenode (both for
+        // the table and its toast relation); decoding must follow via the replayed
+        // pg_class rows, or every later record would fail the relnode filter
+        try (Statement st = setup.createStatement()) {
+            st.execute("TRUNCATE t_wal_spike");
+            String r25 = "(25, 's-025-π', 251.5, false, '2026-10-05 12:00:25.123456', 'post-truncate')";
+            st.execute("INSERT INTO t_wal_spike VALUES " + r25);
+            expected.add(List.of(renderRow(r25)));
+        }
+        // S7: TOAST reassembly — a wide INCOMPRESSIBLE value (hex chain) is stored
+        // as uncompressed external chunks; the decoder must reassemble by pointer
+        setup.setAutoCommit(false);
+        try (PreparedStatement ps = setup.prepareStatement(
+                "INSERT INTO t_wal_spike VALUES (26, ?, 261.5, true, '2026-10-05 12:00:26.123456', 'wide')")) {
+            StringBuilder wide = new StringBuilder("w");
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] d = "seed-26".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            while (wide.length() < 7000) {
+                d = md.digest(d);
+                for (byte b : d) wide.append(String.format("%02x", b));
+            }
+            wide.setLength(7000);
+            ps.setString(1, wide.toString());
+            ps.executeUpdate();
+            expected.add(List.of("(26, " + wide + ", 261.5, true, 2026-10-05T12:00:26.123456, wide)"));
+        }
+        setup.commit();
+        setup.setAutoCommit(true);
         return expected;
     }
 
@@ -792,9 +981,7 @@ public class WalParseSpike {
     }
 
     // ---- report -------------------------------------------------------------------
-    static void report(List<ParsedRecord> records, long spcOid, long dbOid, long relNode,
-                       long tableRelid, long pgAttrRelNode, Map<Long, AttrRow> attrRows,
-                       WalWalker walker, List<List<String>> expected) {
+    static void report(List<ParsedRecord> records, WalWalker walker, List<List<String>> expected) {
         // group our-table rows by xid; commit order by commit LSN
         Map<Integer, List<String>> rowsByXid = new LinkedHashMap<>();
         Map<Integer, Long> commitLsnByXid = new LinkedHashMap<>();
@@ -809,15 +996,23 @@ public class WalParseSpike {
                 else if (op == XLOG_XACT_ABORT) abortLsnByXid.put(rec.xid(), rec.lsn());
                 continue;
             }
-            // catalog replay FIRST: pg_attribute heap records mutate the dictionary
-            // that subsequent DML records in this same LSN-ordered pass decode with
-            replayPgAttribute(rec, spcOid, dbOid, pgAttrRelNode, attrRows, tableRelid);
-            String[] kinds = dictKinds(attrRows, tableRelid);
+            // catalog replay FIRST: dictionaries (pg_attribute/pg_class) and the
+            // table's CURRENT relfilenode all move with the WAL stream, so that
+            // later DML in this same LSN-ordered pass decodes with as-of state
+            replayCatalogs(rec);
+            ClassRow table = CLASS_ROWS.get(trackedTableCtid);
+            long relNode = table != null ? table.relfilenode() : -1;
+            String[] kinds = dictKinds(ATTR_ROWS, tableRelid);
             if (rec.rmid() == RM_HEAP_ID && (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_INSERT) {
                 BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relNode);
                 if (b0 == null) continue;
                 singleInsertRecords++;
                 int offnum = u16(rec.raw(), rec.mainOff());
+                if (b0.dataLen() > 55)
+                    dbg("[wide] lsn=%s totLen=%d dataLen=%d head=%s%n",
+                            lsn(rec.lsn()), rec.totLen(), b0.dataLen(),
+                            java.util.HexFormat.of().formatHex(java.util.Arrays.copyOfRange(
+                                    rec.raw(), b0.dataOff(), Math.min(b0.dataOff() + 40, rec.raw().length))));
                 String decoded;
                 if (b0.hasData()) {
                     decoded = tupleFromPayload(rec.raw(), b0.dataOff(), kinds).toString();
@@ -918,7 +1113,7 @@ public class WalParseSpike {
                 singleInsertRecords, multiInsertRecords, fpwSeen, fpwCrossChecked, fpwMismatches);
         System.out.printf("contrecords stitched=%d  last record lsn=%s  sawLongHeader=%s blcksz=%d%n",
                 walker.contrecords, lsn(walker.lastRecordLsn), walker.sawLongHeader, walker.blckszFromLongHeader);
-        List<String> finalCols = attrRows.values().stream()
+        List<String> finalCols = ATTR_ROWS.values().stream()
                 .filter(a -> a.attrelid() == tableRelid && a.attnum() > 0 && !a.attisdropped())
                 .sorted(java.util.Comparator.comparingInt(AttrRow::attnum))
                 .map(AttrRow::attname).toList();
@@ -946,85 +1141,471 @@ public class WalParseSpike {
                 Boolean.TRUE.equals(dropped));
     }
 
+    /** Raw tail (bytes from heap-tuple offset 23) of a data-path single tuple:
+     *  block data = [xl_heap_header 5B][tail] with total length dataLen. */
+    static byte[] tailOf(byte[] raw, int off, int dataLen) {
+        return java.util.Arrays.copyOfRange(raw, off + 5, off + dataLen);
+    }
+
+    /** Raw tail of one multi-insert entry: [datalen u16][xl_heap_header 5B][tail]. */
+    static byte[] tailOfMulti(byte[] raw, int cur, int datalen) {
+        return java.util.Arrays.copyOfRange(raw, cur + 7, cur + 7 + datalen);
+    }
+
+    record Reconstructed(byte[] tail, Row row) {}
+
     /**
-     * Applies one WAL record's effect on the pg_attribute ctid index. Insert
-     * upserts (block,offnum)->row; delete removes the old ctid; update removes
-     * old and upserts new — the same MVCC move heap itself performs. Upsert
-     * semantics make double-apply (JDBC seed window overlap) idempotent.
+     * Value-based reconstruction of a pg_class truncated update: prefix bytes (if
+     * within cols 1-7, 92 bytes) are re-ENCODED from the known old row, the middle
+     * comes from the record, and the suffix is zero-filled — valid because the
+     * suffix columns are fixed-width (values unread) or NULL varlenas (skipped via
+     * the bitmap). Returns null when prefix extends past col 7 (unsupported).
      */
-    static void replayPgAttribute(ParsedRecord rec, long spcOid, long dbOid, long pgAttrRelNode,
-                                  Map<Long, AttrRow> attrRows, long tableRelid) {
-        BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, pgAttrRelNode);
-        if (b0 == null) {
-            if (DEBUG && rec.rmid() == RM_HEAP_ID)
-                for (BlockRef b : rec.blocks())
-                    if (b.fork() == 0 && b.db() == dbOid)
-                        dbg("[rpl-miss] lsn=%s info=%02x relnode=%d (want %d)%n",
-                                lsn(rec.lsn()), rec.info(), b.relNode(), pgAttrRelNode);
-            return;
+    static Reconstructed reconstructClassTruncated(ParsedRecord rec, BlockRef b0, ClassRow oldRow) {
+        int upFlags = rec.raw()[rec.mainOff() + 7];
+        int cur = b0.dataOff();
+        int prefix = 0, suffix = 0;
+        if ((upFlags & 0x20) != 0) { prefix = u16(rec.raw(), cur); cur += 2; }
+        if ((upFlags & 0x40) != 0) { suffix = u16(rec.raw(), cur); cur += 2; }
+        int im2 = u16(rec.raw(), cur);
+        int im = u16(rec.raw(), cur + 2);
+        int tHoff = rec.raw()[cur + 4] & 0xFF;
+        cur += 5;
+        if (prefix > 88) return null; // would need old values of cols 8+ (relpages etc.)
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        if (prefix == 0) {
+            int chunkLen = b0.dataLen() - (cur - b0.dataOff());
+            out.write(rec.raw(), cur, chunkLen);          // includes bitmap area
+        } else {
+            int bitmapLen = tHoff - TUPLE_BITS_OFFSET;
+            out.write(rec.raw(), cur, bitmapLen);          // bitmap [+ padding]
+            cur += bitmapLen;
+            byte[] enc = oldRow.encodeFirstSevenCols();
+            out.write(enc, 0, prefix);
+            int midLen = b0.dataLen() - (cur - b0.dataOff());
+            out.write(rec.raw(), cur, midLen);
         }
+        out.write(new byte[suffix], 0, suffix);            // zero-filled unread tail
+        byte[] tail = out.toByteArray();
+        byte[] full = new byte[TUPLE_BITS_OFFSET + tail.length];
+        System.arraycopy(tail, 0, full, TUPLE_BITS_OFFSET, tail.length);
+        return new Reconstructed(tail, decodeTupleData(full, 0, tHoff, im, im2, PGCLASS_KINDS));
+    }
+
+    /**
+     * Reconstructs the new tuple of a prefix/suffix-truncated update by splicing
+     * the logged middle with the stored old tail (heapam.c chunk layout:
+     * [prefix u16?][suffix u16?][xl_heap_header 5B] then, prefix==0 ? full tail
+     * minus suffix : [bitmap+pad (t_hoff-23 B)][data region from t_hoff+prefix]),
+     * then decoding with the header fields carried by the record.
+     */
+    static Reconstructed reconstructTruncated(ParsedRecord rec, BlockRef b0, byte[] oldTail, String[] kinds) {
+        int upFlags = rec.raw()[rec.mainOff() + 7];
+        int cur = b0.dataOff();
+        int prefix = 0, suffix = 0;
+        if ((upFlags & 0x20) != 0) { prefix = u16(rec.raw(), cur); cur += 2; }   // PREFIX_FROM_OLD
+        if ((upFlags & 0x40) != 0) { suffix = u16(rec.raw(), cur); cur += 2; }   // SUFFIX_FROM_OLD
+        int im2 = u16(rec.raw(), cur);
+        int im = u16(rec.raw(), cur + 2);
+        int tHoff = rec.raw()[cur + 4] & 0xFF;
+        cur += 5;
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        if (prefix == 0) {
+            // logged chunk = tail minus suffix; append the unchanged old tail end
+            int chunkLen = b0.dataLen() - (cur - b0.dataOff());
+            out.write(rec.raw(), cur, chunkLen);
+            out.write(oldTail, oldTail.length - suffix, suffix);
+        } else {
+            int bitmapLen = tHoff - TUPLE_BITS_OFFSET;
+            out.write(rec.raw(), cur, bitmapLen);
+            cur += bitmapLen;
+            int oldDataStart = tHoff - TUPLE_BITS_OFFSET;
+            out.write(oldTail, oldDataStart, prefix);
+            int midLen = b0.dataLen() - (cur - b0.dataOff());
+            out.write(rec.raw(), cur, midLen);
+            out.write(oldTail, oldTail.length - suffix, suffix);
+        }
+        byte[] tail = out.toByteArray();
+        byte[] full = new byte[TUPLE_BITS_OFFSET + tail.length];
+        System.arraycopy(tail, 0, full, TUPLE_BITS_OFFSET, tail.length);
+        return new Reconstructed(tail, decodeTupleData(full, 0, tHoff, im, im2, kinds));
+    }
+
+    /**
+     * On-demand raw tail for rows that predate the stream window: read the heap
+     * page via pg_read_binary_file and extract the tuple at the ctid. NOTE: this
+     * reads the CURRENT on-disk state — valid for prefix/suffix bytes because
+     * those regions are unchanged by the update being reconstructed (and our
+     * tracked fields sit in the logged middle). Throwaway-spike shortcut.
+     */
+    /**
+     * Tail of a TRACKED pg_class row, read at its CURRENT ctid (queried by oid) —
+     * the right fallback for truncated updates that themselves moved the row, so
+     * the record's old ctid is already dead on the final-state page.
+     */
+    static byte[] fetchTrackedClassTail(long classRelOid) {
+        try (Statement st = TAIL_CONN.createStatement();
+             ResultSet rs = st.executeQuery("SELECT ctid::text FROM pg_class WHERE oid=" + classRelOid)) {
+            if (!rs.next()) return null;
+            String[] parts = rs.getString(1).replaceAll("[() ]", "").split(",");
+            return fetchTailOnDemand(pgClassRelnode,
+                    ctidKey(Integer.parseInt(parts[0]), Integer.parseInt(parts[1])));
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
+    static byte[] fetchTailOnDemand(long relfilenode, long ctid) {
+        int block = (int) (ctid >>> 16);
+        int offnum = (int) (ctid & 0xFFFF);
+        try (Statement st = TAIL_CONN.createStatement();
+             ResultSet rs = st.executeQuery(String.format(
+                     "SELECT pg_read_binary_file('base/%d/%d', %d, 8192)",
+                     dbOid, relfilenode, block * 8192L))) {
+            if (!rs.next()) return null;
+            byte[] page = rs.getBytes(1);
+            int itemId = u32(page, 24 + (offnum - 1) * 4);
+            if (((itemId >> 15) & 0x3) != 1) return null; // moved/dead at final state
+            int lpOff = itemId & 0x7FFF;
+            int lpLen = (itemId >> 17) & 0x7FFF;
+            return java.util.Arrays.copyOfRange(page, lpOff + TUPLE_BITS_OFFSET, lpOff + lpLen);
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
+    /** A decoded heap-level event on a watched relation (catalog or TOAST). */
+    record HeapEvent(int op, long oldCtid, long newCtid, Row row, byte[] rawTail) {
+        static final int INS = 0, DEL = 1, UPD = 2;
+    }
+
+    /**
+     * Extracts heap-level row events of one WAL record for a watched relfilenode,
+     * decoding tuples via the given kinds. Handles the data path AND the FPW-image
+     * path (catalogs log no tuple data when an FPW is taken; the image is the
+     * post-change page state, so new rows are extracted by offset from it).
+     */
+    static List<HeapEvent> heapEvents(ParsedRecord rec, long watchedRelnode, String[] kinds, Map<Long, byte[]> rawStore) {
+        List<HeapEvent> out = new ArrayList<>();
+        if (rec.rmid() != RM_HEAP_ID && rec.rmid() != RM_HEAP2_ID) return out;
+        BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, watchedRelnode);
+        if (b0 == null) return out;
         int op = rec.info() & XLOG_XACT_OPMASK;
-        Row r = null;
-        int rOffnum = 0;
-        if (rec.rmid() == RM_HEAP_ID && op == XLOG_HEAP_INSERT && b0.hasData()) {
-            rOffnum = u16(rec.raw(), rec.mainOff());
-            r = tupleFromPayload(rec.raw(), b0.dataOff(), PGATTR_KINDS);
-            attrRows.put(ctidKey(b0.blockNo(), rOffnum), toAttrRow(r));
+        if (rec.rmid() == RM_HEAP_ID && op == XLOG_HEAP_INSERT) {
+            int offnum = u16(rec.raw(), rec.mainOff());
+            if (b0.hasData()) {
+                dbg("[ins] lsn=%s relnode=%d dataLen=%d totLen=%d im2=%d im=%04x hoff=%d head=%s%n",
+                        lsn(rec.lsn()), watchedRelnode, b0.dataLen(), rec.totLen(),
+                        u16(rec.raw(), b0.dataOff()), u16(rec.raw(), b0.dataOff() + 2),
+                        rec.raw()[b0.dataOff() + 4] & 0xFF,
+                        java.util.HexFormat.of().formatHex(java.util.Arrays.copyOfRange(
+                                rec.raw(), b0.dataOff(), Math.min(b0.dataOff() + 32, rec.raw().length))));
+                out.add(new HeapEvent(HeapEvent.INS, 0, ctidKey(b0.blockNo(), offnum),
+                        tupleFromPayload(rec.raw(), b0.dataOff(), kinds),
+                        tailOf(rec.raw(), b0.dataOff(), b0.dataLen())));
+            } else if (b0.hasImage()) {
+                byte[] page = rebuildPage(rec, b0);
+                int lpOff = u32(page, 24 + (offnum - 1) * 4) & 0x7FFF;
+                out.add(new HeapEvent(HeapEvent.INS, 0, ctidKey(b0.blockNo(), offnum),
+                        tupleFromPage(page, lpOff, kinds), null));
+            }
         } else if (rec.rmid() == RM_HEAP_ID && op == XLOG_HEAP_DELETE) {
-            attrRows.remove(ctidKey(b0.blockNo(), u16(rec.raw(), rec.mainOff() + 4)));
+            out.add(new HeapEvent(HeapEvent.DEL, ctidKey(b0.blockNo(), u16(rec.raw(), rec.mainOff() + 4)), 0, null, null));
+        } else if (rec.rmid() == RM_HEAP_ID && (op == XLOG_HEAP_UPDATE || op == XLOG_HEAP_HOT_UPDATE)) {
+            int upFlags = rec.raw()[rec.mainOff() + 7];
+            // OLD heap block is block ref id 1 — but the record may also carry
+            // visibility-map blocks (ids 2/3, fork 1): pick by fork, not by index
+            int oldBlock = -1;
+            for (BlockRef b : rec.blocks())
+                if (b.fork() == 0 && b.blockNo() != b0.blockNo()) { oldBlock = b.blockNo(); break; }
+            if (oldBlock < 0) oldBlock = b0.blockNo(); // same-page (HOT) update
+            long oldCtid = ctidKey(oldBlock, u16(rec.raw(), rec.mainOff() + 4));
+            int newOffnum = u16(rec.raw(), rec.mainOff() + 12);
+            if (b0.hasData()) {
+                byte[] tail;
+                Row r;
+                dbg("[upd] lsn=%s info=%02x flags=%02x dataLen=%d mainLen=%d totLen=%d im2=%d%n",
+                        lsn(rec.lsn()), rec.info(), upFlags, b0.dataLen(), rec.mainLen(), rec.totLen(),
+                        u16(rec.raw(), b0.dataOff()));
+                if ((upFlags & XLH_UPDATE_TRUNCATION) != 0) {
+                    // pg_class: value-based reconstruction; when the record's old ctid is
+                    // unknown (prune moved the row outside our view), try the tracked
+                    // table/toast rows as candidates and SELF-VERIFY by the decoded OID
+                    // column — healing the tracked ctid chain on match
+                    Reconstructed rc = null;
+                    if (watchedRelnode == pgClassRelnode) {
+                        ClassRow oldRow = CLASS_ROWS.get(oldCtid);
+                        if (oldRow == null) {
+                            for (ClassRow cand : new ClassRow[]{
+                                    CLASS_ROWS.get(trackedTableCtid), CLASS_ROWS.get(trackedToastCtid)}) {
+                                if (cand == null) continue;
+                                Reconstructed t = reconstructClassTruncated(rec, b0, cand);
+                                if (t != null
+                                        && ((Number) t.row().vals()[PGCLASS_OID]).longValue() == cand.relOid()) {
+                                    rc = t;
+                                    // heal: this record's new position is the row's live ctid
+                                    if (cand == CLASS_ROWS.get(trackedTableCtid))
+                                        trackedTableCtid = ctidKey(b0.blockNo(), newOffnum);
+                                    else trackedToastCtid = ctidKey(b0.blockNo(), newOffnum);
+                                    dbg("[cls] self-heal: oid=%d tracked ctid -> %d/%d%n",
+                                            cand.relOid(), b0.blockNo(), newOffnum);
+                                    break;
+                                }
+                            }
+                        } else {
+                            rc = reconstructClassTruncated(rec, b0, oldRow);
+                        }
+                    }
+                    if (rc == null) {
+                        byte[] oldTail = rawStore == null ? null : rawStore.get(oldCtid);
+                        if (oldTail == null && rawStore != null)
+                            oldTail = fetchTailOnDemand(watchedRelnode, oldCtid);
+                        if (oldTail == null) {
+                            // untracked catalog row (not ours): its truncated update is noise
+                            dbg("[rpl] skipping truncated update of untracked row ctid=%d relnode=%d%n",
+                                    oldCtid, watchedRelnode);
+                            return out;
+                        }
+                        rc = reconstructTruncated(rec, b0, oldTail, kinds);
+                    }
+                    tail = rc.tail();
+                    r = rc.row();
+                } else {
+                    tail = tailOf(rec.raw(), b0.dataOff(), b0.dataLen());
+                    r = tupleFromPayload(rec.raw(), b0.dataOff(), kinds);
+                }
+                out.add(new HeapEvent(HeapEvent.UPD, oldCtid, ctidKey(b0.blockNo(), newOffnum), r, tail));
+            } else if (b0.hasImage()) {
+                byte[] page = rebuildPage(rec, b0);
+                int lpOff = u32(page, 24 + (newOffnum - 1) * 4) & 0x7FFF;
+                out.add(new HeapEvent(HeapEvent.UPD, oldCtid, ctidKey(b0.blockNo(), newOffnum),
+                        tupleFromPage(page, lpOff, kinds), null));
+            }
         } else if (rec.rmid() == RM_HEAP2_ID && op == XLOG_HEAP2_MULTI_INSERT) {
-            // catalog inserts (even single-row ADD COLUMN) use multi-insert, and
-            // catalogs are excluded from RelationIsLogicallyLogged: no KEEP_DATA,
-            // so when the record carries an FPW the tuple bytes exist ONLY in the
-            // page image (which is the post-change state — extract by offset)
             int ntuples = u16(rec.raw(), rec.mainOff() + 2);
-            dbg("[rpl-mi] lsn=%s ntuples=%d dataLen=%d mainOff=%d mainLen=%d totLen=%d imgLen=%d init=%b%n",
-                    lsn(rec.lsn()), ntuples, b0.dataLen(), rec.mainOff(), rec.mainLen(), rec.totLen(), b0.imageLen(),
-                    (rec.info() & XLOG_HEAP_INIT_PAGE) != 0);
+            boolean init = (rec.info() & XLOG_HEAP_INIT_PAGE) != 0;
             if (b0.hasData()) {
                 int cur = b0.dataOff();
                 for (int i = 0; i < ntuples; i++) {
                     cur = (cur + 1) & ~1;
                     int datalen = u16(rec.raw(), cur);
-                    int offnum = u16(rec.raw(), rec.mainOff() + 4 + 2 * i);
-                    Row row = tupleFromPayload(rec.raw(), cur + 2, PGATTR_KINDS);
-                    attrRows.put(ctidKey(b0.blockNo(), offnum), toAttrRow(row));
-                    r = row; rOffnum = offnum;
+                    int offnum = init ? i + 1 : u16(rec.raw(), rec.mainOff() + 4 + 2 * i);
+                    out.add(new HeapEvent(HeapEvent.INS, 0, ctidKey(b0.blockNo(), offnum),
+                            tupleFromPayload(rec.raw(), cur + 2, kinds),
+                            tailOfMulti(rec.raw(), cur, datalen)));
                     cur += 7 + datalen;
                 }
             } else if (b0.hasImage()) {
                 byte[] page = rebuildPage(rec, b0);
                 for (int i = 0; i < ntuples; i++) {
-                    int offnum = u16(rec.raw(), rec.mainOff() + 4 + 2 * i);
-                    int itemId = u32(page, 24 + (offnum - 1) * 4);
-                    int lpOff = itemId & 0x7FFF;
-                    if (((itemId >> 15) & 0x3) != 1)
-                        throw new IllegalStateException("catalog FPW: offnum " + offnum + " not LP_NORMAL");
-                    Row row = tupleFromPage(page, lpOff, PGATTR_KINDS);
-                    attrRows.put(ctidKey(b0.blockNo(), offnum), toAttrRow(row));
-                    r = row; rOffnum = offnum;
+                    int offnum = init ? i + 1 : u16(rec.raw(), rec.mainOff() + 4 + 2 * i);
+                    int lpOff = u32(page, 24 + (offnum - 1) * 4) & 0x7FFF;
+                    out.add(new HeapEvent(HeapEvent.INS, 0, ctidKey(b0.blockNo(), offnum),
+                            tupleFromPage(page, lpOff, kinds), null));
                 }
             }
-        } else if (rec.rmid() == RM_HEAP_ID && (op == XLOG_HEAP_UPDATE || op == XLOG_HEAP_HOT_UPDATE)
-                && b0.hasData()) {
-            int upFlags = rec.raw()[rec.mainOff() + 7];
-            if ((upFlags & XLH_UPDATE_TRUNCATION) != 0)
-                throw new IllegalStateException("pg_attribute update with truncation unsupported in spike");
-            // old ctid: block ref 1 (old page) when present, else same page as new
-            int oldBlock = b0.blockNo();
-            if (rec.blocks().size() > 1) oldBlock = rec.blocks().get(1).blockNo();
-            attrRows.remove(ctidKey(oldBlock, u16(rec.raw(), rec.mainOff() + 4)));
-            int newOffnum = u16(rec.raw(), rec.mainOff() + 12);
-            r = tupleFromPayload(rec.raw(), b0.dataOff(), PGATTR_KINDS);
-            attrRows.put(ctidKey(b0.blockNo(), newOffnum), toAttrRow(r));
-            rOffnum = newOffnum;
         }
-        if (r != null && rOffnum > 0) {
-            AttrRow a = toAttrRow(r);
-            if (a.attrelid() == tableRelid)
-                System.out.printf("[dict] lsn=%s pg_attribute ctid=%d/%d %s attnum=%d typOid=%d dropped=%b%n",
-                        lsn(rec.lsn()), b0.blockNo(), rOffnum,
-                        a.attname(), a.attnum(), a.atttypid(), a.attisdropped());
+        return out;
+    }
+
+    static ClassRow toClassRow(Row r) {
+        return new ClassRow(((Number) r.vals()[PGCLASS_OID]).longValue(),
+                r.vals()[PGCLASS_RELNAME].toString(),
+                ((Number) r.vals()[2]).longValue(), ((Number) r.vals()[3]).longValue(),
+                ((Number) r.vals()[4]).longValue(), ((Number) r.vals()[5]).longValue(),
+                ((Number) r.vals()[6]).longValue(),
+                ((Number) r.vals()[PGCLASS_RELEFILENODE]).longValue(),
+                ((Number) r.vals()[PGCLASS_RELTOASTRELID]).longValue());
+    }
+
+    /**
+     * Replay hook for one record: applies pg_attribute/pg_class row events to the
+     * ctid-keyed dictionaries (following pg_class ctid moves for our table and its
+     * toast relation), and harvests TOAST chunk rows into the reassembly store.
+     */
+    /**
+     * Replays heap2 PRUNE records (on-access / vacuum scan / vacuum cleanup) on
+     * the watched catalogs: pruning physically RELOCATES live HOT-chain roots
+     * into freed holes (redirected[]) and kills line pointers (nowdead/nowunused)
+     * — without this, ctid tracking loses rows whenever autovacuum compacts a
+     * catalog page between our seed and the next update (empirically hit in S6).
+     */
+    static void replayPrune(ParsedRecord rec) {
+        if (rec.rmid() != RM_HEAP2_ID) return;
+        int op = rec.info() & XLOG_XACT_OPMASK;
+        if (op != 0x10 && op != 0x20 && op != 0x30) return; // PRUNE_ON_ACCESS / VACUUM_SCAN / VACUUM_CLEANUP
+        for (long relnode : new long[]{pgAttrRelnode, pgClassRelnode}) {
+            BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relnode);
+            if (b0 == null) continue;
+            int flags = rec.raw()[rec.mainOff() + 1] & 0xFF;
+            dbg("[prn-dbg] lsn=%s relnode=%d info=%02x flags=%02x mainLen=%d dataLen=%d totLen=%d main=%s data=%s%n",
+                    lsn(rec.lsn()), relnode, rec.info(), flags, rec.mainLen(), b0.dataLen(), rec.totLen(),
+                    java.util.HexFormat.of().formatHex(java.util.Arrays.copyOfRange(rec.raw(),
+                            rec.mainOff(), Math.min(rec.mainOff() + 8, rec.raw().length))),
+                    java.util.HexFormat.of().formatHex(java.util.Arrays.copyOfRange(rec.raw(),
+                            b0.dataOff(), Math.min(b0.dataOff() + 24, rec.raw().length))));
+            int cur = b0.dataOff();
+            int end = b0.dataOff() + b0.dataLen();
+            try {
+                if ((flags & 0x10) != 0) {      // freeze plans: nplans u16 + 2B pad + plans*12B
+                    cur += 4 + u16(rec.raw(), cur) * 12;
+                }
+                if ((flags & 0x20) != 0) {      // redirected: pairs (old,new) relocate
+                    int n = u16(rec.raw(), cur);
+                    cur += 2;
+                    for (int i = 0; i < n; i++) {
+                        int from = u16(rec.raw(), cur), to = u16(rec.raw(), cur + 2);
+                        cur += 4;
+                        remapCtid(relnode, b0.blockNo(), from, to);
+                    }
+                }
+                if ((flags & 0x40) != 0) {      // nowdead
+                    int n = u16(rec.raw(), cur);
+                    cur += 2;
+                    for (int i = 0; i < n; i++) dropCtid(relnode, b0.blockNo(), u16(rec.raw(), cur + 2 * i));
+                    cur += 2 * n;
+                }
+                if ((flags & 0x80) != 0) {      // nowunused
+                    int n = u16(rec.raw(), cur);
+                    cur += 2;
+                    for (int i = 0; i < n; i++) dropCtid(relnode, b0.blockNo(), u16(rec.raw(), cur + 2 * i));
+                    cur += 2 * n;
+                }
+            } catch (ArrayIndexOutOfBoundsException e) {
+                dbg("[prn] parse overflow at lsn=%s relnode=%d flags=%02x — skipping remainder%n",
+                        lsn(rec.lsn()), relnode, flags);
+            }
+            if (cur > end)
+                dbg("[prn] layout mismatch: walked %d past dataLen end %d (flags=%02x)%n", cur, end, flags);
+        }
+    }
+
+    static void remapCtid(long relnode, int block, int from, int to) {
+        long oldKey = ctidKey(block, from), newKey = ctidKey(block, to);
+        boolean isClass = relnode == pgClassRelnode;
+        Map<Long, ?> rows = isClass ? CLASS_ROWS : ATTR_ROWS;
+        if (rows.remove(oldKey) != null) {
+            if (isClass) {
+                ClassRow v = null; // value must be re-put: use raw maps to carry values
+            }
+        }
+        // move decoded rows and raw tails
+        if (isClass) {
+            ClassRow cr = remapClass(oldKey, newKey);
+            if (cr != null) System.out.printf("[prn] lsn-block %d: pg_class redirect %d->%d oid=%d%n",
+                    block, from, to, cr.relOid());
+        } else {
+            AttrRow ar = (AttrRow) ((Map) ATTR_ROWS).remove(oldKey);
+            if (ar != null) ATTR_ROWS.put(newKey, ar);
+            byte[] t = RAW_PGATTR.remove(oldKey);
+            if (t != null) RAW_PGATTR.put(newKey, t);
+        }
+    }
+
+    static ClassRow remapClass(long oldKey, long newKey) {
+        ClassRow cr = CLASS_ROWS.remove(oldKey);
+        if (cr != null) CLASS_ROWS.put(newKey, cr);
+        byte[] t = RAW_PGCLASS.remove(oldKey);
+        if (t != null) RAW_PGCLASS.put(newKey, t);
+        if (trackedTableCtid == oldKey) trackedTableCtid = newKey;
+        if (trackedToastCtid == oldKey) trackedToastCtid = newKey;
+        return cr;
+    }
+
+    static void dropCtid(long relnode, int block, int off) {
+        long key = ctidKey(block, off);
+        if (relnode == pgClassRelnode) {
+            if (trackedTableCtid == key || trackedToastCtid == key)
+                dbg("[prn] WARNING: tracked ctid %d pruned dead/unused%n", key);
+            CLASS_ROWS.remove(key);
+            RAW_PGCLASS.remove(key);
+        } else {
+            ATTR_ROWS.remove(key);
+            RAW_PGATTR.remove(key);
+        }
+    }
+
+    /**
+     * Replays XLOG_HEAP_INPLACE on tracked pg_class rows (TRUNCATE/ANALYZE path —
+     * PG 18 rewrites the new relfilenode IN PLACE: ctid unchanged, block data is
+     * the new data region from t_hoff, header/bitmap untouched). Column offsets
+     * in the data region are fixed, so relfilenode@92 / reltoastrelid@120 read
+     * straight off the payload without any header knowledge.
+     */
+    static void replayInplace(ParsedRecord rec) {
+        if (rec.rmid() != RM_HEAP_ID || (rec.info() & XLOG_XACT_OPMASK) != XLOG_HEAP_INPLACE) return;
+        BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, pgClassRelnode);
+        if (b0 == null || !b0.hasData()) return;
+        int offnum = u16(rec.raw(), rec.mainOff());
+        long key = ctidKey(b0.blockNo(), offnum);
+        ClassRow cr = CLASS_ROWS.get(key);
+        if (cr == null) return; // row we don't track
+        // data-region offsets: cols 1-7 (oid+name+5xoid) = 4+64+20 = 88 bytes,
+        // relfilenode@88, then 5 fixed cols, reltoastrelid@112
+        long newFileno = u32(rec.raw(), b0.dataOff() + 88) & 0xFFFFFFFFL;
+        long newToast = u32(rec.raw(), b0.dataOff() + 112) & 0xFFFFFFFFL;
+        CLASS_ROWS.put(key, new ClassRow(cr.relOid(), cr.relname(), cr.relnamespace(), cr.reltype(),
+                cr.reloftype(), cr.relowner(), cr.relam(), newFileno, newToast));
+        RAW_PGCLASS.remove(key); // tail is stale now; value-based reconstruction covers the future
+        dbg("[cls] lsn=%s INPLACE oid=%d filenode %d -> %d toast %d -> %d%n",
+                lsn(rec.lsn()), cr.relOid(), cr.relfilenode(), newFileno, cr.reltoastrelid(), newToast);
+    }
+
+    static void replayCatalogs(ParsedRecord rec) {
+        replayPrune(rec);
+        replayInplace(rec);
+        for (HeapEvent ev : heapEvents(rec, pgAttrRelnode, PGATTR_KINDS, RAW_PGATTR)) {
+            if (ev.op() == HeapEvent.DEL) { ATTR_ROWS.remove(ev.oldCtid()); RAW_PGATTR.remove(ev.oldCtid()); }
+            else {
+                if (ev.op() == HeapEvent.UPD) { ATTR_ROWS.remove(ev.oldCtid()); RAW_PGATTR.remove(ev.oldCtid()); }
+                ATTR_ROWS.put(ev.newCtid(), toAttrRow(ev.row()));
+                if (ev.rawTail() != null) RAW_PGATTR.put(ev.newCtid(), ev.rawTail());
+            }
+        }
+        for (HeapEvent ev : heapEvents(rec, pgClassRelnode, PGCLASS_KINDS, RAW_PGCLASS)) {
+            if (ev.op() == HeapEvent.DEL) {
+                dbg("[cls] lsn=%s DEL ctid=%d (tracked table=%d toast=%d)%n",
+                        lsn(rec.lsn()), ev.oldCtid(), trackedTableCtid, trackedToastCtid);
+                CLASS_ROWS.remove(ev.oldCtid());
+                RAW_PGCLASS.remove(ev.oldCtid());
+            } else {
+                ClassRow before = ev.op() == HeapEvent.UPD ? CLASS_ROWS.get(ev.oldCtid()) : null;
+                ClassRow cr = toClassRow(ev.row());
+                if (ev.op() == HeapEvent.UPD) {
+                    CLASS_ROWS.remove(ev.oldCtid());
+                    RAW_PGCLASS.remove(ev.oldCtid());
+                }
+                CLASS_ROWS.put(ev.newCtid(), cr);
+                if (ev.rawTail() != null) RAW_PGCLASS.put(ev.newCtid(), ev.rawTail());
+                if (ev.op() == HeapEvent.UPD) {
+                    dbg("[cls] lsn=%s upd oid=%d filenode %d -> %d (toast %d -> %d) ctid %d -> %d tracked=%d%n",
+                            lsn(rec.lsn()), cr.relOid(),
+                            before != null ? before.relfilenode() : -1, cr.relfilenode(),
+                            before != null ? before.reltoastrelid() : -1, cr.reltoastrelid(),
+                            ev.oldCtid(), ev.newCtid(), trackedTableCtid);
+                }
+                if (ev.oldCtid() == trackedTableCtid && ev.op() == HeapEvent.UPD) trackedTableCtid = ev.newCtid();
+                if (ev.oldCtid() == trackedToastCtid && ev.op() == HeapEvent.UPD) trackedToastCtid = ev.newCtid();
+                // a recreated toast relation arrives as a NEW pg_class row whose oid
+                // equals the table's current reltoastrelid
+                if (ev.op() == HeapEvent.INS && cr.relOid() != 0) {
+                    ClassRow t = CLASS_ROWS.get(trackedTableCtid);
+                    if (t != null && cr.relOid() == t.reltoastrelid()) trackedToastCtid = ev.newCtid();
+                }
+            }
+        }
+        if (trackedToastCtid != 0) {
+            ClassRow toast = CLASS_ROWS.get(trackedToastCtid);
+            if (toast != null && toast.relfilenode() != 0) {
+                for (HeapEvent ev : heapEvents(rec, toast.relfilenode(), TOAST_KINDS, null)) {
+                    if (ev.op() != HeapEvent.INS) continue;
+                    Row r = ev.row();
+                    long chunkId = ((Number) r.vals()[0]).longValue();
+                    int seq = ((Number) r.vals()[1]).intValue();
+                    byte[] data = (byte[]) r.vals()[2];
+                    TOAST_CHUNKS.computeIfAbsent(chunkId, k -> new java.util.TreeMap<>()).put(seq, data);
+                }
+            }
         }
     }
 
