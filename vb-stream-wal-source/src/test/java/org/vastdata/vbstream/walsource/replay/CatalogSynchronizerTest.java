@@ -234,6 +234,47 @@ class CatalogSynchronizerTest {
                 "非数字端口须 fail-fast");
     }
 
+    /**
+     * 用例 8（终审 C1 离线判定）：start 返回的 lsn 作 appliedLsn 种子后，引导窗口
+     * 记录不被过滤线吞掉——种子前沿（= 引导首句 flush LSN / stored lsn，B ≤ 快照
+     * 时点 S）恰为重投递过滤线：记录末尾 ≤ 种子的（种子前重投递）被跳过且前沿不动；
+     * 紧邻其后的首条记录（末尾 &gt; 种子，即 (B,S] 引导窗口内的记录）必须施加。
+     * flush 读取次序的时序本身离线不可测，本用例锚定"种子 lsn 不吞引导窗口记录"的
+     * 语义——若有人把种子化回退成"种子之后再读 flush"的旧形态（B &gt; S，窗口记录
+     * 末尾 ≤ B 被过滤线吞掉），配合 IT 场景即暴露。
+     */
+    @Test
+    void bootstrapSeededFrontierFiltersPreSeedButNotImmediateWindowRecord() {
+        CatalogStores stores = freshStores();
+        long oldKey = CatalogReplay.ctidKey(0, 1);
+        long newKey = CatalogReplay.ctidKey(2, 3);
+        TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
+        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
+        stores.rawClassTails().put(oldKey, tailOf(oldTuple));
+        stores.trackedTableCtid(oldKey);
+
+        // 种子 = start 返回的流起点（引导形态 max(P₀, B)）；一条"种子前"记录（末尾恰=种子）
+        WalRecord preSeed = rec(updateRecord(0, 0, 1, 2, 3, classTuple(100, "stale", 999, 0, 1).payload()), 0x200000L);
+        long seed = endLsn(preSeed);
+        CatalogSynchronizer sync = new CatalogSynchronizer(stores,
+                new CatalogReplay(layout, new TupleDecoder(layout)), seed);
+
+        sync.apply(preSeed);
+        assertEquals(oldKey, stores.trackedTableCtid(), "末尾 ≤ 种子的记录必须被过滤（不施加）");
+        assertEquals("t1", stores.classRows().get(oldKey).relname(), "种子前记录施加会污染种子状态");
+        assertEquals(seed, sync.snapshot().lsn(), "过滤不推进前沿（前沿单调不回退）");
+
+        // 紧邻种子的窗口记录（起点恰 = 种子、末尾 > 种子）——引导窗口 (B,S] 内的形态，必须施加
+        WalRecord window = rec(updateRecord(0, 0, 1, 2, 3, classTuple(100, "t2", 205, 0, 1).payload()), seed);
+        sync.apply(window);
+        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0),
+                stores.classRows().get(newKey), "紧邻种子后的窗口记录必须施加（upsert 幂等消化重叠）");
+        assertEquals(newKey, stores.trackedTableCtid(), "窗口记录施加后 tracked 须随 UPD 移动");
+        assertEquals(endLsn(window), sync.snapshot().lsn());
+        assertEquals(1L, sync.metrics().getOrDefault(CatalogStores.CatalogMetrics.REPLAYED, 0L),
+                "仅窗口记录计入已施加事件");
+    }
+
     // ---- 测试基建：记录拼装（CatalogReplayTest 同源转录，双源互证） ----------------
 
     /**

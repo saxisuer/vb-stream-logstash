@@ -21,10 +21,13 @@ import java.util.List;
  *
  * <p><strong>一致性顺序（调用方契约）</strong>：槽 P₀ 须已由调用方先经
  * {@code PhysicalSlotManager.ensureSlot} 取得（建槽自身的 WAL 写入落在引导快照之前）
- * → 本类在 <strong>REPEATABLE READ 单事务</strong>内执行全部种子查询（首句
- * {@code SET TRANSACTION ISOLATION LEVEL REPEATABLE READ}，两表快照同一时点）→
- * 返回同事务内的 {@code pg_current_wal_flush_lsn()}——调用方以 max(P₀, 返回值)
- * 起流，窗口重叠由 ctid 键控 upsert 幂等消化。</p>
+ * → 本类在 <strong>REPEATABLE READ 单事务</strong>内执行：首句
+ * {@code SET TRANSACTION ISOLATION LEVEL REPEATABLE READ}，<strong>紧随其后的第一句
+ * 读 {@code pg_current_wal_flush_lsn()}（B）——先于任何种子查询</strong>（使 B ≤ 种子
+ * 快照时点 S：快照未建立前读不到"未来"，而种子快照后的提交其 WAL 记录末尾必 &gt; B，
+ * 落进重放窗口），此后两表种子查询共享同一时点快照——调用方以 max(P₀, B) 起流，
+ * (B,S] 窗口重叠按 spec §6① 原意<strong>重放</strong>消化（INS/UPD ctid 键控 upsert
+ * 幂等、截断更新走 ctid 寻址末态采纳收敛——引导后小段自愈 probe 噪声属预期）。</p>
  *
  * <p>种子查询面（spike main 种子段的全表扩展）：pg_attribute 全表取
  * {@code attnum > 0}（裁定与 spike 一致——系统列不进字典面）；pg_class
@@ -73,23 +76,26 @@ public final class CatalogBootstrap {
 
     /**
      * 执行一致性引导：REPEATABLE READ 单事务内灌满两目录全行 + 回填 relfilenode 与
-     * tracked 双 ctid，返回同事务内的 flush LSN。
+     * tracked 双 ctid，返回同事务内<strong>首句读取</strong>的 flush LSN。
      *
      * <p>关键步骤：① 记住并关闭 autoCommit，首句 SET TRANSACTION ISOLATION LEVEL
-     * REPEATABLE READ（此后所有查询共享同一时点快照）；② 回填
+     * REPEATABLE READ；② <strong>紧随其后（任何种子查询之前）读 flush LSN（B）</strong>
+     * ——次序是一致性契约的一部分：B 必须不晚于种子快照时点 S（终审 C1 修复——原
+     * "种子之后再读"形态下 (S,B] 并发提交的 DDL/ANALYZE 效果既不在种子快照、WAL 记录
+     * 又被 appliedLsn 过滤线永久跳过，pg_attribute INSERT 丢失无自愈通道）；③ 回填
      * {@code pg_relation_filenode('pg_attribute'/'pg_class'::regclass)}（块匹配面，
-     * 未引导时重放引擎按 0 不匹配）；③ 两目录全行种子（ctid 文本折键 + 行模型落
-     * 字典）；④ 按 interest oid 定位 tracked 表行位与 toast 行位（v1 tracked 面单表：
-     * 多个命中取最小 oid 并 WARN）；⑤ 同事务内查 flush LSN → commit 复原 autoCommit
-     * → 返回。边界与异常语义：任一 SQLException 走 rollback + 复原 autoCommit 后原样
-     * 上抛（半灌状态不留在 stores——调用方废弃本 stores 重建）；interest oid 查无行
-     * WARN 后跳过（关系尚未创建）。<strong>会话副作用</strong>：本方法临时接管调用方
-     * 会话的事务边界——关闭 autoCommit、置 REPEATABLE READ、结束时 commit——调用方
-     * 在传入连接上若有<strong>未决事务会被一并 commit</strong>（请以干净会话传入）。
-     * 线程约束：装配线程单次调用。</p>
+     * 未引导时重放引擎按 0 不匹配，此后所有种子查询共享同一时点快照）；④ 两目录全行
+     * 种子（ctid 文本折键 + 行模型落字典）；⑤ 按 interest oid 定位 tracked 表行位与
+     * toast 行位（v1 tracked 面单表：多个命中取最小 oid 并 WARN）→ commit 复原
+     * autoCommit → 返回 B。边界与异常语义：任一 SQLException 走 rollback + 复原
+     * autoCommit 后原样上抛（半灌状态不留在 stores——调用方废弃本 stores 重建）；
+     * interest oid 查无行 WARN 后跳过（关系尚未创建）。<strong>会话副作用</strong>：
+     * 本方法临时接管调用方会话的事务边界——关闭 autoCommit、置 REPEATABLE READ、结束
+     * 时 commit——调用方在传入连接上若有<strong>未决事务会被一并 commit</strong>
+     * （请以干净会话传入）。线程约束：装配线程单次调用。</p>
      *
      * @param stores 引导目标状态容器（本方法为首个也是唯一写者）
-     * @return 引导完成时点的 {@code pg_current_wal_flush_lsn()}（打包 long）
+     * @return 事务首句时点的 {@code pg_current_wal_flush_lsn()}（打包 long，≤ 种子快照时点）
      * @throws SQLException 任一种子/位点查询失败
      */
     public long bootstrap(CatalogStores stores) throws SQLException {
@@ -97,14 +103,16 @@ public final class CatalogBootstrap {
         connection.setAutoCommit(false);
         try (Statement tx = connection.createStatement()) {
             tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            // flush LSN 必须先于全部种子查询读取（终审 C1）：保证 B ≤ 种子快照时点 S——
+            // 种子快照后的任何提交其记录末尾必 > B，进重放窗口；(B,S] 重叠由 upsert 幂等消化
+            long flushLsn = currentFlushLsn(tx);
             seedRelfilenodes(stores);
             int attrCount = seedAttrRows(stores);
             int classCount = seedClassRows(stores);
             locateTracked(stores);
-            long flushLsn = currentFlushLsn(tx);
             connection.commit();
             LOG.info("catalog 引导完成 (layout PG{}): pg_attribute {} 行 / pg_class {} 行, pgAttrRelnode={}, pgClassRelnode={},"
-                            + " trackedTable={}, trackedToast={}, 快照 flush LSN={}",
+                            + " trackedTable={}, trackedToast={}, 首句 flush LSN={}（≤ 种子快照时点）",
                     layout.majorVersion(), attrCount, classCount,
                     stores.pgAttrRelfilenode(), stores.pgClassRelfilenode(),
                     stores.trackedTableCtid(), stores.trackedToastCtid(), Lsn.format(flushLsn));
@@ -263,11 +271,12 @@ public final class CatalogBootstrap {
 
     /**
      * 同事务内的当前 flush 位点（write 位点可能领先 flush——START_REPLICATION 起点
-     * 用它会被拒，spike 注记；REPEATABLE READ 不冻结该全局量，返回值 ≥ 种子快照
-     * 时点，多出的窗口重叠由 ctid upsert 幂等消化）。
+     * 用它会被拒，spike 注记；REPEATABLE READ 不冻结该全局量，<strong>必须先于全部
+     * 种子查询调用</strong>——使返回值 B ≤ 种子快照时点 S（种子快照后的提交记录末尾
+     * 必 &gt; B、进重放窗口），(B,S] 窗口重叠由 ctid 键控 upsert 幂等重放消化）。
      *
      * @param tx 事务语句（保证与种子同一事务）
-     * @return flush LSN（打包 long）
+     * @return flush LSN（打包 long，读取时点 ≤ 种子快照时点）
      * @throws SQLException 查询失败
      */
     private static long currentFlushLsn(Statement tx) throws SQLException {

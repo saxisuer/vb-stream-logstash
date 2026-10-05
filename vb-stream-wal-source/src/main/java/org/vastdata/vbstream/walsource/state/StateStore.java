@@ -36,7 +36,8 @@ import java.util.zip.CheckedOutputStream;
  *
  * <p><strong>文件布局（formatVersion=1，大端，DataOutputStream 原生序）</strong>：
  * <pre>
- * header 24B: magic "VBWS" 4B + formatVersion u16 + pgVersion u16（大版本，18）
+ * header 24B: magic "VBWS" 4B + formatVersion u16 + pgVersion u16（大版本，与构造
+ *             入参 layout.majorVersion() 同源——17 写 17、18 写 18，load 校验同源）
  *             + lsn u64 + headerLen u32(=24) + headerCrc32 u32（前 20 字节）
  * body:       attr 表（rowCount u32 + 行[ctid u64 + attrelid u64 + atttypid u64
  *               + attnum u32 + attisdropped u8 + attname u16 前缀 UTF]×n）
@@ -71,9 +72,6 @@ public final class StateStore {
     /** 格式版本（header u16——不符拒载，不回退兼容解读）。 */
     private static final int FORMAT_VERSION = 1;
 
-    /** 服务端大版本（header u16——v1 布局仅 PG 18（WalLayouts 唯一分发 V18），不符拒载）。 */
-    private static final int PG_MAJOR = 18;
-
     /** header 定长 24B（4+2+2+8+4+4——版本演进的前向兼容跳读锚）。 */
     private static final int HEADER_LEN = 24;
 
@@ -86,15 +84,24 @@ public final class StateStore {
     private final Path target;
     private final Path part;
 
+    /** 本存储器绑定的大版本（写 header 与 load 校验同源——17 写 17、18 写 18）。 */
+    private final int pgVersion;
+
     /**
      * 建立指定目录上的检查点存储器（不触碰文件系统——目录与文件按
      * checkpoint/load 时点惰性创建/读取）。
      *
-     * @param dir 检查点所在目录（不存在则 checkpoint 期建目录）
+     * <p>pgVersion 与同步器的 layout 同源传入（终审 I1：原固定 18 常量使 PG 17 写出
+     * 的检查点 header 也记 18——17/18 共用目录或版本切换时错配文件无法被 load 校验
+     * 拒绝）。错配拒载（load 报 pgVersion 不符 → empty）由 caller 回落全新引导。</p>
+     *
+     * @param dir       检查点所在目录（不存在则 checkpoint 期建目录）
+     * @param pgVersion 大版本号（layout.majorVersion()——写与 load 校验同源）
      */
-    public StateStore(Path dir) {
+    public StateStore(Path dir, int pgVersion) {
         this.target = dir.resolve(FILE_NAME);
         this.part = dir.resolve(FILE_NAME + PART_SUFFIX);
+        this.pgVersion = pgVersion;
     }
 
     /**
@@ -183,12 +190,12 @@ public final class StateStore {
      * @return 完整文件字节
      * @throws IOException 序列化失败（内存流上实际不发生）
      */
-    private static byte[] serialize(CatalogStores stores, long lsn) throws IOException {
+    private byte[] serialize(CatalogStores stores, long lsn) throws IOException {
         ByteArrayOutputStream prefixBuf = new ByteArrayOutputStream(HEADER_LEN - 4);
         DataOutputStream prefix = new DataOutputStream(prefixBuf);
         prefix.write(MAGIC);
         prefix.writeShort(FORMAT_VERSION);
-        prefix.writeShort(PG_MAJOR);
+        prefix.writeShort(pgVersion);
         prefix.writeLong(lsn);
         prefix.writeInt(HEADER_LEN);
         prefix.flush();
@@ -296,7 +303,7 @@ public final class StateStore {
      * @return 解出的完整可重建态
      * @throws IOException 任一校验不符或解析期截断（具体原因进异常消息）
      */
-    private static StoredState decode(byte[] bytes) throws IOException {
+    private StoredState decode(byte[] bytes) throws IOException {
         if (bytes.length < HEADER_LEN + FOOTER_LEN) {
             throw new EOFException("文件过短: " + bytes.length + "B");
         }
@@ -317,9 +324,10 @@ public final class StateStore {
         if (formatVersion != FORMAT_VERSION) {
             throw new IOException("formatVersion 不符: " + formatVersion + " 期望 " + FORMAT_VERSION);
         }
-        int pgVersion = in.readUnsignedShort();
-        if (pgVersion != PG_MAJOR) {
-            throw new IOException("pgVersion 不符: " + pgVersion + " 期望 " + PG_MAJOR);
+        int storedPgVersion = in.readUnsignedShort();
+        if (storedPgVersion != pgVersion) {
+            throw new IOException("pgVersion 不符: " + storedPgVersion + " 期望 " + pgVersion
+                    + "（layout 与检查点错配——拒载回落全新引导）");
         }
         long lsn = in.readLong();
         int headerLen = in.readInt();

@@ -43,8 +43,12 @@ import java.util.StringJoiner;
  *
  * <p><strong>装配序（spec §6①）</strong>：① {@link PhysicalSlotManager#ensureSlot} 取
  * P₀（建槽自身的 WAL 先于种子快照落盘）→ ② {@link CatalogBootstrap#bootstrap} 在
- * REPEATABLE READ 单事务内灌满两目录并返回同事务 flush LSN（B）→ ③ 流起点
- * max(P₀, B)（页对齐由接收器内部下取整）——窗口重叠由 ctid 键控 upsert 幂等消化。</p>
+ * REPEATABLE READ 单事务内灌满两目录并返回<strong>事务首句读取</strong>的 flush LSN
+ * （B ≤ 种子快照时点 S，终审 C1）→ ③ 流起点 max(P₀, B)（页对齐由接收器内部下取整）
+ * ——引导路径的过滤线种子取<strong>页对齐流起点</strong>：流交付的重叠段（(B,S] 窗口
+ * + 在途事务跨 B 的记录）按 spec §6① 原意重放消化（ctid 键控 upsert 幂等 + 截断更新
+ * 末态采纳收敛）；续传/forced 路径过滤线仍 = stored/forced lsn（已施加记录二次施加
+ * 非幂等，见 {@link #apply} javadoc）。</p>
  *
  * <p><strong>凭据移交（控制器裁定）</strong>：接收器自建物理复制连接，而 JDBC
  * {@link Connection} 不暴露密码。带凭据重载
@@ -113,6 +117,24 @@ public final class CatalogSynchronizer {
     }
 
     /**
+     * 带前沿种子的纯逻辑缝（离线测试用）：在双参缝之上镜像 {@code startInternal} 的
+     * {@code sync.appliedLsn = start} 种子化——引导路径 start = max(P₀, B)（bootstrap
+     * 返回的首句 flush LSN）、续传路径 start = stored lsn。
+     *
+     * <p>测试锚定语义（终审 C1 离线判定）：种子 lsn 充当 apply 过滤线——记录末尾
+     * ≤ 种子被跳过（重投递窗口过滤），紧邻其后（末尾 &gt; 种子）的首条记录必须施加
+     * ——引导窗口内的记录不被过滤线吞掉。线程约束：构造线程单次调用。</p>
+     *
+     * @param stores         重放状态容器（调用方持有引导/种子责任）
+     * @param replay         重放引擎
+     * @param seedAppliedLsn 已施加前沿种子（start 返回的流起点）
+     */
+    CatalogSynchronizer(CatalogStores stores, CatalogReplay replay, long seedAppliedLsn) {
+        this(stores, replay, null, null, null, null, null);
+        this.appliedLsn = seedAppliedLsn;
+    }
+
+    /**
      * 全参构造（start 组装路径）。
      *
      * @param stores           重放状态容器（已引导或已自检查点恢复）
@@ -163,8 +185,10 @@ public final class CatalogSynchronizer {
      * 注册 0 个合法——纯字典同步形态）；② ensureSlot 得 P₀；③ bootstrap 得种子 +
      * 同事务 flush LSN（B）；④ 接收器连接参数 host/port/db 取引导连接 metadata URL
      * 派生 + 显式 user/password 覆盖；⑤ {@code receiver.start(this::apply, max(P0, B))}
-     * ——页对齐由接收器内取整，sink 在接收线程同步执行；⑥ 已施加前沿种子化为流起点
-     * max(P₀, B)——引导后首条记录施加前 snapshot().lsn() 即引导一致点而非 0。
+     * ——页对齐由接收器内取整，sink 在接收线程同步执行；⑥ 已施加前沿种子化为
+     * <strong>页对齐流起点</strong>（引导路径——过滤线不吞流交付的重叠段，终审 C1；
+     * 续传路径 = stored lsn）——引导后首条记录施加前 snapshot().lsn() 即引导一致点
+     * 而非 0。
      * <strong>自愈接线（Task 13）</strong>：本档构造 {@code new SelfHealer(new JdbcProbeImpl(sql))}
      * 注入重放引擎——截断更新未知 oldCtid 走 ctid 寻址精确采纳（class/attr 两面：
      * 按记录 new 位探测 JDBC 末态行整行采纳，末态回填语义）；
@@ -206,7 +230,9 @@ public final class CatalogSynchronizer {
      * <p><strong>load 失败 / 无文件 → 全新引导</strong>（现路径：bootstrap + max(P₀, B)）。
      * <strong>forcedStartLsn &gt; 0</strong> 时无视上述计算直接以其为流起点（页对齐仍由
      * 接收器下取整）——诊断/丢页注入接缝（IT 模拟跳变用），字典恢复/引导决策不受其
-     * 影响；须落在服务端有效 WAL 区间内（未来位点被 START_REPLICATION 拒绝）。</p>
+     * 影响；<strong>须 ≥ 上述决策起点</strong>（低于 = 对已恢复字典二次施加的错位重放，
+     * 启动期 ISE，终审 M1 守卫）；须落在服务端有效 WAL 区间内（未来位点被
+     * START_REPLICATION 拒绝）。</p>
      *
      * <p><strong>运行中检查点</strong>：接收线程 apply 后按"距上次落盘 &ge;
      * {@code intervalMs} 或新施加 catalog 行事件 &ge; {@code eventsThreshold}（先到为准）"
@@ -277,7 +303,7 @@ public final class CatalogSynchronizer {
         boolean resumed = false;
         long storedLsn = 0;
         if (state != null && state.enabled()) {
-            stateStore = new StateStore(state.dir());
+            stateStore = new StateStore(state.dir(), layout.majorVersion());
             Optional<StoredState> loaded = stateStore.load();
             if (loaded.isPresent() && loaded.get().lsn() >= p0) {
                 loaded.get().restoreInto(stores);
@@ -300,8 +326,17 @@ public final class CatalogSynchronizer {
             long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
             start = Math.max(p0, bootstrapLsn);
         }
+        boolean forced = false;
         if (forcedStartLsn > 0) {
+            if (forcedStartLsn < start) {
+                // 终审 M1 守卫：forcedStartLsn 低于字典一致起点 = 起流点落回字典覆盖窗口
+                // 之前——已恢复（续传/引导）字典会被窗口内记录二次施加，且部分记录类
+                // 二次施加非幂等（见 apply javadoc），宁拒启不错位重放
+                throw new IllegalStateException("forcedStartLsn " + Lsn.format(forcedStartLsn)
+                        + " 低于字典一致起点 " + Lsn.format(start) + "——对已恢复字典二次施加风险，拒绝启动");
+            }
             start = forcedStartLsn;
+            forced = true;
         }
 
         ConnInfo ci = ConnInfo.from(sql).withCredentials(user, password);
@@ -310,9 +345,16 @@ public final class CatalogSynchronizer {
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout), healer), receiver,
                 slotName, state, stateStore, stateStore == null ? null : sql);
-        sync.appliedLsn = start;    // 前沿种子化：续传=stored lsn / 引导=引导一致点——
-                                     // 兼作重投递过滤线（apply 跳过 end <= 前沿的记录, Low-5 泛化:
-                                     // 覆盖续传页对齐多收与断流重连重发两个窗口, 前沿单调不回退）
+        // 前沿种子化（终审 C1 两级语义）——前沿兼作 apply 的重投递过滤线，种子按字典来源分级：
+        // ① 续传/forced：字典已<strong>施加</strong>到 stored/forced lsn——部分记录类二次施加
+        //    非幂等，须在未对齐的 stored/forced lsn 处严格过滤（Low-5 泛化：续传页对齐
+        //    多收 + 断流重连重发 + 丢页注入的 gap 尾页）；② 全新引导：字典来自快照（无任何
+        //    "已施加"记录），过滤线取<strong>页对齐流起点</strong>——流实际交付的重叠段
+        //    （含在途事务跨 B 的记录：INSERT 已 flush ≤ B 而 commit 晚于快照）按 spec §6①
+        //    原意重放消化（INS/UPD ctid upsert 幂等、截断更新走 ctid 寻址末态采纳收敛），
+        //    实测该段不过滤会在引导并发 DDL 下偶发丢 attr 行（终审复测实证）
+        sync.appliedLsn = resumed || forced ? start
+                : start & ~((long) layout.walBlockSize() - 1);
         sync.resumedFromState = resumed;
         if (state != null && state.enabled()) {
             sync.lastCheckpointWallMs = System.currentTimeMillis();
@@ -353,12 +395,14 @@ public final class CatalogSynchronizer {
      * MAXALIGN 末尾（与 walker 记录对齐边界同式）→ {@link #maybeCheckpoint}（先到为
      * 准的节拍判定，未达阈值为 no-op）。边界与异常语义：非 catalog 记录（其它
      * rmgr/关系）为引擎内 no-op，前沿照常推进——位点语义是"已走读"而非"已改字典"；
-     * <strong>重复窗口过滤（Low-5 泛化）</strong>——记录末尾 &le; 已施加前沿的直接跳过，
-     * 统一覆盖两类重投递窗口：① 续传时接收器页对齐下取整多收的检查点前记录（前沿
-     * 种子 = stored lsn）；② 断流重连自 consumedLsn 重发的已施加记录。跳过重放的
-     * 依据是部分记录类二次施加非幂等（截断更新对已被 INPLACE 失效 tail 的旧行做
-     * 值编码重建曾产出部分零字段的行——Task 15 IT 实证），且跳过保证前沿单调不回退。
-     * 线程约束：接收线程单写者。</p>
+     * <strong>重复窗口过滤（Low-5 泛化 + 终审 C1 两级种子）</strong>——记录末尾 &le;
+     * 已施加前沿的直接跳过。前沿种子按字典来源分级：<strong>续传/forced 路径</strong>
+     * 种子 = stored/forced lsn（未对齐）——字典已"施加"到该点，二次施加非幂等（截断
+     * 更新对已被 INPLACE 失效 tail 的旧行做值编码重建曾产出部分零字段的行——Task 15
+     * IT 实证），须严格过滤页对齐多收/重连重发/gap 尾页三类重投递；<strong>全新引导
+     * 路径</strong>种子 = 页对齐流起点——快照字典无"已施加"记录，流交付的重叠段
+     * （含在途事务跨 B 的记录）按 spec §6① 原意重放消化而非过滤。跳过保证前沿单调
+     * 不回退。线程约束：接收线程单写者。</p>
      *
      * @param r 走读完成的记录
      */
@@ -499,6 +543,17 @@ public final class CatalogSynchronizer {
     public WalStreamMetrics streamMetrics() {
         WalStreamReceiver r = receiver;
         return r == null ? null : r.metrics();
+    }
+
+    /**
+     * 接收器终态失败透传面（终审 I2）：接收线程因确定性失败（重连耗尽/解析 ISE）自行
+     * 退出时返回根因，Main/宿主据此 fail-fast；正常停机与运行中/纯逻辑缝为 empty。
+     *
+     * @return 终态根因；无接收器或运行中为 empty
+     */
+    public Optional<Throwable> terminalFailure() {
+        WalStreamReceiver r = receiver;
+        return r == null ? Optional.empty() : r.terminalFailure();
     }
 
     /**
@@ -663,8 +718,9 @@ public final class CatalogSynchronizer {
     private final class SnapshotView implements CatalogSnapshot {
 
         /**
-         * 已施加前沿（start 种子化为流起点 max(P₀, 引导 LSN)，此后 = 最近一次 apply
-         * 完成的记录末尾）——字典内容的 as-of 位点。
+         * 已施加前沿（start 种子化：引导路径 = 页对齐流起点（终审 C1）、续传/forced
+         * 路径 = stored/forced lsn，此后 = 最近一次 apply 完成的记录末尾）——字典
+         * 内容的 as-of 位点。
          *
          * @return 打包 LSN（未 start 的纯逻辑缝实例为 0）
          */

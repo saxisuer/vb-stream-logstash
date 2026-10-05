@@ -25,7 +25,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ②正文中翻一位字节 → 全文件 CRC 拒载 empty；③header formatVersion 改写 → 拒载
  * empty；④只剩 {@code .part} 半成品 → 不 load 且 {@code exists()} 为 false；
  * ⑤连写两次检查点 → 旧检查点被原子替换（load 到第二次内容、无 .part 残留）；
- * ⑥class 表最小行宽形态（relname 空串 ×50）→ 计数防线不误拒（审查修复钉）。
+ * ⑥class 表最小行宽形态（relname 空串 ×50）→ 计数防线不误拒（审查修复钉）；
+ * ⑦pgVersion 参数化（终审 I1）——17 写 17 / 18 写 18，跨版本 load 错配拒载 empty。
  *
  * <p>byte[] tail 值不参与 record equals（数组恒一性），断言经
  * {@link #assertTailsEqual} 手工逐键比较；其余字段用 record/集合 equals。</p>
@@ -49,7 +50,7 @@ class StateStoreTest {
      */
     @Test
     void roundtripPreservesEntireStateAndRestoresIntoFreshStores() throws IOException {
-        StateStore store = new StateStore(dir);
+        StateStore store = new StateStore(dir, 18);
         CatalogStores stores = filledStores();
         store.checkpoint(stores, LSN);
         assertTrue(store.exists(), "checkpoint 后正式检查点应存在");
@@ -90,7 +91,7 @@ class StateStoreTest {
      */
     @Test
     void singleFlippedByteRejectsLoad() throws IOException {
-        StateStore store = new StateStore(dir);
+        StateStore store = new StateStore(dir, 18);
         store.checkpoint(filledStores(), LSN);
         Path file = dir.resolve(FILE_NAME);
         byte[] bytes = Files.readAllBytes(file);
@@ -107,7 +108,7 @@ class StateStoreTest {
      */
     @Test
     void formatVersionMismatchRejectsLoad() throws IOException {
-        StateStore store = new StateStore(dir);
+        StateStore store = new StateStore(dir, 18);
         store.checkpoint(filledStores(), LSN);
         Path file = dir.resolve(FILE_NAME);
         byte[] bytes = Files.readAllBytes(file);
@@ -123,7 +124,7 @@ class StateStoreTest {
      */
     @Test
     void leftoverPartFileIsNeverLoaded() throws IOException {
-        StateStore store = new StateStore(dir);
+        StateStore store = new StateStore(dir, 18);
         store.checkpoint(filledStores(), LSN);
         Path file = dir.resolve(FILE_NAME);
         Files.move(file, dir.resolve(FILE_NAME + ".part"));
@@ -138,7 +139,7 @@ class StateStoreTest {
      */
     @Test
     void repeatedCheckpointAtomicallyReplacesPreviousState() throws IOException {
-        StateStore store = new StateStore(dir);
+        StateStore store = new StateStore(dir, 18);
         CatalogStores first = filledStores();
         store.checkpoint(first, LSN);
 
@@ -166,7 +167,7 @@ class StateStoreTest {
      */
     @Test
     void minimalWidthClassRowsRoundtripWithoutOverStrictGuard() throws IOException {
-        StateStore store = new StateStore(dir);
+        StateStore store = new StateStore(dir, 18);
         CatalogStores stores = new CatalogStores();
         for (int i = 0; i < 50; i++) {
             stores.classRows().put(100L + i, new ClassRow(20000 + i, "", 0, 0, 0, 0, 0, 30000 + i, 0));
@@ -176,6 +177,23 @@ class StateStoreTest {
         Optional<StoredState> loaded = store.load();
         assertTrue(loaded.isPresent(), "最小行宽形态的合法检查点不应被计数防线误拒");
         assertEquals(stores.classRows(), loaded.orElseThrow().classes(), "50 条空 relname 行应 roundtrip 全等");
+    }
+
+    /**
+     * 用例 ⑦（终审 I1）：pgVersion 与构造入参同源——18 存储器写出/读回自洽、17 存储
+     * 器同目录同形态亦自洽（17 写 17、18 写 18），而 17 写出的检查点用 18 存储器 load
+     * 必须拒载 empty（错配拒载——caller 回落全新引导），反之亦然。修复前 pgVersion
+     * 恒写 18：17 侧写出的检查点 header 记 18，版本切换后错配文件无法被校验拒绝。
+     */
+    @Test
+    void pgVersionIsParameterizedAndMismatchedVersionRejectsLoad() throws IOException {
+        new StateStore(dir, 18).checkpoint(filledStores(), LSN);
+        assertTrue(new StateStore(dir, 18).load().isPresent(), "同版本（18）load 应自洽");
+        assertTrue(new StateStore(dir, 17).load().isEmpty(), "18 写出的检查点用 17 存储器 load 应拒载 empty");
+
+        new StateStore(dir, 17).checkpoint(filledStores(), LSN);
+        assertTrue(new StateStore(dir, 17).load().isPresent(), "同版本（17）load 应自洽——17 写 17");
+        assertTrue(new StateStore(dir, 18).load().isEmpty(), "17 写出的检查点用 18 存储器 load 应拒载 empty");
     }
 
     /**

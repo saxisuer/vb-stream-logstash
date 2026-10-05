@@ -32,7 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 生命周期 IT（Task 15，spec §8 生命周期行）——检查点续传 / 损坏回落全新引导 /
- * 位点不回退 / 丢页跳变自愈四形态，全部复用 {@link WalSyncItBase} 的场景工具与
+ * 位点不回退 / 丢页跳变自愈 / 门面全装配 / <strong>引导窗口并发 DDL 不丢行</strong>
+ * （终审 C1）六形态，全部复用 {@link WalSyncItBase} 的场景工具与
  * 停流对拍器（ctid 键控逐行全等）。状态目录用 {@link TempDir} 每用例独立。
  *
  * <p>场景对位：① 半程 DDL → stop（含最终检查点 + 槽推进）→ 新同步器同目录续传
@@ -95,7 +96,7 @@ class WalLifecycleIT extends WalSyncItBase {
         slots.add(slot);
         Interference.dropPhysicalSlotQuietly(slot);
         long mainOid = prepareTables("t_life");
-        StateStore store = new StateStore(stateDir);
+        StateStore store = new StateStore(stateDir, layout.majorVersion());
         // events 阈值压到 1：任一 catalog 行事件即触发——运行中周期检查点必然先行覆盖
         // （replayed 计数只算 watched 目录的行事件，轻量 DDL 不足以越过默认 1000）
         StateConfig cfg = new StateConfig(stateDir, 30_000, 1);
@@ -162,7 +163,7 @@ class WalLifecycleIT extends WalSyncItBase {
         slots.add(slot);
         Interference.dropPhysicalSlotQuietly(slot);
         long mainOid = prepareTables("t_trunc");
-        StateStore store = new StateStore(stateDir);
+        StateStore store = new StateStore(stateDir, layout.majorVersion());
         StateConfig cfg = new StateConfig(stateDir, 30_000, 1);
 
         CatalogSynchronizer sync1 = startSync(slot, cfg, mainOid);
@@ -181,7 +182,7 @@ class WalLifecycleIT extends WalSyncItBase {
         Path stateFile = stateDir.resolve(StateStore.FILE_NAME);
         byte[] bytes = Files.readAllBytes(stateFile);
         Files.write(stateFile, Arrays.copyOf(bytes, bytes.length - 3));
-        assertTrue(new StateStore(stateDir).load().isEmpty(), "截断后的检查点应拒载（load 返回 empty）");
+        assertTrue(new StateStore(stateDir, layout.majorVersion()).load().isEmpty(), "截断后的检查点应拒载（load 返回 empty）");
 
         CatalogSynchronizer sync2 = startSync(slot, cfg, mainOid);
         assertFalse(sync2.resumedFromState(), "检查点拒载时应走全新引导");
@@ -232,7 +233,7 @@ class WalLifecycleIT extends WalSyncItBase {
             awaitConsumed(sync1, target, "首段 DDL 接收前沿");
         }
         sync1.stop();
-        Optional<StoredState> stored = new StateStore(stateDir).load();
+        Optional<StoredState> stored = new StateStore(stateDir, layout.majorVersion()).load();
         assertTrue(stored.isPresent(), "检查点一致点应已落盘");
         long frontier = stored.get().lsn();
 
@@ -331,7 +332,7 @@ class WalLifecycleIT extends WalSyncItBase {
             awaitTrue(() -> source.consumedLsn() >= target, "WalSource 全管线接收前沿");
         }
         source.close();
-        Optional<StoredState> stored = new StateStore(stateDir).load();
+        Optional<StoredState> stored = new StateStore(stateDir, layout.majorVersion()).load();
         assertTrue(stored.isPresent(), "close 的最终检查点应落盘可加载");
         assertSlotAdvancedTo(slot, stored.get().lsn());
 
@@ -345,6 +346,61 @@ class WalLifecycleIT extends WalSyncItBase {
         }
         second.close();
         assertTrue(second.consumedLsn() >= stored.get().lsn(), "第二轮前沿不应回退到检查点之前");
+    }
+
+    /**
+     * 场景 ⑥（终审 C1 复测 + Task 16 跟进项第一嫌疑验证）：bootstrap 进行时另一连接
+     * 持续 ADD/DROP COLUMN——两连接制造引导窗口重叠。修复前形态（种子查询全部完成
+     * 后才读 flush LSN，时点 B ≥ 快照 S）下，窗口 (S,B] 内提交的 ADD COLUMN 的
+     * pg_attribute INSERT 末尾 ≤ appliedLsn 种子（= B），被过滤线永久跳过且种子快照
+     * 又看不到——丢行无自愈通道；修复后 flush LSN 于 RR 事务首句读取（B ≤ S），窗口
+     * 记录必进重放面（upsert 幂等消化重叠）。断言对拍全等（40 轮 ADD/DROP 后 attr 面
+     * 含 40 条 dropped 占位行，缺一条即红）。<strong>17 侧不复刻</strong>：已知
+     * "干扰风暴与 DDL 并发交织偶发丢 INSERT"跟进项（Task 16）会混淆本场景的归因，
+     * 18 侧已验即记档。
+     */
+    @Test
+    void concurrentDdlDuringBootstrapWindowIsNotLostToFilterLine() throws Exception {
+        String slot = "wal_life_conc_" + SLOT_SEQ.incrementAndGet();
+        slots.add(slot);
+        Interference.dropPhysicalSlotQuietly(slot);
+        long mainOid = prepareTables("t_conc");
+        StateConfig cfg = new StateConfig(null, 30_000, 1_000);    // state 禁用——本场景只考引导窗口
+
+        // 引导窗口风暴：与 start() 内部 bootstrap（RR 事务种子全库两目录，数十毫秒级）
+        // 并发地反复 ADD/DROP——每次 ADD 都插一条 pg_attribute 行、DROP 置 dropped 占位
+        Thread storm = new Thread(() -> {
+            try (Connection c = Interference.newSqlConnection(); Statement st = c.createStatement()) {
+                for (int i = 0; i < 40; i++) {
+                    st.execute("ALTER TABLE t_conc ADD COLUMN storm_col int");
+                    st.execute("ALTER TABLE t_conc DROP COLUMN storm_col");
+                }
+            } catch (SQLException e) {
+                LOG.warn("引导并发 DDL 风暴提前终止: {}", e.getMessage());
+            }
+        }, "bootstrap-ddl-storm");
+        storm.start();
+
+        CatalogSynchronizer sync = startSync(slot, cfg, mainOid);
+        storm.join(30_000);
+        assertTrue(!storm.isAlive(), "风暴线程应在 join 上限内退出");
+
+        try (Connection c = Interference.newSqlConnection()) {
+            execDdl(c,
+                    "ALTER TABLE t_conc ADD COLUMN final_col int",
+                    "INSERT INTO t_conc SELECT g, 'p-' || g, g FROM generate_series(1, 50) g",
+                    "VACUUM ANALYZE pg_class",
+                    "VACUUM ANALYZE pg_attribute",
+                    "INSERT INTO t_conc_tail VALUES (1)");
+            long target = flushLsn(c);
+            awaitConsumed(sync, target, "引导并发 DDL 场景接收前沿");
+        }
+        sync.stop();
+
+        try (Connection probe = Interference.newSqlConnection()) {
+            assertCatalogMatchesJdbc(sync, probe, mainOid, mainOid);
+        }
+        LOG.info("引导并发 DDL 窗口不丢行验证通过: 指标 {} / 接收器 {}", sync.metrics(), sync.streamMetrics());
     }
 
     /**

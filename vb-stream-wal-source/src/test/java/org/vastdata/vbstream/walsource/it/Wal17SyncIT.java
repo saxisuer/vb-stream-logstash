@@ -193,7 +193,7 @@ class Wal17SyncIT extends WalSyncItBase {
         slots.add(slot);
         Wal17TestEnv.dropPhysicalSlotQuietly(slot);
         long mainOid = prepareTables("t_life17");
-        StateStore store = new StateStore(stateDir);
+        StateStore store = new StateStore(stateDir, layout.majorVersion());
         // events 阈值压到 1：任一 catalog 行事件即触发运行中周期检查点（对齐 18 侧生命周期 IT）
         StateConfig cfg = new StateConfig(stateDir, 30_000, 1);
 
@@ -258,7 +258,7 @@ class Wal17SyncIT extends WalSyncItBase {
         slots.add(slot);
         Wal17TestEnv.dropPhysicalSlotQuietly(slot);
         long mainOid = prepareTables("t_trunc17");
-        StateStore store = new StateStore(stateDir);
+        StateStore store = new StateStore(stateDir, layout.majorVersion());
         StateConfig cfg = new StateConfig(stateDir, 30_000, 1);
 
         CatalogSynchronizer sync1 = startSync(slot, cfg, mainOid);
@@ -277,7 +277,7 @@ class Wal17SyncIT extends WalSyncItBase {
         Path stateFile = stateDir.resolve(StateStore.FILE_NAME);
         byte[] bytes = Files.readAllBytes(stateFile);
         Files.write(stateFile, Arrays.copyOf(bytes, bytes.length - 3));
-        assertTrue(new StateStore(stateDir).load().isEmpty(), "截断后的检查点应拒载（load 返回 empty）");
+        assertTrue(new StateStore(stateDir, layout.majorVersion()).load().isEmpty(), "截断后的检查点应拒载（load 返回 empty）");
 
         CatalogSynchronizer sync2 = startSync(slot, cfg, mainOid);
         assertFalse(sync2.resumedFromState(), "检查点拒载时应走全新引导");
@@ -327,7 +327,7 @@ class Wal17SyncIT extends WalSyncItBase {
             awaitConsumed(sync1, target, "PG17 首段 DDL 接收前沿");
         }
         sync1.stop();
-        Optional<StoredState> stored = new StateStore(stateDir).load();
+        Optional<StoredState> stored = new StateStore(stateDir, layout.majorVersion()).load();
         assertTrue(stored.isPresent(), "检查点一致点应已落盘");
         long frontier = stored.get().lsn();
 

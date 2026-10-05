@@ -907,10 +907,11 @@ public final class CatalogReplay {
      * tracked 时不得搬移/告警（spike remapCtid 的 attr 分支同判）。
      *
      * <p>关键步骤：按 relNode 匹配块（不属则 no-op）→ redirected 段逐对 (from,to)
-     * 折键重定位（行命中计 pruneRedirects；tail 无行也可单独存在，随迁；isClass
-     * 时 tracked 跟随）→ dead/unused 段逐行移除（行命中计 pruneDropped；isClass
-     * 且 tracked 命中打 WARN）。边界与异常语义：段空（flags 未置位）由视图访问器
-     * 回空表自然跳过。线程约束：单写者。</p>
+     * 折键重定位（行命中计 pruneRedirects；<strong>from 位无行且 healer 可用时按
+     * to 位精确采纳物化</strong>——终审收敛洞修复，见 {@link #adoptRedirectTarget}；
+     * tail 无行也可单独存在，随迁；isClass 时 tracked 跟随）→ dead/unused 段逐行移除
+     * （行命中计 pruneDropped；isClass 且 tracked 命中打 WARN）。边界与异常语义：
+     * 段空（flags 未置位）由视图访问器回空表自然跳过。线程约束：单写者。</p>
      *
      * @param view        prune 视图（freeze 段已跳过）
      * @param relfilenode 目录 relfilenode（0 不匹配）
@@ -932,6 +933,13 @@ public final class CatalogReplay {
             long from = ctidKey(blockNo, pairs.get(i));
             long to = ctidKey(blockNo, pairs.get(i + 1));
             T row = rows.remove(from);
+            if (row == null) {
+                // 终审收敛洞修复：from 位无行 = 链已断（典型路径：先前截断更新的精确采纳
+                // 因行已再迁移被拒——行现居位恰是本 redirect 的 to 位）——旧形态此处
+                // no-op 使该行永久丢失（redirect 无法物化缺行）。按 to 位做 ctid 寻址
+                // 精确采纳物化末态（与截断更新采纳同一语义），闭合丢行通道。
+                row = adoptRedirectTarget(view.rec(), to, stores, isClass);
+            }
             if (row != null) {
                 rows.put(to, row);
                 stores.metrics().inc(CatalogStores.CatalogMetrics.PRUNE_REDIRECTS);
@@ -950,6 +958,42 @@ public final class CatalogReplay {
         for (int off : view.nowunused()) {
             dropPruned(blockNo, off, rows, tails, stores, isClass);
         }
+    }
+
+    /**
+     * PRUNE redirect 的 from 位无行时的 <strong>ctid 寻址精确采纳物化</strong>（终审
+     * 收敛洞修复）：按 redirect 的 to 位探测 JDBC 末态行——行被压实搬迁后"末态仍居
+     * to 位"即该行的精确状态，整行采纳落字典（末态回填语义，与截断更新采纳同源）。
+     *
+     * <p>关键步骤：healer 未注入直接 null（保留纯 skip 行为）；class 面走
+     * {@link #ctidExactAdoptClass}（含 tracked 修复 + stale 记账），attr 面走
+     * {@link #attrExactAdopt}——attr 采纳行 attnum &le; 0（系统列，字典面契约外）
+     * 丢弃不落。边界与异常语义：探测无行（to 位也被再迁移/复用）返回 null（本
+     * redirect 放弃物化，行留待后续链事件/对拍暴露）；拒绝记账仅 class 面（与
+     * 截断更新采纳同规则）。线程约束：单写者（重放线程，probe 复用 healer 会话）。</p>
+     *
+     * @param r       走读完成的 PRUNE 记录（LSN 定位日志面）
+     * @param to      redirect 目标 ctid 键（探测位 = 行末态位）
+     * @param stores  状态容器（tracked/stale/指标）
+     * @param isClass 是否 pg_class 目录
+     * @param <T>     行模型类型（AttrRow / ClassRow）
+     * @return 采纳行模型；healer 未注入/探测无行/attnum≤0 为 null
+     */
+    @SuppressWarnings("unchecked")
+    private <T> T adoptRedirectTarget(WalRecord r, long to, CatalogStores stores, boolean isClass) {
+        if (healer == null || !healer.enabled()) {
+            return null;
+        }
+        if (isClass) {
+            Reconstruction rc = ctidExactAdoptClass(r, to, stores);
+            return rc == null ? null : (T) CatalogRow.ClassRow.fromDecoded(rc.row(), layout);
+        }
+        Reconstruction rc = attrExactAdopt(r, to, stores.metrics());
+        if (rc == null) {
+            return null;
+        }
+        CatalogRow.AttrRow attr = CatalogRow.AttrRow.fromDecoded(rc.row(), layout);
+        return attr.attnum() > 0 ? (T) attr : null;
     }
 
     /**
