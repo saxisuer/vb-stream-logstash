@@ -84,7 +84,7 @@ public final class Main {
     }
 
     /**
-     * 收集 {@code vb.wal.*} 六键系统属性为门面配置。
+     * 收集 {@code vb.wal.*} 六键 + state 三键系统属性为门面配置。
      *
      * <p>关键步骤：逐键 {@code System.getProperty}，仅非 null 值入 Properties——缺键留给
      * {@link WalSource} 构造器取默认值（单一默认值来源，Main 不复刻）。</p>
@@ -99,6 +99,9 @@ public final class Main {
         copySysProp(WalSource.KEY_USER, cfg);
         copySysProp(WalSource.KEY_PASS, cfg);
         copySysProp(WalSource.KEY_SLOT, cfg);
+        copySysProp(WalSource.KEY_STATE_DIR, cfg);
+        copySysProp(WalSource.KEY_STATE_INTERVAL_MS, cfg);
+        copySysProp(WalSource.KEY_STATE_EVENTS, cfg);
         return cfg;
     }
 
@@ -116,10 +119,13 @@ public final class Main {
     }
 
     /**
-     * 打一行周期统计：消费前沿 LSN + 三计数 + census 前 3 形态。
+     * 打一行周期统计：消费前沿 LSN + 三计数 + census 前 3 形态（+ state 启用时的
+     * checkpoint/槽推进观测）。
      *
      * <p>关键步骤：census 快照（不可变副本）按值降序取前 3，{@code 键=条数} 逗号拼接——
-     * 快照为空（尚无记录交付）时 censusTop3 渲染为空串。数据面均只读（volatile 镜像 +
+     * 快照为空（尚无记录交付）时 censusTop3 渲染为空串；{@code vb.wal.state.dir} 配置时
+     * 追加 {@code ckpt=LSN adv=LSN}（检查点与槽推进前沿——二者相等即"落盘后必推过"，
+     * 落后即推进失败被 WARN 吞掉的形态）。数据面均只读（volatile 镜像 +
      * {@code sum()} 快照），任意时点打行安全。</p>
      *
      * @param source 运行中的门面
@@ -131,11 +137,15 @@ public final class Main {
                 .limit(CENSUS_TOP_N)
                 .map(e -> e.getKey() + "=" + e.getValue())
                 .collect(Collectors.joining(", "));
-        LOG.info("smoke: lsn={} records={} resyncs={} reconnects={} censusTop3=[{}]",
+        String state = source.stateDir() == null ? ""
+                : " ckpt=" + Lsn.format(source.lastCheckpointLsn())
+                        + " adv=" + Lsn.format(source.lastSlotAdvanceLsn());
+        LOG.info("smoke: lsn={} records={} resyncs={} reconnects={} censusTop3=[{}]{}",
                 Lsn.format(source.consumedLsn()),
                 m.records.sum(),
                 m.resyncs.sum(),
                 m.reconnects.sum(),
-                censusTop3);
+                censusTop3,
+                state);
     }
 }

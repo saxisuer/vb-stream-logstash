@@ -19,11 +19,13 @@ import java.sql.Statement;
  * confirmed_flush_lsn）返回，实现重启续传。建槽撞 42710（duplicate_object）视为他方并发
  * 建槽的竞态——捕获后重查存在槽走复用路径，不向调用方扩散。</p>
  *
- * <p>已知限制（记档）：{@code pg_create_physical_replication_slot} 的 immediately_reserve
- * 缺省为 false，建槽后 restart_lsn 在首个消费者附槽前为 NULL——此时复用路径回落返回
- * {@code pg_current_wal_flush_lsn()}（等效"槽在但从未消费过"的新建语义）。另注：
- * pgjdbc 42.7.13 的物理流构造器无槽选项（START_REPLICATION 不带 SLOT），槽当前只作
- * 位点锚与 WAL 保留策略的载体，见 {@link WalStreamReceiver} javadoc。</p>
+ * <p>已知限制（记档，Task 15 部分收敛）：建槽带 {@code immediately_reserve=true}，
+ * restart_lsn 自建槽时刻非 NULL 且可被 {@code pg_replication_slot_advance} 推进
+ * （Task 15 检查点后推槽的依托）；存量槽若由未 reserve 形态建出（restart_lsn
+ * NULL），复用路径回落返回 {@code pg_current_wal_flush_lsn()}（等效"槽在但从未消费
+ * 过"的新建语义）。另注：pgjdbc 42.7.13 的物理流构造器无槽选项（START_REPLICATION
+ * 不带 SLOT），槽当前作位点锚与 WAL 保留策略的载体（推进 restart_lsn 即收缩保留
+ * 窗口下界），见 {@link WalStreamReceiver} javadoc。</p>
  *
  * <p>线程约束：持有外部 {@link Connection} 单连接，非线程安全——调用方保证串行调用
  * （典型为装配线程一次性 ensureSlot 后交给接收器）。</p>
@@ -52,8 +54,11 @@ public final class PhysicalSlotManager {
      *
      * <p>关键步骤：① 查 {@code pg_replication_slots}（slot_name + slot_type='physical' 双条件，
      * 同名逻辑槽不算命中）——存在即按 restart_lsn（NULL 回落 flush LSN）返回；② 不存在则
-     * {@code pg_create_physical_replication_slot(?)} 建槽（PreparedStatement 参数绑定，槽名
-     * 不拼串）后返回当前 flush LSN；③ 建槽抛 42710 = 并发竞态，静默重查走复用路径。
+     * {@code pg_create_physical_replication_slot(?, true)} 建槽（<strong>immediately_reserve
+     * = true</strong>，Task 15：restart_lsn 自建槽时刻即保留 WAL——未 reserve 的槽
+     * restart_lsn 为 NULL，既不可被 {@code pg_replication_slot_advance} 推进（服务端
+     * "never previously reserved WAL" 拒绝），保留窗口也不成立）后返回建槽时刻 flush
+     * LSN；③ 建槽抛 42710 = 并发竞态，静默重查走复用路径。
      * 边界与异常语义：42710 以外的 SQLException 原样上抛（权限不足/连接失效等）；重查仍无槽
      * （异常形态）按新建路径返回 flush LSN 并 WARN。</p>
      *
@@ -68,12 +73,12 @@ public final class PhysicalSlotManager {
             return existing;
         }
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT * FROM pg_create_physical_replication_slot(?)")) {
+                "SELECT * FROM pg_create_physical_replication_slot(?, true)")) {
             ps.setString(1, name);
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
             }
-            LOG.info("物理槽 {} 创建成功", name);
+            LOG.info("物理槽 {} 创建成功（immediately_reserve=true, restart_lsn 已保留）", name);
         } catch (SQLException e) {
             if (!"42710".equals(e.getSQLState())) {
                 throw e;

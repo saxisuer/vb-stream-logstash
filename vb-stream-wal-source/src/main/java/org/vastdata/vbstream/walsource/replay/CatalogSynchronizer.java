@@ -10,14 +10,20 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.receive.PhysicalSlotManager;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 import org.vastdata.vbstream.walsource.receive.WalStreamReceiver;
+import org.vastdata.vbstream.walsource.state.StateConfig;
+import org.vastdata.vbstream.walsource.state.StateStore;
+import org.vastdata.vbstream.walsource.state.StoredState;
 
+import java.io.IOException;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.StringJoiner;
 
@@ -25,7 +31,14 @@ import java.util.StringJoiner;
  * 伪备库 catalog 同步器（spec §5 组件四）：JDBC 一致性引导 + 物理流接收 + ctid 重放
  * 的 v1 组装——一次 {@link #start} 完成槽确保、REPEATABLE READ 全行种子、起流（sink
  * 委派本类 {@link #apply}），此后字典随消费增量维护并经 {@link #snapshot()} 提供
- * {@link CatalogSnapshot} as-of 查询。
+ * {@link CatalogSnapshot} as-of 查询。</p>
+ *
+ * <p><strong>检查点生命周期（Task 15）</strong>：state 启用（{@link StateConfig} dir
+ * 非 null）时——启动按"检查点存在且 lsn 在槽保留窗口内 → {@link StoredState#restoreInto}
+ * 续传（跳过引导）；否则全新引导"双路决策；接收线程按 interval/events 双节拍周期落盘
+ * （{@link StateStore#checkpoint}，单线程天然一致点）；落盘成功后经
+ * {@code pg_replication_slot_advance} 推槽（严格持久化之后）；{@link #stop()} 最终
+ * best-effort 检查点。state 禁用时行为与 Task 13 前完全一致。</p>
  *
  * <p><strong>装配序（spec §6①）</strong>：① {@link PhysicalSlotManager#ensureSlot} 取
  * P₀（建槽自身的 WAL 先于种子快照落盘）→ ② {@link CatalogBootstrap#bootstrap} 在
@@ -57,6 +70,36 @@ public final class CatalogSynchronizer {
     /** 接收器（start 组装路径注入；纯逻辑测试缝为 null）。 */
     private final WalStreamReceiver receiver;
 
+    /** 槽名（槽推进 SQL 的目标；纯逻辑缝为 null）。 */
+    private final String slotName;
+
+    /** 检查点配置（null = 禁用——无落盘/续传/槽推进，Task 13 前的无状态形态）。 */
+    private final StateConfig stateConfig;
+
+    /** 检查点存储器（stateConfig 启用时非 null）。 */
+    private final StateStore stateStore;
+
+    /** 槽推进复用的 SQL 会话（引导会话；接收线程单写者上下文与 stop 调用线程串行使用）。 */
+    private final Connection advanceConnection;
+
+    /** 最近一次检查点落盘时点（毫秒墙钟）——周期判定基准，接收线程单写者。 */
+    private long lastCheckpointWallMs;
+
+    /** 最近一次检查点落盘时的 catalog 行事件计数——事件阈值判定基准，接收线程单写者。 */
+    private long replayedAtCheckpoint;
+
+    /** 最近一次成功落盘的检查点 lsn（volatile 跨线程观测，未落盘为 0）。 */
+    private volatile long lastCheckpointLsn;
+
+    /** 最近一次槽推进成功的目标 lsn（volatile 跨线程观测，未推过为 0）。 */
+    private volatile long lastSlotAdvanceLsn;
+
+    /** 本次 start 是否自检查点续传（true = restoreInto 路径、false = 全新引导）。 */
+    private volatile boolean resumedFromState;
+
+    /** 续传过滤线：记录末尾 &le; 此线的已在检查点前施加过，apply 跳过重放（0 = 无过滤）。 */
+    private long replayFilterLsn;
+
     /** 已施加前沿镜像：最近一次 apply 完成的记录 MAXALIGN 末尾（volatile 跨线程读）。 */
     private volatile long appliedLsn;
 
@@ -68,20 +111,29 @@ public final class CatalogSynchronizer {
      * @param replay 重放引擎（与 stores 配对的 layout/decoder 组合）
      */
     CatalogSynchronizer(CatalogStores stores, CatalogReplay replay) {
-        this(stores, replay, null);
+        this(stores, replay, null, null, null, null, null);
     }
 
     /**
      * 全参构造（start 组装路径）。
      *
-     * @param stores   重放状态容器（已引导）
-     * @param replay   重放引擎
-     * @param receiver 接收器（null = 无流面，consumedLsn 回落 appliedLsn）
+     * @param stores           重放状态容器（已引导或已自检查点恢复）
+     * @param replay           重放引擎
+     * @param receiver         接收器（null = 无流面，consumedLsn 回落 appliedLsn）
+     * @param slotName         槽名（槽推进目标；null = 纯逻辑缝）
+     * @param stateConfig      检查点配置（null = 禁用落盘/续传/槽推进）
+     * @param stateStore       检查点存储器（stateConfig 禁用时 null）
+     * @param advanceConnection 槽推进复用会话（null = 不推进）
      */
-    private CatalogSynchronizer(CatalogStores stores, CatalogReplay replay, WalStreamReceiver receiver) {
+    private CatalogSynchronizer(CatalogStores stores, CatalogReplay replay, WalStreamReceiver receiver,
+            String slotName, StateConfig stateConfig, StateStore stateStore, Connection advanceConnection) {
         this.stores = stores;
         this.replay = replay;
         this.receiver = receiver;
+        this.slotName = slotName;
+        this.stateConfig = stateConfig;
+        this.stateStore = stateStore;
+        this.advanceConnection = advanceConnection;
     }
 
     /**
@@ -102,7 +154,7 @@ public final class CatalogSynchronizer {
         ConnInfo ci = ConnInfo.from(sql);
         LOG.warn("CatalogSynchronizer 未显式传凭据——复制连接按派生凭据建立（URL 参数优先、"
                 + "否则 user=metadata 用户名/password 空）；密码认证环境请用带凭据重载 start(..., user, password, ...)");
-        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, interestRelOid);
+        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, null, 0L, interestRelOid);
     }
 
     /**
@@ -136,13 +188,59 @@ public final class CatalogSynchronizer {
         // SelfHealer 真接线（Task 13 装配裁定）：带凭据档 = 生产推荐形态，探测复用引导会话
         // ——probe 在接收线程单写者上下文调用，引导会话自此归同步器独占（调用方不得并发使用）
         return startInternal(sql, slotName, layout, user, password,
-                new SelfHealer(new JdbcProbeImpl(sql)), interestRelOid);
+                new SelfHealer(new JdbcProbeImpl(sql)), null, 0L, interestRelOid);
     }
 
     /**
-     * 组装共核（两个公开 start 重载的唯一实现）：healer 注入与否是两档唯一差异——带凭据
+     * v1 组装入口（带凭据 + 检查点档，Task 15 全参版）：带凭据档之上接入
+     * {@link StateStore} 生命周期 + 显式流起点覆盖。
+     *
+     * <p><strong>启动序（state.dir 有文件且 load 成功 → 续传）</strong>：① ensureSlot 取
+     * P₀（槽必须存在——槽推进的目标）；② {@link StateStore#load()} 成功且 stored lsn
+     * &ge; P₀ → {@link StoredState#restoreInto} 恢复字典 + 流起点 = stored lsn（页对齐
+     * 由接收器下取整），<strong>跳过引导</strong>——已施加前沿种子化为 stored lsn，
+     * <strong>apply 面按 LSN 过滤线跳过检查点前已施加的记录</strong>（页对齐多收的窗口
+     * 不重施加——部分记录类二次施加非幂等，见 {@link #apply} javadoc），此后 WAL 增量
+     * 重放。stored lsn &lt; P₀ = 槽保留窗口已越前（槽被越程推进/重建），字典无法覆盖
+     * 窗口 → WARN + 回落全新引导（安全侧：宁可重引导，不可错位窗口重放，spec §7）。</p>
+     *
+     * <p><strong>load 失败 / 无文件 → 全新引导</strong>（现路径：bootstrap + max(P₀, B)）。
+     * <strong>forcedStartLsn &gt; 0</strong> 时无视上述计算直接以其为流起点（页对齐仍由
+     * 接收器下取整）——诊断/丢页注入接缝（IT 模拟跳变用），字典恢复/引导决策不受其
+     * 影响；须落在服务端有效 WAL 区间内（未来位点被 START_REPLICATION 拒绝）。</p>
+     *
+     * <p><strong>运行中检查点</strong>：接收线程 apply 后按"距上次落盘 &ge;
+     * {@code intervalMs} 或新施加 catalog 行事件 &ge; {@code eventsThreshold}（先到为准）"
+     * 落一次检查点（单线程天然一致点，spec §7）；每次落盘成功后经 SQL 会话
+     * {@code pg_replication_slot_advance(slot, 检查点 lsn)} 推进物理槽 restart_lsn
+     * （Task 8 裁定方案 a：<strong>严格持久化之后</strong>——崩溃时最坏重复重放已落盘
+     * 检查点之后的窗口，不丢状态）。检查点 IOException WARN 不中断接收；推进失败
+     * （槽不存在/参数错）WARN 不中断。{@link #stop()} 在接收线程 join 后做最终
+     * best-effort 检查点 + 推进（冻结态一致点）。</p>
+     *
+     * @param sql             引导用 SQL 会话（probe 与槽推进复用，归同步器独占）
+     * @param slotName        物理槽名
+     * @param layout          版本布局描述符
+     * @param user            复制连接用户
+     * @param password        复制连接密码
+     * @param state           检查点配置（null 或 dir=null = 禁用）
+     * @param forcedStartLsn  显式流起点（0 = 按续传/引导决策；&gt;0 = 覆盖，诊断接缝）
+     * @param interestRelOid  tracked 面 oid
+     * @return 已运行的同步器
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
+            String user, String password, StateConfig state, long forcedStartLsn,
+            long... interestRelOid) throws SQLException {
+        return startInternal(sql, slotName, layout, user, password,
+                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, interestRelOid);
+    }
+
+    /**
+     * 组装共核（全部公开 start 重载的唯一实现）：healer 与 state 注入是各档差异——带凭据
      * 档注入 {@link SelfHealer}（probe 复用引导会话），无凭据回落档 healer=null（截断
-     * 未知 oldCtid 保留 skip + 计数行为）。组装序见带凭据重载 javadoc。
+     * 未知 oldCtid 保留 skip + 计数行为）；state 启用时按续传/引导双路决策（见全参档
+     * javadoc）。组装序见带凭据重载 javadoc。
      *
      * @param sql            引导用 SQL 会话（healer 非 null 时生命周期须覆盖同步器全程）
      * @param slotName       物理槽名
@@ -150,47 +248,180 @@ public final class CatalogSynchronizer {
      * @param user           复制连接用户
      * @param password       复制连接密码
      * @param healer         截断自愈校验器（null = 禁用）
+     * @param state          检查点配置（null = 禁用）
+     * @param forcedStartLsn 显式流起点（0 = 按决策；&gt;0 = 覆盖）
      * @param interestRelOid tracked 面 oid
      * @return 已运行的同步器
      * @throws SQLException 槽管理或引导查询失败
      */
     private static CatalogSynchronizer startInternal(Connection sql, String slotName, WalLayout layout,
-            String user, String password, SelfHealer healer, long... interestRelOid) throws SQLException {
+            String user, String password, SelfHealer healer, StateConfig state, long forcedStartLsn,
+            long... interestRelOid) throws SQLException {
         CatalogStores stores = new CatalogStores();
         for (long oid : interestRelOid) {
             stores.interestRelOids().add(oid);
         }
         long p0 = new PhysicalSlotManager(sql).ensureSlot(slotName);
-        long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
-        long start = Math.max(p0, bootstrapLsn);
+
+        StateStore stateStore = null;
+        long start;
+        boolean resumed = false;
+        long storedLsn = 0;
+        if (state != null && state.enabled()) {
+            stateStore = new StateStore(state.dir());
+            Optional<StoredState> loaded = stateStore.load();
+            if (loaded.isPresent() && loaded.get().lsn() >= p0) {
+                loaded.get().restoreInto(stores);
+                storedLsn = loaded.get().lsn();
+                start = storedLsn;
+                resumed = true;
+                LOG.info("CatalogSynchronizer 自检查点续传: stored lsn={}（attr {} / class {} 行, 跳过引导）",
+                        Lsn.format(start), stores.attrRows().size(), stores.classRows().size());
+            } else if (loaded.isPresent()) {
+                LOG.warn("检查点 lsn {} 落在槽保留窗口 P₀ {} 之前——字典无法覆盖窗口, 回落全新引导（安全侧）",
+                        Lsn.format(loaded.get().lsn()), Lsn.format(p0));
+                start = Long.MIN_VALUE;    // 哨兵：下方引导路径覆盖
+            } else {
+                start = Long.MIN_VALUE;    // 无文件/拒载：全新引导
+            }
+        } else {
+            start = Long.MIN_VALUE;
+        }
+        if (!resumed && start == Long.MIN_VALUE) {
+            long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
+            start = Math.max(p0, bootstrapLsn);
+        }
+        if (forcedStartLsn > 0) {
+            start = forcedStartLsn;
+        }
 
         ConnInfo ci = ConnInfo.from(sql).withCredentials(user, password);
         WalStreamReceiver receiver = new WalStreamReceiver(
                 ci.host(), ci.port(), ci.database(), ci.user(), ci.pass(), layout, slotName);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
-                new CatalogReplay(layout, new TupleDecoder(layout), healer), receiver);
-        sync.appliedLsn = start;    // 前沿种子化：引导一致点而非 0（首条 apply 前的 as-of）
+                new CatalogReplay(layout, new TupleDecoder(layout), healer), receiver,
+                slotName, state, stateStore, stateStore == null ? null : sql);
+        sync.appliedLsn = start;    // 前沿种子化：续传=stored lsn / 引导=引导一致点（首条 apply 前的 as-of）
+        sync.resumedFromState = resumed;
+        // 续传过滤线 = stored lsn（forcedStartLsn 只改流起点不改过滤线）：接收器页对齐
+        // 下取整多收的检查点前记录在 apply 面跳过——重放窗口按 LSN 过滤而非重施加
+        // （非幂等记录类二次施加会产出部分零字段行, Task 15 IT 实证）
+        sync.replayFilterLsn = resumed ? storedLsn : 0L;
+        if (state != null && state.enabled()) {
+            sync.lastCheckpointWallMs = System.currentTimeMillis();
+            sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
+        }
         receiver.start(sync::apply, start);
-        LOG.info("CatalogSynchronizer 启动: slot={} 流起点 max(P0={}, bootstrap={}) = {}（interest {} 个, selfHeal={}）",
-                slotName, Lsn.format(p0), Lsn.format(bootstrapLsn), Lsn.format(start),
-                interestRelOid.length, healer != null);
+        LOG.info("CatalogSynchronizer 启动: slot={} 流起点 {}（interest {} 个, selfHeal={}, state={}, resumed={}）",
+                slotName, Lsn.format(start), interestRelOid.length, healer != null,
+                state != null && state.enabled(), resumed);
         return sync;
     }
 
     /**
-     * 流消费面（接收线程回调）：施加一条 WAL 记录到 catalog 字典并推进已施加前沿。
+     * 流消费面（接收线程回调）：施加一条 WAL 记录到 catalog 字典并推进已施加前沿，
+     * state 启用时顺带判定周期检查点。
      *
      * <p>关键步骤：{@link CatalogReplay#applyCatalogRecord}（prune → inplace → attr
      * events → class events + tracked 跟随，施加次序由引擎固定）→ 前沿推进到本记录
-     * MAXALIGN 末尾（与 walker 记录对齐边界同式）。边界与异常语义：非 catalog 记录
-     * （其它 rmgr/关系）为引擎内 no-op，前沿照常推进——位点语义是"已走读"而非"已改
-     * 字典"。线程约束：接收线程单写者。</p>
+     * MAXALIGN 末尾（与 walker 记录对齐边界同式）→ {@link #maybeCheckpoint}（先到为
+     * 准的节拍判定，未达阈值为 no-op）。边界与异常语义：非 catalog 记录（其它
+     * rmgr/关系）为引擎内 no-op，前沿照常推进——位点语义是"已走读"而非"已改字典"；
+     * <strong>续传过滤线</strong>（resumed 时 = stored lsn）——记录末尾 &le; 过滤线的
+     * 已在检查点前施加过（接收器页对齐下取整导致的多收窗口），跳过重放且前沿不回退
+     * （部分记录类二次施加非幂等：截断更新对已被 INPLACE 失效 tail 的旧行做值编码
+     * 重建会产出部分零字段的行——重放窗口必须按 LSN 过滤而非重施加，Task 15 IT
+     * 实证）。线程约束：接收线程单写者。</p>
      *
      * @param r 走读完成的记录
      */
     public void apply(WalRecord r) {
+        long end = (r.lsn() + r.totLen() + 7) & ~7L;
+        if (end <= replayFilterLsn) {
+            return;    // 检查点前已施加——跳过重放, appliedLsn 保持种子不回退
+        }
         replay.applyCatalogRecord(r, stores);
-        appliedLsn = (r.lsn() + r.totLen() + 7) & ~7L;
+        appliedLsn = end;
+        maybeCheckpoint();
+    }
+
+    /**
+     * 周期检查点判定（接收线程）：距上次落盘 &ge; {@code intervalMs} 或距上次落盘点
+     * 新施加 catalog 行事件 &ge; {@code eventsThreshold}（先到为准）即落一次检查点。
+     *
+     * <p>关键步骤：state 禁用直接返回；节拍基准（墙钟/事件计数）在每次落盘后重置。
+     * 边界与异常语义：{@link #persistCheckpoint} 内部吞 IOException（WARN 不中断接收
+     * ——检查点失败不损既有正名文件，下次节拍重试）。线程约束：接收线程单写者
+     * （节拍基准为普通 long 字段）。</p>
+     */
+    private void maybeCheckpoint() {
+        StateConfig cfg = stateConfig;
+        if (cfg == null || !cfg.enabled()) {
+            return;
+        }
+        long replayed = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
+        if (System.currentTimeMillis() - lastCheckpointWallMs < cfg.intervalMs()
+                && replayed - replayedAtCheckpoint < cfg.eventsThreshold()) {
+            return;
+        }
+        lastCheckpointWallMs = System.currentTimeMillis();
+        replayedAtCheckpoint = replayed;
+        persistCheckpoint(appliedLsn);
+    }
+
+    /**
+     * 落一次检查点（best-effort）+ 持久化成功后推槽（Task 8 裁定方案 a）。
+     *
+     * <p>关键步骤：{@link StateStore#checkpoint}（全量序列化 + fsync + 原子换名）成功
+     * 才记 {@link #lastCheckpointLsn} 并 {@link #advanceSlot}——推进严格在持久化之后
+     * （崩溃时最坏重复重放已落盘之后的窗口，不丢状态）。边界与异常语义：IOException
+     * WARN 吞掉（旧检查点不受损）；推进失败仅 WARN。线程约束：接收线程（周期路径）与
+     * stop 调用线程（最终路径）串行——stop 先 join 接收线程。</p>
+     *
+     * @param lsn 检查点 lsn（调用时点的已施加前沿）
+     */
+    private void persistCheckpoint(long lsn) {
+        StateStore store = stateStore;
+        if (store == null) {
+            return;
+        }
+        try {
+            store.checkpoint(stores, lsn);
+            lastCheckpointLsn = lsn;
+            advanceSlot(lsn);
+        } catch (IOException e) {
+            LOG.warn("检查点落盘失败（保留旧检查点, 接收不中断）: lsn={} 原因: {}",
+                    Lsn.format(lsn), e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 推进物理槽 restart_lsn 到检查点 lsn（SQL：{@code pg_replication_slot_advance}）。
+     *
+     * <p>关键步骤：参数绑定槽名与 lsn 文本（{@code ?::pg_lsn} 服务端转换）；成功记
+     * {@link #lastSlotAdvanceLsn}。边界与异常语义：槽不存在/参数错等 SQLException 一律
+     * WARN 不中断（推进是保留窗口的优化而非正确性前提——WAL 保留兜底由
+     * {@code max_slot_wal_keep_size} 承担）；会话失效同样 WARN（下次检查点重试）。
+     * 线程约束：与 persistCheckpoint 同线程串行。</p>
+     *
+     * @param lsn 推进目标（刚落盘的检查点 lsn）
+     */
+    private void advanceSlot(long lsn) {
+        Connection c = advanceConnection;
+        String slot = slotName;
+        if (c == null || slot == null) {
+            return;
+        }
+        try (PreparedStatement ps = c.prepareStatement("SELECT pg_replication_slot_advance(?, ?::pg_lsn)")) {
+            ps.setString(1, slot);
+            ps.setString(2, Lsn.format(lsn));
+            ps.executeQuery();
+            lastSlotAdvanceLsn = lsn;
+            LOG.debug("槽推进完成: {} -> {}", slot, Lsn.format(lsn));
+        } catch (SQLException e) {
+            LOG.warn("槽推进失败（不中断, 下次检查点重试）: slot={} 目标={} 原因: {}",
+                    slot, Lsn.format(lsn), e.getMessage());
+        }
     }
 
     /**
@@ -244,15 +475,52 @@ public final class CatalogSynchronizer {
     }
 
     /**
-     * 幂等停机：停接收线程（join 3s 上限，委派 {@link WalStreamReceiver#stop()}）；
-     * 引导 SQL 会话归调用方持有生命周期，本类不越权关闭。
+     * 最近一次成功落盘的检查点 lsn（Main 周期行 / 生命周期 IT 观测面）。
+     *
+     * @return 检查点 lsn；state 禁用或尚未落盘为 0
+     */
+    public long lastCheckpointLsn() {
+        return lastCheckpointLsn;
+    }
+
+    /**
+     * 最近一次槽推进成功的目标 lsn（观测面——与 {@link #lastCheckpointLsn()} 相等即
+     * "落盘后必推过"，落后即推进失败被 WARN 吞掉的形态）。
+     *
+     * @return 推进目标 lsn；未推过为 0
+     */
+    public long lastSlotAdvanceLsn() {
+        return lastSlotAdvanceLsn;
+    }
+
+    /**
+     * 本次 start 是否自检查点续传（生命周期 IT 的路径断言面：true = restoreInto 跳过
+     * 引导，false = 全新引导或拒载回落）。
+     *
+     * @return 续传为 true；纯逻辑缝/引导路径为 false
+     */
+    public boolean resumedFromState() {
+        return resumedFromState;
+    }
+
+    /**
+     * 幂等停机：停接收线程（join 3s 上限，委派 {@link WalStreamReceiver#stop()}）→
+     * state 启用时做最终 best-effort 检查点 + 槽推进（接收线程已 join，冻结态即单
+     * 线程天然一致点）；引导 SQL 会话归调用方持有生命周期，本类不越权关闭。
+     *
+     * <p>重复调用安全：appliedLsn 已冻结，重复落盘内容幂等。</p>
      */
     public void stop() {
         WalStreamReceiver r = receiver;
         if (r != null) {
             r.stop();
         }
-        LOG.info("CatalogSynchronizer 停机: 已施加前沿 {}", Lsn.format(appliedLsn));
+        StateConfig cfg = stateConfig;
+        if (cfg != null && cfg.enabled()) {
+            persistCheckpoint(appliedLsn);
+        }
+        LOG.info("CatalogSynchronizer 停机: 已施加前沿 {}（检查点 {} / 槽推进 {}）",
+                Lsn.format(appliedLsn), Lsn.format(lastCheckpointLsn), Lsn.format(lastSlotAdvanceLsn));
     }
 
     /**
