@@ -55,10 +55,12 @@ slf4j-api，组件细节与坑位见模块 `CLAUDE.md`。
 对抗性对拍 IT：autovacuum 拉满 / 并发 DDL / 随机 CHECKPOINT 干扰下执行 DDL 场景序列，
 快照与 JDBC REPEATABLE READ 实查**逐行全等**（ctid / relfilenode / toast 映射 / dropped /
 列序）——PG 17/18 双版本矩阵，`mvn test -pl vb-stream-wal-source` 单命令全跑
-（128 用例 = 离线 108 + Testcontainers IT 20，后者需本机 Docker）。
+（131 用例 = 离线 110 + Testcontainers IT 21，后者需本机 Docker）。
 
 ## 已知限制（详版见模块 CLAUDE.md）
 
+- **接收器 5 次重连失败/解析 ISE 后进程 exit 1**——接收线程自行退出后冒烟 `Main`
+  周期行检测终态 → ERROR + `System.exit(1)`（fail-fast，对齐引擎约定）
 - **压缩 FPW / external varlena 不支持**——运维前提 `wal_compression=off`（CHECKPOINT
   后首写必带页镜像）；TOAST 重组属 v2
 - **末态回填语义**：自愈只承诺 catalog **末态**正确（对拍面即末态全等），丢页/断链窗口
