@@ -39,6 +39,12 @@ public final class WalLayoutV18 implements WalLayout {
      * 合计 24B；spike replayInplace 以 dataOff+112 实读新 reltoastrelid 实证锚定。 */
     private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 112;
 
+    /** pg_attribute 词典槽位：attisdropped=16（V18 无 attcacheoff——PG 18 删除该列）。 */
+    private static final int ATTR_DROPPED_INDEX = 16;
+
+    /** pg_class 词典槽位：reltoastrelid=13（relallfrozen@12 后移一位，PG 18 增列）。 */
+    private static final int CLASS_TOAST_RELID_INDEX = 13;
+
     /**
      * pg_attribute 列解码词典（25 项），逐行转录自 spike PGATTR_KINDS，
      * 原始出处 pg_attribute.h (REL_18_STABLE)。注意 attstattarget 在 PG 17 起
@@ -182,6 +188,18 @@ public final class WalLayoutV18 implements WalLayout {
     @Override
     public int pgClassRelfilenodeDataOffset() {
         return PGCLASS_RELFILENODE_DATA_OFFSET;
+    }
+
+    /** {@inheritDoc}——16（attisdropped，pg_attribute.h (REL_18_STABLE) 列序）。 */
+    @Override
+    public int attrDroppedIndex() {
+        return ATTR_DROPPED_INDEX;
+    }
+
+    /** {@inheritDoc}——13（reltoastrelid；live PG 18.6 pg_attribute 于 pg_class 的行序）。 */
+    @Override
+    public int classToastRelidIndex() {
+        return CLASS_TOAST_RELID_INDEX;
     }
 
     /** {@inheritDoc}——112（relfilenode@88 后 5 个定宽列合计 24B，spike 实证）。 */

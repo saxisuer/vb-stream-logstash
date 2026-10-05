@@ -96,23 +96,49 @@ public interface WalLayout {
     /**
      * pg_attribute 行解码词典（每列一个解码 kind）。
      *
-     * <p>逐列 kind 与 pg_attribute.h 目录定义同序（REL_18_STABLE）；varlena 列
-     * 记 "skip"。数组长度即目录列数，目录回放解码据此走位。返回防御副本。</p>
+     * <p>逐列 kind 与 pg_attribute.h 目录定义同序（各版本 STABLE 分支）；varlena
+     * 列记 "skip"。数组长度即目录列数，目录回放解码据此走位——V17 26 项
+     * （含 PG 18 删除的 attcacheoff）、V18 25 项；attisdropped 槽位经
+     * {@link #attrDroppedIndex()} 取。返回防御副本。</p>
      *
-     * @return 列 kind 数组（25 项）
+     * @return 列 kind 数组（V17 26 项 / V18 25 项）
      */
     String[] pgAttributeKinds();
 
     /**
      * pg_class 行解码词典（每列一个解码 kind）。
      *
-     * <p>逐列 kind 转录自 live PG 18 服务端 pg_attribute 于 pg_class 的行
-     * （attnum 升序）；relfilenode 在偏移 7、reltoastrelid 在偏移 13。
-     * 返回防御副本。</p>
+     * <p>逐列 kind 转录自 live 服务端 pg_attribute 于 pg_class 的行
+     * （attnum 升序）；relfilenode 在偏移 7（V17/V18 一致）、reltoastrelid 在
+     * 偏移 {@link #classToastRelidIndex()}（V17=12，V18=13——PG 18 增列
+     * relallfrozen 所致）。返回防御副本。</p>
      *
-     * @return 列 kind 数组（34 项）
+     * @return 列 kind 数组（V17 33 项 / V18 34 项）
      */
     String[] pgClassKinds();
+
+    /**
+     * pg_attribute 解码词典中 attisdropped 的槽位（0 起）。
+     *
+     * <p>行投影（AttrRow）按本槽位取 dropped 标志——列序随大版本漂移
+     * （V17=17：多 attcacheoff；V18=16），投影索引必须与词典同版本取值，
+     * 禁止跨版本硬编码。</p>
+     *
+     * @return attisdropped 槽位（V17 17 / V18 16）
+     */
+    int attrDroppedIndex();
+
+    /**
+     * pg_class 解码词典中 reltoastrelid 的槽位（0 起）。
+     *
+     * <p>行投影（ClassRow）按本槽位取 toast 关系 oid；与
+     * {@link #pgClassReltoastrelidDataOffset()} 成对（同列的词典槽位与数据区
+     * 偏移两副面孔）——PG 18 在 relallvisible 后增列 relallfrozen 使 V18 槽位
+     * 后移一位。</p>
+     *
+     * @return reltoastrelid 槽位（V17 12 / V18 13）
+     */
+    int classToastRelidIndex();
 
     /**
      * pg_class 数据区 relfilenode 列偏移（自 t_hoff 起）。

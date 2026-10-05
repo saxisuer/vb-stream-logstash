@@ -49,15 +49,18 @@ abstract class WalSyncItBase {
     /** 对拍等待接收前沿的超时（毫秒）。 */
     private static final long POLL_TIMEOUT_MS = 30_000;
 
-    /** 本基类布局（干扰容器单例就绪后解析，PG 18 → V18 描述符）——子类起同步器共用。 */
+    /** 本基类布局（构造期按 {@link #serverVersion()} 解析——默认干扰容器 PG 18 → V18，
+     * 17 矩阵子类覆写指向 Wal17TestEnv）——子类起同步器共用。 */
     protected final WalLayout layout = WalLayouts.forServerVersion(serverVersion());
 
     /**
-     * 干扰容器服务端版本号（布局分发输入）。
+     * 本测试环境的服务端版本号（布局分发输入）——实例方法钩子，子类可覆写指向
+     * 其他版本容器（默认干扰容器；构造器/字段初始化期调用，覆写实现不得依赖
+     * 子类自有字段未初始化的状态）。
      *
-     * @return 十进制版本号（如 180000）
+     * @return 十进制版本号（如 180000 / 170000）
      */
-    protected static int serverVersion() {
+    protected int serverVersion() {
         try {
             return Interference.serverVersionNum();
         } catch (SQLException e) {

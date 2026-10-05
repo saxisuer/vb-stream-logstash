@@ -57,7 +57,7 @@ class CatalogSynchronizerTest {
         long oldKey = CatalogReplay.ctidKey(0, 1);
         long newKey = CatalogReplay.ctidKey(2, 3);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple)));
+        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
         stores.rawClassTails().put(oldKey, tailOf(oldTuple));
         stores.trackedTableCtid(oldKey);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
@@ -95,7 +95,7 @@ class CatalogSynchronizerTest {
         long afterPrune = CatalogReplay.ctidKey(7, 5);
         long afterUpdate = CatalogReplay.ctidKey(8, 2);
         TupleBytes seed = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(start, CatalogRow.ClassRow.fromDecoded(decode(seed)));
+        stores.classRows().put(start, CatalogRow.ClassRow.fromDecoded(decode(seed), layout));
         stores.rawClassTails().put(start, tailOf(seed));
         stores.trackedTableCtid(start);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,

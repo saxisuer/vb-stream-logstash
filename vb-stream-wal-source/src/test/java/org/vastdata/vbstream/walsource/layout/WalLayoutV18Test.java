@@ -65,11 +65,11 @@ class WalLayoutV18Test {
         assertEquals(18, WalLayouts.forServerVersion(189999).majorVersion());
     }
 
-    /** 未知大版本（含 190000 与 Task 16 未注册前的 17）启动期 ISE fail-fast，不得静默回退。 */
+    /** 未知大版本（190000 及以上、160000 及以下）启动期 ISE fail-fast，不得静默回退——
+     *  170000 自 Task 16 起分发 V17，不再属拒绝面（17 断言面归 WalLayoutV17Test）。 */
     @Test
     void forServerVersionRejectsUnknownOrUnregisteredMajors() {
         assertThrows(IllegalStateException.class, () -> WalLayouts.forServerVersion(190000));
-        assertThrows(IllegalStateException.class, () -> WalLayouts.forServerVersion(170000));
         assertThrows(IllegalStateException.class, () -> WalLayouts.forServerVersion(160000));
         assertThrows(IllegalStateException.class, () -> WalLayouts.forServerVersion(0));
     }

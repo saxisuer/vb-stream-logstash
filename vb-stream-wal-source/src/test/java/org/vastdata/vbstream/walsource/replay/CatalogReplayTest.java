@@ -109,7 +109,7 @@ class CatalogReplayTest {
         long oldKey = CatalogReplay.ctidKey(3, 1);
         long newKey = CatalogReplay.ctidKey(5, 2);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple)));
+        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
         stores.rawClassTails().put(oldKey, tailOf(oldTuple));
         stores.trackedTableCtid(oldKey);
 
@@ -144,7 +144,7 @@ class CatalogReplayTest {
         long oldKey = CatalogReplay.ctidKey(3, 1);
         long newKey = CatalogReplay.ctidKey(5, 2);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        CatalogRow.ClassRow oldRow = CatalogRow.ClassRow.fromDecoded(decode(oldTuple));
+        CatalogRow.ClassRow oldRow = CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout);
         stores.classRows().put(oldKey, oldRow);
 
         TupleBytes newTuple = classTuple(100, "t1", 201, 0, 1);   // 列 1-7 与旧行一致（prefix 区）
@@ -161,7 +161,7 @@ class CatalogReplayTest {
         int bitmapLen = newTuple.tHoff() - 23;
         ByteArrayOutputStream expect = new ByteArrayOutputStream();
         expect.write(newTail, 0, bitmapLen);
-        expect.write(oldRow.encodeReadRegion(), 0, 88);
+        expect.write(oldRow.encodeReadRegion(layout), 0, 88);
         expect.write(newTail, bitmapLen + 88, newTail.length - bitmapLen - 88);
         assertArrayEquals(expect.toByteArray(), stores.rawClassTails().get(newKey));
     }
@@ -210,7 +210,7 @@ class CatalogReplayTest {
         long oldKey = CatalogReplay.ctidKey(3, 1);
         long newKey = CatalogReplay.ctidKey(5, 2);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple)));
+        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
         stores.rawClassTails().put(oldKey, tailOf(oldTuple));
 
         // 新行：列 1-7 与 relfilenode@88/tablespace@92 落在 prefix=96 区（不变），
@@ -304,7 +304,7 @@ class CatalogReplayTest {
         CatalogStores stores = freshStores();
         long key = CatalogReplay.ctidKey(0, 1);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(key, CatalogRow.ClassRow.fromDecoded(decode(oldTuple)));
+        stores.classRows().put(key, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
         stores.rawClassTails().put(key, tailOf(oldTuple));
 
         TupleBytes newTuple = classTuple(100, "t1", 777, 888, 1);

@@ -55,7 +55,8 @@ public final class CatalogReplay {
     /** HeapTupleHeader 的 t_bits 偏移（offsetof=23，截断重建的位图区起点）。 */
     private static final int TUPLE_BITS_OFFSET = 23;
 
-    // 派生档九槽位（与 pgClassKinds() 词典列序一致，位号同 CatalogRow.ClassRow 的 IX_* 私有镜像——两处须同步）
+    // 派生档九槽位（与 pgClassKinds() 词典列序一致，位号同 CatalogRow.ClassRow 的 IX_* 私有镜像——两处须同步；
+    // 词典前八槽 V17/V18 同序，reltoastrelid 槽位随版本漂移经 layout.classToastRelidIndex() 取）
     /** 词典槽位：oid（列 1）。 */
     private static final int IX_CLASS_OID = 0;
 
@@ -80,10 +81,8 @@ public final class CatalogReplay {
     /** 词典槽位：relfilenode（列 8，数据区偏移 88）。 */
     private static final int IX_CLASS_RELFILENODE = 7;
 
-    /** 词典槽位：reltoastrelid（列 14，数据区偏移 112）。 */
-    private static final int IX_CLASS_RELTOASTRELID = 13;
-
-    // attr 面精确采纳的五槽位（与 pgAttributeKinds() 词典列序一致，位号同 CatalogRow.AttrRow 的 IX_* 私有镜像——两处须同步）
+    // attr 面精确采纳的五槽位（与 pgAttributeKinds() 词典列序一致，位号同 CatalogRow.AttrRow 的 IX_* 私有镜像——两处须同步；
+    // 前五槽 V17/V18 同序，attisdropped 槽位随版本漂移经 layout.attrDroppedIndex() 取）
     /** 词典槽位：attrelid（列 1）。 */
     private static final int IX_ATTR_ATTRELID = 0;
 
@@ -95,9 +94,6 @@ public final class CatalogReplay {
 
     /** 词典槽位：attnum（列 5）。 */
     private static final int IX_ATTR_ATTNUM = 4;
-
-    /** 词典槽位：attisdropped（列 17）。 */
-    private static final int IX_ATTR_ATTISDROPPED = 16;
 
     private final WalLayout layout;
     private final TupleDecoder decoder;
@@ -424,7 +420,7 @@ public final class CatalogReplay {
                 if (ev.op() == HeapEvent.UPD) {
                     stores.attrRows().remove(ev.oldCtid());
                 }
-                CatalogRow.AttrRow row = CatalogRow.AttrRow.fromDecoded(ev.row());
+                CatalogRow.AttrRow row = CatalogRow.AttrRow.fromDecoded(ev.row(), layout);
                 if (row.attnum() > 0) {
                     // 字典面契约与引导同源：attnum>0（系统列行不进字典——流内建表时
                     // pg_attribute 的负 attnum INS 与种子查询的过滤口径一致，Task 13）
@@ -447,7 +443,7 @@ public final class CatalogReplay {
                 if (ev.op() == HeapEvent.UPD) {
                     stores.classRows().remove(ev.oldCtid());
                 }
-                CatalogRow.ClassRow cr = CatalogRow.ClassRow.fromDecoded(ev.row());
+                CatalogRow.ClassRow cr = CatalogRow.ClassRow.fromDecoded(ev.row(), layout);
                 stores.classRows().put(ev.newCtid(), cr);
                 if (ev.op() == HeapEvent.UPD) {
                     stores.followTracked(ev.oldCtid(), ev.newCtid());
@@ -480,7 +476,8 @@ public final class CatalogReplay {
      * pg_class 截断更新的值编码重建（spike {@code reconstructClassTruncated} 移植，
      * 发现 24 + 审查 High-1 读区回填）——prefix 落在读区（≤{@code 读区末尾}）时由
      * 已知旧行 {@link CatalogRow.ClassRow#encodeReadRegion()} 重编码前缀，中段取自
-     * 记录；后缀零填充<strong>仅在读区之外合法</strong>，与读区 [0,116) 的重叠段按
+     * 记录；后缀零填充<strong>仅在读区之外合法</strong>，与读区（V18 [0,116) / V17
+     * [0,108)，由 layout 的 toast 偏移锚定）的重叠段按
      * 旧行读区字节回填（suffix 截断省略的尾段与旧元组逐字节相同是其定义，回填即
      * 精确值——此前盲零填充在 RENAME 形态把 relnamespace..relam 清零）。
      *
@@ -521,7 +518,7 @@ public final class CatalogReplay {
         } else {
             out.write(raw, cur, bitmapLen);    // 位图 + 垫齐
             cur += bitmapLen;
-            out.write(oldRow.encodeReadRegion(), 0, prefix);
+            out.write(oldRow.encodeReadRegion(layout), 0, prefix);
             out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 中段
         }
         out.write(new byte[suffix], 0, suffix);    // 后缀零填充占位（读区重叠段下方回填）
@@ -536,7 +533,7 @@ public final class CatalogReplay {
             return null;    // 防御：suffix 超数据区长（畸形记录）——落 tail/自愈兜底
         }
         if (zeroStart < readEnd) {
-            byte[] readRegion = oldRow.encodeReadRegion();
+            byte[] readRegion = oldRow.encodeReadRegion(layout);
             int backfillEnd = Math.min(dataLen, readEnd);
             for (int i = zeroStart; i < backfillEnd; i++) {
                 assembled[bitmapLen + i] = readRegion[i];
@@ -707,7 +704,7 @@ public final class CatalogReplay {
         vals[IX_CLASS_RELOWNER] = row.relowner();
         vals[IX_CLASS_RELAM] = row.relam();
         vals[IX_CLASS_RELFILENODE] = row.relfilenode();
-        vals[IX_CLASS_RELTOASTRELID] = row.reltoastrelid();
+        vals[layout.classToastRelidIndex()] = row.reltoastrelid();
         repairTracked(stores, row, newCtid);
         noteAdoption(row.relOid());
         stores.metrics().inc(CatalogStores.CatalogMetrics.SELF_HEALED);
@@ -786,7 +783,7 @@ public final class CatalogReplay {
         vals[IX_ATTR_ATTNAME] = row.attname();
         vals[IX_ATTR_ATTTYPEID] = row.atttypid();
         vals[IX_ATTR_ATTNUM] = (short) row.attnum();
-        vals[IX_ATTR_ATTISDROPPED] = row.attisdropped();
+        vals[layout.attrDroppedIndex()] = row.attisdropped();
         if (metrics != null) {
             metrics.inc(CatalogStores.CatalogMetrics.SELF_HEALED);
         }

@@ -56,7 +56,7 @@ class SelfHealerTest {
         CatalogStores stores = freshStores();
         long staleCtid = CatalogReplay.ctidKey(3, 1);
         long newCtid = CatalogReplay.ctidKey(5, 2);
-        CatalogRow.ClassRow candidate = CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1)));
+        CatalogRow.ClassRow candidate = CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1)), layout);
         stores.classRows().put(staleCtid, candidate);
         stores.rawClassTails().put(staleCtid, new byte[]{1, 2, 3});
         stores.trackedTableCtid(staleCtid);
@@ -90,7 +90,7 @@ class SelfHealerTest {
         CatalogStores stores = freshStores();
         long staleCtid = CatalogReplay.ctidKey(3, 1);
         long newCtid = CatalogReplay.ctidKey(5, 2);
-        stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1))));
+        stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1)), layout));
         stores.trackedTableCtid(staleCtid);
         stores.interestRelOids().add(100L);
 
@@ -139,7 +139,7 @@ class SelfHealerTest {
         CatalogStores stores = freshStores();
         long staleCtid = CatalogReplay.ctidKey(3, 1);
         long newCtid = CatalogReplay.ctidKey(5, 2);
-        stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1))));
+        stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1)), layout));
         stores.trackedTableCtid(staleCtid);
         stores.interestRelOids().add(100L);
 
