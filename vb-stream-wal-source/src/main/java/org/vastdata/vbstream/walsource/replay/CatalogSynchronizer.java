@@ -1,0 +1,339 @@
+package org.vastdata.vbstream.walsource.replay;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
+import org.vastdata.vbstream.walsource.layout.Lsn;
+import org.vastdata.vbstream.walsource.layout.TupleDecoder;
+import org.vastdata.vbstream.walsource.layout.WalLayout;
+import org.vastdata.vbstream.walsource.layout.WalRecord;
+import org.vastdata.vbstream.walsource.receive.PhysicalSlotManager;
+import org.vastdata.vbstream.walsource.receive.WalStreamReceiver;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalLong;
+import java.util.StringJoiner;
+
+/**
+ * 伪备库 catalog 同步器（spec §5 组件四）：JDBC 一致性引导 + 物理流接收 + ctid 重放
+ * 的 v1 组装——一次 {@link #start} 完成槽确保、REPEATABLE READ 全行种子、起流（sink
+ * 委派本类 {@link #apply}），此后字典随消费增量维护并经 {@link #snapshot()} 提供
+ * {@link CatalogSnapshot} as-of 查询。
+ *
+ * <p><strong>装配序（spec §6①）</strong>：① {@link PhysicalSlotManager#ensureSlot} 取
+ * P₀（建槽自身的 WAL 先于种子快照落盘）→ ② {@link CatalogBootstrap#bootstrap} 在
+ * REPEATABLE READ 单事务内灌满两目录并返回同事务 flush LSN（B）→ ③ 流起点
+ * max(P₀, B)（页对齐由接收器内部下取整）——窗口重叠由 ctid 键控 upsert 幂等消化。</p>
+ *
+ * <p><strong>凭据移交限制（v1 已知）</strong>：接收器自建物理复制连接，而 JDBC
+ * {@link Connection} 不暴露密码——复制连接的凭据取自引导连接 URL 的 query 参数
+ * （{@code ?user=..&amp;password=..}），缺省 user 取 metadata 用户名、password 为空串
+ * （trust 认证）。目标环境为密码认证（scram）时，调用方须以携带凭据的 URL 建立引导
+ * 连接。</p>
+ *
+ * <p>线程约束：{@link #apply} 在接收线程（wal-receiver）单写者执行；stores 集合均按
+ * 单写者假设（Task 10 契约）；{@link #snapshot()}/{@link #consumedLsn()}/{@link #metrics()}
+ * 为只读观测面——v1 执行模型单线程直通，跨线程读为尽力一致（apply 中前沿经 volatile
+ * 先于字典更新发布，读方可能看到略旧字典 + 新前沿，spec §7 检查点取天然一致点）。
+ * {@link #stop()} 幂等，可从任意线程调用。</p>
+ */
+public final class CatalogSynchronizer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CatalogSynchronizer.class);
+
+    private final CatalogStores stores;
+    private final CatalogReplay replay;
+
+    /** 接收器（start 组装路径注入；纯逻辑测试缝为 null）。 */
+    private final WalStreamReceiver receiver;
+
+    /** 已施加前沿镜像：最近一次 apply 完成的记录 MAXALIGN 末尾（volatile 跨线程读）。 */
+    private volatile long appliedLsn;
+
+    /**
+     * 纯逻辑构造缝（测试/离线组装用：直接持 stores + 重放引擎，无接收器——apply 面
+     * 与 start 组装路径完全同源）。
+     *
+     * @param stores 重放状态容器（调用方持有引导/种子责任）
+     * @param replay 重放引擎（与 stores 配对的 layout/decoder 组合）
+     */
+    CatalogSynchronizer(CatalogStores stores, CatalogReplay replay) {
+        this(stores, replay, null);
+    }
+
+    /**
+     * 全参构造（start 组装路径）。
+     *
+     * @param stores   重放状态容器（已引导）
+     * @param replay   重放引擎
+     * @param receiver 接收器（null = 无流面，consumedLsn 回落 appliedLsn）
+     */
+    private CatalogSynchronizer(CatalogStores stores, CatalogReplay replay, WalStreamReceiver receiver) {
+        this.stores = stores;
+        this.replay = replay;
+        this.receiver = receiver;
+    }
+
+    /**
+     * v1 组装入口：槽确保 → 一致性引导 → 起接收流（sink = 本实例 apply）。
+     *
+     * <p>关键步骤：① interest oid 注册进 stores（引导据此定位 tracked 双 ctid；v1
+     * 注册 0 个合法——纯字典同步形态）；② ensureSlot 得 P₀；③ bootstrap 得种子 +
+     * 同事务 flush LSN（B）；④ 由引导连接的 metadata URL 解析接收器连接参数（见类
+     * javadoc 凭据限制）；⑤ {@code receiver.start(this::apply, max(P0, B))}——页对齐
+     * 由接收器内取整，sink 在接收线程同步执行。边界与异常语义：SQLException/ISE
+     * 原样上抛（半建资源由接收器自有生命周期兜底，未 start 的接收器无需停机）；
+     * 重复/前置失败由各组件自身 fail-fast。</p>
+     *
+     * @param sql            引导用 SQL 会话（普通连接；凭据限制见类 javadoc）
+     * @param slotName       物理槽名
+     * @param layout         版本布局描述符（重放引擎与接收器共用）
+     * @param interestRelOid 需要列字典/toast 跟踪的关系 oid（v1 tracked 面单表，可空）
+     * @return 已运行的同步器（apply 消费面 + snapshot 查询面）
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
+            long... interestRelOid) throws SQLException {
+        CatalogStores stores = new CatalogStores();
+        for (long oid : interestRelOid) {
+            stores.interestRelOids().add(oid);
+        }
+        long p0 = new PhysicalSlotManager(sql).ensureSlot(slotName);
+        long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
+        long start = Math.max(p0, bootstrapLsn);
+
+        ConnInfo ci = ConnInfo.from(sql);
+        WalStreamReceiver receiver = new WalStreamReceiver(
+                ci.host(), ci.port(), ci.database(), ci.user(), ci.pass(), layout, slotName);
+        CatalogSynchronizer sync = new CatalogSynchronizer(stores,
+                new CatalogReplay(layout, new TupleDecoder(layout)), receiver);
+        receiver.start(sync::apply, start);
+        LOG.info("CatalogSynchronizer 启动: slot={} 流起点 max(P0={}, bootstrap={}) = {}（interest {} 个）",
+                slotName, Lsn.format(p0), Lsn.format(bootstrapLsn), Lsn.format(start), interestRelOid.length);
+        return sync;
+    }
+
+    /**
+     * 流消费面（接收线程回调）：施加一条 WAL 记录到 catalog 字典并推进已施加前沿。
+     *
+     * <p>关键步骤：{@link CatalogReplay#applyCatalogRecord}（prune → inplace → attr
+     * events → class events + tracked 跟随，施加次序由引擎固定）→ 前沿推进到本记录
+     * MAXALIGN 末尾（与 walker 记录对齐边界同式）。边界与异常语义：非 catalog 记录
+     * （其它 rmgr/关系）为引擎内 no-op，前沿照常推进——位点语义是"已走读"而非"已改
+     * 字典"。线程约束：接收线程单写者。</p>
+     *
+     * @param r 走读完成的记录
+     */
+    public void apply(WalRecord r) {
+        replay.applyCatalogRecord(r, stores);
+        appliedLsn = (r.lsn() + r.totLen() + 7) & ~7L;
+    }
+
+    /**
+     * 字典 as-of 快照（{@link CatalogSnapshot} 契约实现——内部视图类，活引用不冻结）。
+     *
+     * @return 快照视图（lsn = 已施加前沿；查询随字典推进反映最新状态）
+     */
+    public CatalogSnapshot snapshot() {
+        return new SnapshotView();
+    }
+
+    /**
+     * 接收消费前沿（透传 {@link WalStreamReceiver#consumedLsn()}——含已走读但 sink
+     * 尚在执行的批内记录；纯逻辑缝无接收器时回落已施加前沿）。
+     *
+     * @return 下一个未消费字节的 LSN；未 start 为 0
+     */
+    public long consumedLsn() {
+        WalStreamReceiver r = receiver;
+        return r == null ? appliedLsn : r.consumedLsn();
+    }
+
+    /**
+     * 重放指标快照（防御拷贝——跨线程只读面）。
+     *
+     * @return 计数键值不可变拷贝（replayed/skippedTruncated/pruneRedirects/...）
+     */
+    public Map<String, Long> metrics() {
+        return stores.metrics().snapshot();
+    }
+
+    /**
+     * 幂等停机：停接收线程（join 3s 上限，委派 {@link WalStreamReceiver#stop()}）；
+     * 引导 SQL 会话归调用方持有生命周期，本类不越权关闭。
+     */
+    public void stop() {
+        WalStreamReceiver r = receiver;
+        if (r != null) {
+            r.stop();
+        }
+        LOG.info("CatalogSynchronizer 停机: 已施加前沿 {}", Lsn.format(appliedLsn));
+    }
+
+    /**
+     * 引导连接的 metadata URL 解析产物（接收器复制连接的四件 + 凭据）。
+     *
+     * @param host     主机（多宿主取首个，v1 限制）
+     * @param port     端口（缺省 5432）
+     * @param database 库名（缺省回落用户名——pgjdbc 同语义）
+     * @param user     用户（URL 参数优先，回落 metadata 用户名）
+     * @param pass     密码（仅取 URL 参数；缺省空串——trust 认证，见类 javadoc）
+     */
+    private record ConnInfo(String host, int port, String database, String user, String pass) {
+
+        /**
+         * 从 JDBC Connection 的 metadata 解析连接参数：URL 即 pgjdbc 建连时的原串
+         * （{@code PgConnection.getURL()} 返回 creatingURL），形如
+         * {@code jdbc:postgresql://host[:port][/db][?k=v&..]}。
+         *
+         * <p>边界与异常语义：非 postgresql URL / 端口非数字抛 ISE（fail-fast 优于
+         * 静默连错目标）；IPv6 字面量与多宿主列表取首段（v1 限制）；URL 参数值不做
+         * 百分号解码（pgjdbc URL 参数即明文 properties，官方语义）。</p>
+         *
+         * @param c 引导连接
+         * @return 解析产物
+         * @throws SQLException metadata 读取失败
+         */
+        static ConnInfo from(Connection c) throws SQLException {
+            String url = c.getMetaData().getURL();
+            String prefix = "jdbc:postgresql:";
+            if (!url.startsWith(prefix)) {
+                throw new IllegalStateException("非 postgresql URL，无法派生复制连接: " + url);
+            }
+            String rest = url.substring(prefix.length());
+            Map<String, String> params = new HashMap<>();
+            int q = rest.indexOf('?');
+            if (q >= 0) {
+                for (String kv : rest.substring(q + 1).split("&")) {
+                    int eq = kv.indexOf('=');
+                    if (eq > 0) {
+                        params.put(kv.substring(0, eq), kv.substring(eq + 1));
+                    }
+                }
+                rest = rest.substring(0, q);
+            }
+            String host = "localhost";
+            int port = 5432;
+            String db = null;
+            if (rest.startsWith("//")) {
+                rest = rest.substring(2);
+                int slash = rest.indexOf('/');
+                String hostPort = slash >= 0 ? rest.substring(0, slash) : rest;
+                db = slash >= 0 ? rest.substring(slash + 1) : null;
+                int colon = hostPort.indexOf(':');
+                if (colon >= 0) {
+                    host = hostPort.substring(0, colon);
+                    String portText = hostPort.substring(colon + 1);
+                    try {
+                        port = Integer.parseInt(portText);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalStateException("URL 端口非数字: " + url);
+                    }
+                } else {
+                    host = hostPort;
+                }
+            } else if (!rest.isEmpty()) {
+                db = rest;    // jdbc:postgresql:dbname 形态（全默认主机）
+            }
+            int comma = host.indexOf(',');
+            if (comma >= 0) {
+                host = host.substring(0, comma);    // 多宿主取首个（v1 限制）
+            }
+            String user = params.getOrDefault("user", c.getMetaData().getUserName());
+            if (db == null || db.isEmpty()) {
+                db = user;    // pgjdbc 缺省库 = 用户名
+            }
+            return new ConnInfo(host, port, db, user, params.getOrDefault("password", ""));
+        }
+    }
+
+    /**
+     * {@link CatalogSnapshot} 的内部视图实现——活引用 stores（不冻结拷贝，v1 单线程
+     * 直通下的天然一致；跨协议方法逐查询直读，见接口 javadoc 的尽力一致语义）。
+     */
+    private final class SnapshotView implements CatalogSnapshot {
+
+        /**
+         * 已施加前沿（最近一次 apply 完成的记录末尾）——字典内容的 as-of 位点。
+         *
+         * @return 打包 LSN（未施加任何记录为 0）
+         */
+        @Override
+        public long lsn() {
+            return appliedLsn;
+        }
+
+        /**
+         * 列字典查询：attrRows 值域过滤 attrelid 后按 attnum 升序投影——含 dropped
+         * 占位行（发现 26），未知关系空表。
+         *
+         * @param relOid 关系 oid
+         * @return 列列表（attnum 升序）
+         */
+        @Override
+        public List<Column> columnsOf(long relOid) {
+            List<Column> out = new ArrayList<>();
+            for (CatalogRow.AttrRow row : stores.attrRows().values()) {
+                if (row.attrelid() == relOid) {
+                    out.add(new Column(row.attnum(), row.attname(), row.atttypid(), row.attisdropped()));
+                }
+            }
+            out.sort(Comparator.comparingInt(Column::attnum));
+            return out;
+        }
+
+        /**
+         * relfilenode 查询：classRows 值域首配 relOid（oid 目录内唯一，首配即全配）。
+         *
+         * @param relOid 关系 oid
+         * @return 当前 relfilenode；不在字典 empty
+         */
+        @Override
+        public OptionalLong relfilenodeOf(long relOid) {
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relOid() == relOid) {
+                    return OptionalLong.of(row.relfilenode());
+                }
+            }
+            return OptionalLong.empty();
+        }
+
+        /**
+         * toast 关系查询：与 {@link #relfilenodeOf(long)} 同源行取 reltoastrelid。
+         *
+         * @param relOid 关系 oid
+         * @return toast 关系 oid（无 toast 为 of(0)）；不在字典 empty
+         */
+        @Override
+        public OptionalLong toastOf(long relOid) {
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relOid() == relOid) {
+                    return OptionalLong.of(row.reltoastrelid());
+                }
+            }
+            return OptionalLong.empty();
+        }
+
+        /**
+         * 诊断用字符串形态（前沿 + 两字典行数 + tracked 双 ctid）。
+         *
+         * @return 概要文本
+         */
+        @Override
+        public String toString() {
+            return new StringJoiner(", ", "CatalogSnapshot[", "]")
+                    .add("lsn=" + Lsn.format(appliedLsn))
+                    .add("attrRows=" + stores.attrRows().size())
+                    .add("classRows=" + stores.classRows().size())
+                    .add("trackedTable=" + stores.trackedTableCtid())
+                    .add("trackedToast=" + stores.trackedToastCtid())
+                    .toString();
+        }
+    }
+}
