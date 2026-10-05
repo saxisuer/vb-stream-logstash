@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.layout.BlockRef;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.HeapViews;
+import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.layout.PageImages;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
@@ -13,8 +14,11 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.LongFunction;
 
 /**
@@ -26,9 +30,11 @@ import java.util.function.LongFunction;
  * <p>对 spike 的两处裁定差异（spec §6）：① {@code pg_read_binary_file} 页读兜底
  * <strong>整体删除</strong>——截断更新优先值编码重建（prefix ≤ 88 由已知
  * {@link CatalogRow.ClassRow} 重编码，发现 24），越界或有 rawTail 走 splice，两者
- * 皆无 skip + 计数 skippedTruncated（窗口外噪声不抛）；② tracked 断链自愈
- * <strong>不做</strong>（Task 12 专题：中段新值对 JDBC 末态校验）——本任务 unknown
- * oldCtid 直接 skip + 计数。</p>
+ * 皆无时（healer 已注入且为 pg_class 面）走 ②自愈、否则 skip + 计数
+ * skippedTruncated（窗口外噪声不抛）；② tracked 断链自愈（Task 12 落地）——未知
+ * oldCtid 的 pg_class 截断更新按候选行枚举重建，经 {@link SelfHealer} 以<strong>中段
+ * 新值对 JDBC 末态</strong>校验（spec §6②，废 spike 的 OID 恒真校验——发现 23a），
+ * 命中采纳并修复 tracked；healer 未注入（null）保留纯 skip 行为。</p>
  *
  * <p>线程约束：实例持 layout + decoder（decoder 无共享可变状态），但通过
  * {@link CatalogStores} 的重放入口按<strong>单线程</strong>假设运行（spec §3 单线程
@@ -52,15 +58,31 @@ public final class CatalogReplay {
     private final WalLayout layout;
     private final TupleDecoder decoder;
 
+    /** 截断自愈校验器（null = 禁用：未知 oldCtid 保留 skip + 计数行为）。 */
+    private final SelfHealer healer;
+
     /**
-     * 构造重放引擎。
+     * 构造重放引擎（自愈禁用档）。
      *
      * @param layout  版本布局描述符（截断阈值 88、INPLACE 偏移 88/112、两目录词典均取自它）
      * @param decoder 磁盘格式 tuple 解码器（实例无状态，可与他处共享）
      */
     public CatalogReplay(WalLayout layout, TupleDecoder decoder) {
+        this(layout, decoder, null);
+    }
+
+    /**
+     * 构造重放引擎（全参档）。
+     *
+     * @param layout  版本布局描述符（截断阈值 88、INPLACE 偏移 88/112、两目录词典均取自它）
+     * @param decoder 磁盘格式 tuple 解码器（实例无状态，可与他处共享）
+     * @param healer  截断自愈校验器（null 保留 skip 行为；非 null 时 pg_class 面
+     *                未知 oldCtid 的截断更新走候选枚举 + 中段新值对 JDBC 末态校验）
+     */
+    public CatalogReplay(WalLayout layout, TupleDecoder decoder, SelfHealer healer) {
         this.layout = layout;
         this.decoder = decoder;
+        this.healer = healer;
     }
 
     /**
@@ -91,28 +113,51 @@ public final class CatalogReplay {
      * @return 事件列表（记录不属于该关系或全 skip 为空表）
      */
     public List<HeapEvent> heapEvents(WalRecord r, long watchedRelfilenode, String[] kinds, Map<Long, ?> rawTailStore) {
-        return heapEvents(r, watchedRelfilenode, kinds, rawTailStore, null, null);
+        return heapEvents(r, watchedRelfilenode, kinds, rawTailStore, null, null, null);
     }
 
     /**
-     * 提取 heap 级行事件（全量档）——INS / DEL / UPD（含截断重建）/ MULTI_INSERT，
-     * data 与 FPW image 双路径（发现 14：catalogs 在 FPI 时不记 tuple data；发现 15：
-     * 镜像是变更后页状态，offnum 行直接在页内）。
+     * 提取 heap 级行事件（全量档，自愈禁用）：语义与七参档
+     * {@link #heapEvents(WalRecord, long, String[], Map, LongFunction,
+     * CatalogStores.CatalogMetrics, CatalogStores)} 完全一致（healStores=null，
+     * 旧行值与 tail 皆无即 skip），见其 javadoc。
+     *
+     * @param r                 走读完成的记录
+     * @param watchedRelfilenode watched 关系 relfilenode（0 恒不匹配）
+     * @param kinds             逐列解码词典
+     * @param rawTailStore      raw tail 存储（维护契约见四参档；null 不维护）
+     * @param classRowLookup    pg_class 行字典查找（null 则截断仅 rawTail splice）
+     * @param metrics           指标容器（skip 计数；null 不计）
+     * @return 事件列表
+     */
+    public List<HeapEvent> heapEvents(WalRecord r, long watchedRelfilenode, String[] kinds,
+            Map<Long, ?> rawTailStore, LongFunction<CatalogRow.ClassRow> classRowLookup,
+            CatalogStores.CatalogMetrics metrics) {
+        return heapEvents(r, watchedRelfilenode, kinds, rawTailStore, classRowLookup, metrics, null);
+    }
+
+    /**
+     * 提取 heap 级行事件（全量档 + 自愈档）——INS / DEL / UPD（含截断重建）/
+     * MULTI_INSERT，data 与 FPW image 双路径（发现 14：catalogs 在 FPI 时不记
+     * tuple data；发现 15：镜像是变更后页状态，offnum 行直接在页内）。
      *
      * <p>关键步骤：rmid 筛（heap/heap2）→ 块链按 relNode 匹配 watched（fork=0）→
      * 按 opcode 分支：INS data 路径 [xl_heap_header 5B][tail] 解码并落 tail、image
      * 路径重建页后按行号取 ItemId 解码（无 tail）；DEL 仅事件 + 删 tail；UPD 以
      * HeapUpdateView 取 old/new 行号（旧页块按 fork 过滤选取，spike VM 块教训），
      * 截断位组置位时先试值编码（classRowLookup 命中且 prefix ≤ 88）、再试 rawTail
-     * splice、皆无 skip（metrics 计数 skippedTruncated，UPD 必删旧 tail——spike
-     * 教训）；MULTI_INSERT 逐 entry（2 对齐起点、datalen 只计 tail 字节，spike 锚）
-     * 或 image 路径按 offsets（INIT_PAGE 时隐含 i+1，发现 3）。INPLACE 不在本方法
-     * 面（返回空）——原地改写需要行字典就地更新与 tail 失效，由
-     * {@link #applyInplace} 承载。</p>
+     * splice、皆无时若 healStores 非 null（pg_class 面 + healer 已注入）走
+     * {@code selfHealTruncated} 候选枚举自愈（spec §6②，单次路径内完成——本方法
+     * 非幂等，不重复调用），否则 skip（metrics 计数 skippedTruncated，UPD 必删旧
+     * tail——spike 教训）；MULTI_INSERT 逐 entry（2 对齐起点、datalen 只计 tail
+     * 字节，spike 锚）或 image 路径按 offsets（INIT_PAGE 时隐含 i+1，发现 3）。
+     * INPLACE 不在本方法面（返回空）——原地改写需要行字典就地更新与 tail 失效，
+     * 由 {@link #applyInplace} 承载。</p>
      *
      * <p>边界与异常语义：opcode/结构错配由 HeapViews 各工厂 ISE fail-fast；块无
-     * data 且无 image（协议违约）静默无事件；截断 skip 不抛。线程约束：纯提取 +
-     * 对 rawTailStore/classRowLookup 的单写者假设（stores 生命周期内仅重放线程调用）。</p>
+     * data 且无 image（协议违约）静默无事件；截断 skip 不抛（自愈判否同不抛——
+     * 连续失败只计数/标 stale）。线程约束：纯提取 + 对 rawTailStore/classRowLookup
+     * /healStores 的单写者假设（stores 生命周期内仅重放线程调用）。</p>
      *
      * @param r                 走读完成的记录
      * @param watchedRelfilenode watched 关系 relfilenode（0 恒不匹配）
@@ -122,11 +167,16 @@ public final class CatalogReplay {
      *                          null 即约定 kinds 为 pgClassKinds()</strong>，null 则
      *                          截断仅 rawTail splice）
      * @param metrics           指标容器（skip 计数；null 不计）
+     * @param healStores        自愈状态容器（tracked 双 ctid/候选行字典/staleOids；
+     *                          <strong>非 null 即约定 watchedRelfilenode 为
+     *                          pg_class 且 kinds 为 pg_class 词典</strong>——仅
+     *                          {@link #applyCatalogRecord} 的 pg_class 腿传入；
+     *                          null 则旧行值与 tail 皆无即 skip）
      * @return 事件列表
      */
     public List<HeapEvent> heapEvents(WalRecord r, long watchedRelfilenode, String[] kinds,
             Map<Long, ?> rawTailStore, LongFunction<CatalogRow.ClassRow> classRowLookup,
-            CatalogStores.CatalogMetrics metrics) {
+            CatalogStores.CatalogMetrics metrics, CatalogStores healStores) {
         List<HeapEvent> out = new ArrayList<>();
         if (r.rmid() != HeapOps.RM_HEAP_ID && r.rmid() != HeapOps.RM_HEAP2_ID) {
             return out;
@@ -169,7 +219,7 @@ public final class CatalogReplay {
                 byte[] tail;
                 if ((view.flags() & HeapOps.XLH_UPDATE_TRUNCATION) != 0) {
                     Reconstruction rc = reconstructTruncatedUpdate(
-                            r, b0, oldCtid, kinds, tails, classRowLookup, metrics);
+                            r, b0, oldCtid, newCtid, kinds, tails, classRowLookup, metrics, healStores);
                     if (rc == null) {
                         return out;    // 旧行值与 raw tail 皆无：窗口外噪声，skip 不抛
                     }
@@ -301,7 +351,9 @@ public final class CatalogReplay {
      * <p>关键步骤（pg_class 事件施加）：DEL 删行；INS/UPD 落新键行模型（UPD 先删
      * 旧键——heapEvents 已维护 tail，此处维护行字典）；UPD 时 tracked 双 ctid
      * 跟随；INS 且新行 oid 等于 tracked 表的 reltoastrelid 时收养为 trackedToast
-     * （toast 关系重建以新 pg_class 行到达）。边界与异常语义：非 heap 家族记录仅
+     * （toast 关系重建以新 pg_class 行到达）。pg_class 腿以 stores 作 healStores
+     * 传入 heapEvents——healer 已注入时未知 oldCtid 的截断更新在提取内完成自愈
+     * （spec §6②，含 tracked 修复）。边界与异常语义：非 heap 家族记录仅
      * prune/inplace 两个 no-op 筛；replayed 指标按施加事件数计。线程约束：单写者。</p>
      *
      * @param r      走读完成的记录
@@ -325,7 +377,7 @@ public final class CatalogReplay {
         }
         List<HeapEvent> classEvents = heapEvents(r, stores.pgClassRelfilenode(),
                 layout.pgClassKinds(), stores.rawClassTails(), stores.classRows()::get,
-                stores.metrics());
+                stores.metrics(), stores);
         for (HeapEvent ev : classEvents) {
             if (ev.op() == HeapEvent.DEL) {
                 stores.classRows().remove(ev.oldCtid());
@@ -437,26 +489,30 @@ public final class CatalogReplay {
     }
 
     /**
-     * 截断 UPDATE 的重建决策（spec §6 两级：值编码 → rawTail splice → skip）。
+     * 截断 UPDATE 的重建决策（spec §6 三级：值编码 → rawTail splice → 自愈/skip）。
      *
      * <p>关键步骤：值编码优先——classRowLookup 非空且 prefix ≤ 88 时查旧行，命中
      * 即走 {@link #reconstructClassTruncated}（prefix 越界防御性再判一次）；未命中
-     * 或未配 lookup 则取 rawTailStore 的旧 tail 走 splice；两者皆无返回 null（调用
-     * 方 skip）并对 metrics 计数 skippedTruncated（spike 差异①：页读兜底已删）。
-     * 边界与异常语义：tail/lookup 任一非 null 即重建，不抛；线程约束：单写者。</p>
+     * 或未配 lookup 则取 rawTailStore 的旧 tail 走 splice；两者皆无时若 healer 与
+     * healStores 均可用（pg_class 面）走 {@code selfHealTruncated} 候选枚举自愈
+     * （spec §6②），仍无则返回 null（调用方 skip）并对 metrics 计数
+     * skippedTruncated（spike 差异①：页读兜底已删）。边界与异常语义：tail/lookup
+     * 任一非 null 即重建；自愈判否不抛（连续失败只计数/标 stale）；线程约束：单写者。</p>
      *
      * @param r               走读完成的 UPDATE 记录
      * @param b0              新页块引用
      * @param oldCtid         旧行 ctid 键（查找面）
+     * @param newCtid         新行 ctid 键（自愈校验的末态行位对照面）
      * @param kinds           逐列解码词典
      * @param tails           raw tail 存储（可为 null）
      * @param classRowLookup  pg_class 行字典查找（可为 null；非 null 约定 kinds 为 pg_class 词典）
      * @param metrics         指标容器（可为 null）
+     * @param healStores      自愈状态容器（可为 null；非 null 约定为 pg_class 面）
      * @return 重建产物；skip 为 null
      */
-    private Reconstruction reconstructTruncatedUpdate(WalRecord r, BlockRef b0, long oldCtid, String[] kinds,
-            Map<Long, byte[]> tails, LongFunction<CatalogRow.ClassRow> classRowLookup,
-            CatalogStores.CatalogMetrics metrics) {
+    private Reconstruction reconstructTruncatedUpdate(WalRecord r, BlockRef b0, long oldCtid, long newCtid,
+            String[] kinds, Map<Long, byte[]> tails, LongFunction<CatalogRow.ClassRow> classRowLookup,
+            CatalogStores.CatalogMetrics metrics, CatalogStores healStores) {
         if (classRowLookup != null) {
             CatalogRow.ClassRow oldRow = classRowLookup.apply(oldCtid);
             if (oldRow != null) {
@@ -468,6 +524,12 @@ public final class CatalogReplay {
         }
         byte[] oldTail = tails == null ? null : tails.get(oldCtid);
         if (oldTail == null) {
+            if (healer != null && healStores != null) {
+                Reconstruction healed = selfHealTruncated(r, b0, newCtid, healStores);
+                if (healed != null) {
+                    return healed;
+                }
+            }
             if (metrics != null) {
                 metrics.inc(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED);
             }
@@ -475,6 +537,126 @@ public final class CatalogReplay {
             return null;
         }
         return reconstructTruncated(r, b0, oldTail, kinds);
+    }
+
+    /**
+     * 自愈候选：候选行在 pg_class 行字典中的 ctid 位 + 该位上的行模型——采纳后须
+     * 清除的陈旧副本位与重建 prefix 来源的成对载体。
+     *
+     * @param ctid 候选行当前登记位（行字典键）
+     * @param row  候选行值模型
+     */
+    private record HealCandidate(long ctid, CatalogRow.ClassRow row) {
+    }
+
+    /**
+     * 未知 oldCtid 的 pg_class 截断更新自愈（spec §6②，spike self-heal 正式化）——
+     * 候选枚举重建 + {@link SelfHealer} 中段新值对 JDBC 末态校验，命中即修复 tracked
+     * 与行字典并返回重建产物（调用方按常规 UPD 事件流继续：行/tail 落 newCtid）。
+     *
+     * <p>关键步骤：候选枚举（先按 oid 匹配 interest/tracked 面、再 tracked 双 ctid
+     * 位上的行，oid 去重）→ 逐候选 {@link #reconstructClassTruncated}（prefix &gt; 88
+     * 的候选跳过）→ healer.validate 三级校验（末态行存在 / 末态 ctid == newCtid /
+     * 中段 relfilenode、reltoastrelid 至少一项非零相等——spike 发现 23a：OID 恒真
+     * 校验已废）→ 命中：清陈旧副本（行 + tail）、按 oid 归属修 tracked 双 ctid、
+     * 计数 selfHealed + WARN；判否：连续失败 ≥ 2 起向 staleOids 登记（去重）待下轮
+     * 引导。边界与异常语义：全候选拒绔回 null（调用方走 skip 计数），不抛；线程
+     * 约束：单写者（与 heapEvents 同缝，本方法在提取单次路径内完成——facade 非
+     * 幂等，不重复调用）。</p>
+     *
+     * @param r      走读完成的 UPDATE 记录
+     * @param b0     新页块引用（须携带 data）
+     * @param newCtid 记录新行 ctid 键
+     * @param stores 自愈状态容器（tracked/候选行字典/staleOids/指标）
+     * @return 采纳的重建产物；全候选拒绝 null
+     */
+    private Reconstruction selfHealTruncated(WalRecord r, BlockRef b0, long newCtid, CatalogStores stores) {
+        for (HealCandidate cand : healCandidates(stores)) {
+            Reconstruction rc = reconstructClassTruncated(r, b0, cand.row());
+            if (rc == null) {
+                continue;    // prefix 越界（>88）：该候选不可值编码重建
+            }
+            if (healer.validate(rc, cand.row(), newCtid, r).isPresent()) {
+                repairTracked(stores, cand.ctid(), cand.row(), newCtid);
+                stores.metrics().inc(CatalogStores.CatalogMetrics.SELF_HEALED);
+                LOG.warn("截断自愈采纳: oid={} 候选位 {} -> newCtid {}（中段新值对 JDBC 末态校验通过, lsn={}）",
+                        cand.row().relOid(), cand.ctid(), newCtid, Lsn.format(r.lsn()));
+                return rc;
+            }
+            if (healer.repeatedFailure(cand.row().relOid())) {
+                stores.staleOids().add(cand.row().relOid());    // 第二次连续失败起标 stale（Set 去重）
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 自愈候选枚举（任务书序：先按 oid 匹配、再 tracked 双 ctid 位）——候选 oid 集
+     * = interestRelOids ∪ tracked 表行 oid ∪ 其 reltoastrelid（toast 行也是断链自愈
+     * 目标）；阶段一扫 pg_class 行字典取 oid 命中行，阶段二补 tracked 双 ctid 位上
+     * 的行（oid 去重——tracked 行通常已入阶段一，防重复探测）。
+     *
+     * <p>边界与异常语义：行字典空/tracked 未引导返回空表（自愈自然落空）；
+     * ConcurrentHashMap 迭代弱一致不抛 CME。线程约束：单写者上下文调用。</p>
+     *
+     * @param stores 状态容器
+     * @return 候选列表（枚举序即校验序，首个校验命中者胜）
+     */
+    private List<HealCandidate> healCandidates(CatalogStores stores) {
+        Set<Long> oids = new LinkedHashSet<>(stores.interestRelOids());
+        CatalogRow.ClassRow tableRow = stores.classRows().get(stores.trackedTableCtid());
+        if (tableRow != null) {
+            oids.add(tableRow.relOid());
+            if (tableRow.reltoastrelid() != 0) {
+                oids.add(tableRow.reltoastrelid());
+            }
+        }
+        List<HealCandidate> out = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        for (Map.Entry<Long, CatalogRow.ClassRow> e : stores.classRows().entrySet()) {
+            long oid = e.getValue().relOid();
+            if (oids.contains(oid) && seen.add(oid)) {
+                out.add(new HealCandidate(e.getKey(), e.getValue()));
+            }
+        }
+        for (long tracked : new long[]{stores.trackedTableCtid(), stores.trackedToastCtid()}) {
+            if (tracked != 0) {
+                CatalogRow.ClassRow row = stores.classRows().get(tracked);
+                if (row != null && seen.add(row.relOid())) {
+                    out.add(new HealCandidate(tracked, row));
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 采纳后的 tracked 修复与陈旧副本清除——先取 tracked 双 ctid 位上的现行（判断
+     * 候选 oid 归属），再清候选位副本（行 + tail：行已物理离开该位，残留会让字典
+     * 出现同 oid 双键），最后按归属改 tracked：候选 oid == tracked 表行 oid → 表位；
+     * == tracked toast 行 oid 或 == 表行 reltoastrelid（toast 收养面）→ toast 位；
+     * 均不中（interest 关系但非 tracked 面）不动 tracked。
+     *
+     * <p>边界与异常语义：tracked 位无行（断链态）时归属判据退化为表行 toast 面；
+     * 本方法幂等性依赖调用点（提取单次路径内调用一次）。线程约束：单写者。</p>
+     *
+     * @param stores        状态容器
+     * @param candidateCtid 候选行原登记位（清除面）
+     * @param cand          采纳的候选行值模型（oid 归属判据）
+     * @param newCtid       记录新行 ctid 键（tracked 修复目标位）
+     */
+    private void repairTracked(CatalogStores stores, long candidateCtid, CatalogRow.ClassRow cand, long newCtid) {
+        CatalogRow.ClassRow tableRow = stores.classRows().get(stores.trackedTableCtid());
+        CatalogRow.ClassRow toastRow = stores.classRows().get(stores.trackedToastCtid());
+        stores.classRows().remove(candidateCtid);       // 陈旧行副本清除（同 oid 双键防御）
+        stores.rawClassTails().remove(candidateCtid);   // 陈旧 tail 同步失效
+        long oid = cand.relOid();
+        if (tableRow != null && tableRow.relOid() == oid) {
+            stores.trackedTableCtid(newCtid);
+        } else if ((toastRow != null && toastRow.relOid() == oid)
+                || (tableRow != null && tableRow.reltoastrelid() == oid)) {
+            stores.trackedToastCtid(newCtid);
+        }
     }
 
     /**

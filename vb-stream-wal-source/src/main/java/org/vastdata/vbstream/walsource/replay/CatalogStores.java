@@ -216,6 +216,9 @@ public final class CatalogStores {
         /** 计数键：INPLACE 就地更新（TRUNCATE/ANALYZE 改 relfilenode/toast）的行数。 */
         public static final String INPLACE_UPDATES = "inplaceUpdates";
 
+        /** 计数键：截断更新经自愈校验采纳（中段新值对 JDBC 末态，spec §6②）的次数。 */
+        public static final String SELF_HEALED = "selfHealed";
+
         private final Map<String, Long> counters = new ConcurrentHashMap<>();
 
         /**
