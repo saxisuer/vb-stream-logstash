@@ -38,8 +38,8 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
    转录 C struct 到 Java 时必须按编译器规则补 padding，不能只看逻辑字段。
 4. **ItemIdData 位段序**：`lp_off:15`（低位）→ `lp_flags:2`（bit 15-16）→ `lp_len:15`；
    **LP_NORMAL = 1**（不是 2，不是最高位）。
-5. **FPW 页镜像是变更前状态**：新插入行的 offnum 在镜像里是 LP_UNUSED（lp_off 指向
-   pd_upper 空闲位）；镜像的正确用途是读**旧行**（UPDATE/DELETE 前像、既有行回读）。
+5. **FPW 页镜像的语义**：镜像是变更后状态（见发现 15 勘误）；既可用于按 offnum 解
+   新行，也可读旧行（UPDATE/DELETE 前像、既有行回读）。
 6. **块内载荷序 = [页镜像][block data]**，其后才是 main data；`mainOff+mainLen==totLen`
    可作布局自检不变量。
 7. **tuple 列对齐相对 tuple 起点**（t_hoff + 偏移满足 typalign），WAL 载荷里 tuple 起点
@@ -53,6 +53,9 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
 10. 记录形态普查（本次窗口）：heap 0x00/0x10/0x20/0x40/0x70/0x80、heap2 0x50/0x70、
     XACT 0x00~0x80（含 INVALIDATIONS 0x60）、XLOG_FPI 0xB0、btree、standby、smgr
     create——正式模块的过滤白名单以外的形态只需识别即可跳过。
+11. 流起始的**孤立续体**（contrecord 头在窗口之前）需静默跳过；起始 LSN 向下对齐到页边界
+    后首个页可能是续体页。记录跨页拼接要按"当前页剩余空间"取数，不能把累计消耗与页内
+    偏移混在同一坐标系（多页记录必踩）。
 12. **UPDATE/DELETE 的前像位置**：old tuple（replica identity 产出）拼在 **main data**
     尾部——`xl_heap_update`（14B：old_xmax u32/old_offnum u16/old_infobits u8/flags u8/
     new_xmax u32/new_offnum u16）之后、`xl_heap_delete`（8B）之后，格式同 insert 的
@@ -75,17 +78,15 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
     （PG 18 为 25 列，`attstattarget` 在 17+ 挪到尾部 varlen 区——版本漂移活例）。
     另：流起点/终点必须用 `pg_current_wal_flush_lsn()`——write 位点可能超前于 flush，
     START_REPLICATION 会拒绝超 flush 的起点。
-11. 流起始的**孤立续体**（contrecord 头在窗口之前）需静默跳过；起始 LSN 向下对齐到页边界
-    后首个页可能是续体页。记录跨页拼接要按"当前页剩余空间"取数，不能把累计消耗与页内
-    偏移混在同一坐标系（多页记录必踩）。
 
 ## 与既有架构的衔接（若立项正式模块）
 
 - 下游全复用：事务组装按 XACT commit/abort 记录分桶 = 现有 assembler 语义；输出管线
   （MessagePipe / 回放 / 格式层）不变。
 - pgjdbc 物理流不建逻辑槽，槽管理退化为物理槽（或纯 LSN 记账）+ 自管 checkpoint。
-- 新增机器三件：WAL 记录解析器（本 spike 已验证主干）、磁盘格式 tuple 解码器（对齐/
-  null bitmap/varlena 已验证，TOAST/pglz 压缩未做）、catalog 重放器（未做）。
+- 新增机器三件：WAL 记录解析器（已验证主干）、磁盘格式 tuple 解码器（对齐/null
+  bitmap/varlena 已验证，TOAST/pglz 压缩未做）、catalog 重放器（最小闭环已验证：
+  pg_attribute/ctid/双路径；pg_class 等其余 catalog 未做）。
 
 ## 正式模块第二梯队验证清单（按风险排序）
 
