@@ -36,6 +36,8 @@ class WalLayoutV18Test {
         assertEquals(24, layout.recordHeaderSize());
         assertEquals(14, layout.sizeOfHeapUpdate());
         assertEquals(8, layout.sizeOfHeapDelete());
+        // MinSizeOfHeapInplace = offsetof(msgs)：offnum+pad+dbId+tsId+bool+pad+nmsgs 固定前缀
+        assertEquals(20, layout.sizeOfHeapInplace());
         assertEquals(88, layout.pgClassRelfilenodeDataOffset());
         assertEquals(112, layout.pgClassReltoastrelidDataOffset());
     }

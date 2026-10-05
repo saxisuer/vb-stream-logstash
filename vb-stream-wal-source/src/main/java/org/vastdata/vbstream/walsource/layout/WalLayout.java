@@ -82,12 +82,14 @@ public interface WalLayout {
     int sizeOfHeapDelete();
 
     /**
-     * xl_heap_inplace 主数据区固定前缀尺寸（SizeOfHeapInplace）。
+     * xl_heap_inplace 主数据区固定前缀尺寸（MinSizeOfHeapInplace）。
      *
-     * <p>INPLACE（pg_class TRUNCATE/ANALYZE 原地改写路径）主数据中位于 offnum
-     * 之后的结构字节数（heapam_xlog.h，REL_18_STABLE）——后续任务消费。</p>
+     * <p>柔性 msgs[]（共享失效消息数组）之前的固定结构字节数
+     * （offsetof(xl_heap_inplace, msgs)=20，heapam_xlog.h，REL_18_STABLE）：
+     * offnum u16@0 + pad2 + dbId u32@4 + tsId u32@8 +
+     * relcacheInitFileInval bool@12 + pad3 + nmsgs int@16——后续任务消费。</p>
      *
-     * @return 结构前缀字节数
+     * @return 固定结构前缀字节数（20）
      */
     int sizeOfHeapInplace();
 

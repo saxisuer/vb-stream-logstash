@@ -25,12 +25,18 @@ public final class WalLayoutV18 implements WalLayout {
     private static final int SIZE_OF_HEAP_UPDATE = 14;
     /** xl_heap_delete 前缀 8 // heapam_xlog.h (REL_18_STABLE)。 */
     private static final int SIZE_OF_HEAP_DELETE = 8;
-    /** xl_heap_inplace 前缀 2 // heapam_xlog.h (REL_18_STABLE)：offsetof(offnum)+sizeof(uint16)。 */
-    private static final int SIZE_OF_HEAP_INPLACE = 2;
+    /** xl_heap_inplace 固定前缀 20 // heapam_xlog.h (REL_18_STABLE)：MinSizeOfHeapInplace = offsetof(msgs)——
+     * offnum u16@0 + pad2 + dbId u32@4 + tsId u32@8 + relcacheInitFileInval bool@12 + pad3 + nmsgs int@16，
+     * 柔性 msgs[] 起于 20（非 offsetof(offnum)+sizeof(uint16) 的首字段尺寸 2）。 */
+    private static final int SIZE_OF_HEAP_INPLACE = 20;
 
-    /** pg_class 数据区 relfilenode 偏移 88：列 1-7（oid+name64B+5×oid）定宽合计后。 */
-    private static final int PGCLASS_REFILENODE_DATA_OFFSET = 88;
-    /** pg_class 数据区 reltoastrelid 偏移 112：relfilenode@88 后 5 个定宽列。 */
+    /** pg_class 数据区 relfilenode 偏移 88——推算依据（非头文件直出处）：pg_class 列 1-7
+     * （oid 4B + name 64B + 5×oid 20B）定宽合计 4+64+20=88，relfilenode 紧随其后；
+     * spike replayInplace（WalParseSpike）以 dataOff+88 实读新 relfilenode 实证锚定。 */
+    private static final int PGCLASS_RELFILENODE_DATA_OFFSET = 88;
+    /** pg_class 数据区 reltoastrelid 偏移 112——推算依据：relfilenode@88 后 5 个定宽列
+     * （reltablespace oid + relpages int4 + reltuples float4 + relallvisible int4 + relallfrozen int4）
+     * 合计 24B；spike replayInplace 以 dataOff+112 实读新 reltoastrelid 实证锚定。 */
     private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 112;
 
     /**
@@ -154,7 +160,7 @@ public final class WalLayoutV18 implements WalLayout {
         return SIZE_OF_HEAP_DELETE;
     }
 
-    /** {@inheritDoc}——2（offsetof(offnum)+sizeof(uint16)）。 */
+    /** {@inheritDoc}——20（MinSizeOfHeapInplace = offsetof(msgs)）。 */
     @Override
     public int sizeOfHeapInplace() {
         return SIZE_OF_HEAP_INPLACE;
@@ -172,13 +178,13 @@ public final class WalLayoutV18 implements WalLayout {
         return PG_CLASS_KINDS.clone();
     }
 
-    /** {@inheritDoc}——88（列 1-7 定宽合计之后）。 */
+    /** {@inheritDoc}——88（列 1-7 定宽 4+64+20 合计，spike replayInplace 实证）。 */
     @Override
     public int pgClassRelfilenodeDataOffset() {
-        return PGCLASS_REFILENODE_DATA_OFFSET;
+        return PGCLASS_RELFILENODE_DATA_OFFSET;
     }
 
-    /** {@inheritDoc}——112（relfilenode@88 后 5 个定宽列）。 */
+    /** {@inheritDoc}——112（relfilenode@88 后 5 个定宽列合计 24B，spike 实证）。 */
     @Override
     public int pgClassReltoastrelidDataOffset() {
         return PGCLASS_RELTOASTRELID_DATA_OFFSET;
