@@ -8,6 +8,7 @@ import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.receive.PhysicalSlotManager;
+import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 import org.vastdata.vbstream.walsource.receive.WalStreamReceiver;
 
 import java.sql.Connection;
@@ -101,7 +102,7 @@ public final class CatalogSynchronizer {
         ConnInfo ci = ConnInfo.from(sql);
         LOG.warn("CatalogSynchronizer 未显式传凭据——复制连接按派生凭据建立（URL 参数优先、"
                 + "否则 user=metadata 用户名/password 空）；密码认证环境请用带凭据重载 start(..., user, password, ...)");
-        return start(sql, slotName, layout, ci.user(), ci.pass(), interestRelOid);
+        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, interestRelOid);
     }
 
     /**
@@ -114,6 +115,10 @@ public final class CatalogSynchronizer {
      * 派生 + 显式 user/password 覆盖；⑤ {@code receiver.start(this::apply, max(P0, B))}
      * ——页对齐由接收器内取整，sink 在接收线程同步执行；⑥ 已施加前沿种子化为流起点
      * max(P₀, B)——引导后首条记录施加前 snapshot().lsn() 即引导一致点而非 0。
+     * <strong>自愈接线（Task 13）</strong>：本档构造 {@code new SelfHealer(new JdbcProbeImpl(sql))}
+     * 注入重放引擎——pg_class 截断未知 oldCtid 走候选枚举 + 中段新值对 JDBC 末态校验；
+     * probe 复用引导会话，故 <strong>sql 会话自此归同步器独占</strong>（接收线程单写者
+     * 上下文调用，调用方不得再并发使用；无凭据四参档 healer=null 保留 skip 行为）。
      * 边界与异常语义：SQLException/ISE 原样上抛（半建资源由接收器自有生命周期兜底，
      * 未 start 的接收器无需停机）；重复/前置失败由各组件自身 fail-fast。</p>
      *
@@ -128,6 +133,29 @@ public final class CatalogSynchronizer {
      */
     public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
             String user, String password, long... interestRelOid) throws SQLException {
+        // SelfHealer 真接线（Task 13 装配裁定）：带凭据档 = 生产推荐形态，探测复用引导会话
+        // ——probe 在接收线程单写者上下文调用，引导会话自此归同步器独占（调用方不得并发使用）
+        return startInternal(sql, slotName, layout, user, password,
+                new SelfHealer(new JdbcProbeImpl(sql)), interestRelOid);
+    }
+
+    /**
+     * 组装共核（两个公开 start 重载的唯一实现）：healer 注入与否是两档唯一差异——带凭据
+     * 档注入 {@link SelfHealer}（probe 复用引导会话），无凭据回落档 healer=null（截断
+     * 未知 oldCtid 保留 skip + 计数行为）。组装序见带凭据重载 javadoc。
+     *
+     * @param sql            引导用 SQL 会话（healer 非 null 时生命周期须覆盖同步器全程）
+     * @param slotName       物理槽名
+     * @param layout         版本布局描述符
+     * @param user           复制连接用户
+     * @param password       复制连接密码
+     * @param healer         截断自愈校验器（null = 禁用）
+     * @param interestRelOid tracked 面 oid
+     * @return 已运行的同步器
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    private static CatalogSynchronizer startInternal(Connection sql, String slotName, WalLayout layout,
+            String user, String password, SelfHealer healer, long... interestRelOid) throws SQLException {
         CatalogStores stores = new CatalogStores();
         for (long oid : interestRelOid) {
             stores.interestRelOids().add(oid);
@@ -140,11 +168,12 @@ public final class CatalogSynchronizer {
         WalStreamReceiver receiver = new WalStreamReceiver(
                 ci.host(), ci.port(), ci.database(), ci.user(), ci.pass(), layout, slotName);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
-                new CatalogReplay(layout, new TupleDecoder(layout)), receiver);
+                new CatalogReplay(layout, new TupleDecoder(layout), healer), receiver);
         sync.appliedLsn = start;    // 前沿种子化：引导一致点而非 0（首条 apply 前的 as-of）
         receiver.start(sync::apply, start);
-        LOG.info("CatalogSynchronizer 启动: slot={} 流起点 max(P0={}, bootstrap={}) = {}（interest {} 个）",
-                slotName, Lsn.format(p0), Lsn.format(bootstrapLsn), Lsn.format(start), interestRelOid.length);
+        LOG.info("CatalogSynchronizer 启动: slot={} 流起点 max(P0={}, bootstrap={}) = {}（interest {} 个, selfHeal={}）",
+                slotName, Lsn.format(p0), Lsn.format(bootstrapLsn), Lsn.format(start),
+                interestRelOid.length, healer != null);
         return sync;
     }
 
@@ -191,6 +220,27 @@ public final class CatalogSynchronizer {
      */
     public Map<String, Long> metrics() {
         return stores.metrics().snapshot();
+    }
+
+    /**
+     * 重放状态容器直读面（活引用，非拷贝）——诊断/对拍（Task 13 IT 的 ctid 键控逐行
+     * 对拍）与 Task 14 StateStore 持久化的种子来源。读方语义：停流（{@link #stop()}
+     * 后）为冻结视图；流运行期为尽力一致（见类 javadoc 线程约束节）。
+     *
+     * @return 内部 stores（与本同步器同寿）
+     */
+    public CatalogStores stores() {
+        return stores;
+    }
+
+    /**
+     * 接收器指标观测面（resyncs/reconnects/census 等锚定协议计数）。
+     *
+     * @return 接收器内建计数器；纯逻辑缝实例（无接收器）null
+     */
+    public WalStreamMetrics streamMetrics() {
+        WalStreamReceiver r = receiver;
+        return r == null ? null : r.metrics();
     }
 
     /**

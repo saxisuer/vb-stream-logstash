@@ -80,6 +80,9 @@ public final class WalStreamWalker {
     /** carry[0] 的绝对 LSN；亦即"已消费到"的游标前沿（consumedLsn 的真身）。 */
     private long carryStartLsn;
 
+    /** 已喂字节的绝对末尾（自维护数据锚，0 = 未初始化——首块走调用方游标锚）。 */
+    private long dataEndLsn;
+
     /** 是否已 feed 过（首个 chunk 免做衔接校验）。 */
     private boolean sawAny;
 
@@ -112,25 +115,52 @@ public final class WalStreamWalker {
     }
 
     /**
+     * 锚点重置（连接（重）建立时由接收器调用）：清零自维护数据锚——本连接的首个
+     * feed 回落调用方游标锚（{@code chunkEndLsn - len}），其后各 chunk 恢复自锚。
+     *
+     * <p><strong>为什么首块不能预锚请求位</strong>：物理流服务端自请求位读到首个
+     * <strong>记录边界</strong> 才起发——请求位落在记录中段时首块真实起点晚于请求位
+     * （预锚会错位，实测以挂起/假再同步暴露）。首块以调用方游标锚（pgjdbc
+     * {@code getLastReceiveLSN()} 对 data 消息为 dataStart+len，准确）为准；
+     * <strong>为什么后续块要自锚（Task 13 对拍 IT 实证）</strong>：keepalive 的
+     * walEnd 会使该游标跳变——keepalive/data 交错时以其推算 chunk 起点把字节锚到
+     * 错误地址，页界处触发假再同步（重者静默跳段丢记录）。连接内字节流严格连续，
+     * 自维护末位锚即免疫；重连清零后由首块游标锚 + 既有 carry 丢弃语义接管纠偏。</p>
+     */
+    public void resetAnchor() {
+        dataEndLsn = 0;
+    }
+
+    /**
      * 喂入一个 readPending chunk（任意切分，不必页对齐）。
      *
-     * <p>关键步骤：① 由 chunkEndLsn 推算 chunk 起点并做 carry 衔接校验——失配说明
-     * 调用方 LSN 算术与游标漂移（spike 实测 keepalive/data 交错下 ±32B），WARN 后
-     * 丢弃 carry 从本 chunk 自身锚点重启（页头锚定随后在页边界接管纠偏）；② carry
-     * 拼接为合并缓冲；③ 解析循环消费到"字节不足需等待"为止，余量回填 carry，
-     * carryStartLsn 重置为停点 LSN（再同步重锚后该值已切换到 pageaddr 权威空间）。</p>
+     * <p>关键步骤：① chunk 起点取<strong>自维护数据锚</strong>（已喂末位；未初始化时
+     * 回落调用方游标 {@code chunkEndLsn - len}——两者差值即 keepalive 交错漂移，
+     * DEBUG 记录）并做 carry 衔接校验——失配（重连续传重发覆盖 carry）WARN 后丢弃
+     * carry 从本 chunk 锚点重启；② carry 拼接为合并缓冲；③ 解析循环消费到"字节不足
+     * 需等待"为止，余量回填 carry，carryStartLsn 重置为停点 LSN（再同步重锚后该值
+     * 已切换到 pageaddr 权威空间），数据锚推进到已喂末位。</p>
      *
-     * <p>边界与异常语义：data 空数组仅推进衔接校验后直接返回；页头/记录头/记录体
-     * 跨 chunk 分裂时留待后续 feed；pageaddr 失配超容差抛 ISE（feed 半途抛出时，
-     * 此前已交付 sink 的记录不受影响——at-least-once 语义由上游续传兜底）。
-     * 线程约束：仅接收线程调用。</p>
+     * <p>边界与异常语义：data 空数组仅推进数据锚；页头/记录头/记录体跨 chunk 分裂时
+     * 留待后续 feed；pageaddr 失配超容差抛 ISE（feed 半途抛出时，此前已交付 sink 的
+     * 记录不受影响——at-least-once 语义由上游续传兜底）。线程约束：仅接收线程调用。</p>
      *
      * @param chunkEndLsn 本 chunk 最后一个字节之后的 LSN（调用方游标，如
-     *                    pgjdbc {@code getLastReceiveLSN()}；仅作衔接校验与初值）
+     *                    pgjdbc {@code getLastReceiveLSN()}；仅未初始化时的首块锚
+     *                    与漂移 DEBUG 观测用——权威锚为自维护数据末位）
      * @param data        chunk 字节
      */
     public void feed(long chunkEndLsn, byte[] data) {
-        long chunkStart = chunkEndLsn - data.length;
+        long chunkStart;
+        if (dataEndLsn != 0) {
+            chunkStart = dataEndLsn;
+            if (chunkEndLsn - data.length != chunkStart) {
+                LOG.debug("chunk anchor drift {} bytes (caller cursor vs self anchor) — self anchor trusted",
+                        chunkEndLsn - data.length - chunkStart);
+            }
+        } else {
+            chunkStart = chunkEndLsn - data.length;
+        }
         if (sawAny && chunkStart != carryStartLsn + carry.length) {
             if (carry.length > 0) {
                 metrics.carryDrops.increment();
@@ -154,6 +184,7 @@ public final class WalStreamWalker {
         carry = new byte[result.len() - result.consumed()];
         System.arraycopy(merged, result.consumed(), carry, 0, carry.length);
         carryStartLsn = result.endLsn();
+        dataEndLsn = carryStartLsn + carry.length;
     }
 
     /**
@@ -388,6 +419,7 @@ public final class WalStreamWalker {
             int dropped = p - dropFrom;
             if (dropped > 0) {
                 System.arraycopy(buf, p, buf, dropFrom, len - p);
+                metrics.lossyResyncs.increment();   // 越过错位字节 = 数据丢失面（dropped==0 为服务端空页跳过的良性重锚）
             }
             metrics.resyncs.increment();
             LOG.warn("WAL stream resync at {}: expected page header {}, found {} — dropped {} bytes, re-anchored to {}",

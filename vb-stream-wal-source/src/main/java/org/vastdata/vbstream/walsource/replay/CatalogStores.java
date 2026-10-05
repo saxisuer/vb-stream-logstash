@@ -28,7 +28,8 @@ public final class CatalogStores {
     private final Map<Long, CatalogRow.ClassRow> classRows = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawAttrTails = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawClassTails = new ConcurrentHashMap<>();
-    private final Set<Long> interestRelOids = new HashSet<>();
+    // interest 集 CHM：重放线程的自愈候选枚举与消费方的中途登记（新关系出现时）并发——弱一致不抛 CME
+    private final Set<Long> interestRelOids = ConcurrentHashMap.newKeySet();
     private final Set<Long> staleOids = new HashSet<>();
     private final CatalogMetrics metrics = new CatalogMetrics();
     private long trackedTableCtid;
@@ -164,9 +165,13 @@ public final class CatalogStores {
 
     /**
      * 兴趣关系 oid 登记（caller 指定需要列字典/toast 映射的关系）——活引用；
-     * 引导据此裁剪查询、快照据此取列。
+     * 引导据此裁剪查询、快照据此取列、自愈候选枚举据此圈定 oid 域。
      *
-     * @return oid 集合（非拷贝）
+     * <p><strong>中途登记（Task 13）</strong>：CHM 键集，流运行期消费方可随时登记
+     * 新出现的 interest oid（重放线程迭代弱一致不抛 CME）——对抗性场景中新关系创建
+     * 后其 pg_class 行即进入自愈候选域。</p>
+     *
+     * @return oid 集合（非拷贝，弱一致并发）
      */
     public Set<Long> interestRelOids() {
         return interestRelOids;

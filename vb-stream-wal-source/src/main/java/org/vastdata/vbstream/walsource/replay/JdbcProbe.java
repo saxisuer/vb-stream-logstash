@@ -28,6 +28,38 @@ public interface JdbcProbe {
     ProbedRow currentClassRow(long relOid);
 
     /**
+     * 按物理 ctid 点查 pg_attribute 末态行——attr 面截断自愈的<strong>精确采纳</strong>
+     * 探测面（Task 13）：更新会移动行位，故"末态仍居记录 new 位"的行即该记录施加后
+     * 的精确状态（其后任何更新都会再移 ctid），整行采纳无需中段值校验。
+     *
+     * <p>查询形如 {@code SELECT ctid, attrelid, attname, atttypid, attnum, attisdropped
+     * FROM pg_attribute WHERE ctid = ?::tid}。边界与异常语义：该位无行返回 null
+     * （行已再迁移，记录形态过时——采纳拒绝）；基础设施失败抛非受检异常（fail-fast，
+     * 同 {@link #currentClassRow}）。</p>
+     *
+     * @param ctidText ctid 文本形态（"(block,off)"，与记录 new 位同源渲染）
+     * @return 末态行值模型；该位无行 null
+     */
+    CatalogRow.AttrRow currentAttrRowByCtid(String ctidText);
+
+    /**
+     * 按物理 ctid 点查 pg_class 末态行——class 面<strong>精确采纳</strong>探测面
+     * （Task 13）：更新必移行位，"末态仍居记录 new 位"的行即该记录施加后的精确状态，
+     * 整行采纳无候选值时序问题（对抗性风暴下字典陈旧副本的列 1-7 是历史值，以其为
+     * 前缀源重建会写出时代错位的行且可能不被后续事件纠正）。
+     *
+     * <p>查询形如 {@code SELECT ctid::text, oid, relname, relnamespace, reltype,
+     * reloftype, relowner, relam, relfilenode, reltoastrelid FROM pg_class
+     * WHERE ctid = ?::tid}（pg_class 无 ctid 索引，走小表顺序扫描——点查代价可忽略）。
+     * 边界与异常语义：该位无行返回 null（行已再迁移——采纳拒绝）；基础设施失败抛
+     * 非受检异常（fail-fast，同 {@link #currentClassRow}）。</p>
+     *
+     * @param ctidText ctid 文本形态（"(block,off)"，与记录 new 位同源渲染）
+     * @return 末态行（ctid 键 + 行模型）；该位无行 null
+     */
+    ProbedRow currentClassRowByCtid(String ctidText);
+
+    /**
      * 末态探测产物——物理行位（ctid 键，式同 {@link CatalogReplay#ctidKey}）+
      * 行值模型。record 的数组无关性不涉及（ClassRow 为纯标量 record）。
      *

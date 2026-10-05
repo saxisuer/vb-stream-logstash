@@ -262,7 +262,8 @@ public final class HeapViews {
      *
      * @param flags   XLHP_* 标志（u8，main@1）
      * @param dataOff 块0 data 区中 redirected/nowdead/nowunused 首段在 raw 中的
-     *                绝对偏移（freeze 段已跳过）
+     *                绝对偏移（freeze 段已跳过）；<strong>-1 = 空 prune</strong>
+     *                （块0 无 data 的 LSN 推进形态，三访问器恒空表）
      * @param rec     源记录引用（三访问器逐段回读 raw，契约只读）
      */
     public record PruneView(int flags, int dataOff, WalRecord rec) {
@@ -271,16 +272,18 @@ public final class HeapViews {
          * 解析一条 heap2 PRUNE 记录（三种 prune opcode 等价，spike 走读同判）。
          *
          * <p>关键步骤：校验 rmid==RM_HEAP2_ID 且 opcode ∈ {0x10, 0x20, 0x30}；main 区
-         * 须至少 2 字节（reason + flags）；块 id 0 须携带 data（分段载体）；flags 读
-         * main@1（&amp;0xFF 掩码）；freeze 段（flags&amp;0x10）在块0 data 起点上跳过
-         * 4 + nplans×12 字节得 dataOff（冲突水位在 main 区，不影响块区走读）。
-         * 边界与异常语义：错配/main 过短/无块 data 均 ISE；线程约束：静态纯函数 +
+         * 须至少 2 字节（reason + flags）；flags 读 main@1（&amp;0xFF 掩码）；freeze 段
+         * （flags&amp;0x10）在块0 data 起点上跳过 4 + nplans×12 字节得 dataOff（冲突水位
+         * 在 main 区，不影响块区走读）。边界与异常语义：<strong>块0 无 data 为合法空
+         * prune 形态</strong>（heap_prune.c PG 16+：无 redirected/dead/unused/freeze 段
+         * 仍写记录推页 LSN，Task 13 对抗性 IT 实证）——返回 dataOff=-1 的空段视图，
+         * 三访问器恒空表；错配/main 过短/无块仍 ISE。线程约束：静态纯函数 +
          * 只读记录引用，并发安全。</p>
          *
          * @param r      走读完成的记录（main 区即 xl_heap_prune 头）
          * @param layout 版本布局描述符（本视图分段布局为 PG 16+ 稳定形态，暂不取值；签名统一）
-         * @return 视图（flags + dataOff + 源记录引用）
-         * @throws IllegalStateException rmid/opcode 错配、main 过短或块0 无 data
+         * @return 视图（flags + dataOff[-1=空段] + 源记录引用）
+         * @throws IllegalStateException rmid/opcode 错配、main 过短或块链为空
          */
         public static PruneView parse(WalRecord r, WalLayout layout) {
             int op = r.info() & HeapOps.XLOG_XACT_OPMASK;
@@ -293,12 +296,16 @@ public final class HeapViews {
                         HeapOps.RM_HEAP2_ID, r.rmid(), r.info()));
             }
             requireMainLen(r, 2, "xl_heap_prune");
-            if (r.blocks().isEmpty() || !r.blocks().get(0).hasData()) {
-                throw new IllegalStateException("prune record without block data");
+            if (r.blocks().isEmpty()) {
+                throw new IllegalStateException("prune record without block");
             }
             byte[] raw = r.raw();
             // &0xFF 掩码：高位段标志（0x40/0x80）经有符号 byte 会符号扩展为负（spike 教训）
             int flags = raw[r.mainOff() + 1] & 0xFF;
+            if (!r.blocks().get(0).hasData()) {
+                // 空 prune（PG 16+ LSN 推进形态）：无任何段，访问器恒空表
+                return new PruneView(flags, -1, r);
+            }
             int cur = r.blocks().get(0).dataOff();
             if ((flags & HeapOps.XLHP_HAS_FREEZE_PLANS) != 0) {
                 // nplans u16 + 2B padding + nplans × xlhp_freeze_plan(12B)
@@ -318,7 +325,7 @@ public final class HeapViews {
          * @return 展平的 (from, to) 对列表（长度 2n；无段为空表）
          */
         public List<Integer> redirectedPairs() {
-            if ((flags & HeapOps.XLHP_HAS_REDIRECTIONS) == 0) {
+            if (dataOff < 0 || (flags & HeapOps.XLHP_HAS_REDIRECTIONS) == 0) {
                 return List.of();
             }
             return readItems(dataOff, 2);
@@ -333,7 +340,7 @@ public final class HeapViews {
          * @return 偏移号列表（长度 n；无段为空表）
          */
         public List<Integer> nowdead() {
-            if ((flags & HeapOps.XLHP_HAS_DEAD_ITEMS) == 0) {
+            if (dataOff < 0 || (flags & HeapOps.XLHP_HAS_DEAD_ITEMS) == 0) {
                 return List.of();
             }
             return readItems(nowdeadStart(), 1);
@@ -349,7 +356,7 @@ public final class HeapViews {
          * @return 偏移号列表（长度 n；无段为空表）
          */
         public List<Integer> nowunused() {
-            if ((flags & HeapOps.XLHP_HAS_NOW_UNUSED_ITEMS) == 0) {
+            if (dataOff < 0 || (flags & HeapOps.XLHP_HAS_NOW_UNUSED_ITEMS) == 0) {
                 return List.of();
             }
             return readItems(nowunusedStart(), 1);

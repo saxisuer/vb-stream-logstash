@@ -24,8 +24,10 @@ import java.util.function.Consumer;
  * 新增。数据面：复制 URL 带 {@code replication=database&assumeMinServerVersion=9.4}（缺后者
  * replication 参数被驱动静默丢弃）→ {@code replicationStream().physical().withStartPosition(...)
  * .withStatusInterval(1s).start()} → readPending drain 轮询（null 空轮睡 100ms——spike 节拍；
- * 每轮一条+固定睡会把读取上限钉死 ~10 msg/s，见引擎 1.7 吐噬踩坑）→ chunk 字节 + 流游标
- * {@code getLastReceiveLSN()} 成对喂 walker。起点按页边界下取整（walker 页导航假设流首是页头；
+ * 每轮一条+固定睡会把读取上限钉死 ~10 msg/s，见引擎 1.7 吐噬踩坑）→ chunk 字节喂
+ * walker（地址锚由 walker 自维护数据末位承担——{@code getLastReceiveLSN()} 会随
+ * keepalive 的 walEnd 跳变，采信它会在 keepalive/data 交错时假再同步，Task 13
+ * 对拍 IT 实证）。起点按页边界下取整（walker 页导航假设流首是页头；
  * 多收的页首段记录由调用方按 LSN 窗口过滤）。</p>
  *
  * <p><strong>已知限制（pgjdbc 42.7.13）</strong>：物理流构造器无槽选项——发出的命令是
@@ -290,6 +292,9 @@ public final class WalStreamReceiver {
                 .withStartPosition(LogSequenceNumber.valueOf(startLsn))
                 .withStatusInterval(1, TimeUnit.SECONDS)
                 .start();
+        // 数据锚清零（重连/首连同式）：本连接首块回落调用方游标锚，其后各 chunk 自锚
+        // （免疫 getLastReceiveLSN 的 keepalive walEnd 跳变——Task 13 实证的假再同步根因）
+        walker.resetAnchor();
         LOG.info("WAL 物理流已建立: slot={} 起点 {}", slotName, Lsn.format(startLsn));
     }
 

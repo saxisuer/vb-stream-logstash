@@ -14,8 +14,6 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,10 +29,11 @@ import java.util.function.LongFunction;
  * <strong>整体删除</strong>——截断更新优先值编码重建（prefix ≤ 88 由已知
  * {@link CatalogRow.ClassRow} 重编码，发现 24），越界或有 rawTail 走 splice，两者
  * 皆无时（healer 已注入且为 pg_class 面）走 ②自愈、否则 skip + 计数
- * skippedTruncated（窗口外噪声不抛）；② tracked 断链自愈（Task 12 落地）——未知
- * oldCtid 的 pg_class 截断更新按候选行枚举重建，经 {@link SelfHealer} 以<strong>中段
- * 新值对 JDBC 末态</strong>校验（spec §6②，废 spike 的 OID 恒真校验——发现 23a），
- * 命中采纳并修复 tracked；healer 未注入（null）保留纯 skip 行为。</p>
+ * skippedTruncated（窗口外噪声不抛）；② tracked 断链自愈（Task 12 落地，Task 13
+ * 收敛）——未知 oldCtid 的截断更新经 {@link SelfHealer} 按<strong>记录 new 位 ctid
+ * 寻址探测目录末态行</strong>，行仍居该位即为本记录施加后的精确状态，整行采纳并修复
+ * tracked（Task 12 的候选枚举 + 中段值校验形态经对抗性 IT 实证存在时序身份混窗，
+ * 已废——见 SelfHealer javadoc）；healer 未注入（null）保留纯 skip 行为。</p>
  *
  * <p>线程约束：实例持 layout + decoder（decoder 无共享可变状态），但通过
  * {@link CatalogStores} 的重放入口按<strong>单线程</strong>假设运行（spec §3 单线程
@@ -54,6 +53,50 @@ public final class CatalogReplay {
 
     /** HeapTupleHeader 的 t_bits 偏移（offsetof=23，截断重建的位图区起点）。 */
     private static final int TUPLE_BITS_OFFSET = 23;
+
+    // 派生档九槽位（与 pgClassKinds() 词典列序一致，位号同 CatalogRow.ClassRow 的 IX_* 私有镜像——两处须同步）
+    /** 词典槽位：oid（列 1）。 */
+    private static final int IX_CLASS_OID = 0;
+
+    /** 词典槽位：relname（列 2）。 */
+    private static final int IX_CLASS_RELNAME = 1;
+
+    /** 词典槽位：relnamespace（列 3）。 */
+    private static final int IX_CLASS_RELNAMESPACE = 2;
+
+    /** 词典槽位：reltype（列 4）。 */
+    private static final int IX_CLASS_RELTYPE = 3;
+
+    /** 词典槽位：reloftype（列 5）。 */
+    private static final int IX_CLASS_RELOFTYPE = 4;
+
+    /** 词典槽位：relowner（列 6）。 */
+    private static final int IX_CLASS_RELOWNER = 5;
+
+    /** 词典槽位：relam（列 7）。 */
+    private static final int IX_CLASS_RELAM = 6;
+
+    /** 词典槽位：relfilenode（列 8，数据区偏移 88）。 */
+    private static final int IX_CLASS_RELFILENODE = 7;
+
+    /** 词典槽位：reltoastrelid（列 14，数据区偏移 112）。 */
+    private static final int IX_CLASS_RELTOASTRELID = 13;
+
+    // attr 面精确采纳的五槽位（与 pgAttributeKinds() 词典列序一致，位号同 CatalogRow.AttrRow 的 IX_* 私有镜像——两处须同步）
+    /** 词典槽位：attrelid（列 1）。 */
+    private static final int IX_ATTR_ATTRELID = 0;
+
+    /** 词典槽位：attname（列 2）。 */
+    private static final int IX_ATTR_ATTNAME = 1;
+
+    /** 词典槽位：atttypid（列 3）。 */
+    private static final int IX_ATTR_ATTTYPEID = 2;
+
+    /** 词典槽位：attnum（列 5）。 */
+    private static final int IX_ATTR_ATTNUM = 4;
+
+    /** 词典槽位：attisdropped（列 17）。 */
+    private static final int IX_ATTR_ATTISDROPPED = 16;
 
     private final WalLayout layout;
     private final TupleDecoder decoder;
@@ -76,8 +119,8 @@ public final class CatalogReplay {
      *
      * @param layout  版本布局描述符（截断阈值 88、INPLACE 偏移 88/112、两目录词典均取自它）
      * @param decoder 磁盘格式 tuple 解码器（实例无状态，可与他处共享）
-     * @param healer  截断自愈校验器（null 保留 skip 行为；非 null 时 pg_class 面
-     *                未知 oldCtid 的截断更新走候选枚举 + 中段新值对 JDBC 末态校验）
+     * @param healer  截断自愈探测面（null 保留 skip 行为；非 null 时未知 oldCtid 的
+     *                截断更新走 ctid 寻址精确采纳——pg_class 面与 pg_attribute 面）
      */
     public CatalogReplay(WalLayout layout, TupleDecoder decoder, SelfHealer healer) {
         this.layout = layout;
@@ -231,7 +274,9 @@ public final class CatalogReplay {
                 }
                 if (tails != null) {
                     tails.remove(oldCtid);   // UPD 必删旧（spike 教训）
-                    tails.put(newCtid, tail);
+                    if (tail != null) {
+                        tails.put(newCtid, tail);    // 派生档 tail=null：无从重建，不落伪 tail（后续截断走值编码/自愈）
+                    }
                 }
                 out.add(new HeapEvent(HeapEvent.UPD, oldCtid, newCtid, row));
             } else if (b0.hasImage()) {
@@ -367,13 +412,23 @@ public final class CatalogReplay {
         for (HeapEvent ev : attrEvents) {
             if (ev.op() == HeapEvent.DEL) {
                 stores.attrRows().remove(ev.oldCtid());
+                stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
             } else {
                 if (ev.op() == HeapEvent.UPD) {
                     stores.attrRows().remove(ev.oldCtid());
                 }
-                stores.attrRows().put(ev.newCtid(), CatalogRow.AttrRow.fromDecoded(ev.row()));
+                CatalogRow.AttrRow row = CatalogRow.AttrRow.fromDecoded(ev.row());
+                if (row.attnum() > 0) {
+                    // 字典面契约与引导同源：attnum>0（系统列行不进字典——流内建表时
+                    // pg_attribute 的负 attnum INS 与种子查询的过滤口径一致，Task 13）
+                    stores.attrRows().put(ev.newCtid(), row);
+                    stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
+                } else if (row.attnum() == 0 || row.attnum() < -6) {
+                    // 解码异常指示：合法系统列 attnum ∈ [-6,-1]，越界值意味着词典/字节错位
+                    LOG.warn("pg_attribute 行解码异常 attnum={}（attrelid={} attname={}）——疑似词典错位",
+                            row.attnum(), row.attrelid(), row.attname());
+                }
             }
-            stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
         }
         List<HeapEvent> classEvents = heapEvents(r, stores.pgClassRelfilenode(),
                 layout.pgClassKinds(), stores.rawClassTails(), stores.classRows()::get,
@@ -389,6 +444,15 @@ public final class CatalogReplay {
                 stores.classRows().put(ev.newCtid(), cr);
                 if (ev.op() == HeapEvent.UPD) {
                     stores.followTracked(ev.oldCtid(), ev.newCtid());
+                }
+                // tracked 归位兜底（Task 13）：链经 splice/值编码事件重建（不走自愈的
+                // repairTracked）时 tracked 位可能仍指陈旧位——位上无行或行 oid 已不符
+                // （他关系占位/同 oid 旧副本）而新行 oid 是 interest 最小 oid（v1 tracked
+                // 表判据，与引导同规则）即归位到本事件新位
+                CatalogRow.ClassRow trackedRow = stores.classRows().get(stores.trackedTableCtid());
+                if (minInterestOid(stores) == cr.relOid()
+                        && (trackedRow == null || trackedRow.relOid() != cr.relOid())) {
+                    stores.trackedTableCtid(ev.newCtid());
                 }
                 if (ev.op() == HeapEvent.INS && cr.relOid() != 0) {
                     // toast 关系重建：新 pg_class 行的 oid 恰为 tracked 表的 reltoastrelid
@@ -524,10 +588,20 @@ public final class CatalogReplay {
         }
         byte[] oldTail = tails == null ? null : tails.get(oldCtid);
         if (oldTail == null) {
-            if (healer != null && healStores != null) {
-                Reconstruction healed = selfHealTruncated(r, b0, newCtid, healStores);
-                if (healed != null) {
-                    return healed;
+            if (healer != null && healer.enabled()) {
+                if (healStores != null) {
+                    // pg_class 面：候选枚举 + 中段新值对 JDBC 末态校验（spec §6②）
+                    Reconstruction healed = selfHealTruncated(r, b0, newCtid, healStores);
+                    if (healed != null) {
+                        return healed;
+                    }
+                } else if (classRowLookup == null) {
+                    // pg_attribute 面（Task 13）：ctid 寻址精确采纳——更新必移行位，
+                    // "末态仍居记录 new 位"的行即该记录施加后的精确状态，整行采纳
+                    Reconstruction adopted = attrExactAdopt(r, newCtid, metrics);
+                    if (adopted != null) {
+                        return adopted;
+                    }
                 }
             }
             if (metrics != null) {
@@ -539,124 +613,162 @@ public final class CatalogReplay {
         return reconstructTruncated(r, b0, oldTail, kinds);
     }
 
-    /**
-     * 自愈候选：候选行在 pg_class 行字典中的 ctid 位 + 该位上的行模型——采纳后须
-     * 清除的陈旧副本位与重建 prefix 来源的成对载体。
+        /**
+     * 未知 oldCtid 的 pg_class 截断更新自愈（spec §6② 的 Task 13 收敛形态）——
+     * <strong>ctid 寻址精确采纳</strong>：更新必移行位，"JDBC 末态仍居记录 new 位"的行
+     * 即本记录施加后的精确状态，整行采纳（{@link #ctidExactAdoptClass}）。
      *
-     * @param ctid 候选行当前登记位（行字典键）
-     * @param row  候选行值模型
-     */
-    private record HealCandidate(long ctid, CatalogRow.ClassRow row) {
-    }
-
-    /**
-     * 未知 oldCtid 的 pg_class 截断更新自愈（spec §6②，spike self-heal 正式化）——
-     * 候选枚举重建 + {@link SelfHealer} 中段新值对 JDBC 末态校验，命中即修复 tracked
-     * 与行字典并返回重建产物（调用方按常规 UPD 事件流继续：行/tail 落 newCtid）。
+     * <p><strong>对 Task 12 候选枚举 + 中段值校验形态的裁定（对抗性 IT 实证）</strong>：
+     * 候选前缀源（字典行值）在断链窗口内是<strong>历史快照</strong>，与记录中段拼装会
+     * 产出时代错位的混合行（实测：pre-RENAME 的 relname 混入 toast 关系的 relfilenode）；
+     * 且"末态 ctid == new 位"可被恰巧途经该位的他关系行满足——中段值校验的鉴别力在
+     * 高频迁移风暴下不足。ctid 精确采纳的行值全部来自探测行自身（身份自述），不存在
+     * 拼装；该位无行（行已再迁移，记录形态过时）返回 null（skip 计数），链由该 oid 的
+     * <strong>末条记录在追平后</strong>的精确采纳收敛。线程约束：单写者（与 heapEvents
+     * 同缝，本方法在提取单次路径内完成——facade 非幂等，不重复调用）。</p>
      *
-     * <p>关键步骤：候选枚举（先按 oid 匹配 interest/tracked 面、再 tracked 双 ctid
-     * 位上的行，oid 去重）→ 逐候选 {@link #reconstructClassTruncated}（prefix &gt; 88
-     * 的候选跳过）→ healer.validate 三级校验（末态行存在 / 末态 ctid == newCtid /
-     * 中段 relfilenode、reltoastrelid 至少一项非零相等——spike 发现 23a：OID 恒真
-     * 校验已废）→ 命中：清陈旧副本（行 + tail）、按 oid 归属修 tracked 双 ctid、
-     * 计数 selfHealed + WARN；判否：连续失败 ≥ 2 起向 staleOids 登记（去重）待下轮
-     * 引导。边界与异常语义：全候选拒绔回 null（调用方走 skip 计数），不抛；线程
-     * 约束：单写者（与 heapEvents 同缝，本方法在提取单次路径内完成——facade 非
-     * 幂等，不重复调用）。</p>
-     *
-     * @param r      走读完成的 UPDATE 记录
-     * @param b0     新页块引用（须携带 data）
+     * @param r      走读完成的 UPDATE 记录（LSN 定位日志面）
+     * @param b0     新页块引用（保留签名对齐——精确采纳不消费块细节）
      * @param newCtid 记录新行 ctid 键
-     * @param stores 自愈状态容器（tracked/候选行字典/staleOids/指标）
-     * @return 采纳的重建产物；全候选拒绝 null
+     * @param stores 自愈状态容器（tracked/staleOids/指标）
+     * @return 采纳产物；该位无行 null（调用方走 skip 计数）
      */
     private Reconstruction selfHealTruncated(WalRecord r, BlockRef b0, long newCtid, CatalogStores stores) {
-        for (HealCandidate cand : healCandidates(stores)) {
-            Reconstruction rc = reconstructClassTruncated(r, b0, cand.row());
-            if (rc == null) {
-                continue;    // prefix 越界（>88）：该候选不可值编码重建
-            }
-            if (healer.validate(rc, cand.row(), newCtid, r).isPresent()) {
-                repairTracked(stores, cand.ctid(), cand.row(), newCtid);
-                stores.metrics().inc(CatalogStores.CatalogMetrics.SELF_HEALED);
-                LOG.warn("截断自愈采纳: oid={} 候选位 {} -> newCtid {}（中段新值对 JDBC 末态校验通过, lsn={}）",
-                        cand.row().relOid(), cand.ctid(), newCtid, Lsn.format(r.lsn()));
-                return rc;
-            }
-            if (healer.repeatedFailure(cand.row().relOid())) {
-                stores.staleOids().add(cand.row().relOid());    // 第二次连续失败起标 stale（Set 去重）
-            }
+        return ctidExactAdoptClass(r, newCtid, stores);
+    }
+
+        /**
+     * pg_class 截断更新的 <strong>ctid 寻址精确采纳</strong>（Task 13）——按"末态仍居
+     * 记录 new 位 ⟹ 该行即本记录施加后的精确状态"（其后任何更新都会再移 ctid）整行
+     * 采纳 JDBC 末态值（九槽全来自探测行，与字典候选的时序错位彻底解耦）。
+     *
+     * <p>关键步骤：new 位渲染 "(block,off)" → probe 点查 → 命中则九槽值行组装 +
+     * repairTracked（probed 行 oid 作归属判据）+ selfHealed 计数 + WARN 返回派生档
+     * 产物（tail=null）。边界与异常语义：该位无行返回 null（回落候选枚举档——
+     * 行已再迁移的记录形态本就过时）；行位复用窗口（毫秒级理论残留）由对拍暴露。
+     * 线程约束：单写者（重放线程）。</p>
+     *
+     * @param r       走读完成的 UPDATE 记录（LSN 定位日志面）
+     * @param newCtid 记录新行 ctid 键
+     * @param stores  状态容器（tracked 修复面）
+     * @return 采纳产物（tail=null + 九槽值行）；该位无行 null
+     */
+    private Reconstruction ctidExactAdoptClass(WalRecord r, long newCtid, CatalogStores stores) {
+        String ctidText = "(" + (newCtid >>> 16) + "," + (newCtid & 0xFFFF) + ")";
+        JdbcProbe.ProbedRow end = healer.probeClassByCtid(ctidText);
+        if (end == null) {
+            return null;
         }
-        return null;
+        CatalogRow.ClassRow row = end.row();
+        Object[] vals = new Object[layout.pgClassKinds().length];
+        vals[IX_CLASS_OID] = row.relOid();
+        vals[IX_CLASS_RELNAME] = row.relname();
+        vals[IX_CLASS_RELNAMESPACE] = row.relnamespace();
+        vals[IX_CLASS_RELTYPE] = row.reltype();
+        vals[IX_CLASS_RELOFTYPE] = row.reloftype();
+        vals[IX_CLASS_RELOWNER] = row.relowner();
+        vals[IX_CLASS_RELAM] = row.relam();
+        vals[IX_CLASS_RELFILENODE] = row.relfilenode();
+        vals[IX_CLASS_RELTOASTRELID] = row.reltoastrelid();
+        repairTracked(stores, row, newCtid);
+        stores.metrics().inc(CatalogStores.CatalogMetrics.SELF_HEALED);
+        LOG.warn("class 精确采纳: ctid={} oid={}（末态仍居记录 new 位, lsn={}）", ctidText, row.relOid(), Lsn.format(r.lsn()));
+        return new Reconstruction(null, vals);
     }
 
     /**
-     * 自愈候选枚举（任务书序：先按 oid 匹配、再 tracked 双 ctid 位）——候选 oid 集
-     * = interestRelOids ∪ tracked 表行 oid ∪ 其 reltoastrelid（toast 行也是断链自愈
-     * 目标）；阶段一扫 pg_class 行字典取 oid 命中行，阶段二补 tracked 双 ctid 位上
-     * 的行（oid 去重——tracked 行通常已入阶段一，防重复探测）。
+     * pg_attribute 截断更新的 <strong>ctid 寻址精确采纳</strong>（Task 13）——attr 面
+     * 无值编码重建（AttrRow 仅五字段投影，无法重编码全前缀）、种子行无 raw tail 时，
+     * 按"末态仍居记录 new 位 ⟹ 该行即本记录施加后的精确状态"（其后任何更新都会再移
+     * ctid）整行采纳 JDBC 末态值。
      *
-     * <p>边界与异常语义：行字典空/tracked 未引导返回空表（自愈自然落空）；
-     * ConcurrentHashMap 迭代弱一致不抛 CME。线程约束：单写者上下文调用。</p>
+     * <p>关键步骤：new 位渲染 "(block,off)" → probe 点查 → 命中则组装五槽位稀疏值行
+     * （仅填 {@link CatalogRow.AttrRow} 消费的词典槽位）返回 tail=null 派生档产物 +
+     * selfHealed 计数 + WARN。边界与异常语义：该位无行（行已再迁移，记录形态过时）
+     * 返回 null（调用方走 skip 计数）；行位复用窗口（行迁走后新行复占同位）为毫秒级
+     * 理论残留，采纳错行会被后续事件/对拍暴露。线程约束：单写者（重放线程）。</p>
      *
-     * @param stores 状态容器
-     * @return 候选列表（枚举序即校验序，首个校验命中者胜）
+     * @param r       走读完成的 UPDATE 记录（LSN 定位日志面）
+     * @param newCtid 记录新行 ctid 键
+     * @param metrics 指标容器（可为 null）
+     * @return 采纳产物（tail=null + 五槽值行）；拒绝 null
      */
-    private List<HealCandidate> healCandidates(CatalogStores stores) {
-        Set<Long> oids = new LinkedHashSet<>(stores.interestRelOids());
-        CatalogRow.ClassRow tableRow = stores.classRows().get(stores.trackedTableCtid());
-        if (tableRow != null) {
-            oids.add(tableRow.relOid());
-            if (tableRow.reltoastrelid() != 0) {
-                oids.add(tableRow.reltoastrelid());
-            }
+    private Reconstruction attrExactAdopt(WalRecord r, long newCtid, CatalogStores.CatalogMetrics metrics) {
+        String ctidText = "(" + (newCtid >>> 16) + "," + (newCtid & 0xFFFF) + ")";
+        CatalogRow.AttrRow row = healer.probeAttrByCtid(ctidText);
+        if (row == null) {
+            return null;
         }
-        List<HealCandidate> out = new ArrayList<>();
-        Set<Long> seen = new HashSet<>();
-        for (Map.Entry<Long, CatalogRow.ClassRow> e : stores.classRows().entrySet()) {
-            long oid = e.getValue().relOid();
-            if (oids.contains(oid) && seen.add(oid)) {
-                out.add(new HealCandidate(e.getKey(), e.getValue()));
-            }
+        Object[] vals = new Object[layout.pgAttributeKinds().length];
+        vals[IX_ATTR_ATTRELID] = row.attrelid();
+        vals[IX_ATTR_ATTNAME] = row.attname();
+        vals[IX_ATTR_ATTTYPEID] = row.atttypid();
+        vals[IX_ATTR_ATTNUM] = (short) row.attnum();
+        vals[IX_ATTR_ATTISDROPPED] = row.attisdropped();
+        if (metrics != null) {
+            metrics.inc(CatalogStores.CatalogMetrics.SELF_HEALED);
         }
-        for (long tracked : new long[]{stores.trackedTableCtid(), stores.trackedToastCtid()}) {
-            if (tracked != 0) {
-                CatalogRow.ClassRow row = stores.classRows().get(tracked);
-                if (row != null && seen.add(row.relOid())) {
-                    out.add(new HealCandidate(tracked, row));
-                }
-            }
-        }
-        return out;
+        LOG.warn("attr 精确采纳: ctid={} attrelid={} attnum={}（末态仍居记录 new 位, lsn={}）",
+                ctidText, row.attrelid(), row.attnum(), Lsn.format(r.lsn()));
+        return new Reconstruction(null, vals);
     }
 
-    /**
-     * 采纳后的 tracked 修复与陈旧副本清除——先取 tracked 双 ctid 位上的现行（判断
-     * 候选 oid 归属），再清候选位副本（行 + tail：行已物理离开该位，残留会让字典
-     * 出现同 oid 双键），最后按归属改 tracked：候选 oid == tracked 表行 oid → 表位；
-     * == tracked toast 行 oid 或 == 表行 reltoastrelid（toast 收养面）→ toast 位；
-     * 均不中（interest 关系但非 tracked 面）不动 tracked。
+                /**
+     * 采纳后的 tracked 修复与陈旧副本清扫（Task 13 ctid 精确采纳形态）——精确采纳
+     * 不知旧行位，按 <strong>oid 扫除</strong>陈旧副本（行 + tail：行已物理离开旧位，
+     * 残留会同 oid 双键），再修 tracked：tracked 表位上的行 oid == 采纳 oid → 表位；
+     * tracked toast 位行 oid 或表行 reltoastrelid == 采纳 oid → toast 位；表行位断链
+     * （字典无行）且采纳 oid 是 interest 最小 oid → 保守归表位（v1 tracked 面单表）；
+     * 均不中不动 tracked。
      *
-     * <p>边界与异常语义：tracked 位无行（断链态）时归属判据退化为表行 toast 面；
-     * 本方法幂等性依赖调用点（提取单次路径内调用一次）。线程约束：单写者。</p>
+     * <p>边界与异常语义：清扫先于归属判据（tracked 位上的同 oid 陈旧行被清后走
+     * interest 保守档——语义等价且更简）；采纳同时撤回该 oid 的 stale 标记。线程
+     * 约束：单写者。</p>
      *
-     * @param stores        状态容器
-     * @param candidateCtid 候选行原登记位（清除面）
-     * @param cand          采纳的候选行值模型（oid 归属判据）
-     * @param newCtid       记录新行 ctid 键（tracked 修复目标位）
+     * @param stores  状态容器
+     * @param adopted 采纳的探测行值模型（oid 归属判据）
+     * @param newCtid 记录新行 ctid 键（tracked 修复目标位，清扫的豁免位）
      */
-    private void repairTracked(CatalogStores stores, long candidateCtid, CatalogRow.ClassRow cand, long newCtid) {
+    private void repairTracked(CatalogStores stores, CatalogRow.ClassRow adopted, long newCtid) {
+        long oid = adopted.relOid();
+        // 同 oid 陈旧副本清扫（含 tail）——精确采纳行落 newCtid，其余同 oid 位皆已物理离开
+        List<Long> staleCtids = new ArrayList<>();
+        stores.classRows().forEach((k, v) -> {
+            if (v.relOid() == oid && k != newCtid) {
+                staleCtids.add(k);
+            }
+        });
+        for (long k : staleCtids) {
+            stores.classRows().remove(k);
+            stores.rawClassTails().remove(k);
+        }
+        stores.staleOids().remove(oid);    // 链已修复：撤回既往 stale 标记（下轮引导不再被裁剪面引用）
         CatalogRow.ClassRow tableRow = stores.classRows().get(stores.trackedTableCtid());
         CatalogRow.ClassRow toastRow = stores.classRows().get(stores.trackedToastCtid());
-        stores.classRows().remove(candidateCtid);       // 陈旧行副本清除（同 oid 双键防御）
-        stores.rawClassTails().remove(candidateCtid);   // 陈旧 tail 同步失效
-        long oid = cand.relOid();
         if (tableRow != null && tableRow.relOid() == oid) {
             stores.trackedTableCtid(newCtid);
         } else if ((toastRow != null && toastRow.relOid() == oid)
                 || (tableRow != null && tableRow.reltoastrelid() == oid)) {
             stores.trackedToastCtid(newCtid);
+        } else if (tableRow == null && minInterestOid(stores) == oid) {
+            // 断链修复档：表行副本已失（PRUNE 清除），interest 最小 oid 即 v1 tracked 表面
+            stores.trackedTableCtid(newCtid);
         }
+    }
+
+    /**
+     * interest 集最小 oid——v1 tracked 表面判据（与引导 locateTracked 的"取最小存在
+     * oid"规则同源：interest 集中 tracked 面单表，动态登记的新关系 oid 较大不抢位）。
+     *
+     * @param stores 状态容器
+     * @return 最小 oid；interest 空 Long.MAX_VALUE（恒不命中任何真实 oid）
+     */
+    private static long minInterestOid(CatalogStores stores) {
+        long min = Long.MAX_VALUE;
+        for (Long oid : stores.interestRelOids()) {
+            min = Math.min(min, oid);
+        }
+        return min;
     }
 
     /**

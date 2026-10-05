@@ -45,4 +45,22 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 本模块对抗性 IT（WalAdversarialIT 等）与离线 *Test 同属 mvn test 面（需 Docker，
+                 与仓库引擎模块 IT 同惯例不设手动档）；surefire 默认 includes 只认 *Test，此处显式扩 *IT。
+                 其余配置（argLine/systemPropertyVariables）继承 parent。 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*Test.java</include>
+                        <include>**/*IT.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

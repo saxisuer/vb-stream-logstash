@@ -33,6 +33,11 @@ public final class WalStreamMetrics {
     /** pageaddr 锚定失配后的受控再同步次数（每次丢弃错位字节并重锚计 1）。 */
     public final LongAdder resyncs = new LongAdder();
 
+    /** <strong>丢字节</strong>再同步次数（resyncs 中 dropped&gt;0 的子集——错位记录被
+     *  越过的数据丢失面；dropped==0 的重锚是服务端空页跳过的良性形态，Task 13 实证
+     *  物理流可跳过未初始化页，对拍完整性由内容全等兜底）。 */
+    public final LongAdder lossyResyncs = new LongAdder();
+
     /** 跨页记录缝合消费的续体页头数（每越过一个续体页计 1）。 */
     public final LongAdder contrecords = new LongAdder();
 
@@ -51,6 +56,19 @@ public final class WalStreamMetrics {
      *  线程），读取经 {@link #censusSnapshot()} 弱一致快照——多读单写下须并发安全载体
      *  （HashMap 在并发遍历下会 CME 杀死读者，Task 9 审查 High 修复）。 */
     private final ConcurrentHashMap<String, Long> census = new ConcurrentHashMap<>();
+
+    /**
+     * 诊断用字符串形态（六计数概览）——IT/冒烟的指标行打印面（Task 13）。
+     *
+     * @return 形如 {@code records=.. resyncs=.. contrecords=.. orphanSkips=.. carryDrops=.. reconnects=..}
+     */
+    @Override
+    public String toString() {
+        return "records=" + records.sum() + " resyncs=" + resyncs.sum()
+                + " lossyResyncs=" + lossyResyncs.sum()
+                + " contrecords=" + contrecords.sum() + " orphanSkips=" + orphanSkips.sum()
+                + " carryDrops=" + carryDrops.sum() + " reconnects=" + reconnects.sum();
+    }
 
     /**
      * 记一条已交付记录：records 计数并归入 census 形态桶。

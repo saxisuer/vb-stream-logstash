@@ -15,21 +15,22 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 截断自愈校验（SelfHealer + CatalogReplay 注入）的失败先行测试——stub probe
- * （oid → 末态行映射）替换 JDBC 面，经 {@link CatalogReplay#applyCatalogRecord}
- * 走真实截断重建路径后断言 stores 终态（spec §6②；spike 发现 23a：OID 恒真校验
- * 已废，鉴别力来自中段新值对 JDBC 末态）。
+ * 截断自愈（SelfHealer + CatalogReplay 注入）的失败先行测试——stub probe（ctid →
+ * 末态行映射）替换 JDBC 面，经 {@link CatalogReplay#applyCatalogRecord} 走真实截断
+ * 更新路径后断言 stores 终态（spec §6② 的 Task 13 收敛形态：ctid 寻址精确采纳；
+ * Task 12 的候选枚举 + 中段值校验形态经对抗性 IT 实证存在时序身份混窗，已废——
+ * <strong>采纳行值整行来自探测行</strong>是本组断言的核心面）。
  *
- * <p>三用例：①中段 relfilenode 与末态一致且 ctid 匹配 → 采纳 + tracked 修位 +
- * 陈旧候选副本清除；②中段值不一致 → empty + 第二次连续失败起标 staleOids（第一次
- * 仅计数）；③连续失败不升级异常 + 采纳后连续计数清零。</p>
+ * <p>三用例：①ctid 探测命中 → 精确采纳（探测行整行落位 + tracked 修复 + 陈旧副本
+ * 清除）；②ctid 探测无行（行已再迁移，记录形态过时）→ 拒绝走 skip（不抛、不动
+ * tracked）；③采纳撤回 stale 标记（tracked 断链态下 interest 最小 oid 归表位）。</p>
  */
 class SelfHealerTest {
 
@@ -45,112 +46,87 @@ class SelfHealerTest {
     private final WalLayout layout = WalLayoutV18.INSTANCE;
 
     /**
-     * 用例 ①：未知 oldCtid 的截断更新——候选行（tracked 位上的旧 ClassRow）经值编码
-     * 重建，中段 relfilenode=205 与 stub 末态一致且末态 ctid == 记录 new 位 → 采纳：
-     * 行落 newCtid、tracked 修复到 new 位、陈旧候选副本（行 + tail）清除、
-     * selfHealed 计数、skippedTruncated 不计。
+     * 用例 ①：未知 oldCtid 的截断更新——stub 末态仍居记录 new 位（ctid 探测命中）→
+     * 精确采纳：行值<strong>整行来自探测行</strong>（relfilenode 205——与字典陈旧候选
+     * 的 200 不同源，时代错位混窗由本断言钉死）、行落 newCtid、tracked 修复到 new 位、
+     * 陈旧候选副本（行 + tail）清除、selfHealed 计数、skippedTruncated 不计。
      */
     @Test
-    void midValuesMatchingEndStateAdoptsAndRepairsTracked() {
+    void ctidExactAdoptionLandsProbedRowAndRepairsTracked() {
         CatalogStores stores = freshStores();
         long staleCtid = CatalogReplay.ctidKey(3, 1);
         long newCtid = CatalogReplay.ctidKey(5, 2);
         CatalogRow.ClassRow candidate = CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1)));
         stores.classRows().put(staleCtid, candidate);
+        stores.rawClassTails().put(staleCtid, new byte[]{1, 2, 3});
         stores.trackedTableCtid(staleCtid);
         stores.interestRelOids().add(100L);
 
-        Map<Long, JdbcProbe.ProbedRow> endState = new HashMap<>();
-        endState.put(100L, new JdbcProbe.ProbedRow(newCtid,
-                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0)));
-        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout), new SelfHealer(endState::get));
+        CatalogRow.ClassRow probed = new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0);
+        Map<String, JdbcProbe.ProbedRow> byCtid = new HashMap<>();
+        byCtid.put("(5,2)", new JdbcProbe.ProbedRow(newCtid, probed));
+        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout),
+                new SelfHealer(new StubProbe(byCtid)));
 
-        TupleBytes newTuple = classTuple(100, "t1", 205, 0, 1);   // 列 1-7 与候选一致（prefix 区）
-        WalRecord rec = rec(updateRecord(7, 9, 5, 2, truncatedData(newTuple, 88, 0)));
+        WalRecord rec = rec(updateRecord(7, 9, 5, 2,
+                truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0)));
         replay.applyCatalogRecord(rec, stores);
 
-        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0),
-                stores.classRows().get(newCtid), "采纳后重建行应落 newCtid");
+        assertEquals(probed, stores.classRows().get(newCtid), "采纳行须整行取自探测行（精确，无拼装）");
         assertNull(stores.classRows().get(staleCtid), "陈旧候选副本必须清除（行已物理离开该位）");
         assertEquals(newCtid, stores.trackedTableCtid(), "tracked 须修复到记录 new 位");
-        assertTrue(stores.rawClassTails().containsKey(newCtid), "重建 tail 应落 newCtid");
         assertFalse(stores.rawClassTails().containsKey(staleCtid), "陈旧候选 tail 必须清除");
-        assertTrue(stores.staleOids().isEmpty(), "采纳不得标 stale");
         assertEquals(1L, stores.metrics().get(CatalogStores.CatalogMetrics.SELF_HEALED));
         assertEquals(0L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED));
     }
 
     /**
-     * 用例 ②：中段 relfilenode=205 与末态 999 不一致（toast 双零无鉴别力）→ 拒绝：
-     * 首次失败仅计数（staleOids 空、skippedTruncated=1、tracked 不动、无行落位）；
-     * 第二次失败（另一未知 oldCtid 的同形态记录）起 staleOids 含该 oid（Set 去重）。
+     * 用例 ②：ctid 探测无行（行已再迁移——记录形态过时）→ 采纳拒绝走 skip：不计
+     * selfHealed、计 skippedTruncated、无行落位、tracked 不动、不抛异常（连续拒绝
+     * 不升级——链由该 oid 末条记录追平后的精确采纳收敛）。
      */
     @Test
-    void midValuesMismatchingEndStateMarksStaleOnSecondFailure() {
+    void ctidVacantAtRecordPositionRejectsToSkip() {
         CatalogStores stores = freshStores();
         long staleCtid = CatalogReplay.ctidKey(3, 1);
         long newCtid = CatalogReplay.ctidKey(5, 2);
         stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1))));
         stores.trackedTableCtid(staleCtid);
+        stores.interestRelOids().add(100L);
 
-        Map<Long, JdbcProbe.ProbedRow> endState = new HashMap<>();
-        endState.put(100L, new JdbcProbe.ProbedRow(newCtid,
-                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 999, 0)));   // filenode 不一致
-        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout), new SelfHealer(endState::get));
-
+        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout),
+                new SelfHealer(new StubProbe(new HashMap<>())));
         byte[] data = truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0);
-        replay.applyCatalogRecord(rec(updateRecord(7, 9, 5, 2, data)), stores);
-        assertFalse(stores.staleOids().contains(100L), "首次失败仅计数，不标 stale");
+        assertDoesNotThrow(() -> replay.applyCatalogRecord(rec(updateRecord(7, 9, 5, 2, data)), stores),
+                "探测无行的拒绝不得升级为异常");
         assertEquals(1L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED));
+        assertEquals(0L, stores.metrics().get(CatalogStores.CatalogMetrics.SELF_HEALED));
         assertNull(stores.classRows().get(newCtid), "拒绝不得落行");
-        assertEquals(staleCtid, stores.trackedTableCtid(), "拒绝不得修 tracked");
-
-        replay.applyCatalogRecord(rec(updateRecord(8, 4, 5, 2, truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0))), stores);
-        assertTrue(stores.staleOids().contains(100L), "第二次连续失败须标 stale");
-        assertEquals(2L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED));
+        assertEquals(staleCtid, stores.trackedTableCtid(), "拒绝不动 tracked");
     }
 
     /**
-     * 用例 ③：连续三次失败不升级为异常（逐次 empty 拒绝，staleOids 去重仍 1 个）；
-     * 随后一次成功采纳将连续失败计数清零——其后再失败一次不达 stale 门槛
-     * （repeatedFailure=false，非升级路径）。
+     * 用例 ③：tracked 断链态（字典无表行副本）下的采纳——interest 最小 oid 保守归
+     * 表位（repairTracked 断链修复档）且撤回既往 stale 标记（链已修复，下轮引导
+     * 不再按 stale 裁剪）。
      */
     @Test
-    void consecutiveFailuresDoNotEscalateAndAdoptionResetsCounter() {
+    void adoptionClearsStaleMarkAndRepairsBrokenTracked() {
         CatalogStores stores = freshStores();
-        long staleCtid = CatalogReplay.ctidKey(3, 1);
-        stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1))));
-        stores.trackedTableCtid(staleCtid);
+        long newCtid = CatalogReplay.ctidKey(9, 1);
+        stores.interestRelOids().add(100L);
+        stores.staleOids().add(100L);
 
-        Map<Long, JdbcProbe.ProbedRow> endState = new HashMap<>();
-        long firstNewCtid = CatalogReplay.ctidKey(5, 2);
-        endState.put(100L, new JdbcProbe.ProbedRow(firstNewCtid,
-                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 999, 0)));
-        SelfHealer healer = new SelfHealer(endState::get);
-        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout), healer);
+        CatalogRow.ClassRow probed = new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0);
+        Map<String, JdbcProbe.ProbedRow> byCtid = new HashMap<>();
+        byCtid.put("(9,1)", new JdbcProbe.ProbedRow(newCtid, probed));
+        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout),
+                new SelfHealer(new StubProbe(byCtid)));
 
-        byte[] data = truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0);
-        int[][] olds = {{7, 9}, {8, 4}, {6, 7}};
-        for (int[] old : olds) {
-            assertDoesNotThrow(() -> replay.applyCatalogRecord(
-                    rec(updateRecord(old[0], old[1], 5, 2, data)), stores),
-                    "连续失败不得升级为异常");
-        }
-        assertEquals(1, stores.staleOids().size(), "staleOids 按 oid 去重");
-
-        // 成功采纳：末态行换到与本记录 new 位一致且中段值吻合的形态
-        long adoptCtid = CatalogReplay.ctidKey(9, 1);
-        endState.put(100L, new JdbcProbe.ProbedRow(adoptCtid,
-                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0)));
         replay.applyCatalogRecord(rec(updateRecord(4, 4, 9, 1,
                 truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0))), stores);
-        assertEquals(adoptCtid, stores.trackedTableCtid(), "成功路径 tracked 须修复");
-
-        // 计数已清零：再失败一次仅计数 1，不重复触发 stale 门槛
-        replay.applyCatalogRecord(rec(updateRecord(2, 3, 6, 6,
-                truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0))), stores);
-        assertFalse(healer.repeatedFailure(100L), "采纳后连续计数清零，单次失败不达门槛");
-        assertEquals(1, stores.staleOids().size());
+        assertEquals(newCtid, stores.trackedTableCtid(), "tracked 断链态（无表行副本）下 interest 最小 oid 归表位");
+        assertTrue(stores.staleOids().isEmpty(), "采纳须撤回 stale 标记");
     }
 
     // ---- 测试基建：记录拼装（CatalogReplayTest 同源自持副本） ----------------------
@@ -233,9 +209,9 @@ class SelfHealerTest {
      *
      * @param oidV     relOid（列 1）
      * @param relname  relname（列 2）
-     * @param filenode relfilenode（列 8，数据区偏移 88——中段校验面）
-     * @param toast    reltoastrelid（列 14，数据区偏移 112——中段校验面）
-     * @param relpages relpages（列 10，中段噪声面）
+     * @param filenode relfilenode（列 8，数据区偏移 88）
+     * @param toast    reltoastrelid（列 14，数据区偏移 112）
+     * @param relpages relpages（列 10）
      * @return 已写满全部列的 DSL
      */
     private TupleBytes classTuple(long oidV, String relname, long filenode, long toast, int relpages) {
@@ -295,5 +271,56 @@ class SelfHealerTest {
     private static void put16(ByteArrayOutputStream out, int v) {
         out.write(v & 0xFF);
         out.write((v >>> 8) & 0xFF);
+    }
+
+    /**
+     * stub 探测器：ctid 文本 → pg_class 末态行点查（精确采纳面）；oid 点查与 attr 面
+     * 点查恒 null（本类用例只触 class 面精确采纳——Task 13 收敛后候选枚举已废）。
+     */
+    private static final class StubProbe implements JdbcProbe {
+
+        private final Map<String, ProbedRow> byCtid;
+
+        /**
+         * 构造 stub。
+         *
+         * @param byCtid ctid 文本（"(b,o)"）→ 末态行
+         */
+        StubProbe(Map<String, ProbedRow> byCtid) {
+            this.byCtid = byCtid;
+        }
+
+        /**
+         * oid 点查——本类不触，恒 null。
+         *
+         * @param relOid 关系 oid
+         * @return 恒 null
+         */
+        @Override
+        public ProbedRow currentClassRow(long relOid) {
+            return null;
+        }
+
+        /**
+         * attr 面 ctid 点查——本类不触，恒 null。
+         *
+         * @param ctidText ctid 文本形态
+         * @return 恒 null
+         */
+        @Override
+        public CatalogRow.AttrRow currentAttrRowByCtid(String ctidText) {
+            return null;
+        }
+
+        /**
+         * class 面 ctid 点查——精确采纳的 stub 数据面。
+         *
+         * @param ctidText ctid 文本形态
+         * @return 映射行；无映射 null（采纳拒绝路径）
+         */
+        @Override
+        public ProbedRow currentClassRowByCtid(String ctidText) {
+            return byCtid.get(ctidText);
+        }
     }
 }

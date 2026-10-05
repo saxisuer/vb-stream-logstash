@@ -187,13 +187,46 @@ class WalStreamWalkerTest {
         WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
         // feed 1 干净（游标准确），p0 正常产出
         walker.feed(a + 8192, p0);
-        // feed 2 的 chunkEndLsn 多报 32B：chunkStart ≠ carry 尾 → 丢 carry 重启，锚点错位
+        // 重连窗口（Task 13 契约：resetAnchor 后首块回落调用方游标锚）——feed 2 的
+        // chunkEndLsn 多报 32B：chunkStart ≠ carry 尾 → 丢 carry 重启，锚点错位
+        walker.resetAnchor();
         walker.feed(a + 3 * 8192 + 32, concat(p1, p2));
 
         assertEquals(3, out.size());
         assertEquals(1, metrics.resyncs.sum());
         assertEquals(a + 24, out.get(0).lsn());
         // 重锚后 p1/p2 首记录 LSN 以页头 pageaddr 自述为准（真实地址，无 32B 污染）
+        assertEquals(a + 8192 + 24, out.get(1).lsn());
+        assertEquals(a + 2 * 8192 + 24, out.get(2).lsn());
+        assertEquals(a + 3 * 8192, walker.consumedLsn());
+    }
+
+    /**
+     * 用例 5b（Task 13 锚定协议升级）：连接中段的调用方游标漂移（keepalive walEnd
+     * 跳变形态）被自维护数据锚免疫——chunkEndLsn 多报 32B 不再触发丢 carry/假再同步，
+     * 记录照常产出、地址空间零污染（resyncs==0、carryDrops==0）。
+     */
+    @Test
+    void callerCursorDriftMidStreamIgnoredBySelfAnchor() {
+        long a = 0x40000L;
+        byte[] r0 = smallRec(RM_HEAP_ID, 0x00, 1);
+        byte[] r1 = smallRec(RM_HEAP_ID, 0x00, 2);
+        byte[] r2 = smallRec(RM_HEAP_ID, 0x00, 3);
+        byte[] p0 = WalBytes.page(a, r0);
+        byte[] p1 = WalBytes.page(a + 8192, r1);
+        byte[] p2 = WalBytes.page(a + 2 * 8192, r2);
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
+        walker.feed(a + 8192, p0);
+        // 不 resetAnchor（连接内）：chunkEndLsn 多报 32B 被自锚忽略（DEBUG 观测）
+        walker.feed(a + 3 * 8192 + 32, concat(p1, p2));
+
+        assertEquals(3, out.size(), "自锚下记录须全部产出");
+        assertEquals(0, metrics.resyncs.sum(), "游标漂移不得触发再同步");
+        assertEquals(0, metrics.carryDrops.sum(), "游标漂移不得丢弃 carry");
+        assertEquals(a + 24, out.get(0).lsn());
         assertEquals(a + 8192 + 24, out.get(1).lsn());
         assertEquals(a + 2 * 8192 + 24, out.get(2).lsn());
         assertEquals(a + 3 * 8192, walker.consumedLsn());
@@ -330,7 +363,9 @@ class WalStreamWalkerTest {
         // feed 1 半页：r0 产出，页尾零垫未到齐 → 非空 carry
         walker.feed(a + 4096, Arrays.copyOfRange(p0, 0, 4096));
         assertEquals(1, out.size());
-        // feed 2 的 chunkEndLsn 多报 32B：chunkStart 与 carry 尾不连续 → 丢 carry 计数
+        // 重连窗口（resetAnchor 后首块回落调用方游标锚）——feed 2 的 chunkEndLsn 多报
+        // 32B：chunkStart 与 carry 尾不连续 → 丢 carry 计数
+        walker.resetAnchor();
         walker.feed(a + 4096 + 8192 + 32, p1);
 
         assertEquals(1, metrics.carryDrops.sum());
