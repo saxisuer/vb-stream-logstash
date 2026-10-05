@@ -2,8 +2,8 @@ package org.vastdata.vbstream.walsource.receive;
 
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -18,8 +18,10 @@ import java.util.concurrent.atomic.LongAdder;
  * census 以 {@code "rmid/" + hex(info&0xF0)} 为键记各形态条数，
  * 对齐 spike 的 record census 输出面（wal-direct-decode-spike.md 发现 10 的普查延续）。</p>
  *
- * <p>线程约束：设计为接收线程单写者独占（Task 8 的 readPending 循环），census 用
- * 普通 HashMap 即可；{@link #censusSnapshot()} 返回不可变副本供任意线程读取。
+ * <p>线程约束：计数与 census 写入仅接收线程（Task 8 的 readPending 循环，单写者）；
+ * {@link #censusSnapshot()} 自 Task 9 起被冒烟 Main 的周期行活轮询——快照与写入并发
+ * （多读单写），census 载体须为 {@link ConcurrentHashMap}（弱一致遍历不抛 CME）。
+ * {@link #censusSnapshot()} 返回 {@code Map.copyOf} 不可变副本供任意线程安全读取。
  * LongAdder 字段为 public final——热路径原地自增免方法调用开销，快照读取走
  * {@code sum()}。</p>
  */
@@ -45,8 +47,10 @@ public final class WalStreamMetrics {
      *  断流原地重连 IT 的行为证据面（重连后位点不回退须伴随本计数 &gt; 0）。 */
     public final LongAdder reconnects = new LongAdder();
 
-    /** rmid/info 形态普查：键 {@code "rmid/hex(info&0xF0)"}，值为条数（单写者线程独占）。 */
-    private final HashMap<String, Long> census = new HashMap<>();
+    /** rmid/info 形态普查：键 {@code "rmid/hex(info&0xF0)"}，值为条数。写入单写者（接收
+     *  线程），读取经 {@link #censusSnapshot()} 弱一致快照——多读单写下须并发安全载体
+     *  （HashMap 在并发遍历下会 CME 杀死读者，Task 9 审查 High 修复）。 */
+    private final ConcurrentHashMap<String, Long> census = new ConcurrentHashMap<>();
 
     /**
      * 记一条已交付记录：records 计数并归入 census 形态桶。

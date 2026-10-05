@@ -39,14 +39,6 @@ public final class Main {
     /** censusTop3 展示的形态桶数。 */
     private static final int CENSUS_TOP_N = 3;
 
-    /** 配置六键（与 {@link WalSource} 配置面同形；其 KEY_ 常量在 api 包内不可见，此处同值复刻）。 */
-    private static final String KEY_HOST = "vb.wal.host";
-    private static final String KEY_PORT = "vb.wal.port";
-    private static final String KEY_DB = "vb.wal.db";
-    private static final String KEY_USER = "vb.wal.user";
-    private static final String KEY_PASS = "vb.wal.pass";
-    private static final String KEY_SLOT = "vb.wal.slot";
-
     /** 私有构造器：入口类仅静态 main。 */
     private Main() {
     }
@@ -59,7 +51,7 @@ public final class Main {
      * 录后 close 释放半开资源并 {@code System.exit(1)}；③ shutdown hook（名 wal-source-shutdown）
      * 调 close + countDown——主线程 await 以 10s 分片睡，被打断即退出循环由 hook 收尾；
      * 每个分片醒来打一行 {@link #logSmokeLine(WalSource)}。边界：主线程被中断（非 hook 路径）
-     * 恢复中断位后退出循环（hook 兜底关资源）。</p>
+     * 恢复中断位后主动 {@code source.close()} 兜底（close 幂等——hook 再触发为 no-op）。</p>
      *
      * @param args 未用（配置全部走 -D 系统属性）
      */
@@ -85,6 +77,9 @@ public final class Main {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            // 非 hook 路径的兜底关停（close 幂等，hook 触发时为 no-op）：main 返回不足以
+            // 保证 hook 先于资源失效执行，主动排干接收线程再退出
+            source.close();
         }
     }
 
@@ -98,12 +93,12 @@ public final class Main {
      */
     private static Properties collectConfig() {
         Properties cfg = new Properties();
-        copySysProp(KEY_HOST, cfg);
-        copySysProp(KEY_PORT, cfg);
-        copySysProp(KEY_DB, cfg);
-        copySysProp(KEY_USER, cfg);
-        copySysProp(KEY_PASS, cfg);
-        copySysProp(KEY_SLOT, cfg);
+        copySysProp(WalSource.KEY_HOST, cfg);
+        copySysProp(WalSource.KEY_PORT, cfg);
+        copySysProp(WalSource.KEY_DB, cfg);
+        copySysProp(WalSource.KEY_USER, cfg);
+        copySysProp(WalSource.KEY_PASS, cfg);
+        copySysProp(WalSource.KEY_SLOT, cfg);
         return cfg;
     }
 

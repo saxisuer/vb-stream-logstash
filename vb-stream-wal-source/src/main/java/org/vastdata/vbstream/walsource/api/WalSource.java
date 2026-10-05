@@ -42,22 +42,22 @@ public final class WalSource implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(WalSource.class);
 
     /** PG 主机键（默认 localhost）。 */
-    static final String KEY_HOST = "vb.wal.host";
+    public static final String KEY_HOST = "vb.wal.host";
 
     /** PG 端口键（默认 5432）。 */
-    static final String KEY_PORT = "vb.wal.port";
+    public static final String KEY_PORT = "vb.wal.port";
 
     /** 库名键（默认 postgres）。 */
-    static final String KEY_DB = "vb.wal.db";
+    public static final String KEY_DB = "vb.wal.db";
 
     /** 用户键（默认 postgres，须有 REPLICATION 权限）。 */
-    static final String KEY_USER = "vb.wal.user";
+    public static final String KEY_USER = "vb.wal.user";
 
     /** 密码键（默认 postgres）。 */
-    static final String KEY_PASS = "vb.wal.pass";
+    public static final String KEY_PASS = "vb.wal.pass";
 
     /** 物理复制槽名键（默认 wal_source）。 */
-    static final String KEY_SLOT = "vb.wal.slot";
+    public static final String KEY_SLOT = "vb.wal.slot";
 
     private final String host;
     private final int port;
