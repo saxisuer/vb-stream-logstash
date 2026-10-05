@@ -11,11 +11,12 @@
 
 ## 结论：主干成立（PASS，连续多次稳定复现）
 
-16 个事务 26 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
-DELETE 前像、TOAST 重组的 7000 字符宽值；含 UTF-8 文本 π、float8、bool、timestamp
-微秒精度）；事务分组与提交序全对；**catalog 重放器 + relfilenode 跟踪 + TOAST 重组
-闭环打通**——字典、当前 relfilenode、toast 映射全部由 JDBC 引导 + WAL 重放驱动。
-验证覆盖（通过率说明：16/16 全绿可达且多次复现，约 2/5——不稳定根因见发现 23，
+19 个事务 30+ 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
+DELETE 前像、TOAST 重组的 7000 字符宽值、子事务回滚过滤、DEFAULT 列物理值、DROP 列
+null 占位；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）；事务分组与提交序
+全对；**catalog 重放器 + relfilenode 跟踪 + TOAST 重组 + 子事务语义 + 列增删语义
+全部闭环**——字典、当前 relfilenode、toast 映射全部由 JDBC 引导 + WAL 重放驱动。
+验证覆盖（通过率说明：19/19 全绿可达且多次复现，约 1/3——不稳定根因见发现 23，
 属工程完备性而非可行性）：
 
 | 场景 | 结果 |
@@ -28,6 +29,8 @@ DELETE 前像、TOAST 重组的 7000 字符宽值；含 UTF-8 文本 π、float8
 | S5：catalog 重放器——流中 `ALTER TABLE ADD COLUMN`，字典从 pg_attribute 自身的 WAL 记录按 ctid 重放（JDBC 引导含 ctid 种子） | ✓ ADD COLUMN 被捕捉（`extra attnum=6 typOid=25`）；ALTER 后的行用重放出的 6 列字典解码、第六列值正确，ALTER 前的行仍按当时 5 列字典——as-of 语义成立 |
 | S6：relfilenode 生命周期——流中 `TRUNCATE`（表+toast+索引全换 relfilenode），pg_class 行按 ctid 重放跟踪，后续 DML 按新 relfilenode 解码 | ✓（多次全绿复现）TRUNCATE 的三形态写入被完整捕捉（见发现 17/19），insert-after-truncate 按新 node 解出 |
 | S7：TOAST 重组——7000 字符不可压缩值（MD5 hex 链）走 external 存储，chunk 从 toast 表自身的 WAL 记录采集、按短指针重组 | ✓（多次全绿复现）chunk 采集（multi-insert）→ external 指针解析 → 按序拼装 7000 字符逐字节一致 |
+| S8：子事务——SAVEPOINT 回滚（子 xid abort）+ 整体 ROLLBACK | ✓ 19/19 全绿复现：`aborted-sub filtered=1`——回滚行被剔除、savepoint 前后存活行归并到同一 toplevel 事务；整体 ROLLBACK 零发射 |
+| S9：ADD COLUMN DEFAULT（新元组存默认值 42）+ DROP COLUMN（attisdropped 重放 + null 占位） | ✓ 19/19 全绿复现：`(34,…,x34,42)` 默认值物理存储解出；`(35,null,…)` dropped 列按 null 占位、列位保持 |
 
 ## 过程中钉死的关键事实（正式模块的资产）
 
@@ -111,6 +114,20 @@ DELETE 前像、TOAST 重组的 7000 字符宽值；含 UTF-8 文本 π、float8
 24. **value-based 截断重建**：pg_class 截断更新的 prefix（≤88B，cols 1-7 全定长）可由
     已知行值直接编码重建，suffix 区可零填充（只含不被读取的定长尾部列与经 null bitmap
     跳过的 varlena）——无需旧 tuple 原始字节，也不需要页读。
+25. **子事务归并与回滚过滤**：子事务的 heap 记录在记录头带
+    `XLR_BLOCK_ID_TOPLEVEL_XID`(252) 标记（u32，PG 11+ 为逻辑解码而记）——归并直接读
+    它，无需依赖 ASSIGNMENT 记录（`XLOG_XACT_ASSIGNMENT`(0x50) main=
+    {xid u32, nsubxacts u32, subxacts[]} 仍存在，作兜底）。ROLLBACK TO SAVEPOINT 只对
+    子 xid 发 ABORT——按 effXid 记账后在发射期过滤该来源的行；整体 ROLLBACK 无 commit
+    记录，天然零发射。
+26. **DROP COLUMN 的三重语义**：pg_attribute 行被 UPDATE 为 attisdropped=true 且
+    **attname 同时改写为 `........pg.dropped.<attnum>........`**（改名是发现 dropped 列
+    的可靠信号）；新元组保留列位、以 NULL 存储；解码字典必须保留 dropped 占位（按
+    attnum 的位置真理）而非剔除，否则列错位。
+27. **ADD COLUMN DEFAULT 的存储语义**：**新元组物理存储默认值**——missing-value 优化
+    只作用于存量行（不产生新 WAL 记录），CDC 只解新记录故**无需实现 attmissingval 的
+    读时补值**；pg_attribute 新行的 atthasmissing=true 与 attmissingval（varlena）按
+    skip 走过即可。
 
 ## 与既有架构的衔接（若立项正式模块）
 
@@ -137,8 +154,11 @@ DELETE 前像、TOAST 重组的 7000 字符宽值；含 UTF-8 文本 π、float8
 4. ~~TOAST 重组~~ **已验证**（S7，2026-10-05 补强）：chunk multi-insert 采集 + external
    短指针 + 按序拼装 + extsize 校验。遗留：压缩 external（pglz/lz4 解压）、未变列
    指针早于捕获起点的 JDBC 回查兜底
-5. 子事务（XLOG_XACT_ASSIGNMENT）与 two_phase（commit/abort prepared）
-6. ADD COLUMN DEFAULT 的 attmissingval 语义、DROP COLUMN 的 attisdropped 空洞
+5. ~~子事务~~ **已验证**（S8，2026-10-05 补强）：TOPLEVEL_XID 标记归并 + 回滚过滤 +
+   整体回滚零发射。遗留：two_phase（PREPARE/COMMIT PREPARED 记录形态与挂起语义）
+6. ~~ADD COLUMN DEFAULT / DROP COLUMN~~ **已验证**（S9，2026-10-05 补强）：默认值
+   物理存储、attisdropped 重放（改名占位符）、null 占位解码。遗留：无（attmissingval
+   对 CDC 不需要，见发现 27）
 7. 每大版本布局差异的 descriptor 化（PG 17 对照样转录一组做 diff 验证）
 
 ## 复现

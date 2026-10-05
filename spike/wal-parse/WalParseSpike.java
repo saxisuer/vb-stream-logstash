@@ -252,7 +252,11 @@ public class WalParseSpike {
                     boolean hasImage, int imageOff, int imageLen, int bimgInfo, int holeOffset, int holeLen,
                     boolean hasData, int dataOff, int dataLen) {}
     record ParsedRecord(long lsn, int totLen, int xid, int info, int rmid,
-                        List<BlockRef> blocks, int mainOff, int mainLen, byte[] raw) {}
+                        List<BlockRef> blocks, int mainOff, int mainLen, byte[] raw,
+                        int toplevelXid) {
+        /** transaction this record belongs to (toplevel when in a subtxn) */
+        long effXid() { return toplevelXid != 0 ? toplevelXid : xid; }
+    }
     record Row(Object[] vals) {
         public String toString() {
             StringBuilder sb = new StringBuilder("(");
@@ -433,7 +437,7 @@ public class WalParseSpike {
         int pos = REC_HDR_SIZE;
         List<BlockRef> blocks = new ArrayList<>();
         long[] lastLoc = null; // spc, db, relNode for SAME_REL
-        int mainOff = -1, mainLen = 0;
+        int mainOff = -1, mainLen = 0, toplevelXid = 0;
         int datatotal = 0; // accumulated image+data payload bytes announced by headers
         while (pos < totLen) {
             // header section ends when the remaining bytes are exactly the announced
@@ -448,7 +452,11 @@ public class WalParseSpike {
                 mainLen = u32(rec, pos + 1);
                 pos += 5;
                 break;
-            } else if (id == 253 || id == 252) { // origin / toplevel xid: u32 follows
+            } else if (id == 253) { // origin: u32 follows
+                pos += 5;
+                continue;
+            } else if (id == 252) { // TOPLEVEL_XID: u32 follows — subtxn records carry
+                toplevelXid = u32(rec, pos + 1); // their toplevel xid here
                 pos += 5;
                 continue;
             } else if (id <= 32) {
@@ -511,7 +519,7 @@ public class WalParseSpike {
                     "layout mismatch: mainOff=%d mainLen=%d totLen=%d rmid=%d info=%x",
                     mainOff, mainLen, totLen, rec[17] & 0xFF, rec[16] & 0xFF));
         return new ParsedRecord(lsn, totLen, u32(rec, 4), rec[16] & 0xFF, rec[17] & 0xFF,
-                patched, mainOff, mainLen, rec);
+                patched, mainOff, mainLen, rec, toplevelXid);
     }
 
     // ---- tuple decoding ---------------------------------------------------------
@@ -560,6 +568,7 @@ public class WalParseSpike {
                 case "text" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; vals[i] = readVarlenaText(src, c, next); c = next[0]; }
                 case "bytea" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; vals[i] = readVarlenaBytes(src, c, next); c = next[0]; }
                 case "skip" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; skipVarlena(src, c, next); c = next[0]; }
+                case "dropped" -> { /* attisdropped columns are always stored NULL */ }
                 default -> throw new IllegalStateException("unregistered kind " + kinds[i]);
             }
         }
@@ -954,6 +963,42 @@ public class WalParseSpike {
         }
         setup.commit();
         setup.setAutoCommit(true);
+        // S8: subtransactions — SAVEPOINT rollback must filter the subtxn's rows
+        // (sub records carry TOPLEVEL_XID; ROLLBACK TO aborts the sub xid only),
+        // and a full ROLLBACK emits nothing at all
+        setup.setAutoCommit(false);
+        try (Statement st = setup.createStatement()) {
+            String r30 = "(30, 's-030-π', 301.5, true, '2026-10-05 12:00:30.123456', 'e30')";
+            String r31 = "(31, 's-031-π', 311.5, false, '2026-10-05 12:00:31.123456', 'e31')";
+            String r32 = "(32, 's-032-π', 321.5, true, '2026-10-05 12:00:32.123456', 'e32')";
+            st.execute("INSERT INTO t_wal_spike VALUES " + r30);
+            st.execute("SAVEPOINT sp1");
+            st.execute("INSERT INTO t_wal_spike VALUES " + r31);
+            st.execute("ROLLBACK TO SAVEPOINT sp1");
+            st.execute("INSERT INTO t_wal_spike VALUES " + r32);
+            setup.commit();
+            // r31 rolled back with the savepoint; r30 (pre-savepoint) and r32 survive
+            expected.add(List.of(renderRow(r30), renderRow(r32)));
+
+            String r33 = "(33, 's-033-π', 331.5, false, '2026-10-05 12:00:33.123456', 'e33')";
+            st.execute("INSERT INTO t_wal_spike VALUES " + r33);
+            setup.rollback(); // whole txn vanishes
+        }
+        setup.setAutoCommit(true);
+        // S9: ADD COLUMN DEFAULT — new tuples physically store the default; the new
+        // pg_attribute row carries atthasmissing (varlena skipped) — then DROP COLUMN
+        // sets attisdropped via a catalog UPDATE; later tuples keep the slot as NULL
+        try (Statement st = setup.createStatement()) {
+            st.execute("ALTER TABLE t_wal_spike ADD COLUMN d int DEFAULT 42");
+            st.execute("INSERT INTO t_wal_spike (id, s, f, b, ts, extra)"
+                    + " VALUES (34, 's-034-π', 341.5, true, '2026-10-05 12:00:34.123456', 'x34')");
+            expected.add(List.of("(34, s-034-π, 341.5, true, 2026-10-05T12:00:34.123456, x34, 42)"));
+
+            st.execute("ALTER TABLE t_wal_spike DROP COLUMN s");
+            st.execute("INSERT INTO t_wal_spike (id, f, b, ts, extra, d)"
+                    + " VALUES (35, 351.5, false, '2026-10-05 12:00:35.123456', 'x35', 43)");
+            expected.add(List.of("(35, null, 351.5, false, 2026-10-05T12:00:35.123456, x35, 43)"));
+        }
         return expected;
     }
 
@@ -980,20 +1025,40 @@ public class WalParseSpike {
                 + (m.group(12) != null ? ", " + m.group(12) : "") + ")";
     }
 
+    static final Map<Long, Long> ASSIGNMENT_TOP = new java.util.HashMap<>(); // subxid -> toplevel
+
+    /** Adds a decoded change under the record's EFFECTIVE (toplevel) xid. */
+    static void addRow(Map<Long, List<Object[]>> rowsByXid, ParsedRecord rec, String text) {
+        long eff = rec.effXid();
+        if (eff == rec.xid()) eff = ASSIGNMENT_TOP.getOrDefault((long) rec.xid(), (long) rec.xid());
+        rowsByXid.computeIfAbsent(eff, k -> new ArrayList<>())
+                .add(new Object[]{(long) rec.xid(), text});
+    }
+
     // ---- report -------------------------------------------------------------------
     static void report(List<ParsedRecord> records, WalWalker walker, List<List<String>> expected) {
-        // group our-table rows by xid; commit order by commit LSN
-        Map<Integer, List<String>> rowsByXid = new LinkedHashMap<>();
-        Map<Integer, Long> commitLsnByXid = new LinkedHashMap<>();
-        Map<Integer, Long> abortLsnByXid = new LinkedHashMap<>();
+        // group our-table rows by EFFECTIVE xid (toplevel for subtxn records);
+        // each row is tagged with its originating xid so subtxn aborts can filter
+        Map<Long, List<Object[]>> rowsByXid = new LinkedHashMap<>(); // topXid -> [originXid, text]
+        Map<Long, Long> commitLsnByXid = new LinkedHashMap<>();
+        Map<Long, Long> abortXids = new LinkedHashMap<>();
+        for (ParsedRecord rec : records) {
+            if (rec.rmid() == RM_XACT_ID && (rec.info() & XLOG_XACT_OPMASK) == 0x50) {
+                // XLOG_XACT_ASSIGNMENT: {xid u32, nsubxacts u32, subxacts[]}
+                long top = u32(rec.raw(), rec.mainOff()) & 0xFFFFFFFFL;
+                int n = u32(rec.raw(), rec.mainOff() + 4);
+                for (int i = 0; i < n; i++)
+                    ASSIGNMENT_TOP.put(u32(rec.raw(), rec.mainOff() + 8 + 4 * i) & 0xFFFFFFFFL, top);
+            }
+        }
         int fpwSeen = 0, fpwCrossChecked = 0, fpwMismatches = 0;
         int multiInsertRecords = 0, singleInsertRecords = 0;
 
         for (ParsedRecord rec : records) {
             if (rec.rmid() == RM_XACT_ID) {
                 int op = rec.info() & XLOG_XACT_OPMASK;
-                if (op == XLOG_XACT_COMMIT) commitLsnByXid.put(rec.xid(), rec.lsn());
-                else if (op == XLOG_XACT_ABORT) abortLsnByXid.put(rec.xid(), rec.lsn());
+                if (op == XLOG_XACT_COMMIT) commitLsnByXid.put(rec.effXid(), rec.lsn());
+                else if (op == XLOG_XACT_ABORT) abortXids.put(rec.effXid(), rec.lsn());
                 continue;
             }
             // catalog replay FIRST: dictionaries (pg_attribute/pg_class) and the
@@ -1033,7 +1098,7 @@ public class WalParseSpike {
                         System.out.println("[spike] FPW cross-check skipped: " + e.getMessage());
                     }
                 }
-                rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>()).add(decoded);
+                addRow(rowsByXid, rec, decoded);
             } else if (rec.rmid() == RM_HEAP_ID
                     && ((rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_UPDATE
                         || (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_HOT_UPDATE)) {
@@ -1051,8 +1116,7 @@ public class WalParseSpike {
                 // new tuple is block 0's data, same shape as insert
                 String newStr = tupleFromPayload(rec.raw(), b0.dataOff(), kinds).toString();
                 singleInsertRecords++; // same payload shape as insert for bookkeeping
-                rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>())
-                        .add("U(" + oldStr + ")>(" + newStr + ")");
+                addRow(rowsByXid, rec, "U(" + oldStr + ")>(" + newStr + ")");
             } else if (rec.rmid() == RM_HEAP_ID && (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_DELETE) {
                 BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relNode);
                 if (b0 == null) continue;
@@ -1060,8 +1124,7 @@ public class WalParseSpike {
                 String oldStr = "none";
                 if ((delFlags & XLH_DELETE_CONTAINS_OLD) != 0)
                     oldStr = tupleFromPayload(rec.raw(), rec.mainOff() + SIZEOF_HEAP_DELETE, kinds).toString();
-                rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>())
-                        .add("D(" + oldStr + ")");
+                addRow(rowsByXid, rec, "D(" + oldStr + ")");
             } else if (rec.rmid() == RM_HEAP2_ID && (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP2_MULTI_INSERT) {
                 BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relNode);
                 if (b0 == null) continue;
@@ -1082,19 +1145,26 @@ public class WalParseSpike {
                     perRecord.add(r.toString());
                     cur += 7 + datalen;
                 }
-                rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>()).addAll(perRecord);
+                for (String s : perRecord) addRow(rowsByXid, rec, s);
             }
         }
 
         // transactions in commit order
-        List<Map.Entry<Integer, Long>> commits = new ArrayList<>(commitLsnByXid.entrySet());
+        List<Map.Entry<Long, Long>> commits = new ArrayList<>(commitLsnByXid.entrySet());
         commits.sort(Map.Entry.comparingByValue());
         List<List<String>> actual = new ArrayList<>();
         System.out.println("\n===== decoded transactions (commit order) =====");
         for (var e : commits) {
-            List<String> rows = rowsByXid.get(e.getKey());
-            if (rows == null || rows.isEmpty()) continue; // txn didn't touch our table
-            System.out.printf("xid=%d commit=%s rows=%d%n", e.getKey(), lsn(e.getValue()), rows.size());
+            List<Object[]> tagged = rowsByXid.get(e.getKey());
+            if (tagged == null || tagged.isEmpty()) continue; // txn didn't touch our table
+            // drop rows originating from xids that aborted before the commit
+            // (ROLLBACK TO SAVEPOINT aborts the sub-xid only)
+            List<String> rows = new ArrayList<>();
+            for (Object[] t : tagged)
+                if (!abortXids.containsKey(t[0])) rows.add((String) t[1]);
+            if (rows.isEmpty()) continue;
+            System.out.printf("xid=%d commit=%s rows=%d (aborted-sub filtered=%d)%n",
+                    e.getKey(), lsn(e.getValue()), rows.size(), tagged.size() - rows.size());
             rows.forEach(r -> System.out.println("    " + r));
             actual.add(rows);
         }
@@ -1117,9 +1187,15 @@ public class WalParseSpike {
                 .filter(a -> a.attrelid() == tableRelid && a.attnum() > 0 && !a.attisdropped())
                 .sorted(java.util.Comparator.comparingInt(AttrRow::attnum))
                 .map(AttrRow::attname).toList();
-        System.out.println("final dictionary columns: " + finalCols);
-        if (finalCols.size() != 6 || !finalCols.get(5).equals("extra")) {
-            System.out.println(">>> DICTIONARY REPLAY FAILED: expected 6 columns ending with 'extra'");
+        List<String> droppedCols = ATTR_ROWS.values().stream()
+                .filter(a -> a.attrelid() == tableRelid && a.attnum() > 0 && a.attisdropped())
+                .sorted(java.util.Comparator.comparingInt(AttrRow::attnum))
+                .map(AttrRow::attname).toList();
+        System.out.println("final dictionary columns: " + finalCols + " dropped: " + droppedCols);
+        // DROP COLUMN renames the column to "........pg.dropped.<attnum>........"
+        if (!finalCols.equals(List.of("id", "f", "b", "ts", "extra", "d"))
+                || droppedCols.size() != 1 || !droppedCols.get(0).startsWith("........pg.dropped.2")) {
+            System.out.println(">>> DICTIONARY REPLAY FAILED: expected live [id,f,b,ts,extra,d] dropped pg.dropped.2");
             pass = false;
         }
         System.out.println("\nrecord census (rmid/info-hex -> count): " + walker.census);
@@ -1597,13 +1673,21 @@ public class WalParseSpike {
         if (trackedToastCtid != 0) {
             ClassRow toast = CLASS_ROWS.get(trackedToastCtid);
             if (toast != null && toast.relfilenode() != 0) {
-                for (HeapEvent ev : heapEvents(rec, toast.relfilenode(), TOAST_KINDS, null)) {
-                    if (ev.op() != HeapEvent.INS) continue;
-                    Row r = ev.row();
-                    long chunkId = ((Number) r.vals()[0]).longValue();
-                    int seq = ((Number) r.vals()[1]).intValue();
-                    byte[] data = (byte[]) r.vals()[2];
-                    TOAST_CHUNKS.computeIfAbsent(chunkId, k -> new java.util.TreeMap<>()).put(seq, data);
+                try {
+                    for (HeapEvent ev : heapEvents(rec, toast.relfilenode(), TOAST_KINDS, null)) {
+                        if (ev.op() != HeapEvent.INS) continue;
+                        Row r = ev.row();
+                        long chunkId = ((Number) r.vals()[0]).longValue();
+                        int seq = ((Number) r.vals()[1]).intValue();
+                        byte[] data = (byte[]) r.vals()[2];
+                        TOAST_CHUNKS.computeIfAbsent(chunkId, k -> new java.util.TreeMap<>()).put(seq, data);
+                    }
+                } catch (RuntimeException e) {
+                    // toast-row tracking can mis-heal under catalog churn (racing
+                    // autovacuum): a misattributed relation fails the 3-col decode —
+                    // skip chunk harvest rather than crash; S7's reassembly check
+                    // will surface the loss loudly if it matters
+                    dbg("[toast] chunk harvest skipped at %s: %s%n", lsn(rec.lsn()), e);
                 }
             }
         }
@@ -1612,9 +1696,9 @@ public class WalParseSpike {
     /** Current column kinds of the table, derived from the replayed dictionary. */
     static String[] dictKinds(Map<Long, AttrRow> attrRows, long tableRelid) {
         return attrRows.values().stream()
-                .filter(a -> a.attrelid() == tableRelid && a.attnum() > 0 && !a.attisdropped())
+                .filter(a -> a.attrelid() == tableRelid && a.attnum() > 0)
                 .sorted(java.util.Comparator.comparingInt(AttrRow::attnum))
-                .map(a -> kindForTypeOid(a.atttypid()))
+                .map(a -> a.attisdropped() ? "dropped" : kindForTypeOid(a.atttypid()))
                 .toArray(String[]::new);
     }
 
