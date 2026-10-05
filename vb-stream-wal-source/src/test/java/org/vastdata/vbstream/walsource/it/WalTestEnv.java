@@ -16,6 +16,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * WAL 直解源集成测试共享的单例 PG 18 容器与工具（对齐 engine 模块 {@code PgTestEnv} 范式）。
@@ -102,6 +104,28 @@ public final class WalTestEnv {
              ResultSet rs = st.executeQuery("SELECT current_setting('server_version_num')::int")) {
             rs.next();
             return rs.getInt(1);
+        }
+    }
+
+    /**
+     * 容器的权威 rmid 表：{@code pg_get_wal_resource_managers()} 的 rm_id → rm_name。
+     *
+     * <p>census 对拍的 {@code RMGR_NAMES} 映射表以此为唯一权威——本查询在测试期逐项
+     * 对表（防转录/版本漂移静默错位，错位会被 ≤2 容差吸收成假绿）。</p>
+     *
+     * @return rmid → rmgr 显示名（与 pg_waldump 输出的 rmgr 名同源）
+     * @throws SQLException 查询失败
+     */
+    public static Map<Integer, String> walResourceManagers() throws SQLException {
+        try (Connection c = newSqlConnection();
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT rm_id, rm_name FROM pg_get_wal_resource_managers() ORDER BY rm_id")) {
+            Map<Integer, String> m = new TreeMap<>();
+            while (rs.next()) {
+                m.put(rs.getInt(1), rs.getString(2));
+            }
+            return m;
         }
     }
 

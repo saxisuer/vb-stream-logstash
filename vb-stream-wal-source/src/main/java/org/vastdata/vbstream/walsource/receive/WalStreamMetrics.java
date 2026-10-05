@@ -7,13 +7,15 @@ import java.util.Map;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * WAL 流走读计数器：四项 LongAdder 计数 + rmid/info 形态普查（census）。
+ * WAL 流走读计数器：六项 LongAdder 计数 + rmid/info 形态普查（census）。
  *
  * <p>计数项语义：{@code records}=已交付解析记录数；{@code resyncs}=pageaddr 锚定失配后
  * 受控再同步次数（spike 发现 23b 的正式观测面）；{@code contrecords}=跨页记录缝合时
  * 消费的续体页头数；{@code orphanSkips}=流首/再同步点撞上的孤立续体页跳过数
  * （spike 发现 11）；{@code carryDrops}=feed 衔接校验失配的 carry 丢弃次数（与 resyncs
- * 分列：衔接层丢弃 vs 页头锚定层重锚）。census 以 {@code "rmid/" + hex(info&0xF0)} 为键记各形态条数，
+ * 分列：衔接层丢弃 vs 页头锚定层重锚）；{@code reconnects}=接收器断流重连次数（Task 8
+ * 起——每次 SQLException 触发的重连调度自增 1，由 WalStreamReceiver 维护，walker 不写）。
+ * census 以 {@code "rmid/" + hex(info&0xF0)} 为键记各形态条数，
  * 对齐 spike 的 record census 输出面（wal-direct-decode-spike.md 发现 10 的普查延续）。</p>
  *
  * <p>线程约束：设计为接收线程单写者独占（Task 8 的 readPending 循环），census 用
@@ -38,6 +40,10 @@ public final class WalStreamMetrics {
     /** carry 衔接失配丢弃次数（chunkStart 与游标不连续 → 丢弃未消费 carry；与 resyncs
      *  分列——resyncs 记页头锚定层的重锚，carryDrops 记 feed 衔接层的丢弃）。 */
     public final LongAdder carryDrops = new LongAdder();
+
+    /** 断流重连次数（每次 SQLException 触发的重连调度自增 1；接收器单写，walker 不写）——
+     *  断流原地重连 IT 的行为证据面（重连后位点不回退须伴随本计数 &gt; 0）。 */
+    public final LongAdder reconnects = new LongAdder();
 
     /** rmid/info 形态普查：键 {@code "rmid/hex(info&0xF0)"}，值为条数（单写者线程独占）。 */
     private final HashMap<String, Long> census = new HashMap<>();

@@ -38,6 +38,12 @@ import java.util.function.Consumer;
  * <p>断流重连：IO 异常（SQLException）→ 从 consumedLsn 重连，指数退避 1s/2s/4s/8s/16s；
  * 连续失败 5 次后 ERROR 停机（流数据损坏的 RuntimeException 属确定性失败，重连无益——
  * ERROR 后线程退出，不吞异常面）。成功收到数据即重置失败计数（连接级抖动不累计成停机）。
+ * 重连起点契约（与 walker 双侧约定）：consumedLsn 是<strong>记录对齐</strong>（上条记录
+ * MAXALIGN 后）而非页对齐位点——walker 的页内直通路（首 chunk 不在页界时直接走页内
+ * 记录头分支）恰好接受这种重入点，依赖正是 consumedLsn 恰落在记录边界的语义保证；若
+ * 断流时 carry 挂着半条记录，服务端自 consumedLsn（= carry 首字节）重发，feed 的衔接
+ * 校验会走一次 carry 丢弃+重锚（carryDrops 计数），数据不丢不重。首次建流即失败
+ * （walker 从未 feed）时 resume 保留页对齐初值而非 0 哨兵。
  * 周期反馈：每 5s 或每 1000 条 {@code setFlushedLSN(consumedLsn) + forceUpdateStatus}。</p>
  *
  * <p>线程约束：接收线程（名 wal-receiver，非守护）独占 walker/feed 与流游标读写；
@@ -150,12 +156,16 @@ public final class WalStreamReceiver {
      * 作其交付回调，回调在接收线程内同步执行）→ 起线程即返回（首连接在接收线程内建立，
      * 连接失败走重连循环不阻塞调用方）。边界与异常语义：重复 start 抛 ISE；fromLsn 必须
      * 落在服务端有效 WAL 区间内（非法位点在首个 START_REPLICATION 处 SQLException，重连
-     * 5 次后 ERROR 停机）。</p>
+     * 5 次后 ERROR 停机）；已 stop 的实例再 start 抛 ISE（生命周期单程——新会话新建实例，
+     * 续传位点经 consumedLsn 交接）。</p>
      *
      * @param sink    已解析记录的交付回调（接收线程内同步执行——慢 sink 直接拖慢收流，背压语义）
      * @param fromLsn 起始 LSN（典型 {@link PhysicalSlotManager#ensureSlot(String)} 的返回值）
      */
     public synchronized void start(Consumer<WalRecord> sink, long fromLsn) {
+        if (stopped) {
+            throw new IllegalStateException("receiver already stopped — create a new instance for a new session");
+        }
         if (started) {
             throw new IllegalStateException("receiver already started");
         }
@@ -174,8 +184,8 @@ public final class WalStreamReceiver {
      *
      * <p>关键步骤：synchronized 双检幂等（重复调用为 no-op）；closeStreamQuietly 先关流再关
      * 连接（接收线程正在 readPending 时被关连接会抛 SQLException，接收循环以 stopRequested
-     * 位先行短路吞掉）。join 超时仅 WARN（线程可能仍在退避睡）——停机位保证其随后自行退出。
-     * 边界：未 start 时调用合法（仅置位）。</p>
+     * 位先行短路吞掉）。join 超时则 interrupt 接收线程（打断重连退避睡）后 WARN——停机位
+     * 保证其随后自行退出。边界：未 start 时调用合法（仅置位）。</p>
      */
     public synchronized void stop() {
         if (stopped) {
@@ -191,8 +201,10 @@ public final class WalStreamReceiver {
                 Thread.currentThread().interrupt();
             }
             if (worker.isAlive()) {
-                LOG.warn("wal-receiver 线程 {}ms 内未退出（可能仍在重连退避睡）——停机位已置，随后自行退出",
-                        STOP_JOIN_TIMEOUT_MS);
+                // join 超时（多半卡在重连退避睡）——interrupt 提前打断睡，循环顶的
+                // stopRequested 位随即令其退出
+                worker.interrupt();
+                LOG.warn("wal-receiver 线程 {}ms 内未退出——已 interrupt（停机位已置）", STOP_JOIN_TIMEOUT_MS);
             }
         }
         LOG.info("WAL 接收器停机: slot={} 消费前沿 {}", slotName, Lsn.format(consumedLsn));
@@ -232,8 +244,15 @@ public final class WalStreamReceiver {
                     LOG.error("WAL 流连续重连失败 {} 次，接收器停机（最后错误）", failures, e);
                     return;
                 }
-                resume = walker.consumedLsn();
-                consumedLsn = resume;
+                metrics.reconnects.increment();
+                // resume 兜底（High-1）：walker.consumedLsn() 在从未 feed 时为 0 哨兵——
+                // 首次 openStream 即失败或首 feed 前断流若取 0 会以 0/0 重连（服务端拒绝
+                // →5 次假停机）或按当前位点起流跳过启动窗口，故保留页对齐初值不动
+                long frontier = walker.consumedLsn();
+                if (frontier != 0) {
+                    resume = frontier;
+                    consumedLsn = frontier;
+                }
                 LOG.warn("WAL 流中断（第 {}/{} 次），{}ms 后从 {} 重连: {}", failures, MAX_RECONNECT_ATTEMPTS,
                         backoff, Lsn.format(resume), e.getMessage());
                 sleepQuiet(backoff);

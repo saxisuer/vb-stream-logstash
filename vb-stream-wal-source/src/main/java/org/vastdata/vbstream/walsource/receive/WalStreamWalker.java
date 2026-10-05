@@ -36,6 +36,12 @@ import java.util.function.Consumer;
  *
  * <p>线程约束：单写者——feed/consumedLsn 限定接收线程（Task 8 的 readPending 循环）
  * 调用；sink 回调在 feed 调用线程内同步执行。</p>
+ *
+ * <p>重入契约（与 WalStreamReceiver 双侧约定）：断流重连的续传起点 consumedLsn 是
+ * <strong>记录对齐</strong>（上条记录 MAXALIGN 后）而非页对齐——首 chunk 不落在页界时
+ * 页内直通路（直接按记录头解析）恰好接受这种重入点，其正确性依赖 consumedLsn 恰在
+ * MAXALIGN 记录边界这一语义保证；若断流时 carry 挂着半条记录，重连后服务端自
+ * consumedLsn（= carry 首字节）重发，衔接校验走一次 carry 丢弃 + 重锚，数据不丢不重。</p>
  */
 public final class WalStreamWalker {
 
