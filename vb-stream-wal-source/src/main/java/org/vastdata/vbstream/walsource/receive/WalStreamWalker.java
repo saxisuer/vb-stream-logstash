@@ -1,0 +1,434 @@
+package org.vastdata.vbstream.walsource.receive;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.vastdata.vbstream.walsource.layout.Lsn;
+import org.vastdata.vbstream.walsource.layout.WalLayout;
+import org.vastdata.vbstream.walsource.layout.WalRecord;
+import org.vastdata.vbstream.walsource.layout.WalRecordParser;
+
+import java.util.function.Consumer;
+
+/**
+ * WAL 字节流走读状态机：把 pgjdbc 物理复制流送来的任意切分 chunk 重组为
+ * {@link WalRecord} 序列——页/记录导航 + contrecord 缝合 + pageaddr 锚定协议。
+ *
+ * <p>移植自 spike {@code WalParseSpike.WalWalker}（spike/wal-parse），硬编码尺寸改经
+ * {@link WalLayout} 注入、记录走读委派 {@link WalRecordParser} 静态入口（Task 3 的
+ * 纯函数工具类，无实例可持）；spike 的 {@code getLastReceiveLSN - len} 裸算锚定废除，
+ * 改为<strong>页头 pageaddr 是页内导航的唯一权威</strong>（spike 发现 23b 的正式解）：</p>
+ * <ol>
+ *   <li>chunk 拼接：{@link #feed(long, byte[])} 以调用方传的 chunkEndLsn 推算 chunk 起点
+ *   并做 carry 衔接校验（失配 WARN + 丢弃 carry 重启，页头锚定随后接管）；</li>
+ *   <li>页头锚定：每个页边界（含跨页缝合遇到的续体页头）校验 {@code pageaddr ==
+ *   expectedPageAddr}；首个页头初始化期望并要求页对齐（游标地址空间随即重锚到
+ *   pageaddr）；失配 → 在合并缓冲内扫描下一个合法页头（magic 对、pageaddr 页对齐且
+ *   与游标推算地址差 ≤ 2 页），命中即丢弃错位字节、{@code resyncs++}、WARN、以该
+ *   pageaddr 重锚继续；容差窗口扫完仍无 → ISE fail-fast（含双方 LSN 诊断）。</li>
+ * </ol>
+ *
+ * <p>导航骨架（发现 11）：页边界 → 页头校验（长/短页头按 XLP_LONG_HEADER 分档）→
+ * 孤立续体跳过（MAXALIGN(页头+rem_len) 补齐）→ 记录头（totLen==0 或页尾余量不足
+ * 记录头长 = 零垫，整页跳过）→ 记录缝合（跨页按"当前页剩余"取数——累计消耗与页内
+ * 偏移严禁混用同一坐标系）→ emit。页尾零垫不预消费（无法区分"已到页尾"与"字节
+ * 未到"），待下页字节到达后跳页。</p>
+ *
+ * <p>线程约束：单写者——feed/consumedLsn 限定接收线程（Task 8 的 readPending 循环）
+ * 调用；sink 回调在 feed 调用线程内同步执行。</p>
+ */
+public final class WalStreamWalker {
+
+    private static final Logger LOG = LoggerFactory.getLogger(WalStreamWalker.class);
+
+    /** 页头 info 位 XLP_FIRST_IS_CONTRECORD：本页首条记录是前页记录的续体（xlog_internal.h）。 */
+    private static final int XLP_FIRST_IS_CONTRECORD = 0x0001;
+
+    /** 页头 info 位 XLP_LONG_HEADER：段首长页头（xlog_internal.h）。 */
+    private static final int XLP_LONG_HEADER = 0x0002;
+
+    /** XLogPageHeaderData 定偏移：xlp_info u16@2。 */
+    private static final int INFO_OFFSET = 2;
+
+    /** XLogPageHeaderData 定偏移：xlp_pageaddr u64@8。 */
+    private static final int PAGEADDR_OFFSET = 8;
+
+    /** XLogPageHeaderData 定偏移：xlp_rem_len u32@16。 */
+    private static final int REM_LEN_OFFSET = 16;
+
+    /** 再同步扫描的 pageaddr 容差（页为单位）：±2 页内视为可重锚的受控漂移。 */
+    private static final int RESYNC_TOLERANCE_PAGES = 2;
+
+    /** expectedPageAddr 未初始化标记（0 是合法页地址，不能用零作哨兵）。 */
+    private static final long PAGEADDR_UNSET = Long.MIN_VALUE;
+
+    private static final byte[] EMPTY = {};
+
+    private final WalLayout layout;
+    private final WalStreamMetrics metrics;
+    private final Consumer<WalRecord> sink;
+
+    /** 未消费字节（锚定于 carryStartLsn）——chunk 与 chunk 间的缝合缓冲。 */
+    private byte[] carry = EMPTY;
+
+    /** carry[0] 的绝对 LSN；亦即"已消费到"的游标前沿（consumedLsn 的真身）。 */
+    private long carryStartLsn;
+
+    /** 是否已 feed 过（首个 chunk 免做衔接校验）。 */
+    private boolean sawAny;
+
+    /** 下一个期望页头的 pageaddr（页连续性锚）；PAGEADDR_UNSET 表示尚未初始化。 */
+    private long expectedPageAddr = PAGEADDR_UNSET;
+
+    /**
+     * 装配一个走读器。
+     *
+     * @param layout  版本布局描述符（页/页头/记录头尺寸与页魔数的唯一来源）
+     * @param metrics 计数器（records/resyncs/contrecords/orphanSkips + census，调用方持有观测）
+     * @param sink    已解析记录的交付回调（feed 调用线程内同步执行）
+     */
+    public WalStreamWalker(WalLayout layout, WalStreamMetrics metrics, Consumer<WalRecord> sink) {
+        this.layout = layout;
+        this.metrics = metrics;
+        this.sink = sink;
+    }
+
+    /**
+     * 已消费到的绝对 LSN 游标前沿（= carry[0] 的 LSN；从未 feed 时为 0）。
+     *
+     * <p>Task 8 以本值作周期 flush 确认与断流重连的续传起点——emit 过的记录前沿，
+     * 不含 carry 中等待拼装的半条记录/页。</p>
+     *
+     * @return 下一个未消费字节的 LSN
+     */
+    public long consumedLsn() {
+        return carryStartLsn;
+    }
+
+    /**
+     * 喂入一个 readPending chunk（任意切分，不必页对齐）。
+     *
+     * <p>关键步骤：① 由 chunkEndLsn 推算 chunk 起点并做 carry 衔接校验——失配说明
+     * 调用方 LSN 算术与游标漂移（spike 实测 keepalive/data 交错下 ±32B），WARN 后
+     * 丢弃 carry 从本 chunk 自身锚点重启（页头锚定随后在页边界接管纠偏）；② carry
+     * 拼接为合并缓冲；③ 解析循环消费到"字节不足需等待"为止，余量回填 carry，
+     * carryStartLsn 重置为停点 LSN（再同步重锚后该值已切换到 pageaddr 权威空间）。</p>
+     *
+     * <p>边界与异常语义：data 空数组仅推进衔接校验后直接返回；页头/记录头/记录体
+     * 跨 chunk 分裂时留待后续 feed；pageaddr 失配超容差抛 ISE（feed 半途抛出时，
+     * 此前已交付 sink 的记录不受影响——at-least-once 语义由上游续传兜底）。
+     * 线程约束：仅接收线程调用。</p>
+     *
+     * @param chunkEndLsn 本 chunk 最后一个字节之后的 LSN（调用方游标，如
+     *                    pgjdbc {@code getLastReceiveLSN()}；仅作衔接校验与初值）
+     * @param data        chunk 字节
+     */
+    public void feed(long chunkEndLsn, byte[] data) {
+        long chunkStart = chunkEndLsn - data.length;
+        if (sawAny && chunkStart != carryStartLsn + carry.length) {
+            LOG.warn("chunk anchor drift: carry ends at {} but chunk starts at {} — dropping {} carry bytes",
+                    Lsn.format(carryStartLsn + carry.length), Lsn.format(chunkStart), carry.length);
+            carry = EMPTY;
+        }
+        if (carry.length == 0) {
+            carryStartLsn = chunkStart;
+        }
+        byte[] merged = new byte[carry.length + data.length];
+        System.arraycopy(carry, 0, merged, 0, carry.length);
+        System.arraycopy(data, 0, merged, carry.length, data.length);
+        sawAny = true;
+        ParseResult result = parse(merged, carryStartLsn);
+        carry = new byte[merged.length - result.consumed()];
+        System.arraycopy(merged, result.consumed(), carry, 0, carry.length);
+        carryStartLsn = result.endLsn();
+    }
+
+    /**
+     * 解析循环：消费 buf（锚定于 lsn0）尽可能多的字节，返回消费量与停点 LSN。
+     *
+     * <p>骨架（发现 11）：页边界分支做页头校验/锚定/孤立续体跳过；页内分支做记录头
+     * 读取（零垫判别）与跨页缝合（按"当前页剩余"取数）；每条完整记录经
+     * {@link WalRecordParser} 走读后交付 sink 并计数。所有"字节不足"路径以 break
+     * 收敛——停点 LSN（cur 始终等于 buf[pos] 的绝对地址，再同步重锚只改其值不改其义）
+     * 与消费量一并返回。</p>
+     *
+     * <p>边界与异常语义：totLen 小于记录头长（损坏）抛 ISE；跨页处无
+     * XLP_FIRST_IS_CONTRECORD 标记、pageaddr 锚定丢失均按失配路径处理（再同步或
+     * ISE）。buf 为调用方（feed）私有的合并缓冲，再同步的原地丢弃可安全破坏其前缀。</p>
+     *
+     * @param buf  合并缓冲（从 lsn0 起的字节流）
+     * @param lsn0 buf[0] 的绝对 LSN
+     * @return 消费字节数与停点 LSN（= 未消费首字节的绝对地址）
+     */
+    private ParseResult parse(byte[] buf, long lsn0) {
+        int bs = layout.walBlockSize();
+        int shortHdr = layout.shortPageHeaderSize();
+        int recHdr = layout.recordHeaderSize();
+        int pos = 0;
+        long cur = lsn0;
+        int len = buf.length;
+        while (true) {
+            int pageOff = (int) (cur & (bs - 1));
+            if (pageOff == 0) {
+                // 短页头整体到达前无法判分档/读 pageaddr（magic 不错检——坏 magic 的
+                // pageaddr 必然失配，统一走再同步路径）
+                if (len - pos < shortHdr) {
+                    break;
+                }
+                int info = u16(buf, pos + INFO_OFFSET);
+                int hdrSize = (info & XLP_LONG_HEADER) != 0 ? layout.longPageHeaderSize() : shortHdr;
+                if (len - pos < hdrSize) {
+                    break;
+                }
+                long pageaddr = u64(buf, pos + PAGEADDR_OFFSET);
+                if (expectedPageAddr == PAGEADDR_UNSET) {
+                    if ((pageaddr & (bs - 1)) != 0) {
+                        throw new IllegalStateException("first WAL page header not page-aligned: pageaddr="
+                                + Lsn.format(pageaddr) + " cursor=" + Lsn.format(cur));
+                    }
+                    if (pageaddr != cur) {
+                        // 首页头即与调用方游标漂移：pageaddr 为唯一权威，重锚地址空间
+                        metrics.resyncs.increment();
+                        LOG.warn("initial pageaddr re-anchor: cursor {} -> page header {}",
+                                Lsn.format(cur), Lsn.format(pageaddr));
+                        cur = pageaddr;
+                    }
+                } else if (pageaddr != expectedPageAddr || pageaddr != cur) {
+                    int adopted = resyncAt(buf, pos, len, cur, expectedPageAddr, pageaddr);
+                    if (adopted < 0) {
+                        break;   // 容差窗口未覆盖，等更多字节后重扫
+                    }
+                    pos = adopted;
+                    cur = expectedPageAddr;
+                    continue;
+                }
+                expectedPageAddr = pageaddr + bs;
+                if ((info & XLP_FIRST_IS_CONTRECORD) != 0) {
+                    // 孤立续体（发现 11）：记录头在窗口/再同步点之前，跳余部后继续
+                    metrics.orphanSkips.increment();
+                    int remLen = u32(buf, pos + REM_LEN_OFFSET);
+                    long skipEnd = (cur + hdrSize + remLen + 7) & ~7L;
+                    if (skipEnd - cur > len - pos) {
+                        break;   // 余部未到齐
+                    }
+                    pos += (int) (skipEnd - cur);
+                    cur = skipEnd;
+                    continue;
+                }
+                pos += hdrSize;
+                cur += hdrSize;
+            }
+            // 页内：记录头位置（页尾余量不足记录头长 = 整页零垫，直接跳页）
+            int pageRemain = bs - (int) (cur & (bs - 1));
+            if (pageRemain < recHdr) {
+                if (len - pos < pageRemain) {
+                    break;
+                }
+                pos += pageRemain;
+                cur += pageRemain;
+                continue;
+            }
+            if (len - pos < recHdr) {
+                break;   // 记录头跨 chunk 分裂
+            }
+            int totLen = u32(buf, pos);
+            if (totLen == 0) {
+                // 页内零垫：与"字节未到"不可区分，垫满整页才跳
+                if (len - pos < pageRemain) {
+                    break;
+                }
+                pos += pageRemain;
+                cur += pageRemain;
+                continue;
+            }
+            if (totLen < recHdr) {
+                throw new IllegalStateException("corrupt record header: totLen=" + totLen
+                        + " < header size " + recHdr + " at " + Lsn.format(cur));
+            }
+            // 记录缝合：跨页按"当前页剩余"取数（发现 11 坐标系教训——pageEnd 相对 curL 自身）
+            long recLsn = cur;
+            byte[] rec = new byte[totLen];
+            int recPos = 0;
+            int src = pos;
+            long curL = cur;
+            boolean awaitMore = false;
+            boolean resynced = false;
+            while (recPos < totLen) {
+                int pageEnd = bs - (int) (curL & (bs - 1));
+                int take = Math.min(totLen - recPos, pageEnd);
+                if (len - src < take) {
+                    awaitMore = true;   // 记录体未到齐
+                    break;
+                }
+                System.arraycopy(buf, src, rec, recPos, take);
+                recPos += take;
+                src += take;
+                curL += take;
+                if (recPos < totLen) {
+                    // 越入续体页：整头到达前等待；页头三项全验（magic/标志/pageaddr 锚定）
+                    if (len - src < shortHdr) {
+                        awaitMore = true;
+                        break;
+                    }
+                    int cInfo = u16(buf, src + INFO_OFFSET);
+                    long cPageaddr = u64(buf, src + PAGEADDR_OFFSET);
+                    boolean cLong = (cInfo & XLP_LONG_HEADER) != 0;
+                    int cHdr = cLong ? layout.longPageHeaderSize() : shortHdr;
+                    if (len - src < cHdr) {
+                        awaitMore = true;
+                        break;
+                    }
+                    if (u16(buf, src) != layout.pageMagic()
+                            || (cInfo & XLP_FIRST_IS_CONTRECORD) == 0
+                            || cPageaddr != curL) {
+                        // 续体页头违约（缺 contrecord 标志或 pageaddr 锚定失配）：
+                        // 丢弃半条记录（含记录头），从下一个合法页头重锚
+                        int adopted = resyncAt(buf, pos, len, recLsn, curL, cPageaddr);
+                        if (adopted < 0) {
+                            awaitMore = true;
+                            break;
+                        }
+                        resynced = true;
+                        pos = adopted;
+                        cur = expectedPageAddr;
+                        break;
+                    }
+                    metrics.contrecords.increment();
+                    src += cHdr;
+                    curL += cHdr;
+                }
+            }
+            if (awaitMore) {
+                break;   // 等更多字节（半条记录留在缓冲）
+            }
+            if (resynced) {
+                continue;   // 已重锚到合法页头，回外层页边界分支
+            }
+            WalRecord parsed = WalRecordParser.parse(rec, recLsn, layout);
+            metrics.countRecord(parsed);
+            sink.accept(parsed);
+            pos = src;
+            cur = curL;
+            // 记录起点 MAXALIGN 垫齐（下一条记录/页尾零垫的边界）；垫长至多 7
+            int pad = (int) (((cur + 7) & ~7L) - cur);
+            if (pad > 0) {
+                if (len - pos < pad) {
+                    break;
+                }
+                pos += pad;
+                cur += pad;
+            }
+        }
+        return new ParseResult(pos, cur);
+    }
+
+    /**
+     * 失配点的受控再同步：在 buf 内自 dropFrom（含）起逐字节扫描下一个合法页头，
+     * 命中即原地丢弃错位字节并重锚。
+     *
+     * <p>合法判据三项全过：magic 对（提示这是真页头而非记录内数据）、pageaddr 页对齐、
+     * pageaddr 与游标推算地址（{@code curAtDropFrom + (p - dropFrom)}，缓冲内漂移的
+     * 唯一坐标基准）差 ≤ {@value #RESYNC_TOLERANCE_PAGES} 页。命中：dropFrom..p 原地
+     * 抹除（数组左移，可能为 0 字节——失配页头自身即合法锚的情形）、{@code resyncs++}、
+     * WARN（含期望/实得/重锚三方 LSN）、expectedPageAddr 置为采纳值，返回重锚位置。
+     * dropFrom 起扫描含自身：±32B 漂移形态下失配页头往往就是正确的下一页（pageaddr
+     * 可证），此时零丢弃直接重锚，不损失页内记录。</p>
+     *
+     * <p>边界与异常语义：未命中且自 dropFrom 起缓冲已覆盖 ≥ 2 页（容差窗口必然扫尽）
+     * → ISE fail-fast（消息含期望 pageaddr/失配点游标/实得 pageaddr）；未命中且窗口
+     * 未覆盖 → 返回 -1（调用方等待更多字节后重扫）。</p>
+     *
+     * @param buf         合并缓冲（再同步可安全破坏 dropFrom 之前与 dropFrom..p 区间）
+     * @param dropFrom    错位字节起点（扫描含该位置；缝合路径为整条记录的记录头位）
+     * @param len         缓冲有效长度
+     * @param curAtDropFrom dropFrom 位置的游标 LSN（扫描推算的坐标基准）
+     * @param expectedAddr 失配点的期望页址（诊断用）
+     * @param foundAddr   失配页头实得 pageaddr（诊断用）
+     * @return 重锚后合法页头所在的缓冲位置；-1 表示需等待更多字节
+     * @throws IllegalStateException 容差窗口扫尽仍无合法页头
+     */
+    private int resyncAt(byte[] buf, int dropFrom, int len, long curAtDropFrom,
+                         long expectedAddr, long foundAddr) {
+        int bs = layout.walBlockSize();
+        int hdr = layout.shortPageHeaderSize();
+        long tolerance = (long) RESYNC_TOLERANCE_PAGES * bs;
+        for (int p = dropFrom; p <= len - hdr; p++) {
+            if (u16(buf, p) != layout.pageMagic()) {
+                continue;
+            }
+            long pageaddr = u64(buf, p + PAGEADDR_OFFSET);
+            if ((pageaddr & (bs - 1)) != 0) {
+                continue;
+            }
+            long cursorDerived = curAtDropFrom + (p - dropFrom);
+            long diff = pageaddr - cursorDerived;
+            if (diff > tolerance || diff < -tolerance) {
+                continue;
+            }
+            int dropped = p - dropFrom;
+            if (dropped > 0) {
+                System.arraycopy(buf, p, buf, dropFrom, len - p);
+            }
+            metrics.resyncs.increment();
+            LOG.warn("WAL stream resync at {}: expected page header {}, found {} — dropped {} bytes, re-anchored to {}",
+                    Lsn.format(cursorDerived), Lsn.format(expectedAddr), Lsn.format(foundAddr),
+                    dropped, Lsn.format(pageaddr));
+            expectedPageAddr = pageaddr;
+            return dropFrom;
+        }
+        if (len - dropFrom >= tolerance) {
+            throw new IllegalStateException("WAL pageaddr anchoring lost: expected "
+                    + Lsn.format(expectedAddr) + " but found " + Lsn.format(foundAddr)
+                    + " at cursor " + Lsn.format(curAtDropFrom) + " — no legal page header within "
+                    + tolerance + " bytes (tolerance " + RESYNC_TOLERANCE_PAGES + " pages)");
+        }
+        return -1;
+    }
+
+    /**
+     * 就地读 little-endian u16。
+     *
+     * @param b      源数组（长度须覆盖 offset+2）
+     * @param offset 起始偏移
+     * @return 16 位值
+     */
+    private static int u16(byte[] b, int offset) {
+        return (b[offset] & 0xFF) | ((b[offset + 1] & 0xFF) << 8);
+    }
+
+    /**
+     * 就地读 little-endian u32。
+     *
+     * @param b      源数组（长度须覆盖 offset+4）
+     * @param offset 起始偏移
+     * @return 32 位值
+     */
+    private static int u32(byte[] b, int offset) {
+        return (b[offset] & 0xFF)
+                | ((b[offset + 1] & 0xFF) << 8)
+                | ((b[offset + 2] & 0xFF) << 16)
+                | ((b[offset + 3] & 0xFF) << 24);
+    }
+
+    /**
+     * 就地读 little-endian u64。
+     *
+     * @param b      源数组（长度须覆盖 offset+8）
+     * @param offset 起始偏移
+     * @return 64 位值
+     */
+    private static long u64(byte[] b, int offset) {
+        return (u32(b, offset) & 0xFFFFFFFFL) | ((long) u32(b, offset + 4) << 32);
+    }
+
+    /**
+     * 解析循环的单次返回：消费字节数 + 停点 LSN。
+     *
+     * <p>两者分离是再同步的必然——重锚后停点 LSN 切换到 pageaddr 权威空间，不再等于
+     * {@code lsn0 + consumed}；carry 起点必须取 endLsn 而非裸算。</p>
+     *
+     * @param consumed buf 中已消费的字节数（carry 回填的切分点）
+     * @param endLsn  未消费首字节的绝对 LSN（carry 的新锚点）
+     */
+    private record ParseResult(int consumed, long endLsn) {
+    }
+}

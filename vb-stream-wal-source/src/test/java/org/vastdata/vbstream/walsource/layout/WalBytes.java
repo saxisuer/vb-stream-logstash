@@ -49,6 +49,27 @@ public final class WalBytes {
     /** DATA_SHORT 的 u8 长度上限——main 载荷不超过该值即选短终止头。 */
     private static final int DATA_SHORT_MAX = 255;
 
+    /** WAL 页大小（XLOG_BLCKSZ，xlog_internal.h）——整页拼装的自持常量。 */
+    private static final int PAGE_SIZE = 8192;
+
+    /** 短页头尺寸（MAXALIGN(sizeof(XLogPageHeaderData))）——页内记录段自此后展开。 */
+    private static final int SHORT_PAGE_HEADER_SIZE = 24;
+
+    /** XLogPageHeaderData 定偏移：xlp_pageaddr u64@8（页起始 LSN，页导航唯一权威）。 */
+    private static final int PAGEADDR_OFFSET = 8;
+
+    /** XLogPageHeaderData 定偏移：xlp_rem_len u32@16（续体页的剩余字节数）。 */
+    private static final int REM_LEN_OFFSET = 16;
+
+    /** 测试源码根整页拼装用：PG 18 页魔数（XLOG_PAGE_MAGIC，xlog_internal.h）。 */
+    public static final int XLOG_PAGE_MAGIC = 0xD118;
+
+    /** 页头 info 位 XLP_FIRST_IS_CONTRECORD：本页首条记录是窗口之前记录的续体。 */
+    public static final int XLP_FIRST_IS_CONTRECORD = 0x0001;
+
+    /** 页头 info 位 XLP_LONG_HEADER：段首长页头（额外 16B 段创始信息）。 */
+    public static final int XLP_LONG_HEADER = 0x0002;
+
     private static final byte[] EMPTY = {};
 
     private final int rmid;
@@ -271,6 +292,58 @@ public final class WalBytes {
     }
 
     /**
+     * 拼一个无特殊标志的完整 WAL 页（短页头 + 逐记录段 + 尾零到页大小）。
+     *
+     * <p>页头按 XLogPageHeaderData 展开：magic u16@0、info u16@2（0）、tli u32@4（1）、
+     * pageaddr u64@8、rem_len u32@16（0），MAXALIGN 后即 24B。等价于
+     * {@link #page(long, int, int, byte[]...)} 的 {@code (pageAddr, 0, 0, segments)} 便捷档。</p>
+     *
+     * @param pageAddr       页起始 LSN（须已页对齐；写入页头 xlp_pageaddr）
+     * @param recordSegments 页内记录段字节（通常为 {@code build()} 输出；逐段 MAXALIGN 起点排布）
+     * @return 8192 字节整页
+     */
+    public static byte[] page(long pageAddr, byte[]... recordSegments) {
+        return page(pageAddr, 0, 0, recordSegments);
+    }
+
+    /**
+     * 拼一个可带页头标志的完整 WAL 页（短页头 + 逐记录段 + 尾零到页大小）。
+     *
+     * <p>关键步骤：页头 24B 按定偏移写入（info 携带 {@link #XLP_FIRST_IS_CONTRECORD} 等
+     * 标志、rem_len 声明续体剩余字节——续体页首段为跨页记录的余部，紧贴页头展开）；
+     * 随后逐记录段排布——每段起点 MAXALIGN 到 8（首段落于 24，天然对齐；续体余部
+     * 之后的首个完整记录由此正确垫齐，与 PG 记录起点对齐规则一致）；尾部补零到
+     * {@code PAGE_SIZE}。边界与异常语义：段超页容量抛 IAE（拼装误用即刻失败）；
+     * pageAddr 不页对齐不做前置拦截——页头校验面留给被测 walker。</p>
+     *
+     * @param pageAddr       页起始 LSN（写入 xlp_pageaddr）
+     * @param xlpFlags       页头 info 标志位（如 {@link #XLP_FIRST_IS_CONTRECORD}）
+     * @param xlpRemLen      xlp_rem_len（续体页的剩余字节数；非续体页传 0）
+     * @param recordSegments 页内记录段字节（续体页首段为记录余部，其后段为完整记录）
+     * @return 8192 字节整页
+     * @throws IllegalArgumentException 任一段（含垫齐）超出页容量
+     */
+    public static byte[] page(long pageAddr, int xlpFlags, int xlpRemLen, byte[]... recordSegments) {
+        byte[] page = new byte[PAGE_SIZE];
+        put16(page, 0, XLOG_PAGE_MAGIC);
+        put16(page, 2, xlpFlags);
+        put32(page, 4, 1L);                       // xlp_tli：任意合法时间线
+        put64(page, PAGEADDR_OFFSET, pageAddr);
+        put32(page, REM_LEN_OFFSET, xlpRemLen);
+        int pos = SHORT_PAGE_HEADER_SIZE;
+        for (byte[] seg : recordSegments) {
+            pos = (pos + 7) & ~7;                 // 记录起点 MAXALIGN（首段 24 已对齐）
+            if (pos + seg.length > PAGE_SIZE) {
+                throw new IllegalArgumentException("segment of " + seg.length
+                        + " bytes overflows WAL page at offset " + pos);
+            }
+            System.arraycopy(seg, 0, page, pos, seg.length);
+            pos += seg.length;
+        }
+        return page;
+    }
+
+    /**
      * 断言当前存在可落 image/data 的块，否则 DSL 误用即刻失败。
      *
      * @throws IllegalStateException 尚未调用 block/sameRel
@@ -317,6 +390,31 @@ public final class WalBytes {
         rec[offset + 1] = (byte) ((v >>> 8) & 0xFF);
         rec[offset + 2] = (byte) ((v >>> 16) & 0xFF);
         rec[offset + 3] = (byte) ((v >>> 24) & 0xFF);
+    }
+
+    /**
+     * 就地写 little-endian u16（页头 magic/info 用）。
+     *
+     * @param target 目标数组
+     * @param offset 起始偏移
+     * @param v      16 位值（仅低 16 位有效）
+     */
+    private static void put16(byte[] target, int offset, int v) {
+        target[offset] = (byte) (v & 0xFF);
+        target[offset + 1] = (byte) ((v >>> 8) & 0xFF);
+    }
+
+    /**
+     * 就地写 little-endian u64（页头 xlp_pageaddr 用）。
+     *
+     * @param target 目标数组
+     * @param offset 起始偏移
+     * @param v      64 位值
+     */
+    private static void put64(byte[] target, int offset, long v) {
+        for (int i = 0; i < 8; i++) {
+            target[offset + i] = (byte) ((v >>> (8 * i)) & 0xFF);
+        }
     }
 
     /**
