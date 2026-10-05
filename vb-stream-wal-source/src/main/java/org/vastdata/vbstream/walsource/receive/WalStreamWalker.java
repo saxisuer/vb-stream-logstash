@@ -19,7 +19,8 @@ import java.util.function.Consumer;
  * 改为<strong>页头 pageaddr 是页内导航的唯一权威</strong>（spike 发现 23b 的正式解）：</p>
  * <ol>
  *   <li>chunk 拼接：{@link #feed(long, byte[])} 以调用方传的 chunkEndLsn 推算 chunk 起点
- *   并做 carry 衔接校验（失配 WARN + 丢弃 carry 重启，页头锚定随后接管）；</li>
+ *   并做 carry 衔接校验（失配且 carry 非空：WARN + 丢弃 carry + {@code carryDrops++}；
+ *   carry 为空的锚点偏移静默改锚——页头锚定随后接管纠偏）；</li>
  *   <li>页头锚定：每个页边界（含跨页缝合遇到的续体页头）校验 {@code pageaddr ==
  *   expectedPageAddr}；首个页头初始化期望并要求页对齐（游标地址空间随即重锚到
  *   pageaddr）；失配 → 在合并缓冲内扫描下一个合法页头（magic 对、pageaddr 页对齐且
@@ -125,9 +126,14 @@ public final class WalStreamWalker {
     public void feed(long chunkEndLsn, byte[] data) {
         long chunkStart = chunkEndLsn - data.length;
         if (sawAny && chunkStart != carryStartLsn + carry.length) {
-            LOG.warn("chunk anchor drift: carry ends at {} but chunk starts at {} — dropping {} carry bytes",
-                    Lsn.format(carryStartLsn + carry.length), Lsn.format(chunkStart), carry.length);
-            carry = EMPTY;
+            if (carry.length > 0) {
+                metrics.carryDrops.increment();
+                LOG.warn("chunk anchor drift: carry ends at {} but chunk starts at {} — dropping {} carry bytes",
+                        Lsn.format(carryStartLsn + carry.length), Lsn.format(chunkStart), carry.length);
+                carry = EMPTY;
+            }
+            // carry 为空时的锚点偏移无数据损失，不打 WARN——游标直接改锚，
+            // 页头锚定在下一页界接管纠偏
         }
         if (carry.length == 0) {
             carryStartLsn = chunkStart;
@@ -137,7 +143,9 @@ public final class WalStreamWalker {
         System.arraycopy(data, 0, merged, carry.length, data.length);
         sawAny = true;
         ParseResult result = parse(merged, carryStartLsn);
-        carry = new byte[merged.length - result.consumed()];
+        // carry 切分以解析后的有效长度为准——非零丢弃再同步左移字节后，
+        // merged 尾部 (dropped) 字节是陈旧副本，不得回填 carry
+        carry = new byte[result.len() - result.consumed()];
         System.arraycopy(merged, result.consumed(), carry, 0, carry.length);
         carryStartLsn = result.endLsn();
     }
@@ -157,7 +165,8 @@ public final class WalStreamWalker {
      *
      * @param buf  合并缓冲（从 lsn0 起的字节流）
      * @param lsn0 buf[0] 的绝对 LSN
-     * @return 消费字节数与停点 LSN（= 未消费首字节的绝对地址）
+     * @return 消费字节数、停点 LSN（= 未消费首字节的绝对地址）与有效长度（非零丢弃
+     *         再同步收缩后的缓冲界，feed 据此切 carry）
      */
     private ParseResult parse(byte[] buf, long lsn0) {
         int bs = layout.walBlockSize();
@@ -169,8 +178,7 @@ public final class WalStreamWalker {
         while (true) {
             int pageOff = (int) (cur & (bs - 1));
             if (pageOff == 0) {
-                // 短页头整体到达前无法判分档/读 pageaddr（magic 不错检——坏 magic 的
-                // pageaddr 必然失配，统一走再同步路径）
+                // 短页头整体到达前无法判分档/读 pageaddr（magic 不错检——见下方 anchored 判据）
                 if (len - pos < shortHdr) {
                     break;
                 }
@@ -180,26 +188,29 @@ public final class WalStreamWalker {
                     break;
                 }
                 long pageaddr = u64(buf, pos + PAGEADDR_OFFSET);
-                if (expectedPageAddr == PAGEADDR_UNSET) {
-                    if ((pageaddr & (bs - 1)) != 0) {
-                        throw new IllegalStateException("first WAL page header not page-aligned: pageaddr="
-                                + Lsn.format(pageaddr) + " cursor=" + Lsn.format(cur));
-                    }
-                    if (pageaddr != cur) {
-                        // 首页头即与调用方游标漂移：pageaddr 为唯一权威，重锚地址空间
-                        metrics.resyncs.increment();
-                        LOG.warn("initial pageaddr re-anchor: cursor {} -> page header {}",
-                                Lsn.format(cur), Lsn.format(pageaddr));
-                        cur = pageaddr;
-                    }
-                } else if (pageaddr != expectedPageAddr || pageaddr != cur) {
-                    int adopted = resyncAt(buf, pos, len, cur, expectedPageAddr, pageaddr);
-                    if (adopted < 0) {
+                boolean firstHeader = expectedPageAddr == PAGEADDR_UNSET;
+                boolean anchored = u16(buf, pos) == layout.pageMagic()
+                        && (firstHeader
+                                ? (pageaddr & (bs - 1)) == 0
+                                : pageaddr == expectedPageAddr && pageaddr == cur);
+                if (!anchored) {
+                    // 页头校验失败（坏 magic / 首头未页对齐 / pageaddr 锚定失配）→ 受控再同步
+                    Adoption adopted = resyncAt(buf, pos, len, cur,
+                            firstHeader ? cur : expectedPageAddr, pageaddr);
+                    if (adopted == null) {
                         break;   // 容差窗口未覆盖，等更多字节后重扫
                     }
-                    pos = adopted;
+                    pos = adopted.pos();
+                    len = adopted.len();
                     cur = expectedPageAddr;
                     continue;
+                }
+                if (firstHeader && pageaddr != cur) {
+                    // 首页头即与调用方游标漂移：pageaddr 为唯一权威，重锚地址空间
+                    metrics.resyncs.increment();
+                    LOG.warn("initial pageaddr re-anchor: cursor {} -> page header {}",
+                            Lsn.format(cur), Lsn.format(pageaddr));
+                    cur = pageaddr;
                 }
                 expectedPageAddr = pageaddr + bs;
                 if ((info & XLP_FIRST_IS_CONTRECORD) != 0) {
@@ -282,17 +293,19 @@ public final class WalStreamWalker {
                             || cPageaddr != curL) {
                         // 续体页头违约（缺 contrecord 标志或 pageaddr 锚定失配）：
                         // 丢弃半条记录（含记录头），从下一个合法页头重锚
-                        int adopted = resyncAt(buf, pos, len, recLsn, curL, cPageaddr);
-                        if (adopted < 0) {
+                        Adoption adopted = resyncAt(buf, pos, len, recLsn, curL, cPageaddr);
+                        if (adopted == null) {
                             awaitMore = true;
                             break;
                         }
                         resynced = true;
-                        pos = adopted;
+                        pos = adopted.pos();
+                        len = adopted.len();
                         cur = expectedPageAddr;
                         break;
                     }
                     metrics.contrecords.increment();
+                    expectedPageAddr = cPageaddr + bs;   // 缝合越页：期望随之推进（否则后续页界必伪再同步）
                     src += cHdr;
                     curL += cHdr;
                 }
@@ -318,7 +331,7 @@ public final class WalStreamWalker {
                 cur += pad;
             }
         }
-        return new ParseResult(pos, cur);
+        return new ParseResult(pos, cur, len);
     }
 
     /**
@@ -329,25 +342,27 @@ public final class WalStreamWalker {
      * pageaddr 与游标推算地址（{@code curAtDropFrom + (p - dropFrom)}，缓冲内漂移的
      * 唯一坐标基准）差 ≤ {@value #RESYNC_TOLERANCE_PAGES} 页。命中：dropFrom..p 原地
      * 抹除（数组左移，可能为 0 字节——失配页头自身即合法锚的情形）、{@code resyncs++}、
-     * WARN（含期望/实得/重锚三方 LSN）、expectedPageAddr 置为采纳值，返回重锚位置。
+     * WARN（含期望/实得/重锚三方 LSN）、expectedPageAddr 置为采纳值，返回重锚位置与
+     * <strong>收缩后的有效长度</strong>（左移丢弃后尾部 dropped 字节为陈旧副本，调用
+     * 方的 len/carry 切分必须随之收缩，否则陈旧区会被二次解析成幻影记录、游标虚进）。
      * dropFrom 起扫描含自身：±32B 漂移形态下失配页头往往就是正确的下一页（pageaddr
      * 可证），此时零丢弃直接重锚，不损失页内记录。</p>
      *
      * <p>边界与异常语义：未命中且自 dropFrom 起缓冲已覆盖 ≥ 2 页（容差窗口必然扫尽）
      * → ISE fail-fast（消息含期望 pageaddr/失配点游标/实得 pageaddr）；未命中且窗口
-     * 未覆盖 → 返回 -1（调用方等待更多字节后重扫）。</p>
+     * 未覆盖 → 返回 null（调用方等待更多字节后重扫）。</p>
      *
      * @param buf         合并缓冲（再同步可安全破坏 dropFrom 之前与 dropFrom..p 区间）
      * @param dropFrom    错位字节起点（扫描含该位置；缝合路径为整条记录的记录头位）
-     * @param len         缓冲有效长度
+     * @param len         缓冲当前有效长度
      * @param curAtDropFrom dropFrom 位置的游标 LSN（扫描推算的坐标基准）
      * @param expectedAddr 失配点的期望页址（诊断用）
      * @param foundAddr   失配页头实得 pageaddr（诊断用）
-     * @return 重锚后合法页头所在的缓冲位置；-1 表示需等待更多字节
+     * @return 重锚位置与收缩后的有效长度；null 表示需等待更多字节
      * @throws IllegalStateException 容差窗口扫尽仍无合法页头
      */
-    private int resyncAt(byte[] buf, int dropFrom, int len, long curAtDropFrom,
-                         long expectedAddr, long foundAddr) {
+    private Adoption resyncAt(byte[] buf, int dropFrom, int len, long curAtDropFrom,
+                              long expectedAddr, long foundAddr) {
         int bs = layout.walBlockSize();
         int hdr = layout.shortPageHeaderSize();
         long tolerance = (long) RESYNC_TOLERANCE_PAGES * bs;
@@ -373,7 +388,7 @@ public final class WalStreamWalker {
                     Lsn.format(cursorDerived), Lsn.format(expectedAddr), Lsn.format(foundAddr),
                     dropped, Lsn.format(pageaddr));
             expectedPageAddr = pageaddr;
-            return dropFrom;
+            return new Adoption(dropFrom, len - dropped);
         }
         if (len - dropFrom >= tolerance) {
             throw new IllegalStateException("WAL pageaddr anchoring lost: expected "
@@ -381,7 +396,7 @@ public final class WalStreamWalker {
                     + " at cursor " + Lsn.format(curAtDropFrom) + " — no legal page header within "
                     + tolerance + " bytes (tolerance " + RESYNC_TOLERANCE_PAGES + " pages)");
         }
-        return -1;
+        return null;
     }
 
     /**
@@ -421,14 +436,26 @@ public final class WalStreamWalker {
     }
 
     /**
-     * 解析循环的单次返回：消费字节数 + 停点 LSN。
+     * 解析循环的单次返回：消费字节数 + 停点 LSN + 有效长度。
      *
-     * <p>两者分离是再同步的必然——重锚后停点 LSN 切换到 pageaddr 权威空间，不再等于
-     * {@code lsn0 + consumed}；carry 起点必须取 endLsn 而非裸算。</p>
+     * <p>endLsn 与 consumed 分离是再同步的必然——重锚后停点 LSN 切换到 pageaddr 权威
+     * 空间，不再等于 {@code lsn0 + consumed}；carry 起点必须取 endLsn 而非裸算。
+     * len 是非零丢弃再同步收缩后的缓冲有效长度——carry 回填以它为界（数组物理长度
+     * 减去被丢弃的陈旧尾），防止陈旧副本进 carry。</p>
      *
      * @param consumed buf 中已消费的字节数（carry 回填的切分点）
      * @param endLsn  未消费首字节的绝对 LSN（carry 的新锚点）
+     * @param len     缓冲有效长度（≥ consumed；feed 据此切 carry）
      */
-    private record ParseResult(int consumed, long endLsn) {
+    private record ParseResult(int consumed, long endLsn, int len) {
+    }
+
+    /**
+     * 一次成功再同步的重锚结果：合法页头所在位置 + 左移丢弃后收缩的缓冲有效长度。
+     *
+     * @param pos 重锚后合法页头所在的缓冲位置（= 调用方传入的 dropFrom）
+     * @param len 收缩后的有效长度（原长减去丢弃字节数；零丢弃时不变）
+     */
+    private record Adoption(int pos, int len) {
     }
 }

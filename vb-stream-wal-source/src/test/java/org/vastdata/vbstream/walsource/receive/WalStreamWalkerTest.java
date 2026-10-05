@@ -220,6 +220,126 @@ class WalStreamWalkerTest {
         assertEquals(a + 24, out.get(0).lsn());
     }
 
+    /** 回归（审查 F1）：跨页缝合消费续体页头后必须推进期望页址——后续整页页界零再同步通过。 */
+    @Test
+    void recordSpanningPagesThenNextPageValidatesWithoutResync() {
+        long p1 = 0x68000L;
+        long p2 = p1 + 8192;
+        long p3 = p2 + 8192;
+        byte[] big = bigRec();
+        int firstSegLen = 8192 - 24;
+        byte[] firstSeg = Arrays.copyOfRange(big, 0, firstSegLen);
+        byte[] remainder = Arrays.copyOfRange(big, firstSegLen, big.length);
+        byte[] trailing = smallRec(RM_HEAP_ID, 0x00, 66);
+        byte[] r3 = smallRec(RM_HEAP_ID, 0x00, 77);
+        byte[] stream = concat(
+                WalBytes.page(p1, firstSeg),
+                WalBytes.page(p2, WalBytes.XLP_FIRST_IS_CONTRECORD, remainder.length, remainder, trailing),
+                WalBytes.page(p3, r3));
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
+        walker.feed(p1 + 3 * 8192, stream);
+
+        assertEquals(3, out.size());
+        assertEquals(1, metrics.contrecords.sum());
+        // F1 钉死：缝合路径推进 expectedPageAddr 后，P3 页界正常通过——无伪再同步
+        assertEquals(0, metrics.resyncs.sum());
+        assertEquals(p1 + 24, out.get(0).lsn());
+        assertEquals(p2 + 24 + align8(remainder.length), out.get(1).lsn());
+        assertEquals(p3 + 24, out.get(2).lsn());
+        assertEquals(p3 + 8192, walker.consumedLsn());
+    }
+
+    /** 回归（审查 F4）：记录跨三页（双续体页）缝合完整，且跨出后续页界零再同步。 */
+    @Test
+    void recordSpanningThreePagesStitchesBothContinuations() {
+        long p1 = 0x6A000L;
+        long p2 = p1 + 8192;
+        long p3 = p2 + 8192;
+        long p4 = p3 + 8192;
+        int cap = 8192 - 24;
+        byte[] mainData = new byte[17000];
+        Arrays.fill(mainData, (byte) 0x5C);
+        byte[] big = WalBytes.record(0, 0x30, 0)
+                .block(0, 1663L, 16385L, 24600L, 0)
+                .image(new byte[300], 40, 0x01)
+                .main(mainData)
+                .build();
+        byte[] s1 = Arrays.copyOfRange(big, 0, cap);
+        byte[] s2 = Arrays.copyOfRange(big, cap, 2 * cap);
+        byte[] s3 = Arrays.copyOfRange(big, 2 * cap, big.length);
+        byte[] r4 = smallRec(RM_HEAP_ID, 0x00, 88);
+        byte[] stream = concat(
+                WalBytes.page(p1, s1),
+                WalBytes.page(p2, WalBytes.XLP_FIRST_IS_CONTRECORD, s2.length, s2),
+                WalBytes.page(p3, WalBytes.XLP_FIRST_IS_CONTRECORD, s3.length, s3, r4),
+                WalBytes.page(p4, smallRec(RM_HEAP_ID, 0x00, 99)));
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
+        walker.feed(p1 + 4 * 8192, stream);
+
+        assertEquals(3, out.size());
+        assertArrayEquals(big, out.get(0).raw());   // 三页缝合逐字节完整
+        assertEquals(p1 + 24, out.get(0).lsn());
+        assertEquals(2, metrics.contrecords.sum());
+        assertEquals(0, metrics.resyncs.sum());     // 双续体页期望逐页推进，P4 页界零再同步
+        assertEquals(p3 + 24 + align8(s3.length), out.get(1).lsn());
+        assertEquals(p4 + 24, out.get(2).lsn());
+        assertEquals(p4 + 8192, walker.consumedLsn());
+    }
+
+    /** 回归（审查 F2）：非零丢弃再同步后缓冲有效长度收缩——同 feed 无幻影记录、consumedLsn 无虚进。 */
+    @Test
+    void nonZeroDropResyncShrinksBufferAndContinuesWithoutPhantoms() {
+        long a = 0x70000L;
+        byte[] r0 = smallRec(RM_HEAP_ID, 0x00, 1);
+        byte[] r2 = smallRec(RM_HEAP_ID, 0x00, 2);
+        byte[] p1bad = WalBytes.page(a + 8192, smallRec(RM_HEAP_ID, 0x00, 3));
+        p1bad[0] = 0x00;   // 页头 magic 打坏：页头校验失败 → 整页 8192B 作错位字节丢弃
+        p1bad[1] = 0x00;
+        byte[] stream = concat(WalBytes.page(a, r0), p1bad, WalBytes.page(a + 2 * 8192, r2));
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
+        walker.feed(a + 3 * 8192, stream);
+
+        assertEquals(1, metrics.resyncs.sum());     // 单次 8192B 丢弃再同步
+        // 无幻影：丢弃左移后陈旧尾不重复产出 r2（修复前缓冲尾驻留 p2 副本被二次解析）
+        assertEquals(2, out.size());
+        assertEquals(a + 24, out.get(0).lsn());
+        assertEquals(a + 2 * 8192 + 24, out.get(1).lsn());
+        // 无虚进：停点=真实流末（修复前 len 未收缩致游标越过有效尾）
+        assertEquals(a + 3 * 8192, walker.consumedLsn());
+    }
+
+    /** 回归（审查 F3）：carry 衔接失配丢弃 pending carry 计数 carryDrops，丢后页头锚定恢复产出。 */
+    @Test
+    void carryAnchorDriftDropsPendingCarryAndCounts() {
+        long a = 0x78000L;
+        byte[] p0 = WalBytes.page(a, smallRec(RM_HEAP_ID, 0x00, 1));
+        byte[] p1 = WalBytes.page(a + 8192, smallRec(RM_HEAP_ID, 0x00, 2));
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
+        // feed 1 半页：r0 产出，页尾零垫未到齐 → 非空 carry
+        walker.feed(a + 4096, Arrays.copyOfRange(p0, 0, 4096));
+        assertEquals(1, out.size());
+        // feed 2 的 chunkEndLsn 多报 32B：chunkStart 与 carry 尾不连续 → 丢 carry 计数
+        walker.feed(a + 4096 + 8192 + 32, p1);
+
+        assertEquals(1, metrics.carryDrops.sum());
+        assertEquals(2, out.size());
+        // 丢弃后以错锚点重启 → 页头锚定重锚（resyncs 1 次）→ p1 记录正常产出
+        assertEquals(1, metrics.resyncs.sum());
+        assertEquals(a + 8192 + 24, out.get(1).lsn());
+    }
+
     /**
      * 造一条小体积完整记录（单 block data + 8B main），尺寸可控便于页内排布推算。
      *
