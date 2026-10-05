@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- 测试环境：root INFO 可见场景进度与容器生命周期；testcontainers 传递的 dockerjava
+         http 客户端默认 DEBUG 会刷屏（每次容器 exec 打整段 wire 日志），压到 WARN；
+         排障 walker/接收器时把 org.vastdata.vbstream.walsource 调到 DEBUG -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{20} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="com.github.dockerjava" level="WARN"/>
+    <logger name="org.testcontainers" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
