@@ -15,6 +15,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Optional;
 import java.util.Properties;
 
 /**
@@ -169,6 +170,18 @@ public final class WalSource implements AutoCloseable {
             throw new IllegalStateException("metrics available only after start()");
         }
         return s.streamMetrics();
+    }
+
+    /**
+     * 接收器终态失败透传面（终审 I2——接收器死亡静默修复）：接收线程因重连耗尽/解析
+     * ISE 自行退出后返回根因；Main 周期行检测到终态即 ERROR + exit(1)。运行中/正常
+     * 停机/未 start 为 empty。
+     *
+     * @return 终态根因；运行中或无终态失败为 empty
+     */
+    public Optional<Throwable> receiverTerminalFailure() {
+        CatalogSynchronizer s = sync;
+        return s == null ? Optional.empty() : s.terminalFailure();
     }
 
     /**

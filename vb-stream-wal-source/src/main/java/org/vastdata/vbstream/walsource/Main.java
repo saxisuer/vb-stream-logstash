@@ -7,6 +7,7 @@ import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -25,9 +26,11 @@ import java.util.stream.Collectors;
  * （形态面收敛到最热 rmgr，冒烟时一眼看出 DDL/写入落在哪个资源管理器）。</p>
  *
  * <p>生命周期：启动失败 ERROR + close 清理 + {@code System.exit(1)}（对齐引擎 Main 约定）；
- * 正常路径主线程以 {@link CountDownLatch#await(long, TimeUnit)} 分片睡 10s（hook countDown
- * 即时打断，停机不等当前周期耗尽）；hook 内 close 幂等，先于 JVM halt 排干接收线程
- * （已收数据至少留痕 census）。</p>
+ * 运行期每个分片醒来先检 {@link WalSource#receiverTerminalFailure()}——接收器终态死亡
+ * （5 次重连失败/解析 ISE 后线程自行退出，终审 I2）即 ERROR 一行 + close + exit 1，
+ * 不让进程带死接收器空转；正常路径主线程以 {@link CountDownLatch#await(long, TimeUnit)}
+ * 分片睡 10s（hook countDown 即时打断，停机不等当前周期耗尽）；hook 内 close 幂等，
+ * 先于 JVM halt 排干接收线程（已收数据至少留痕 census）。</p>
  */
 public final class Main {
 
@@ -73,6 +76,15 @@ public final class Main {
         LOG.info("WAL 直解源冒烟运行中（{}ms 周期统计行，Ctrl-C 优雅退出）", STATS_INTERVAL_MS);
         try {
             while (!shutdown.await(STATS_INTERVAL_MS, TimeUnit.MILLISECONDS)) {
+                Optional<Throwable> terminal = source.receiverTerminalFailure();
+                if (terminal.isPresent()) {
+                    // 接收器终态死亡（5 次重连失败/解析 ISE 后线程已自行退出）——进程
+                    // 继续空转只会让 WAL 观测面停更（终审 I2），对齐引擎 fail-fast 退出
+                    LOG.error("WAL 接收器终态失败，进程退出（exit 1）", terminal.get());
+                    source.close();
+                    System.exit(1);
+                    return;
+                }
                 logSmokeLine(source);
             }
         } catch (InterruptedException e) {

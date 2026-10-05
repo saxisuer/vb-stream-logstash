@@ -13,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -97,6 +98,11 @@ public final class WalStreamReceiver {
     /** 停机请求位——stop() 置位，接收线程各循环边界检查。 */
     private volatile boolean stopRequested;
 
+    /** 终态失败原因（终审 I2）：仅两个 ERROR 停机出口（重连耗尽/解析 ISE）写入——
+     *  接收线程自行退出后进程若不感知即"终态死亡静默"；volatile 发布，任意线程经
+     *  {@link #terminalFailure()} 轮询。正常停机（stopRequested）与未 start 恒 null。 */
+    private volatile Throwable terminalFailure;
+
     /** start/stop 的单程闸门（synchronized 方法互斥保护）。 */
     private boolean started;
     private boolean stopped;
@@ -137,6 +143,19 @@ public final class WalStreamReceiver {
      */
     public WalStreamMetrics metrics() {
         return metrics;
+    }
+
+    /**
+     * 终态失败观测面（终审 I2——接收器死亡静默修复）：接收线程因<strong>确定性失败
+     * 自行退出</strong>（连续重连耗尽 MAX_RECONNECT_ATTEMPTS 次或 walker 解析 ISE）后，
+     * 本方法返回当时的根因异常；正常停机（stop）与运行中/未 start 返回 empty。
+     * 调用方（Main/宿主）应周期轮询本面，见终态即 fail-fast 退出——接收线程非守护，
+     * 不感知即进程空转且 WAL 停更。
+     *
+     * @return 终态根因；运行中/正常停机/未 start 为 empty
+     */
+    public Optional<Throwable> terminalFailure() {
+        return Optional.ofNullable(terminalFailure);
     }
 
     /**
@@ -243,6 +262,7 @@ public final class WalStreamReceiver {
                 }
                 failures++;
                 if (failures > MAX_RECONNECT_ATTEMPTS) {
+                    terminalFailure = e;
                     LOG.error("WAL 流连续重连失败 {} 次，接收器停机（最后错误）", failures, e);
                     return;
                 }
@@ -260,6 +280,7 @@ public final class WalStreamReceiver {
                 sleepQuiet(backoff);
                 backoff = Math.min(backoff * 2, RECONNECT_BACKOFF_MAX_MS);
             } catch (RuntimeException e) {
+                terminalFailure = e;
                 LOG.error("WAL 流数据解析失败（确定性错误，不重连）——接收器停机，前沿 {}",
                         Lsn.format(walker.consumedLsn()), e);
                 return;

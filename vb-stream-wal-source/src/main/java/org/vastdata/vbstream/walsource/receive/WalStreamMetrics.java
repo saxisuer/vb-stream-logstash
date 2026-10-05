@@ -23,7 +23,10 @@ import java.util.concurrent.atomic.LongAdder;
  * （多读单写），census 载体须为 {@link ConcurrentHashMap}（弱一致遍历不抛 CME）。
  * {@link #censusSnapshot()} 返回 {@code Map.copyOf} 不可变副本供任意线程安全读取。
  * LongAdder 字段为 public final——热路径原地自增免方法调用开销，快照读取走
- * {@code sum()}。</p>
+ * {@code sum()}。<strong>只读契约（终审 M2）：public LongAdder 字段为接收线程热路径
+ * 自增设计，api 门面（{@code WalSource.metrics()} 等）返回的实例对调用方仅约定只读
+ * ——外部 {@code increment()/reset()} 会污染协议计数锚（IT 以 reconnects/resyncs 断言
+ * 行为证据），属契约违约。</strong></p>
  */
 public final class WalStreamMetrics {
 
