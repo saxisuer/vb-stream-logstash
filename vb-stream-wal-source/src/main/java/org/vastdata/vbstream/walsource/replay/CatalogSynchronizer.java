@@ -17,6 +17,7 @@ import org.vastdata.vbstream.walsource.state.StoredState;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -241,7 +242,7 @@ public final class CatalogSynchronizer {
      *
      * @param sql            引导用 SQL 会话（healer 非 null 时生命周期须覆盖同步器全程）
      * @param slotName       物理槽名
-     * @param layout         版本布局描述符
+     * @param layout         版本布局描述符（须覆盖服务端版本，否则启动期 ISE）
      * @param user           复制连接用户
      * @param password       复制连接密码
      * @param healer         截断自愈校验器（null = 禁用）
@@ -250,10 +251,20 @@ public final class CatalogSynchronizer {
      * @param interestRelOid tracked 面 oid
      * @return 已运行的同步器
      * @throws SQLException 槽管理或引导查询失败
+     * @throws IllegalStateException 布局与服务端 server_version_num 错配（跨版本注入）
      */
     private static CatalogSynchronizer startInternal(Connection sql, String slotName, WalLayout layout,
             String user, String password, SelfHealer healer, StateConfig state, long forcedStartLsn,
             long... interestRelOid) throws SQLException {
+        // 版本交叉校验（审查 Med-3）：连接端 server_version_num 与 layout 双向核对——
+        // 错配的常量会让页遍历/记录解析/投影槽位整体错位（如 V18 layout 读 V17 的
+        // reltoastrelid@112 会读进 relallvisible），必须在任何槽/流副作用之前 fail-fast
+        int serverVersionNum = queryServerVersionNum(sql);
+        if (!layout.supports(serverVersionNum)) {
+            throw new IllegalStateException("layout mismatch: descriptor PG" + layout.majorVersion()
+                    + " does not support server_version_num " + serverVersionNum
+                    + "（跨版本注入——请经 WalLayouts.forServerVersion 分发）");
+        }
         CatalogStores stores = new CatalogStores();
         for (long oid : interestRelOid) {
             stores.interestRelOids().add(oid);
@@ -311,6 +322,25 @@ public final class CatalogSynchronizer {
                 slotName, Lsn.format(start), interestRelOid.length, healer != null,
                 state != null && state.enabled(), resumed);
         return sync;
+    }
+
+    /**
+     * 查询连接端 {@code server_version_num}（版本交叉校验的输入，审查 Med-3）。
+     *
+     * <p>关键步骤：单行单列设置查询；边界与异常语义：连接失效/查询失败由 SQLException
+     * 上抛（调用方 startInternal 尚无槽/流副作用，失败即净退出）；线程约束：静态纯
+     * 查询，startInternal 调用线程执行。</p>
+     *
+     * @param sql 引导用 SQL 会话
+     * @return 十进制版本号（如 170011 / 180006）
+     * @throws SQLException 查询失败
+     */
+    private static int queryServerVersionNum(Connection sql) throws SQLException {
+        try (PreparedStatement ps = sql.prepareStatement("SELECT current_setting('server_version_num')::int");
+             ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getInt(1);
+        }
     }
 
     /**

@@ -477,7 +477,7 @@ public final class CatalogReplay {
      * 发现 24 + 审查 High-1 读区回填）——prefix 落在读区（≤{@code 读区末尾}）时由
      * 已知旧行 {@link CatalogRow.ClassRow#encodeReadRegion()} 重编码前缀，中段取自
      * 记录；后缀零填充<strong>仅在读区之外合法</strong>，与读区（V18 [0,116) / V17
-     * [0,108)，由 layout 的 toast 偏移锚定）的重叠段按
+     * [0,112)，由 layout 的 toast 偏移锚定）的重叠段按
      * 旧行读区字节回填（suffix 截断省略的尾段与旧元组逐字节相同是其定义，回填即
      * 精确值——此前盲零填充在 RENAME 形态把 relnamespace..relam 清零）。
      *

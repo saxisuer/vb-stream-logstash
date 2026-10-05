@@ -88,7 +88,7 @@ public final class CatalogRow {
      * @param relam       存取方法 oid（列 7）
      * @param relfilenode relfilenode（列 8，数据区偏移 88）
      * @param reltoastrelid toast 关系 oid（列 13/14 依版本——V17 槽 12 数据区偏移
-     *                      104、V18 槽 13 偏移 112）
+     *                      108、V18 槽 13 偏移 112，两版差恰 4B 单列宽）
      */
     public record ClassRow(long relOid, String relname, long relnamespace, long reltype, long reloftype,
                            long relowner, long relam, long relfilenode, long reltoastrelid) {
@@ -128,8 +128,8 @@ public final class CatalogRow {
          * relfilenode@88（u32）、{@code [92, reltoastrelid 偏移)} 填零
          * （reltablespace/relpages/reltuples/relallvisible[/relallfrozen]——定宽且
          * 不被 {@code fromDecoded} 投影，零值合法；V18 五列 20B 至 112、V17 四列
-         * 16B 至 104）、reltoastrelid@toastOff（u32）——合计
-         * {@code reltoastrelidDataOffset()+4} 字节（V18 116 / V17 108）。
+         * 16B 至 108）、reltoastrelid@toastOff（u32）——合计
+         * {@code reltoastrelidDataOffset()+4} 字节（V18 116 / V17 112）。
          * <strong>消费面</strong>：截断更新的 prefix 重编码（prefix ≤ 读区末尾均可由
          * 旧行无损重编码）与<strong>后缀读区回填</strong>（suffix 截断时被省略的尾段与
          * 读区的重叠段按本编码回填——后缀与旧元组逐字节相同是 suffix 截断的定义，

@@ -28,9 +28,11 @@ package org.vastdata.vbstream.walsource.layout;
  *       PG 18 于 relallvisible 后增列 int4</td></tr>
  *   <tr><td>classToastRelidIndex</td><td>12</td><td>13</td>
  *       <td>同上：relallfrozen 缺席使 reltoastrelid 前移一位</td></tr>
- *   <tr><td>pgClassReltoastrelidDataOffset</td><td>104</td><td>112</td>
- *       <td>relfilenode@88 后 V17 为 4 个定宽列（tablespace oid + relpages int4 +
- *       reltuples float4 + relallvisible int4）合计 16B；V18 多 relallfrozen int4</td></tr>
+ *   <tr><td>pgClassReltoastrelidDataOffset</td><td>108</td><td>112</td>
+ *       <td>relfilenode 自占 [88,92)，其后 V17 为 4 个定宽列（tablespace oid +
+ *       relpages int4 + reltuples float4 + relallvisible int4）合计 16B 占 [92,108)；
+ *       V18 多 relallfrozen int4——两版差恰 4B（审查 High-1 勘误：首版 104 为漏计
+ *       relfilenode 自身 4B 的算术错，其假绿由收尾 ALTER 全行 UPD 掩盖）</td></tr>
  *   <tr><td>其余（walBlockSize 8192 / 页头 24、40 / 记录头 24 / heapUpdate 14 /
  *       heapDelete 8 / relfilenode 偏移 88）</td><td colspan="2">一致</td>
  *       <td>xlog_internal.h / xlogrecord.h / heapam_xlog.h 两分支逐 struct diff
@@ -70,10 +72,11 @@ public final class WalLayoutV17 implements WalLayout {
     /** pg_class 数据区 relfilenode 偏移 88——推算依据同 V18：列 1-7（oid 4B + name 64B
      * + 5×oid 20B）定宽合计 88，relfilenode 紧随其后；live postgres:17 实查列序一致。 */
     private static final int PGCLASS_RELFILENODE_DATA_OFFSET = 88;
-    /** pg_class 数据区 reltoastrelid 偏移 104——推算依据：relfilenode@88 后 4 个定宽列
-     * （reltablespace oid + relpages int4 + reltuples float4 + relallvisible int4）
-     * 合计 16B；V18 多 relallfrozen int4（PG 18 增列）故为 112。 */
-    private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 104;
+    /** pg_class 数据区 reltoastrelid 偏移 108——推算依据（审查 High-1 勘误：relfilenode
+     * 自占 [88,92)）：其后 4 个定宽列（reltablespace oid + relpages int4 + reltuples
+     * float4 + relallvisible int4）合计 16B 占 [92,108)，reltoastrelid@108；V18 多
+     * relallfrozen int4 为 112——两版差恰 4B（单列差），88 锚定法以此自检。 */
+    private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 108;
 
     /** pg_attribute 词典槽位：attisdropped=17（V17 含 attcacheoff@5，其后列整体后移）。 */
     private static final int ATTR_DROPPED_INDEX = 17;
@@ -228,7 +231,8 @@ public final class WalLayoutV17 implements WalLayout {
         return PGCLASS_RELFILENODE_DATA_OFFSET;
     }
 
-    /** {@inheritDoc}——104（relfilenode@88 后 4 个定宽列合计 16B；V18 为 112）。 */
+    /** {@inheritDoc}——108（relfilenode 自占 [88,92) 后 4 个定宽列合计 16B；V18 为 112，
+     *  两版差恰 4B）。 */
     @Override
     public int pgClassReltoastrelidDataOffset() {
         return PGCLASS_RELTOASTRELID_DATA_OFFSET;

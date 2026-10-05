@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * WalLayoutV17 布局常量的失败先行测试——差异常量钉死（Task 16 转录锚：pageMagic
  * 0xD116、sizeOfHeapInplace 2、pg_attribute 26 项含 attcacheoff、pg_class 33 项
- * 缺 relallfrozen、reltoastrelid 偏移 104、两漂移槽位 17/12）、与 V18 的逐常量
+ * 缺 relallfrozen、reltoastrelid 偏移 108（审查 High-1 勘误值）、两漂移槽位 17/12）、与 V18 的逐常量
  * diff 断言（哪些相同哪些不同——两描述符互为转录交叉核）、版本分发（170000-179999
  * 全区间）与跨版本拒绝（160000/169999/190000/0 抛 ISE）。
  *
@@ -31,11 +31,12 @@ class WalLayoutV17Test {
     }
 
     /** 差异常量逐项钉死：inplace 前缀 2（V17 结构仅 offnum，无 PG 18 的失效消息内联）、
-     *  reltoastrelid 数据区偏移 104（缺 relallfrozen 少 4B）、漂移槽位 17/12。 */
+     *  reltoastrelid 数据区偏移 108（relfilenode 自占 [88,92) + 4 定宽列 16B；审查 High-1
+     *  勘误值——首版 104 为漏计 relfilenode 自身 4B 的算术错）、漂移槽位 17/12。 */
     @Test
     void versionDriftedConstantsMatchRel17Transcription() {
         assertEquals(2, layout.sizeOfHeapInplace());
-        assertEquals(104, layout.pgClassReltoastrelidDataOffset());
+        assertEquals(108, layout.pgClassReltoastrelidDataOffset());
         assertEquals(17, layout.attrDroppedIndex());
         assertEquals(12, layout.classToastRelidIndex());
     }
@@ -56,7 +57,8 @@ class WalLayoutV17Test {
         // 差异面照抄反向钉死：pageMagic / inplace / toast 偏移两版必须不同
         assertNotSame(0, layout.pageMagic() ^ v18.pageMagic());
         assertEquals(18, v18.sizeOfHeapInplace() - layout.sizeOfHeapInplace());
-        assertEquals(8, v18.pgClassReltoastrelidDataOffset() - layout.pgClassReltoastrelidDataOffset());
+        // 审查 High-1 锚：两版差恰 4B（relallfrozen 单列）——偏移推导的 88 锚定法自检
+        assertEquals(4, v18.pgClassReltoastrelidDataOffset() - layout.pgClassReltoastrelidDataOffset());
     }
 
     /** 两 kinds 词典长度钉死 26/33，且与 V18 的关系恰为"单列差"：attr 多 attcacheoff@5、

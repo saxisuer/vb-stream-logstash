@@ -34,9 +34,11 @@ public final class WalLayoutV18 implements WalLayout {
      * （oid 4B + name 64B + 5×oid 20B）定宽合计 4+64+20=88，relfilenode 紧随其后；
      * spike replayInplace（WalParseSpike）以 dataOff+88 实读新 relfilenode 实证锚定。 */
     private static final int PGCLASS_RELFILENODE_DATA_OFFSET = 88;
-    /** pg_class 数据区 reltoastrelid 偏移 112——推算依据：relfilenode@88 后 5 个定宽列
-     * （reltablespace oid + relpages int4 + reltuples float4 + relallvisible int4 + relallfrozen int4）
-     * 合计 24B；spike replayInplace 以 dataOff+112 实读新 reltoastrelid 实证锚定。 */
+    /** pg_class 数据区 reltoastrelid 偏移 112——推算依据：relfilenode 自占 [88,92)，
+     *其后 5 个定宽列（reltablespace oid + relpages int4 + reltuples float4 +
+     * relallvisible int4 + relallfrozen int4）各 4B 合计 20B 占 [92,112)（审查 Low-5
+     * 勘误：首版注释误书"合计 24B"，5×4=20——88 锚定法以"两版差恰单列宽"自检）；
+     * spike replayInplace 以 dataOff+112 实读新 reltoastrelid 实证锚定。 */
     private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 112;
 
     /** pg_attribute 词典槽位：attisdropped=16（V18 无 attcacheoff——PG 18 删除该列）。 */
@@ -202,7 +204,7 @@ public final class WalLayoutV18 implements WalLayout {
         return CLASS_TOAST_RELID_INDEX;
     }
 
-    /** {@inheritDoc}——112（relfilenode@88 后 5 个定宽列合计 24B，spike 实证）。 */
+    /** {@inheritDoc}——112（relfilenode@88 后 5 个定宽列各 4B 合计 20B，spike 实证）。 */
     @Override
     public int pgClassReltoastrelidDataOffset() {
         return PGCLASS_RELTOASTRELID_DATA_OFFSET;
