@@ -224,15 +224,63 @@ class TupleDecoderTest {
     }
 
     /**
-     * 用例 11：char/int8/float4 渲染——char 带引号单字符、int8 long、float4 float。
+     * 用例 11：char/int8/float4 渲染——char 仅左引号单字符（与 spike 渲染逐字一致）、
+     * int8 long、float4 float。
      */
     @Test
     void charInt8Float4Render() {
         String[] kinds = {"char", "int8", "float4"};
         byte[] payload = TupleBytes.of(kinds).ch('z').i64(123456789012345L).f4(1.5f).payload();
         Object[] vals = decoder.decodePayload(payload, 0, kinds);
-        assertEquals("'z'", vals[0]);
+        assertEquals("'z", vals[0]);
         assertEquals(123456789012345L, vals[1]);
         assertEquals(1.5f, vals[2]);
+    }
+
+    /**
+     * 用例 12：奇总长 1B varlena 头合法性（审查修正锚）——1B 头总长为奇数时
+     * b0&amp;0x03 恰为 0x03/0x07（bit0=1 即 1B 头），不得当 compressed 拒：空串
+     * （总长 1，b0=0x03）与 "ab"（总长 3，b0=0x07）均须正常解出。
+     */
+    @Test
+    void oddTotalLengthOneByteVarlenaHeaderIsLegal() {
+        String[] kinds = {"text", "text"};
+        byte[] payload = TupleBytes.of(kinds).text("").text("ab").payload();
+        Object[] vals = decoder.decodePayload(payload, 0, kinds);
+        assertEquals("", vals[0]);
+        assertEquals("ab", vals[1]);
+        // 钉死首字节位形：空串 b0=0x03 @tuple24；"ab" 4 对齐到 tuple28（b0=0x07）
+        assertEquals(0x03, payload[6] & 0xFF);
+        assertEquals(0x07, payload[10] & 0xFF);
+        assertEquals(97, payload[11] & 0xFF);   // 'a' 紧随其头，位形钉死双确认
+    }
+
+    /**
+     * 用例 13：skip 列奇总长 varlena——跳过面与读值面走同一头分派，奇总长 1B 头
+     * 的 skip 列须消耗恰准（其后 text 列解对即证明）。
+     */
+    @Test
+    void skipKindConsumesOddTotalLengthVarlena() {
+        String[] kinds = {"skip", "text"};
+        byte[] payload = TupleBytes.of(kinds).skipVarlena("xy").text("tail").payload();
+        Object[] vals = decoder.decodePayload(payload, 0, kinds);
+        assertNull(vals[0]);
+        assertEquals("tail", vals[1]);
+    }
+
+    /**
+     * 用例 14：bytea 奇总长 1B 头（手工直拼，kinds 走 bytea 分支）——读长分派与
+     * text 同源，b0=0x07（总长 3，2 载荷字节）解出 byte[2]。
+     */
+    @Test
+    void byteaOddTotalLengthOneByteHeaderDecodes() {
+        byte[] payload = new byte[5 + 1 + 3];
+        payload[0] = 1;    // infomask2 = natts 1
+        payload[4] = 24;   // t_hoff = MAXALIGN(23)；payload[5] = 垫字节
+        payload[6] = 0x07; // 1B 头：总长 3（奇，b0&0x03==0x03——合法）
+        payload[7] = (byte) 0xAA;
+        payload[8] = (byte) 0xBB;
+        Object[] vals = decoder.decodePayload(payload, 0, new String[]{"bytea"});
+        assertArrayEquals(new byte[]{(byte) 0xAA, (byte) 0xBB}, (byte[]) vals[0]);
     }
 }

@@ -16,13 +16,14 @@ import java.time.ZoneOffset;
  * {@code (b>>1)&0x7F}、4B 头总长 {@code u32le>>>2}（spike 发现 21，小端是实测锚，
  * 防大端误读回归）；dropped 列恒 null 零消耗（spike 发现 26）、skip 列消耗 varlena
  * 不取值；name 定宽 64B 按 NUL 截断；timestamp 按 epoch 2000 微秒渲染为 UTC
- * ISO-8601 字符串。值 → Java 类型映射：bool→Boolean、char→String（带引号单字符）、
- * name/text/timestamp→String、bytea→byte[]、int2→Short、int4→Integer、
- * int8/oid→Long（oid 无符号语义）、float4→Float、float8→Double、dropped/skip/
- * null→null。</p>
+ * ISO-8601 字符串。值 → Java 类型映射：bool→Boolean、char→String（左引号单字符，
+ * 与 spike 渲染逐字一致）、name/text/timestamp→String、bytea→byte[]、int2→Short、
+ * int4→Integer、int8/oid→Long（oid 无符号语义）、float4→Float、float8→Double、
+ * dropped/skip/null→null。</p>
  *
- * <p>外部 TOAST 指针（短 varlena tag 0x01）与 4B 压缩 varlena（tag 0x02/0x03 形态）
- * 在 v1 一律 ISE 拒绝——TOAST 重组留给 v2。实例持 {@link WalLayout} 仅为构造对称
+ * <p>varlena 头分派：首字节恰 0x01（短外部 TOAST 指针）与 tag 位 0x02（4B 压缩）
+ * 在 v1 一律 ISE 拒绝——TOAST 重组留给 v2；bit0=1 的其余首字节（含奇总长的
+ * 0x03/0x07…）均为合法 1B 头。实例持 {@link WalLayout} 仅为构造对称
  * （当前 tuple 布局无版本差异，尚未取值）；实例无共享可变状态，并发安全。</p>
  */
 public final class TupleDecoder {
@@ -167,7 +168,7 @@ public final class TupleDecoder {
                 case "float4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i] = Float.intBitsToFloat(u32(src, c)); c += 4; }
                 case "float8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i] = Double.longBitsToDouble(u64(src, c)); c += 8; }
                 case "bool" -> { vals[i] = src[c] != 0; c += 1; }
-                case "char" -> { vals[i] = "'" + (char) (src[c] & 0x7F) + "'"; c += 1; }
+                case "char" -> { vals[i] = "'" + (char) (src[c] & 0x7F); c += 1; }
                 case "name" -> {   // NameData：定宽 64B，NUL 截断
                     c = tupleStart + align(c - tupleStart, 4);
                     int n = 64;
@@ -177,6 +178,7 @@ public final class TupleDecoder {
                             break;
                         }
                     }
+                    // 显式 UTF-8：与 spike 平台默认字符集的有意差异（跨环境确定性）
                     vals[i] = new String(src, c, n, StandardCharsets.UTF_8);
                     c += 64;
                 }
@@ -275,18 +277,19 @@ public final class TupleDecoder {
     /**
      * 校验 varlena 首字节为 plain（1B 或 4B 未压缩）形态，否则 ISE。
      *
-     * <p>拒绝面：首字节 0x01（短外部 TOAST 指针，vartag 在次字节如 0x12=ONDISK——
-     * 重组属 v2）；tag 位（b0&amp;0x03）为 0x02/0x03（4B 压缩 varlena 形态）。
-     * 线程约束：纯读，并发安全。</p>
+     * <p>拒绝面（按位精确裁定，任务书初版 "tag==0x03 拒" 是规格错误）：首字节恰为
+     * 0x01（短外部 TOAST 指针，vartag 在次字节如 0x12=ONDISK，spike 发现 20——重组
+     * 属 v2）与 tag 位（b0&amp;0x03）==0x02（4B 压缩 varlena）。**1B 头总长为奇数时
+     * b0&amp;0x03 恰为 0x03**（空串 b0=0x03、"ab" b0=0x07）——bit0=1 即合法 1B 头，
+     * 不得拒。线程约束：纯读，并发安全。</p>
      *
      * @param src 源缓冲
      * @param c   varlena 起点
-     * @throws IllegalStateException external/compressed varlena（v1 不支持）
+     * @throws IllegalStateException external(0x01)/compressed(0x02) varlena（v1 不支持）
      */
     private static void rejectNonPlainVarlena(byte[] src, int c) {
         int b0 = src[c] & 0xFF;
-        int tag = b0 & VARLENA_TAG_MASK;
-        if (b0 == VARLENA_TAG_1B_EXTERNAL || tag == 0x02 || tag == 0x03) {
+        if (b0 == VARLENA_TAG_1B_EXTERNAL || (b0 & VARLENA_TAG_MASK) == 0x02) {
             throw new IllegalStateException("external/compressed varlena unsupported in v1: hdr=" + b0);
         }
     }
