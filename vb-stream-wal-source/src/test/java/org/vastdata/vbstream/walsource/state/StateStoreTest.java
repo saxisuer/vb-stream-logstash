@@ -19,12 +19,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * StateStore 原子持久化（spec §7）的失败先行测试——VBWS 检查点格式的五断言面：
+ * StateStore 原子持久化（spec §7）的失败先行测试——VBWS 检查点格式的六断言面：
  * ①roundtrip 全等（attr/class 两行字典 + 双 tail 存储 + tracked 双 ctid + 两
  * relfilenode + interest/stale 全字段，并经 restoreInto 灌回新 stores 逐面复核）；
  * ②正文中翻一位字节 → 全文件 CRC 拒载 empty；③header formatVersion 改写 → 拒载
  * empty；④只剩 {@code .part} 半成品 → 不 load 且 {@code exists()} 为 false；
- * ⑤连写两次检查点 → 旧检查点被原子替换（load 到第二次内容、无 .part 残留）。
+ * ⑤连写两次检查点 → 旧检查点被原子替换（load 到第二次内容、无 .part 残留）；
+ * ⑥class 表最小行宽形态（relname 空串 ×50）→ 计数防线不误拒（审查修复钉）。
  *
  * <p>byte[] tail 值不参与 record equals（数组恒一性），断言经
  * {@link #assertTailsEqual} 手工逐键比较；其余字段用 record/集合 equals。</p>
@@ -154,6 +155,27 @@ class StateStoreTest {
         assertEquals(second.attrRows(), s.attrs(), "行字典应为第二次内容");
         assertEquals(11L, s.trackedTableCtid(), "tracked 应为第二次值");
         assertFalse(Files.exists(dir.resolve(FILE_NAME + ".part")), "完成后不应残留 .part");
+    }
+
+    /**
+     * 用例 ⑥（审查修复钉）：class 表最小行宽形态——relname 全空串的 class 行 50 条
+     * （每行恰最小宽 74B：ctid 8 + 8 个落盘 long 64 + UTF 空串前缀 2）且文件其余段
+     * 保持最小 → 文件实长 74n+86 &lt; 83n。防线常量若过严（如 83）会把"计数×最小
+     * 行宽 &gt; 文件实长"误判损坏而拒载合法检查点——本用例钉死 74 不误拒，roundtrip
+     * 全等可 load。
+     */
+    @Test
+    void minimalWidthClassRowsRoundtripWithoutOverStrictGuard() throws IOException {
+        StateStore store = new StateStore(dir);
+        CatalogStores stores = new CatalogStores();
+        for (int i = 0; i < 50; i++) {
+            stores.classRows().put(100L + i, new ClassRow(20000 + i, "", 0, 0, 0, 0, 0, 30000 + i, 0));
+        }
+        store.checkpoint(stores, LSN);
+
+        Optional<StoredState> loaded = store.load();
+        assertTrue(loaded.isPresent(), "最小行宽形态的合法检查点不应被计数防线误拒");
+        assertEquals(stores.classRows(), loaded.orElseThrow().classes(), "50 条空 relname 行应 roundtrip 全等");
     }
 
     /**

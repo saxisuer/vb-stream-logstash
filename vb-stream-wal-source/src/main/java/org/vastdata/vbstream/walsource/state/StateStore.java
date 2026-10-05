@@ -115,7 +115,10 @@ public final class StateStore {
         Files.createDirectories(target.getParent());
         try (FileChannel ch = FileChannel.open(part,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-            ch.write(ByteBuffer.wrap(payload));
+            ByteBuffer buf = ByteBuffer.wrap(payload);
+            while (buf.hasRemaining()) {
+                ch.write(buf);    // FileChannel.write 允许部分写——循环至耗尽
+            }
             ch.force(true);
         }
         try {
@@ -379,7 +382,9 @@ public final class StateStore {
     }
 
     /**
-     * 读 class 行表（计数防线同 {@link #readAttrTable}——每行至少 83B）。
+     * 读 class 行表（计数防线同 {@link #readAttrTable}——每行至少 74B：ctid u64=8 +
+     * 8 个落盘 long 字段 64 + relname UTF 空串前缀 u16=2；防线过严会误拒最小行宽
+     * 形态的合法检查点，见 StateStoreTest 用例 ⑥）。
      *
      * @param in      输入流
      * @param fileLen 文件实长
@@ -388,7 +393,7 @@ public final class StateStore {
      */
     private static Map<Long, ClassRow> readClassTable(DataInputStream in, int fileLen) throws IOException {
         int rowCount = in.readInt();
-        if (rowCount < 0 || (long) rowCount * 83 > fileLen) {
+        if (rowCount < 0 || (long) rowCount * 74 > fileLen) {
             throw new IOException("class 表计数损坏: " + rowCount);
         }
         Map<Long, ClassRow> classes = new LinkedHashMap<>(Math.max(16, rowCount));
