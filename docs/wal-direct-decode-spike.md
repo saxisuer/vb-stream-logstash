@@ -1,5 +1,9 @@
 # WAL 直解先导实验（spike）结论 — 2026-10-05
 
+> **已立项**——正式模块 `vb-stream-wal-source`（v1 交付 catalog 同步 + WAL 接收，见
+> spec `docs/superpowers/specs/2026-10-05-wal-source-module-design.md` 与
+> feature/wal-source-module 分支）；本文档的 27 条发现作为设计与模块文档的依据档案。
+>
 > 代码：`spike/wal-parse/WalParseSpike.java`（**throwaway**，不进 Maven 模块树、不参与构建；
 > 布局转录自 REL_18_STABLE 头文件，fetch 日期 2026-10-05）
 

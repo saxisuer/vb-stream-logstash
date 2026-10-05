@@ -193,7 +193,8 @@ public final class CatalogReplay {
      * HeapUpdateView 取 old/new 行号（旧页块按 fork 过滤选取，spike VM 块教训），
      * 截断位组置位时先试值编码（classRowLookup 命中且 prefix ≤ 88）、再试 rawTail
      * splice、皆无时若 healStores 非 null（pg_class 面 + healer 已注入）走
-     * {@code selfHealTruncated} 候选枚举自愈（spec §6②，单次路径内完成——本方法
+     * {@code selfHealTruncated} ctid 寻址精确采纳（spec §6② 的收敛形态：按记录
+     * new 位探测 JDBC 末态行整行采纳——末态回填；单次路径内完成——本方法
      * 非幂等，不重复调用），否则 skip（metrics 计数 skippedTruncated，UPD 必删旧
      * tail——spike 教训）；MULTI_INSERT 逐 entry（2 对齐起点、datalen 只计 tail
      * 字节，spike 锚）或 image 路径按 offsets（INIT_PAGE 时隐含 i+1，发现 3）。
@@ -589,8 +590,9 @@ public final class CatalogReplay {
      * <p>关键步骤：值编码优先——classRowLookup 非空且 prefix ≤ 88 时查旧行，命中
      * 即走 {@link #reconstructClassTruncated}（prefix 越界防御性再判一次）；未命中
      * 或未配 lookup 则取 rawTailStore 的旧 tail 走 splice；两者皆无时若 healer 与
-     * healStores 均可用（pg_class 面）走 {@code selfHealTruncated} 候选枚举自愈
-     * （spec §6②），仍无则返回 null（调用方 skip）并对 metrics 计数
+     * healStores 均可用（pg_class 面）走 {@code selfHealTruncated} ctid 寻址精确
+     * 采纳（spec §6② 的收敛形态——末态回填而非历史重建），仍无则返回 null（调用方
+     * skip）并对 metrics 计数
      * skippedTruncated（spike 差异①：页读兜底已删）。边界与异常语义：tail/lookup
      * 任一非 null 即重建；自愈判否不抛（连续失败只计数/标 stale）；线程约束：单写者。</p>
      *

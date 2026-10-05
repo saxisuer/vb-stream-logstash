@@ -200,8 +200,9 @@ public final class TupleDecoder {
     /**
      * 读一个未压缩 varlena 为文本并推进游标。
      *
-     * <p>关键步骤：判头——首字节 0x01（短外部 TOAST 指针）或 tag 位为 0x02/0x03
-     * （4B 压缩形态）一律 ISE（v1 不支持 external/compressed）；tag 位 01 为 1B 头
+     * <p>关键步骤：判头——首字节 0x01（短外部 TOAST 指针）或 tag 位 0x02（4B 压缩
+     * 形态）一律 ISE（v1 不支持 external/compressed；拒绝面按位精确裁定——1B 头奇
+     * 总长的 tag==0x03 形态不拒，见 {@link #rejectNonPlainVarlena}）；tag 位 01 为 1B 头
      * （总长 {@code (b>>1)&0x7F}，含头 1B），tag 位 00 为 4B 头（总长
      * {@code u32le>>>2}，含头 4B——小端是 spike 实测锚，发现 21）。载荷按 UTF-8
      * 解码。边界与异常语义：非 plain varlena 抛 ISE；线程约束：纯读，并发安全。</p>
@@ -232,7 +233,8 @@ public final class TupleDecoder {
      * 读一个未压缩 varlena 为原始字节并推进游标（bytea 面）。
      *
      * <p>头判读与 {@link #readVarlenaText} 同源（发现 21），载荷不解码直接拷出。
-     * 边界与异常语义：非 plain varlena 抛 ISE；线程约束：纯读，并发安全。</p>
+     * 边界与异常语义：非 plain varlena（0x01 外部指针 / tag 0x02 压缩——按位精确
+     * 裁定，见 {@link #rejectNonPlainVarlena}）抛 ISE；线程约束：纯读，并发安全。</p>
      *
      * @param src  源缓冲
      * @param c    varlena 起点（已按 4 对齐）

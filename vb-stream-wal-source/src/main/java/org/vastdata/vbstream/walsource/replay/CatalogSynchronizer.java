@@ -166,7 +166,8 @@ public final class CatalogSynchronizer {
      * ——页对齐由接收器内取整，sink 在接收线程同步执行；⑥ 已施加前沿种子化为流起点
      * max(P₀, B)——引导后首条记录施加前 snapshot().lsn() 即引导一致点而非 0。
      * <strong>自愈接线（Task 13）</strong>：本档构造 {@code new SelfHealer(new JdbcProbeImpl(sql))}
-     * 注入重放引擎——pg_class 截断未知 oldCtid 走候选枚举 + 中段新值对 JDBC 末态校验；
+     * 注入重放引擎——截断更新未知 oldCtid 走 ctid 寻址精确采纳（class/attr 两面：
+     * 按记录 new 位探测 JDBC 末态行整行采纳，末态回填语义）；
      * probe 复用引导会话，故 <strong>sql 会话自此归同步器独占</strong>（接收线程单写者
      * 上下文调用，调用方不得再并发使用；无凭据四参档 healer=null 保留 skip 行为）。
      * 边界与异常语义：SQLException/ISE 原样上抛（半建资源由接收器自有生命周期兜底，

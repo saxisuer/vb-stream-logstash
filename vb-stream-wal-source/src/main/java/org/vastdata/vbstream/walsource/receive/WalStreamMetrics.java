@@ -86,8 +86,10 @@ public final class WalStreamMetrics {
     /**
      * census 只读快照。
      *
-     * <p>返回不可变副本（{@code Map.copyOf}），后续写入不影响已取快照；任意线程可读。
-     * 快照时点 census 无并发写（单写者约束），无需加锁。</p>
+     * <p>返回不可变副本（{@code Map.copyOf}），后续写入不影响已取快照；快照与写入
+     * <strong>可能并发</strong>（冒烟 Main 的周期统计行/IT 指标行在别的线程活轮询
+     * ——接收线程仍在写 census），CHM 载体 + 弱一致拷贝即线程安全，无需加锁；任意
+     * 线程可读。</p>
      *
      * @return 键值不可变副本（键 {@code "rmid/hex(info&0xF0)"}，值条数）
      */
