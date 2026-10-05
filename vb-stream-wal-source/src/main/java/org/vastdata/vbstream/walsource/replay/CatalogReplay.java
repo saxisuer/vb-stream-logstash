@@ -14,6 +14,7 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -103,6 +104,12 @@ public final class CatalogReplay {
 
     /** 截断自愈校验器（null = 禁用：未知 oldCtid 保留 skip + 计数行为）。 */
     private final SelfHealer healer;
+
+    /** per-oid 连续精确采纳拒绝计数（Task 13 审查裁定 3 的 stale 轻量复活）——单写者。 */
+    private final Map<Long, Integer> consecutiveAdoptSkips = new HashMap<>();
+
+    /** 连续采纳拒绝的 stale 登记门槛（控制器裁定 3）。 */
+    private static final int ADOPT_SKIP_STALE_THRESHOLD = 3;
 
     /**
      * 构造重放引擎（自愈禁用档）。
@@ -445,13 +452,16 @@ public final class CatalogReplay {
                 if (ev.op() == HeapEvent.UPD) {
                     stores.followTracked(ev.oldCtid(), ev.newCtid());
                 }
-                // tracked 归位兜底（Task 13）：链经 splice/值编码事件重建（不走自愈的
-                // repairTracked）时 tracked 位可能仍指陈旧位——位上无行或行 oid 已不符
-                // （他关系占位/同 oid 旧副本）而新行 oid 是 interest 最小 oid（v1 tracked
-                // 表判据，与引导同规则）即归位到本事件新位
+                // tracked 归位兜底（Task 13，审查 Med-1 补判据）：链经 splice/值编码事件
+                // 重建（不走自愈的 repairTracked）时 tracked 位可能仍指陈旧位——归位判据
+                // 覆盖三形态：位上无行（断链）、位上行 oid 不符（他关系占位）、<strong>位上
+                // 是同 oid 旧副本</strong>（tracked 位 ctid ≠ 本事件新位——正常 UPD 的
+                // followTracked 已先行归位，此形态仅出现在链重建后的首条事件）；新行 oid
+                // 须为 interest 最小 oid（v1 tracked 表判据，与引导同规则）
                 CatalogRow.ClassRow trackedRow = stores.classRows().get(stores.trackedTableCtid());
                 if (minInterestOid(stores) == cr.relOid()
-                        && (trackedRow == null || trackedRow.relOid() != cr.relOid())) {
+                        && (trackedRow == null || trackedRow.relOid() != cr.relOid()
+                        || stores.trackedTableCtid() != ev.newCtid())) {
                     stores.trackedTableCtid(ev.newCtid());
                 }
                 if (ev.op() == HeapEvent.INS && cr.relOid() != 0) {
@@ -590,7 +600,7 @@ public final class CatalogReplay {
         if (oldTail == null) {
             if (healer != null && healer.enabled()) {
                 if (healStores != null) {
-                    // pg_class 面：候选枚举 + 中段新值对 JDBC 末态校验（spec §6②）
+                    // pg_class 面：ctid 寻址精确采纳（spec §6② 收敛形态）
                     Reconstruction healed = selfHealTruncated(r, b0, newCtid, healStores);
                     if (healed != null) {
                         return healed;
@@ -639,13 +649,14 @@ public final class CatalogReplay {
 
         /**
      * pg_class 截断更新的 <strong>ctid 寻址精确采纳</strong>（Task 13）——按"末态仍居
-     * 记录 new 位 ⟹ 该行即本记录施加后的精确状态"（其后任何更新都会再移 ctid）整行
-     * 采纳 JDBC 末态值（九槽全来自探测行，与字典候选的时序错位彻底解耦）。
+     * 记录 new 位 ⟹ 该行即本记录施加后的精确状态"（更新移位、INPLACE 不移位但
+     * 重放收敛）整行采纳 JDBC 末态值（九槽全来自探测行，与字典候选的时序错位解耦）。
      *
      * <p>关键步骤：new 位渲染 "(block,off)" → probe 点查 → 命中则九槽值行组装 +
      * repairTracked（probed 行 oid 作归属判据）+ selfHealed 计数 + WARN 返回派生档
-     * 产物（tail=null）。边界与异常语义：该位无行返回 null（回落候选枚举档——
-     * 行已再迁移的记录形态本就过时）；行位复用窗口（毫秒级理论残留）由对拍暴露。
+     * 产物（tail=null）。边界与异常语义：该位无行返回 null（调用方走 skip 计数 +
+     * stale 记账——行已再迁移的记录形态本就过时）；行位复用窗口（毫秒级理论残留）
+     * 由对拍暴露。
      * 线程约束：单写者（重放线程）。</p>
      *
      * @param r       走读完成的 UPDATE 记录（LSN 定位日志面）
@@ -657,6 +668,7 @@ public final class CatalogReplay {
         String ctidText = "(" + (newCtid >>> 16) + "," + (newCtid & 0xFFFF) + ")";
         JdbcProbe.ProbedRow end = healer.probeClassByCtid(ctidText);
         if (end == null) {
+            noteAdoptRejection(r, newCtid, stores);
             return null;
         }
         CatalogRow.ClassRow row = end.row();
@@ -671,16 +683,60 @@ public final class CatalogReplay {
         vals[IX_CLASS_RELFILENODE] = row.relfilenode();
         vals[IX_CLASS_RELTOASTRELID] = row.reltoastrelid();
         repairTracked(stores, row, newCtid);
+        noteAdoption(row.relOid());
         stores.metrics().inc(CatalogStores.CatalogMetrics.SELF_HEALED);
         LOG.warn("class 精确采纳: ctid={} oid={}（末态仍居记录 new 位, lsn={}）", ctidText, row.relOid(), Lsn.format(r.lsn()));
         return new Reconstruction(null, vals);
     }
 
     /**
+     * 精确采纳拒绝记账（stale 轻量复活，审查裁定 3）：拒绝记录无身份信息（该位无行），
+     * 归因于 v1 tracked 表面 oid（tracked 位上行 oid，位空回落 interest 最小 oid——
+     * 断链自愈域即该表面）；同 oid 连续拒绝 ≥ {@value ADOPT_SKIP_STALE_THRESHOLD} 次向
+     * {@link CatalogStores#staleOids()} 登记 + WARN（含 oid 与计数）——语义为"该关系
+     * 的链恢复持续失败，<strong>待下轮引导重新种子</strong>（= 重启路径；进程内热重
+     * 引导 v1 不做）"。
+     *
+     * <p>边界与异常语义：无归因面（interest 空）不计数；登记幂等（Set 去重），计数
+     * 继续累计供 WARN 观测。线程约束：单写者（重放线程）。</p>
+     *
+     * @param r       走读完成的 UPDATE 记录（LSN 定位日志面）
+     * @param newCtid 被拒的记录新行 ctid 键
+     * @param stores  状态容器（stale 登记面）
+     */
+    private void noteAdoptRejection(WalRecord r, long newCtid, CatalogStores stores) {
+        CatalogRow.ClassRow trackedRow = stores.classRows().get(stores.trackedTableCtid());
+        long oid = trackedRow != null ? trackedRow.relOid() : minInterestOid(stores);
+        if (oid == Long.MAX_VALUE) {
+            return;    // 无归因面（interest 空 + tracked 位空）：不计数
+        }
+        int times = consecutiveAdoptSkips.merge(oid, 1, Integer::sum);
+        if (times >= ADOPT_SKIP_STALE_THRESHOLD) {
+            stores.staleOids().add(oid);    // 幂等（Set 去重）——待下轮引导（重启路径）
+            // WARN 节流：过门槛即打（含 oid 与计数），其后每 100 次补一行——风暴期拒绝
+            // 可达数千次/重复执行，逐条刷屏会淹没问题日志
+            if (times == ADOPT_SKIP_STALE_THRESHOLD || times % 100 == 0) {
+                LOG.warn("精确采纳连续拒绝 oid={} 第 {} 次（new 位 {} 无行）——登记 stale 待下轮引导（进程内热重引导 v1 不做）, lsn={}",
+                        oid, times, "(" + (newCtid >>> 16) + "," + (newCtid & 0xFFFF) + ")", Lsn.format(r.lsn()));
+            }
+        }
+    }
+
+    /**
+     * 精确采纳成功记账：清零该 oid 的连续拒绝计数（链已恢复，stale 语义解除——
+     * staleOids 标记的撤回由 {@link #repairTracked} 承担）。
+     *
+     * @param oid 采纳行 oid
+     */
+    private void noteAdoption(long oid) {
+        consecutiveAdoptSkips.remove(oid);
+    }
+
+    /**
      * pg_attribute 截断更新的 <strong>ctid 寻址精确采纳</strong>（Task 13）——attr 面
      * 无值编码重建（AttrRow 仅五字段投影，无法重编码全前缀）、种子行无 raw tail 时，
-     * 按"末态仍居记录 new 位 ⟹ 该行即本记录施加后的精确状态"（其后任何更新都会再移
-     * ctid）整行采纳 JDBC 末态值。
+     * 按"末态仍居记录 new 位 ⟹ 该行即本记录施加后的精确状态"（更新移位、INPLACE
+     * 不移位但重放收敛）整行采纳 JDBC 末态值。
      *
      * <p>关键步骤：new 位渲染 "(block,off)" → probe 点查 → 命中则组装五槽位稀疏值行
      * （仅填 {@link CatalogRow.AttrRow} 消费的词典槽位）返回 tail=null 派生档产物 +

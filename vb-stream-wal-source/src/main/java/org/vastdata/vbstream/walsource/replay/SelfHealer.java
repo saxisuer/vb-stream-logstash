@@ -3,7 +3,7 @@ package org.vastdata.vbstream.walsource.replay;
 /**
  * 截断自愈探测面（spec §6② 的 Task 13 收敛形态）——未知 oldCtid 的截断更新经
  * <strong>ctid 寻址精确采纳</strong>恢复：按记录 new 位探测目录末态行，行仍居该位
- * 即为本记录施加后的精确状态（其后任何更新都会再移 ctid），整行采纳。
+ * 即为本记录施加后的精确状态（更新移位、INPLACE 不移位但重放收敛），整行采纳。
  *
  * <p><strong>对 Task 12"候选枚举 + 中段新值对末态校验"形态的裁定（对抗性 IT 实证）</strong>：
  * 候选前缀源是断链窗口内的历史快照，与记录中段拼装会产出时代错位的混合行（实测：

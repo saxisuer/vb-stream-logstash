@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.BooleanSupplier;
 
@@ -193,13 +194,13 @@ abstract class WalSyncItBase {
             probe.setAutoCommit(oldAutoCommit);
         }
 
-        Map<Long, CatalogRow.ClassRow> oursClass = new java.util.TreeMap<>();
+        Map<Long, CatalogRow.ClassRow> oursClass = new TreeMap<>();
         sync.stores().classRows().forEach((k, v) -> {
             if (scope.contains(v.relOid())) {
                 oursClass.put(k, v);
             }
         });
-        Map<Long, CatalogRow.AttrRow> oursAttr = new java.util.TreeMap<>();
+        Map<Long, CatalogRow.AttrRow> oursAttr = new TreeMap<>();
         sync.stores().attrRows().forEach((k, v) -> {
             if (scope.contains(v.attrelid())) {
                 oursAttr.put(k, v);
@@ -253,15 +254,22 @@ abstract class WalSyncItBase {
      */
     private static void assertTrackedMatchesJdbc(CatalogSynchronizer sync,
             Map<Long, CatalogRow.ClassRow> jdbcClass, long trackedOid) {
+        // 两遍扫描（审查 Low-①）：遍历序不定，toast 关系行可能先于表行出现——首遍
+        // 配对表行并发现 toast oid，次遍再配对 toast 行（单遍的 else-if 会漏配）
         Long jdbcTableCtid = null;
         long toastOid = 0;
-        Long jdbcToastCtid = null;
         for (Map.Entry<Long, CatalogRow.ClassRow> e : jdbcClass.entrySet()) {
             if (e.getValue().relOid() == trackedOid) {
                 jdbcTableCtid = e.getKey();
                 toastOid = e.getValue().reltoastrelid();
-            } else if (toastOid != 0 && e.getValue().relOid() == toastOid) {
-                jdbcToastCtid = e.getKey();
+            }
+        }
+        Long jdbcToastCtid = null;
+        if (toastOid != 0) {
+            for (Map.Entry<Long, CatalogRow.ClassRow> e : jdbcClass.entrySet()) {
+                if (e.getValue().relOid() == toastOid) {
+                    jdbcToastCtid = e.getKey();
+                }
             }
         }
         assertTrue(jdbcTableCtid != null, "tracked 表 oid " + trackedOid + " 应在 JDBC 对拍集内");
@@ -331,7 +339,7 @@ abstract class WalSyncItBase {
      */
     private static Map<Long, CatalogRow.ClassRow> queryClassRows(Connection c, TreeSet<Long> oids)
             throws SQLException {
-        Map<Long, CatalogRow.ClassRow> out = new java.util.TreeMap<>();
+        Map<Long, CatalogRow.ClassRow> out = new TreeMap<>();
         String sql = "SELECT ctid::text, oid, relname, relnamespace, reltype, reloftype,"
                 + " relowner, relam, relfilenode, reltoastrelid FROM pg_class WHERE oid IN " + inList(oids);
         try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
@@ -354,7 +362,7 @@ abstract class WalSyncItBase {
      */
     private static Map<Long, CatalogRow.AttrRow> queryAttrRows(Connection c, TreeSet<Long> oids)
             throws SQLException {
-        Map<Long, CatalogRow.AttrRow> out = new java.util.TreeMap<>();
+        Map<Long, CatalogRow.AttrRow> out = new TreeMap<>();
         String sql = "SELECT ctid::text, attrelid, attname, atttypid, attnum, attisdropped"
                 + " FROM pg_attribute WHERE attnum > 0 AND attrelid IN " + inList(oids);
         try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
@@ -438,8 +446,10 @@ abstract class WalSyncItBase {
     }
 
     /**
-     * PG 文本 ctid "(block,off)" 折为 ctid 键（式同 {@link CatalogReplay#ctidKey}，
-     * 测试侧独立实现——主代码解析面为包可见，不为其扩可见性）。
+     * PG 文本 ctid "(block,off)" 折为 ctid 键（式同 {@link CatalogReplay#ctidKey}；
+     * 测试侧独立实现——主代码的 {@code CatalogBootstrap.parseCtidKey} 为 replay 包
+     * 可见（it 包不可达），{@code JdbcProbe.ProbedRow.parse} 面向 ProbedRow 载体，
+     * 裸键解析此处自持最薄）。
      *
      * @param ctid 服务端文本形态
      * @return ctid 键

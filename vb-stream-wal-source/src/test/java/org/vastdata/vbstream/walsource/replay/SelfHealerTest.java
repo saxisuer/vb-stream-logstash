@@ -129,6 +129,43 @@ class SelfHealerTest {
         assertTrue(stores.staleOids().isEmpty(), "采纳须撤回 stale 标记");
     }
 
+    /**
+     * 用例 ④（审查裁定 3）：stale 轻量复活——同 oid（tracked 表面归因）连续 3 次采纳
+     * 拒绝（ctid 探测无行）向 staleOids 登记（待下轮引导 = 重启路径）；其后一次成功
+     * 采纳清零计数并撤回 stale 标记（再单次拒绝不重登）。
+     */
+    @Test
+    void consecutiveAdoptRejectionsRegisterStaleUntilAdoptionClears() {
+        CatalogStores stores = freshStores();
+        long staleCtid = CatalogReplay.ctidKey(3, 1);
+        long newCtid = CatalogReplay.ctidKey(5, 2);
+        stores.classRows().put(staleCtid, CatalogRow.ClassRow.fromDecoded(decode(classTuple(100, "t1", 200, 0, 1))));
+        stores.trackedTableCtid(staleCtid);
+        stores.interestRelOids().add(100L);
+
+        Map<String, JdbcProbe.ProbedRow> byCtid = new HashMap<>();
+        CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout),
+                new SelfHealer(new StubProbe(byCtid)));
+        byte[] data = truncatedData(classTuple(100, "t1", 205, 0, 1), 88, 0);
+        int[][] olds = {{7, 9}, {8, 4}, {6, 7}};
+        for (int[] old : olds) {
+            replay.applyCatalogRecord(rec(updateRecord(old[0], old[1], 5, 2, data)), stores);
+        }
+        assertTrue(stores.staleOids().contains(100L), "连续 3 次拒绝须登记 stale（待下轮引导）");
+        assertEquals(3L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED));
+
+        // 成功采纳：ctid 探测命中 → 计数清零 + stale 撤回
+        long adoptCtid = CatalogReplay.ctidKey(9, 1);
+        byCtid.put("(9,1)", new JdbcProbe.ProbedRow(adoptCtid,
+                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0)));
+        replay.applyCatalogRecord(rec(updateRecord(4, 4, 9, 1, data)), stores);
+        assertTrue(stores.staleOids().isEmpty(), "采纳须撤回 stale 标记");
+
+        // 计数已清零：再单次拒绝不重登（连续计数从 0 起）
+        replay.applyCatalogRecord(rec(updateRecord(2, 3, 6, 6, data)), stores);
+        assertTrue(stores.staleOids().isEmpty(), "清零后单次拒绝不达门槛");
+    }
+
     // ---- 测试基建：记录拼装（CatalogReplayTest 同源自持副本） ----------------------
 
     /**

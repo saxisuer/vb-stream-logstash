@@ -301,7 +301,9 @@ public final class WalStreamReceiver {
     /**
      * drain 轮询循环：readPending 取尽缓冲、空轮睡 100ms、周期反馈 flush LSN。
      *
-     * <p>关键步骤：读到 chunk → 拷贝字节 → walker.feed（流游标 getLastReceiveLSN 作 chunk 锚）
+     * <p>关键步骤：读到 chunk → 拷贝字节 → walker.feed（地址锚由 walker 自维护数据
+     * 末位承担，{@code getLastReceiveLSN()} 仅首块/漂移观测用——keepalive walEnd 跳变
+     * 免疫，见 WalStreamWalker.feed javadoc）
      * → 刷新 consumedLsn 镜像 → 反馈判定（距上次反馈 ≥5s 或距上次反馈点新收 ≥1000 条）。
      * 空轮睡 100ms 前做同款反馈判定（空闲期也保底 5s 上报）。返回仅两种形态：stopRequested
      * 置位（正常）或异常上抛（交重连循环）。</p>

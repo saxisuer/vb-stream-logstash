@@ -30,7 +30,7 @@ public interface JdbcProbe {
     /**
      * 按物理 ctid 点查 pg_attribute 末态行——attr 面截断自愈的<strong>精确采纳</strong>
      * 探测面（Task 13）：更新会移动行位，故"末态仍居记录 new 位"的行即该记录施加后
-     * 的精确状态（其后任何更新都会再移 ctid），整行采纳无需中段值校验。
+     * 的精确状态（更新移位、INPLACE 不移位但重放收敛），整行采纳无需中段值校验。
      *
      * <p>查询形如 {@code SELECT ctid, attrelid, attname, atttypid, attnum, attisdropped
      * FROM pg_attribute WHERE ctid = ?::tid}。边界与异常语义：该位无行返回 null
