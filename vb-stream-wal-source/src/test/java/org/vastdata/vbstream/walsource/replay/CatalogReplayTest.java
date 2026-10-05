@@ -356,6 +356,63 @@ class CatalogReplayTest {
         assertTrue(stores.attrRows().isEmpty());
     }
 
+    /**
+     * 用例 6b（回归，审查修复锚）：pg_attribute 的 PRUNE redirect 的 from 键与
+     * trackedTableCtid <strong>数值相同</strong>——ctidKey 无关系判别、两目录块号键
+     * 空间完全重叠，tracked 双 ctid 是 pg_class 行位：attr 分支不得搬移 tracked
+     * （行本身照常重定位）。
+     */
+    @Test
+    void attrPruneRedirectDoesNotMoveTrackedEvenOnKeyCollision() {
+        CatalogStores stores = freshStores();
+        long collideKey = CatalogReplay.ctidKey(9, 1);    // 数值上与 tracked 相同
+        stores.attrRows().put(collideKey, new CatalogRow.AttrRow(100, "c1", 23, 1, false));
+        stores.trackedTableCtid(collideKey);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        put16(out, 1);      // redirected: n=1
+        put16(out, 1);
+        put16(out, 4);      // (1 -> 4)，from 键 == trackedTableCtid
+        WalRecord rec = rec(WalBytes.record(HeapOps.RM_HEAP2_ID, HeapOps.XLOG_HEAP2_PRUNE_VACUUM_SCAN, 1)
+                .block(0, SPC, DB, ATTR_RELNODE, 9)
+                .data(out.toByteArray())
+                .main(new byte[]{2, (byte) HeapOps.XLHP_HAS_REDIRECTIONS})
+                .build());
+        replay.applyCatalogRecord(rec, stores);
+
+        assertEquals(new CatalogRow.AttrRow(100, "c1", 23, 1, false),
+                stores.attrRows().get(CatalogReplay.ctidKey(9, 4)), "attr 行本身应照常重定位");
+        assertEquals(collideKey, stores.trackedTableCtid(),
+                "tracked 是 pg_class 行位：attr redirect 数值命中不得搬移");
+    }
+
+    /**
+     * 用例 3d（回归，审查修复锚）：pg_attribute 侧的截断 UPDATE skip 同样计入
+     * skippedTruncated——指标面覆盖两目录（attr 侧无值编码路径，旧行值与 raw tail
+     * 皆无即 skip）。
+     */
+    @Test
+    void attrTruncatedUpdateSkipCountsInMetrics() {
+        CatalogStores stores = freshStores();
+        TupleBytes tuple = attrTuple(100, "c1", 23, 1, false);
+        byte[] data = truncatedData(tuple, 88, 0);
+        byte[] main = new byte[14];
+        main[4] = 1;    // old_offnum
+        main[7] = (byte) HeapOps.XLH_UPDATE_TRUNCATION;
+        main[12] = 2;   // new_offnum
+        WalRecord rec = rec(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, 1)
+                .block(0, SPC, DB, ATTR_RELNODE, 5)
+                .data(data)
+                .sameRel(0, 3)
+                .main(main)
+                .build());
+
+        assertDoesNotThrow(() -> replay.applyCatalogRecord(rec, stores));
+        assertTrue(stores.attrRows().isEmpty());
+        assertEquals(1L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED),
+                "attr 侧截断 skip 须计入 skippedTruncated");
+    }
+
     // ---- 测试基建：记录拼装（WalBytes DSL 之上的 heap 家族便捷档） ----------------
 
     /**

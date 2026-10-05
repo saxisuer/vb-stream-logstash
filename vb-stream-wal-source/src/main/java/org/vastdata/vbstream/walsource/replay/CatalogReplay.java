@@ -249,8 +249,8 @@ public final class CatalogReplay {
             return;
         }
         HeapViews.PruneView view = HeapViews.PruneView.parse(r, layout);
-        pruneCatalog(view, stores.pgAttrRelfilenode(), stores.attrRows(), stores.rawAttrTails(), stores);
-        pruneCatalog(view, stores.pgClassRelfilenode(), stores.classRows(), stores.rawClassTails(), stores);
+        pruneCatalog(view, stores.pgAttrRelfilenode(), stores.attrRows(), stores.rawAttrTails(), stores, false);
+        pruneCatalog(view, stores.pgClassRelfilenode(), stores.classRows(), stores.rawClassTails(), stores, true);
     }
 
     /**
@@ -311,7 +311,7 @@ public final class CatalogReplay {
         applyPrune(r, stores);
         applyInplace(r, stores);
         List<HeapEvent> attrEvents = heapEvents(r, stores.pgAttrRelfilenode(),
-                layout.pgAttributeKinds(), stores.rawAttrTails(), null, null);
+                layout.pgAttributeKinds(), stores.rawAttrTails(), null, stores.metrics());
         for (HeapEvent ev : attrEvents) {
             if (ev.op() == HeapEvent.DEL) {
                 stores.attrRows().remove(ev.oldCtid());
@@ -525,24 +525,28 @@ public final class CatalogReplay {
     }
 
     /**
-     * 对一张 watched 目录施加 PruneView：redirect 重定位（行 + tail + tracked
-     * 跟随）、nowdead/nowunused 移除。
+     * 对一张 watched 目录施加 PruneView：redirect 重定位（行 + tail）、nowdead/
+     * nowunused 移除。tracked 跟随（redirect）与 tracked 链断 WARN（dead/unused）
+     * <strong>仅 pg_class 分支</strong>（isClass=true）——tracked 双 ctid 是 pg_class
+     * 行位，而 ctidKey 无关系判别、两目录块号键空间完全重叠，attr 分支数值命中
+     * tracked 时不得搬移/告警（spike remapCtid 的 attr 分支同判）。
      *
      * <p>关键步骤：按 relNode 匹配块（不属则 no-op）→ redirected 段逐对 (from,to)
-     * 折键重定位（行命中计 pruneRedirects；tail 无行也可单独存在，随迁）→
-     * dead/unused 段逐行移除（行命中计 pruneDropped；tracked 命中打 WARN）。
-     * 边界与异常语义：段空（flags 未置位）由视图访问器回空表自然跳过。
-     * 线程约束：单写者。</p>
+     * 折键重定位（行命中计 pruneRedirects；tail 无行也可单独存在，随迁；isClass
+     * 时 tracked 跟随）→ dead/unused 段逐行移除（行命中计 pruneDropped；isClass
+     * 且 tracked 命中打 WARN）。边界与异常语义：段空（flags 未置位）由视图访问器
+     * 回空表自然跳过。线程约束：单写者。</p>
      *
-     * @param view      prune 视图（freeze 段已跳过）
+     * @param view        prune 视图（freeze 段已跳过）
      * @param relfilenode 目录 relfilenode（0 不匹配）
-     * @param rows      行字典（ctid 键控）
-     * @param tails     raw tail 存储
-     * @param stores    状态容器（tracked 跟随 + 指标）
-     * @param <T>       行模型类型（AttrRow / ClassRow）
+     * @param rows        行字典（ctid 键控）
+     * @param tails       raw tail 存储
+     * @param stores      状态容器（tracked 跟随 + 指标）
+     * @param isClass     是否 pg_class 目录（tracked 面的施加判据）
+     * @param <T>         行模型类型（AttrRow / ClassRow）
      */
     private <T> void pruneCatalog(HeapViews.PruneView view, long relfilenode,
-            Map<Long, T> rows, Map<Long, byte[]> tails, CatalogStores stores) {
+            Map<Long, T> rows, Map<Long, byte[]> tails, CatalogStores stores, boolean isClass) {
         BlockRef b = findHeapBlock(view.rec(), relfilenode);
         if (b == null) {
             return;
@@ -561,36 +565,40 @@ public final class CatalogReplay {
             if (tail != null) {
                 tails.put(to, tail);
             }
-            stores.followTracked(from, to);
+            if (isClass) {
+                stores.followTracked(from, to);
+            }
         }
         for (int off : view.nowdead()) {
-            dropPruned(blockNo, off, rows, tails, stores);
+            dropPruned(blockNo, off, rows, tails, stores, isClass);
         }
         for (int off : view.nowunused()) {
-            dropPruned(blockNo, off, rows, tails, stores);
+            dropPruned(blockNo, off, rows, tails, stores, isClass);
         }
     }
 
     /**
-     * PRUNE dead/unused 段的单行移除：行与 tail 删键；tracked 命中（行位被物理
-     * 删除，链断）打 WARN。
+     * PRUNE dead/unused 段的单行移除：行与 tail 删键；pg_class 分支且 tracked 命中
+     * （行位被物理删除，链断）打 WARN——attr 分支数值命中不告警（键空间重叠，
+     * 见 {@link #pruneCatalog}）。
      *
      * @param blockNo 块号
      * @param offnum  行号
      * @param rows    行字典
      * @param tails   raw tail 存储
      * @param stores  状态容器（tracked + 指标）
+     * @param isClass 是否 pg_class 目录
      * @param <T>     行模型类型
      */
     private <T> void dropPruned(int blockNo, int offnum, Map<Long, T> rows,
-            Map<Long, byte[]> tails, CatalogStores stores) {
+            Map<Long, byte[]> tails, CatalogStores stores, boolean isClass) {
         long key = ctidKey(blockNo, offnum);
         T row = rows.remove(key);
         if (row != null) {
             stores.metrics().inc(CatalogStores.CatalogMetrics.PRUNE_DROPPED);
         }
         tails.remove(key);
-        if (stores.trackedTableCtid() == key || stores.trackedToastCtid() == key) {
+        if (isClass && (stores.trackedTableCtid() == key || stores.trackedToastCtid() == key)) {
             LOG.warn("tracked ctid {} (block {}, offnum {}) pruned dead/unused — ctid chain broken", key, blockNo, offnum);
         }
     }
