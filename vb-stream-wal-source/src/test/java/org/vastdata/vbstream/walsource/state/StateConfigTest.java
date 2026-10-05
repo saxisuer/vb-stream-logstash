@@ -60,13 +60,18 @@ class StateConfigTest {
 
     /**
      * 非数字节拍值 fail-fast（NumberFormatException——与 WalSource 端口键同语义，
-     * 不静默跑错节拍）。
+     * 不静默跑错节拍）；interval 与 events 两键对称覆盖（Low-6）。
      */
     @Test
     void nonNumericCadenceFailsFast() {
         Properties p = new Properties();
         p.setProperty(StateConfig.KEY_INTERVAL_MS, "abc");
         assertThrows(NumberFormatException.class, () -> StateConfig.fromProperties(p));
+
+        Properties p2 = new Properties();
+        p2.setProperty(StateConfig.KEY_EVENTS, "not-a-number");
+        assertThrows(NumberFormatException.class, () -> StateConfig.fromProperties(p2),
+                "events 键非数字应与 interval 键同判 fail-fast");
     }
 
     /**

@@ -478,16 +478,23 @@ public final class CatalogReplay {
 
     /**
      * pg_class 截断更新的值编码重建（spike {@code reconstructClassTruncated} 移植，
-     * 发现 24）——prefix 落在列 1-7 定宽区（≤88B）时由已知旧行
-     * {@link CatalogRow.ClassRow#encodeFirstSevenCols()} 重编码前缀，中段取自记录、
-     * 后缀零填充（后缀列必为定宽不读值或位图 null 的 varlena，spike 论证）。
+     * 发现 24 + 审查 High-1 读区回填）——prefix 落在读区（≤{@code 读区末尾}）时由
+     * 已知旧行 {@link CatalogRow.ClassRow#encodeReadRegion()} 重编码前缀，中段取自
+     * 记录；后缀零填充<strong>仅在读区之外合法</strong>，与读区 [0,116) 的重叠段按
+     * 旧行读区字节回填（suffix 截断省略的尾段与旧元组逐字节相同是其定义，回填即
+     * 精确值——此前盲零填充在 RENAME 形态把 relnamespace..relam 清零）。
      *
      * <p>关键步骤：截断头走读（双 u16 前缀 + xl_heap_header 5B）→ prefix 越界
      * （&gt;{@code pgClassRelfilenodeDataOffset()}）返回 null（走 rawTail splice）→
      * prefix=0 整段取记录（只截后缀）否则 [位图][值编码 prefix][中段] 拼装 →
-     * 记录携带的头字段（infomask/infomask2/t_hoff）驱动解码。边界与异常语义：
-     * 返回 null 表示不支持该 prefix 深度（非异常）；解码失败（词典/长度错配）ISE
-     * 裸抛；线程约束：纯函数。</p>
+     * <strong>后缀处理</strong>：零填充区起点（数据区位）&ge; 读区末尾
+     * （reltoastrelid 末尾 = {@code pgClassReltoastrelidDataOffset()}+4）才允许纯零
+     * 填充；否则先零填充占位、再把 [零填充起点, 读区末尾) ∩ [0, 数据区末尾) 段从
+     * 旧行读区编码回填 → 记录携带的头字段（infomask/infomask2/t_hoff）驱动解码。
+     * 边界与异常语义：返回 null 表示不支持该 prefix 深度（非异常，落 rawTail
+     * splice/自愈兜底）；读区回填要求旧行值模型可得（本方法签名保证非 null——
+     * 旧行不可得的形态由 {@link #reconstructTruncatedUpdate} 直接走 tail/自愈）；
+     * 解码失败（词典/长度错配）ISE 裸抛；线程约束：纯函数。</p>
      *
      * @param r      走读完成的 UPDATE 记录
      * @param b0     新页块引用（须携带 data）
@@ -507,18 +514,35 @@ public final class CatalogReplay {
         int infomask = u16(raw, cur + 2);
         int tHoff = raw[cur + 4] & 0xFF;
         cur += 5;
+        int bitmapLen = tHoff - TUPLE_BITS_OFFSET;
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         if (prefix == 0) {
             out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 整段（仅截后缀）
         } else {
-            int bitmapLen = tHoff - TUPLE_BITS_OFFSET;
             out.write(raw, cur, bitmapLen);    // 位图 + 垫齐
             cur += bitmapLen;
-            out.write(oldRow.encodeFirstSevenCols(), 0, prefix);
+            out.write(oldRow.encodeReadRegion(), 0, prefix);
             out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 中段
         }
-        out.write(new byte[suffix], 0, suffix);    // 后缀零填充
-        return finishReconstruction(out.toByteArray(), tHoff, infomask, infomask2, layout.pgClassKinds());
+        out.write(new byte[suffix], 0, suffix);    // 后缀零填充占位（读区重叠段下方回填）
+        byte[] assembled = out.toByteArray();
+        // 读区回填（审查 High-1）：零填充仅在读区之外合法——suffix 起点 < 读区末尾时，
+        // 重叠段从旧行读区编码取精确值（后缀与旧元组逐字节相同是 suffix 截断的定义）。
+        // 两分支的 assembled 均为 [位图][数据区] 形态，数据区偏移 = bitmapLen。
+        int dataLen = assembled.length - bitmapLen;
+        int zeroStart = dataLen - suffix;
+        int readEnd = layout.pgClassReltoastrelidDataOffset() + 4;    // 最后被读列末尾
+        if (zeroStart < 0) {
+            return null;    // 防御：suffix 超数据区长（畸形记录）——落 tail/自愈兜底
+        }
+        if (zeroStart < readEnd) {
+            byte[] readRegion = oldRow.encodeReadRegion();
+            int backfillEnd = Math.min(dataLen, readEnd);
+            for (int i = zeroStart; i < backfillEnd; i++) {
+                assembled[bitmapLen + i] = readRegion[i];
+            }
+        }
+        return finishReconstruction(assembled, tHoff, infomask, infomask2, layout.pgClassKinds());
     }
 
     /**
@@ -654,7 +678,9 @@ public final class CatalogReplay {
      *
      * <p>关键步骤：new 位渲染 "(block,off)" → probe 点查 → 命中则九槽值行组装 +
      * repairTracked（probed 行 oid 作归属判据）+ selfHealed 计数 + WARN 返回派生档
-     * 产物（tail=null）。边界与异常语义：该位无行返回 null（调用方走 skip 计数 +
+     * 产物（tail=null）。边界与异常语义：<strong>末态回填语义（审查 Med-2）</strong>
+     * ——采纳值取自探测时刻的目录末态，丢页/断链窗口内的中间代际不可恢复，v1 仅承诺
+     * catalog 末态正确（对拍面即末态全等）；该位无行返回 null（调用方走 skip 计数 +
      * stale 记账——行已再迁移的记录形态本就过时）；行位复用窗口（毫秒级理论残留）
      * 由对拍暴露。
      * 线程约束：单写者（重放线程）。</p>

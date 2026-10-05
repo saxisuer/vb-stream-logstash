@@ -2,6 +2,7 @@ package org.vastdata.vbstream.walsource.it;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.RepeatedTest;
+import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.layout.Lsn;
@@ -161,6 +162,58 @@ class WalAdversarialIT extends WalSyncItBase {
     }
 
     /**
+     * 七步最小复现用例（审查 High-1 验收锚）：建表 → INSERT/UPDATE/DELETE →
+     * ADD COLUMN×2 → RENAME → 停流对拍——单会话、无干扰线程参与。该序列曾把
+     * pg_class 行 relnamespace/reltype/relowner/relam 清零（RENAME 截断更新 prefix
+     * 落 relname 区、suffix 起点越入读区，旧版盲零填充把读区列抹零）；读区回填
+     * 修复后须全等——防回归钉死。
+     */
+    @Test
+    void renameChainBreakMinimalReproMatchesJdbc() throws Exception {
+        String slot = "wal_adv_it_" + SLOT_SEQ.incrementAndGet();
+        slots.add(slot);
+        Interference.dropPhysicalSlotQuietly(slot);
+
+        long mainOid;
+        try (Connection c = Interference.newSqlConnection()) {
+            execDdl(c,
+                    "DROP TABLE IF EXISTS t_repro",
+                    "DROP TABLE IF EXISTS t_repro_renamed",
+                    "DROP TABLE IF EXISTS t_repro_tail",
+                    "CREATE TABLE t_repro (id int primary key, payload text)",
+                    "CREATE TABLE t_repro_tail (v int)");
+            mainOid = oidOf(c, "t_repro");
+        }
+        bootstrapConn = Interference.newSqlConnection();
+        try {
+            sync = CatalogSynchronizer.start(bootstrapConn, slot, layout,
+                    Interference.username(), Interference.password(), mainOid);
+            try (Connection c = Interference.newSqlConnection()) {
+                execDdl(c,
+                        "INSERT INTO t_repro SELECT g, 'p-' || g || '-' || repeat('x', g % 40) FROM generate_series(1, 200) g",
+                        "UPDATE t_repro SET payload = payload || '-u' WHERE id % 2 = 0",
+                        "DELETE FROM t_repro WHERE id % 3 = 0",
+                        "ALTER TABLE t_repro ADD COLUMN extra int",
+                        "ALTER TABLE t_repro ADD COLUMN note text DEFAULT 'seed'",
+                        "ALTER TABLE t_repro RENAME TO t_repro_renamed",
+                        "INSERT INTO t_repro_tail VALUES (1)");
+                long target = flushLsn(c);
+                awaitConsumed(sync, target, "最小复现序列接收前沿");
+            }
+        } finally {
+            if (sync != null) {
+                sync.stop();
+            }
+            bootstrapConn.close();
+            bootstrapConn = null;
+        }
+        try (Connection probe = Interference.newSqlConnection()) {
+            assertCatalogMatchesJdbc(sync, probe, mainOid, mainOid);
+        }
+        LOG.info("RENAME 最小复现对拍全等: 指标 {}", sync.metrics());
+    }
+
+    /**
      * 场景前置：清场重建主表与尾写表，返回主表 oid（建表在同步器 start 之前——
      * interest oid 供引导定位 tracked 双 ctid）。
      *
@@ -202,8 +255,7 @@ class WalAdversarialIT extends WalSyncItBase {
                 // DROP COLUMN（pg_attribute 行改 dropped 占位——发现 26 面）
                 "ALTER TABLE t_adv DROP COLUMN payload",
                 // RENAME（pg_class 行常规 UPDATE，ctid 迁移）
-                "ALTER TABLE t_adv RENAME TO t_adv_renamed",
-                // TRUNCATE → 回填 → 再 TRUNCATE（INPLACE relfilenode 二连改）
+                "ALTER TABLE t_adv RENAME TO t_adv_renamed",                // TRUNCATE → 回填 → 再 TRUNCATE（INPLACE relfilenode 二连改）
                 "TRUNCATE t_adv_renamed",
                 "INSERT INTO t_adv_renamed (id, extra_tag, note) VALUES (1, 1, 'a'), (2, 2, 'b')",
                 "TRUNCATE t_adv_renamed");

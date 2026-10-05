@@ -117,19 +117,28 @@ public final class CatalogRow {
         private static final int IX_RELTOASTRELID = 13;
 
         /**
-         * 编码列 1-7 的数据区字节（88B 值编码，spike 发现 24）。
+         * 编码<strong>读区</strong>的数据区字节（116B 值编码——发现 24 的 88B 前缀区
+         * 审查扩展：覆盖 {@code fromDecoded} 消费的全部九个投影列）。
          *
-         * <p>关键步骤：oid u32 小端 + relname 定宽 64B（UTF-8 + NUL 尾垫，超 63B
-         * 截断——与 NameData 存储一致）+ 5 个 oid 各 u32 小端；合计 4+64+20=88 字节，
-         * 恰为 layout {@code pgClassRelfilenodeDataOffset()} 的前缀区。截断更新的
-         * prefix ≤ 88 时由此重编码旧行前缀（spec §6：替代已删除的页读兜底）。
-         * 边界与异常语义：relname 超 63B 截断不抛（防御）；线程约束：纯函数，
-         * 并发安全。</p>
+         * <p><strong>读区布局（数据区偏移，与 layout
+         * {@code pgClassRelfilenodeDataOffset()/pgClassReltoastrelidDataOffset()} 锚定）</strong>：
+         * oid@0（u32 小端）、relname@4（定宽 64B，UTF-8 + NUL 尾垫，超 63B 截断——与
+         * NameData 存储一致）、relnamespace..relam@[68,88)（5 个 oid 各 u32）、
+         * relfilenode@88（u32）、[92,112) 20 字节填零（reltablespace/relpages/
+         * reltuples/relallvisible/relallfrozen——定宽且不被 {@code fromDecoded} 投影，
+         * 零值合法）、reltoastrelid@112（u32）——合计 116 字节。
+         * <strong>消费面</strong>：截断更新的 prefix 重编码（prefix ≤ 116 均可由旧行
+         * 无损重编码）与<strong>后缀读区回填</strong>（suffix 截断时被省略的尾段与读区
+         * [0,116) 的重叠段按本编码回填——后缀与旧元组逐字节相同是 suffix 截断的定义，
+         * 回填即精确值；审查 High-1：此前盲零填充在 RENAME 形态（prefix 落 relname 区、
+         * 后缀起点 &lt; 116）会把 relnamespace..relam 等读区列清零）。
+         * 边界与异常语义：relname 超 63B 截断不抛（防御）；116 之外的列不可由行值重编码，
+         * 属零填充合法区（定宽不读值）。线程约束：纯函数，并发安全。</p>
          *
-         * @return 88 字节数据区前缀编码
+         * @return 116 字节数据区读区编码
          */
-        public byte[] encodeFirstSevenCols() {
-            ByteArrayOutputStream out = new ByteArrayOutputStream(88);
+        public byte[] encodeReadRegion() {
+            ByteArrayOutputStream out = new ByteArrayOutputStream(116);
             writeU32(out, relOid);
             byte[] n = relname.getBytes(StandardCharsets.UTF_8);
             out.write(n, 0, Math.min(63, n.length));
@@ -141,6 +150,9 @@ public final class CatalogRow {
             writeU32(out, reloftype);
             writeU32(out, relowner);
             writeU32(out, relam);
+            writeU32(out, relfilenode);
+            out.write(new byte[20], 0, 20);    // [92,112) 五个定宽列——不被投影, 零值合法
+            writeU32(out, reltoastrelid);
             return out.toByteArray();
         }
 

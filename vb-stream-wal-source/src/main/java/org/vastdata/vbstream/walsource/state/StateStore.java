@@ -53,7 +53,9 @@ import java.util.zip.CheckedOutputStream;
  * EOF——{@link #load()} 一律 {@code Optional.empty()} + ERROR 日志，回落重引导
  * 由 caller 决定；{@code .part} 残留永不 load（{@link #exists()} 亦只认正名文件）。
  * 持久化面 = 完整 CatalogStores 可重建态除 metrics 外全部字段（裁定见
- * {@link StoredState}）。线程约束：checkpoint 与 load 意图上在停流/装配期单线程
+ * {@link StoredState}）。<strong>契约（Med-3）：一个目录同一时刻仅一个活实例写
+ * 检查点</strong>——两实例共用目录时后停机者以陈旧状态覆盖新检查点（文件锁后续）。
+ * 线程约束：checkpoint 与 load 意图上在停流/装配期单线程
  * 调用（spec §7 取单线程天然一致点）；文件面自身由换名原子性兜底并发读写。</p>
  */
 public final class StateStore {

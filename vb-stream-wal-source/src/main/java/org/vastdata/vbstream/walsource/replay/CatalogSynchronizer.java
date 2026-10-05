@@ -97,9 +97,6 @@ public final class CatalogSynchronizer {
     /** 本次 start 是否自检查点续传（true = restoreInto 路径、false = 全新引导）。 */
     private volatile boolean resumedFromState;
 
-    /** 续传过滤线：记录末尾 &le; 此线的已在检查点前施加过，apply 跳过重放（0 = 无过滤）。 */
-    private long replayFilterLsn;
-
     /** 已施加前沿镜像：最近一次 apply 完成的记录 MAXALIGN 末尾（volatile 跨线程读）。 */
     private volatile long appliedLsn;
 
@@ -199,9 +196,9 @@ public final class CatalogSynchronizer {
      * P₀（槽必须存在——槽推进的目标）；② {@link StateStore#load()} 成功且 stored lsn
      * &ge; P₀ → {@link StoredState#restoreInto} 恢复字典 + 流起点 = stored lsn（页对齐
      * 由接收器下取整），<strong>跳过引导</strong>——已施加前沿种子化为 stored lsn，
-     * <strong>apply 面按 LSN 过滤线跳过检查点前已施加的记录</strong>（页对齐多收的窗口
-     * 不重施加——部分记录类二次施加非幂等，见 {@link #apply} javadoc），此后 WAL 增量
-     * 重放。stored lsn &lt; P₀ = 槽保留窗口已越前（槽被越程推进/重建），字典无法覆盖
+     * <strong>apply 面跳过末尾 &le; 已施加前沿的重投递记录</strong>（页对齐多收/重连
+     * 重发的窗口不重施加——部分记录类二次施加非幂等，见 {@link #apply} javadoc），
+     * 此后 WAL 增量重放。stored lsn &lt; P₀ = 槽保留窗口已越前（槽被越程推进/重建），字典无法覆盖
      * 窗口 → WARN + 回落全新引导（安全侧：宁可重引导，不可错位窗口重放，spec §7）。</p>
      *
      * <p><strong>load 失败 / 无文件 → 全新引导</strong>（现路径：bootstrap + max(P₀, B)）。
@@ -301,12 +298,10 @@ public final class CatalogSynchronizer {
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout), healer), receiver,
                 slotName, state, stateStore, stateStore == null ? null : sql);
-        sync.appliedLsn = start;    // 前沿种子化：续传=stored lsn / 引导=引导一致点（首条 apply 前的 as-of）
+        sync.appliedLsn = start;    // 前沿种子化：续传=stored lsn / 引导=引导一致点——
+                                     // 兼作重投递过滤线（apply 跳过 end <= 前沿的记录, Low-5 泛化:
+                                     // 覆盖续传页对齐多收与断流重连重发两个窗口, 前沿单调不回退）
         sync.resumedFromState = resumed;
-        // 续传过滤线 = stored lsn（forcedStartLsn 只改流起点不改过滤线）：接收器页对齐
-        // 下取整多收的检查点前记录在 apply 面跳过——重放窗口按 LSN 过滤而非重施加
-        // （非幂等记录类二次施加会产出部分零字段行, Task 15 IT 实证）
-        sync.replayFilterLsn = resumed ? storedLsn : 0L;
         if (state != null && state.enabled()) {
             sync.lastCheckpointWallMs = System.currentTimeMillis();
             sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
@@ -327,18 +322,19 @@ public final class CatalogSynchronizer {
      * MAXALIGN 末尾（与 walker 记录对齐边界同式）→ {@link #maybeCheckpoint}（先到为
      * 准的节拍判定，未达阈值为 no-op）。边界与异常语义：非 catalog 记录（其它
      * rmgr/关系）为引擎内 no-op，前沿照常推进——位点语义是"已走读"而非"已改字典"；
-     * <strong>续传过滤线</strong>（resumed 时 = stored lsn）——记录末尾 &le; 过滤线的
-     * 已在检查点前施加过（接收器页对齐下取整导致的多收窗口），跳过重放且前沿不回退
-     * （部分记录类二次施加非幂等：截断更新对已被 INPLACE 失效 tail 的旧行做值编码
-     * 重建会产出部分零字段的行——重放窗口必须按 LSN 过滤而非重施加，Task 15 IT
-     * 实证）。线程约束：接收线程单写者。</p>
+     * <strong>重复窗口过滤（Low-5 泛化）</strong>——记录末尾 &le; 已施加前沿的直接跳过，
+     * 统一覆盖两类重投递窗口：① 续传时接收器页对齐下取整多收的检查点前记录（前沿
+     * 种子 = stored lsn）；② 断流重连自 consumedLsn 重发的已施加记录。跳过重放的
+     * 依据是部分记录类二次施加非幂等（截断更新对已被 INPLACE 失效 tail 的旧行做
+     * 值编码重建曾产出部分零字段的行——Task 15 IT 实证），且跳过保证前沿单调不回退。
+     * 线程约束：接收线程单写者。</p>
      *
      * @param r 走读完成的记录
      */
     public void apply(WalRecord r) {
         long end = (r.lsn() + r.totLen() + 7) & ~7L;
-        if (end <= replayFilterLsn) {
-            return;    // 检查点前已施加——跳过重放, appliedLsn 保持种子不回退
+        if (end <= appliedLsn) {
+            return;    // 重投递窗口内已施加（续传页对齐多收/重连重发）——跳过, 前沿不回退
         }
         replay.applyCatalogRecord(r, stores);
         appliedLsn = end;

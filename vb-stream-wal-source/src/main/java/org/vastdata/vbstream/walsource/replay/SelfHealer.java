@@ -5,6 +5,11 @@ package org.vastdata.vbstream.walsource.replay;
  * <strong>ctid 寻址精确采纳</strong>恢复：按记录 new 位探测目录末态行，行仍居该位
  * 即为本记录施加后的精确状态（更新移位、INPLACE 不移位但重放收敛），整行采纳。
  *
+ * <p><strong>语义边界（审查 Med-2 收紧）：本类提供的是"末态回填"而非历史重建</strong>
+ * ——采纳值取自<strong>探测时刻</strong>的目录末态；丢页/断链窗口内的中间代际
+ * （该位此后的再迁移/改值轨迹）不可恢复，v1 仅承诺 catalog <strong>末态</strong>
+ * 正确（对拍面即末态全等），不承诺逐记录时点正确。</p>
+ *
  * <p><strong>对 Task 12"候选枚举 + 中段新值对末态校验"形态的裁定（对抗性 IT 实证）</strong>：
  * 候选前缀源是断链窗口内的历史快照，与记录中段拼装会产出时代错位的混合行（实测：
  * pre-RENAME 的 relname 混入 toast 关系的 relfilenode）；且"末态 ctid == new 位"可被

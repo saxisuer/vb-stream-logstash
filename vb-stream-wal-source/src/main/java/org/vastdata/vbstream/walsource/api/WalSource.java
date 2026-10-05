@@ -37,7 +37,9 @@ import java.util.Properties;
  *
  * <p>生命周期：start/close 单程（重复 start 抛 ISE；close 幂等，实现 AutoCloseable；
  * close 含最终 best-effort 检查点 + 槽推进——委派 {@link CatalogSynchronizer#stop()}）；
- * start 中途失败（SQLException/ISE）时内部资源由本类持有，调用方 close 释放。线程约束：
+ * start 中途失败（SQLException/ISE）时内部资源由本类持有，调用方 close 释放。
+ * <strong>契约（Med-3）：一个检查点目录同一时刻仅一个活实例</strong>——旧实例后
+ * stop 会以陈旧状态覆盖新实例的检查点（文件锁后续任务）。线程约束：
  * start/close 仅装配线程调用；{@link #consumedLsn()} 与 {@link #metrics()} 快照面任意
  * 线程可读（前者 volatile 镜像，后者 {@link WalStreamMetrics#censusSnapshot()} 不可变副本）。</p>
  */

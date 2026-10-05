@@ -135,8 +135,8 @@ class CatalogReplayTest {
 
     /**
      * 用例 3a：UPD 截断 prefix=88 值编码重建（发现 24）——旧 ClassRow 已知时按
-     * encodeFirstSevenCols 重建前 88B（列 1-7 定宽区），解码全等；重建 tail 与
-     * 独立拼装的期望字节（旧值编码 + 新行中段）逐字节一致（双源互证）。
+     * encodeReadRegion 重建前 88B（列 1-7 定宽区，读区编码的子段），解码全等；重建
+     * tail 与独立拼装的期望字节（旧值编码 + 新行中段）逐字节一致（双源互证）。
      */
     @Test
     void truncatedUpdatePrefix88RebuildsByValueEncoding() {
@@ -156,14 +156,47 @@ class CatalogReplayTest {
         assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 201, 0),
                 stores.classRows().get(newKey), "prefix=88 应由已知行值编码重建出全行");
 
-        // 期望 tail = [bitmap+pad] + 旧行前 88B 值编码 + 新行中段（数据区 88 起）
+        // 期望 tail = [bitmap+pad] + 旧行读区编码前 88B + 新行中段（数据区 88 起）
         byte[] newTail = tailOf(newTuple);
         int bitmapLen = newTuple.tHoff() - 23;
         ByteArrayOutputStream expect = new ByteArrayOutputStream();
         expect.write(newTail, 0, bitmapLen);
-        expect.writeBytes(oldRow.encodeFirstSevenCols());
+        expect.write(oldRow.encodeReadRegion(), 0, 88);
         expect.write(newTail, bitmapLen + 88, newTail.length - bitmapLen - 88);
         assertArrayEquals(expect.toByteArray(), stores.rawClassTails().get(newKey));
+    }
+
+    /**
+     * 用例 3d：UPD 截断 RENAME 形态（prefix 落 relname 区 + 后缀起点越入读区）的
+     * <strong>读区回填</strong>（审查 High-1）——suffix 零填充区起点 &lt; 读区末尾
+     * （reltoastrelid 末尾 116）时，重叠段必须按旧行读区编码回填精确值而非留零：
+     * 旧行值模型 namespace/owner 与 relfilenode/reltoastrelid 均须完整回填（修复前
+     * relnamespace..relam/relfilenode/reltoastrelid 全部被清零——Task 15 诊断的
+     * RENAME 零字段行）。中段只携带 [prefix, 零填充起点) 的新 relname 尾段。
+     */
+    @Test
+    void truncatedRenameBackfillsReadRegionFromOldRow() {
+        CatalogStores stores = freshStores();
+        long oldKey = CatalogReplay.ctidKey(3, 1);
+        long newKey = CatalogReplay.ctidKey(5, 2);
+        // 旧行值模型带非默认标识值（77/88/66 + filenode 200/toast 900）——回填判别面
+        CatalogRow.ClassRow oldRow = new CatalogRow.ClassRow(100, "t1", 77, 88, 0, 66, 0, 200, 900);
+        stores.classRows().put(oldKey, oldRow);
+
+        TupleBytes newTuple = classTuple(100, "t1x", 201, 0, 1);
+        int bitmapLen = newTuple.tHoff() - 23;
+        int dataLen = newTuple.payload().length - 5 - bitmapLen;
+        int prefix = 4 + 2;              // oid + relname 共有前缀 "t1"
+        int suffix = dataLen - 68;       // 零填充起点钉在 relnamespace@68（越入读区）
+        WalRecord rec = rec(updateRecord(HeapOps.XLH_UPDATE_TRUNCATION,
+                3, 1, 5, 2, truncatedData(newTuple, prefix, suffix)));
+        replay.applyCatalogRecord(rec, stores);
+
+        // 中段只含新 relname 尾段;读区 [68,116) 全部来自旧行回填（suffix 截断的
+        // 定义:省略段与旧元组逐字节相同）——filenode/toast 取旧行值而非新行 DSL 值
+        assertEquals(new CatalogRow.ClassRow(100, "t1x", 77, 88, 0, 66, 0, 200, 900),
+                stores.classRows().get(newKey), "RENAME 形态读区段须按旧行回填而非零填充");
+        assertNull(stores.classRows().get(oldKey));
     }
 
     /**

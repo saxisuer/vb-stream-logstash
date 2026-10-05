@@ -41,8 +41,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 仍全等；③ 续传起点恰为 stored lsn（{@code snapshot().lsn()} 种子断言——不回退
  * 不跳段，引导路径的种子会是引导时刻 flush LSN，二者可区分）；④ 丢页注入——
  * 检查点一致点之后跳过 3 页起新流（gap 内 watched 目录变更全部丢失），后续 DDL
- * 驱动 watched 目录记录，验证"丢失后 watched 后续事件追平"的自愈保证（开放风险
- * 验证：失败即风险证实，如实记录）。</p>
+ * 驱动 watched 目录记录，验证"丢失后 watched 后续事件把 catalog <strong>末态</strong>追平"
+ * （末态回填语义，开放风险验证：失败即风险证实，如实记录）。</p>
  */
 class WalLifecycleIT extends WalSyncItBase {
 
@@ -129,15 +129,15 @@ class WalLifecycleIT extends WalSyncItBase {
                 "续传起点应恰为 stored lsn（引导路径的种子是引导时刻 flush LSN，二者可区分）");
 
         try (Connection c = Interference.newSqlConnection()) {
-            // 注：不含 RENAME——单会话（无检查点/续传参与）同序列即复现 pg_class 行
-            // relnamespace/reltype/relowner/relam 归零的重放引擎既有缺陷（Task 15 诊断
-            // 记档，详见任务报告）；生命周期场景不重复触发该无关缺陷
+            // 含 RENAME——审查 High-1 修复（读区回填）后回归：修复前该形态在单会话
+            // （无检查点/续传参与）即复现 relnamespace/reltype/relowner/relam 归零
             execDdl(c,
                     "ALTER TABLE t_life DROP COLUMN payload",
-                    "TRUNCATE t_life",
-                    "INSERT INTO t_life (id, extra, note) VALUES (1, 1, 'a'), (2, 2, 'b')",
-                    "ALTER TABLE t_life ADD COLUMN late_col int",
-                    "ALTER TABLE t_life SET (autovacuum_enabled = false)");
+                    "ALTER TABLE t_life RENAME TO t_life_renamed",
+                    "TRUNCATE t_life_renamed",
+                    "INSERT INTO t_life_renamed (id, extra, note) VALUES (1, 1, 'a'), (2, 2, 'b')",
+                    "ALTER TABLE t_life_renamed ADD COLUMN late_col int",
+                    "ALTER TABLE t_life_renamed SET (autovacuum_enabled = false)");
             // 确定性收尾（同对抗性 IT）：死元组清在目标位点之前 + 尾写取 flush 目标
             execDdl(c, "VACUUM ANALYZE pg_class", "VACUUM ANALYZE pg_attribute");
             execDdl(c, "INSERT INTO t_life_tail VALUES (2)");
@@ -211,7 +211,9 @@ class WalLifecycleIT extends WalSyncItBase {
      * 场景 ④（丢页注入，Task 13 裁定 2 的跟进——开放风险验证）：检查点一致点之后
      * 跳过一段 WAL（gap 内含 watched 目录的真实变更），从"前沿 + 3 页页对齐"起新流
      * ——gap 记录对重放面等于凭空丢失；随后续 DDL 驱动 watched 目录记录，验证
-     * "丢失后 watched 后续事件追平"的自愈保证。失败 = 风险证实，如实记录不掩盖。
+     * "丢失后 watched 后续事件把 catalog <strong>末态</strong>追平"（精确采纳为末态
+     * 回填语义——探测时刻末态，丢页窗口的中间代际不可恢复也不必恢复，v1 承诺面是
+     * 末态全等）。失败 = 风险证实，如实记录不掩盖。
      */
     @Test
     void lostPagesSkipThenSubsequentWatchedEventsCatchUp() throws Exception {
@@ -289,7 +291,11 @@ class WalLifecycleIT extends WalSyncItBase {
         try (Connection probe = Interference.newSqlConnection()) {
             assertCatalogMatchesJdbc(sync2, probe, mainOid, mainOid);
         }
-        LOG.info("丢页自愈验证通过: 指标 {} / 接收器 {}", sync2.metrics(), sync2.streamMetrics());
+        // 协议断言面：末态追平须由真实后续记录驱动（resyncs==0）——重同步回退补页
+        // 读取了本应丢失的 gap 页会把场景偷换成"未丢页"，属空转假绿
+        assertEquals(0L, sync2.streamMetrics().resyncs.sum(),
+                "丢页场景应零再同步（末态追平由后续 DDL 驱动, 非重同步补页）: " + sync2.streamMetrics());
+        LOG.info("丢页末态追平验证通过: 指标 {} / 接收器 {}", sync2.metrics(), sync2.streamMetrics());
     }
 
     /**
@@ -353,6 +359,7 @@ class WalLifecycleIT extends WalSyncItBase {
         try (Connection c = Interference.newSqlConnection()) {
             execDdl(c,
                     "DROP TABLE IF EXISTS " + table,
+                    "DROP TABLE IF EXISTS " + table + "_renamed",
                     "DROP TABLE IF EXISTS " + table + "_tail",
                     "CREATE TABLE " + table + " (id int primary key, payload text)",
                     "CREATE TABLE " + table + "_tail (v int)");
