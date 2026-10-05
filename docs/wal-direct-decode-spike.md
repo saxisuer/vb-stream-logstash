@@ -11,9 +11,10 @@
 
 ## 结论：主干成立（PASS，连续多次稳定复现）
 
-12 个事务 22 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
+14 个事务 24 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
 DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）；事务分组与提交序
-全对。验证覆盖：
+全对；**catalog 重放器最小闭环打通**——字典不再硬编码，由 JDBC 引导 + WAL 重放驱动。
+验证覆盖：
 
 | 场景 | 结果 |
 |---|---|
@@ -22,6 +23,7 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
 | S2：CHECKPOINT 后 INSERT → FPW 记录（跨页 contrecord + 页镜像） | ✓ 记录拼接成功；页镜像重建（hole 拼接）→ ItemId 走读 → 页内 tuple 解码交叉验证 1/1 通过 |
 | S3：两连接交错事务（A1,B1,A2,B2；先 commit A 后 B） | ✓ 按 xid 分组不串、提交序正确 |
 | S4：默认 replica identity 的 UPDATE（无前像）→ `REPLICA IDENTITY FULL` 后 UPDATE（新旧整行）/ DELETE（前像整行） | ✓ 默认 RI 无 old tuple（与逻辑解码同约束，实证）；FULL 下 `U(old)>(new)`、`D(old)` 逐字节正确；HOT 更新（0x40）与普通更新同构解码 |
+| S5：catalog 重放器——流中 `ALTER TABLE ADD COLUMN`，字典从 pg_attribute 自身的 WAL 记录按 ctid 重放（JDBC 引导含 ctid 种子） | ✓ ADD COLUMN 被捕捉（`extra attnum=6 typOid=25`）；ALTER 后的行用重放出的 6 列字典解码、第六列值正确，ALTER 前的行仍按当时 5 列字典——as-of 语义成立 |
 
 ## 过程中钉死的关键事实（正式模块的资产）
 
@@ -59,6 +61,20 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
 13. **prefix/suffix 截断**（`XLH_UPDATE_PREFIX/SUFFIX_FROM_OLD`）：更新未变更的首/尾列
     字节不落盘，需用 old tuple 重建——spike 以断言拦截（S4 通过改全列规避），正式模块
     必须实现（old tuple 可得时重建平凡）。
+14. **catalog 变更不走 KEEP_DATA 且单行也走 multi-insert**（pg_waldump 实证）：catalog
+    被 `RelationIsLogicallyLogged` 排除（IsCatalogRelation），FPW 记录**不含 tuple
+    data**——数据只在页镜像里；且 `ALTER ADD COLUMN` 对 pg_attribute 的单行插入走
+    HEAP2 MULTI_INSERT。catalog 重放器因此是双路径：非 FPW 记录用 block data、FPW
+    记录从页镜像按 offsets 提取。
+15. **FPW 页镜像是变更后状态**（勘误：S2 时一度误判为变更前）——redo 对
+    XLADR_RESTORED 直接跳过应用即为证据；镜像里新行已就位（LP_NORMAL、lp_len 完整），
+    直接按 offnum 从镜像解新行即可。
+16. **ctid 重放模型**：pg_attribute 行集以 `(block, offnum)` 物理位置索引——insert
+    upsert、delete 按位删、update 先删后插（与 heap 自身的 MVCC 移动同构）；JDBC 引导
+    快照带 ctid 种子、重放 upsert 语义使重叠窗口幂等。pg_attribute 列布局按版本转录
+    （PG 18 为 25 列，`attstattarget` 在 17+ 挪到尾部 varlen 区——版本漂移活例）。
+    另：流起点/终点必须用 `pg_current_wal_flush_lsn()`——write 位点可能超前于 flush，
+    START_REPLICATION 会拒绝超 flush 的起点。
 11. 流起始的**孤立续体**（contrecord 头在窗口之前）需静默跳过；起始 LSN 向下对齐到页边界
     后首个页可能是续体页。记录跨页拼接要按"当前页剩余空间"取数，不能把累计消耗与页内
     偏移混在同一坐标系（多页记录必踩）。
@@ -76,8 +92,10 @@ DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）�
 1. ~~UPDATE / DELETE 记录 + replica identity 前像提取~~ **已验证**（S4，2026-10-05 补强）：
    RI FULL 下前像整行在 main data 尾、HOT 同构、默认 RI 无前像；遗留仅 prefix/suffix
    截断重建（见发现 13）
-2. catalog 重放器：pg_attribute/pg_class 的 heap 记录按 ctid 索引重建行集 + JDBC 引导快照
-   的重叠窗口幂等性
+2. ~~catalog 重放器最小闭环~~ **已验证**（S5，2026-10-05 补强）：pg_attribute 按 ctid
+   重放 + JDBC 引导幂等 + as-of 字典驱动解码 + FPW 镜像路径。遗留：catalog 的
+   UPDATE/DELETE 镜像路径（本次窗口只有 insert）、压缩 FPW（pglz/lz4/zstd）、
+   DROP COLUMN 的 attisdropped 标记流中验证
 3. relfilenode 生命周期：TRUNCATE/VACUUM FULL/rewrite 的 SMGR 记录映射 + pg_filenode.map
    （XLOG_RELMAP）
 4. TOAST：toast chunk 记录重组 + 未变列指针早于捕获起点的 JDBC 回查兜底
