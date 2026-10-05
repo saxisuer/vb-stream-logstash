@@ -18,6 +18,7 @@ import java.util.OptionalLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -178,6 +179,59 @@ class CatalogSynchronizerTest {
     void parseCtidKeyParsesPgTextForm() {
         assertEquals(CatalogReplay.ctidKey(0, 1), CatalogBootstrap.parseCtidKey("(0,1)"));
         assertEquals(CatalogReplay.ctidKey(123, 45), CatalogBootstrap.parseCtidKey("(123,45)"));
+    }
+
+    /**
+     * 用例 6（审查修复回归，Minor②）：带端口的多宿主 URL 先切逗号再切冒号——
+     * {@code //h1:5432,h2:5433/db} 取 h1:5432（原实现整段切冒号会把端口解析成
+     * "5432,h2:5433" 抛 ISE）。
+     */
+    @Test
+    void parseUrlTakesFirstHostOfMultiHostWithPorts() {
+        CatalogSynchronizer.ConnInfo ci = CatalogSynchronizer.parseUrl(
+                "jdbc:postgresql://h1:5432,h2:5433/mydb", "pg");
+        assertEquals("h1", ci.host());
+        assertEquals(5432, ci.port());
+        assertEquals("mydb", ci.database());
+        assertEquals("pg", ci.user());
+        assertEquals("", ci.pass());
+    }
+
+    /**
+     * 用例 7：URL 形态面——query 参数凭据优先于 metadata 回落、缺省端口/库回落、
+     * 非 postgresql URL 与非数字端口 fail-fast。
+     */
+    @Test
+    void parseUrlDerivesParamsCredentialsAndFailsFastOnMalformed() {
+        CatalogSynchronizer.ConnInfo withParams = CatalogSynchronizer.parseUrl(
+                "jdbc:postgresql://h/db?user=u&password=p", "pg");
+        assertEquals("u", withParams.user());
+        assertEquals("p", withParams.pass());
+        assertEquals("h", withParams.host());
+        assertEquals(5432, withParams.port());
+
+        CatalogSynchronizer.ConnInfo bare = CatalogSynchronizer.parseUrl(
+                "jdbc:postgresql://localhost:55432/postgres", "pg");
+        assertEquals("pg", bare.user());
+        assertEquals("", bare.pass());
+        assertEquals("postgres", bare.database());
+
+        CatalogSynchronizer.ConnInfo defaults = CatalogSynchronizer.parseUrl(
+                "jdbc:postgresql:mydb", "pg");
+        assertEquals("localhost", defaults.host());
+        assertEquals(5432, defaults.port());
+        assertEquals("mydb", defaults.database());
+        assertEquals("pg", defaults.user());
+
+        assertEquals("pg", CatalogSynchronizer.parseUrl("jdbc:postgresql:", "pg").database(),
+                "全默认形态缺省库回落用户名");
+
+        assertThrows(IllegalStateException.class,
+                () -> CatalogSynchronizer.parseUrl("jdbc:mysql://h/db", "pg"),
+                "非 postgresql URL 须 fail-fast");
+        assertThrows(IllegalStateException.class,
+                () -> CatalogSynchronizer.parseUrl("jdbc:postgresql://h:notaport/db", "pg"),
+                "非数字端口须 fail-fast");
     }
 
     // ---- 测试基建：记录拼装（CatalogReplayTest 同源转录，双源互证） ----------------

@@ -1,9 +1,9 @@
 package org.vastdata.vbstream.walsource.replay;
 
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * catalog ctid 重放的状态容器——pg_attribute / pg_class 两张 watched 目录的行字典
@@ -13,16 +13,21 @@ import java.util.Set;
  * <p>控制器裁定：本类随 Task 10（重放核心）交付，Task 11（CatalogSynchronizer/
  * 引导）只消费。生命周期约定：Task 11 的 {@code CatalogBootstrap} 在 REPEATABLE READ
  * 单事务内灌入全行含 ctid 并回填两 relfilenode，此后由重放引擎增量维护。
- * <strong>线程约束：非线程安全</strong>——spec §3 执行模型为单线程直通
- * （接收→解析→重放→周期落盘），全部集合按单写者假设使用；持久化快照走
- * {@link CatalogMetrics#snapshot()} 的防御拷贝。</p>
+ * <strong>线程约束：单写者 + 弱一致并发读</strong>——spec §3 执行模型为单线程直通
+ * （接收→解析→重放→周期落盘），put/remove/跟随类复合迁移（先 remove 后 put 的
+ * ctid 搬迁）仍按单写者假设（读线程在搬迁间隙可能瞬时看不到该行，属"尽力一致"
+ * 口径内的窗口）；四个行字典/tail 存储用 {@link ConcurrentHashMap}——跨线程快照
+ * 查询（{@code CatalogSynchronizer.snapshot()} 的迭代）与重放线程写入并发时弱一致
+ * 迭代、不抛 CME；tracked 双 ctid/interest/stale 等标量与小集合仅装配/引导线程
+ * 触碰，保持普通字段/HashSet；持久化与指标快照走 {@link CatalogMetrics#snapshot()}
+ * 的防御拷贝。</p>
  */
 public final class CatalogStores {
 
-    private final Map<Long, CatalogRow.AttrRow> attrRows = new HashMap<>();
-    private final Map<Long, CatalogRow.ClassRow> classRows = new HashMap<>();
-    private final Map<Long, byte[]> rawAttrTails = new HashMap<>();
-    private final Map<Long, byte[]> rawClassTails = new HashMap<>();
+    private final Map<Long, CatalogRow.AttrRow> attrRows = new ConcurrentHashMap<>();
+    private final Map<Long, CatalogRow.ClassRow> classRows = new ConcurrentHashMap<>();
+    private final Map<Long, byte[]> rawAttrTails = new ConcurrentHashMap<>();
+    private final Map<Long, byte[]> rawClassTails = new ConcurrentHashMap<>();
     private final Set<Long> interestRelOids = new HashSet<>();
     private final Set<Long> staleOids = new HashSet<>();
     private final CatalogMetrics metrics = new CatalogMetrics();
@@ -186,8 +191,10 @@ public final class CatalogStores {
     }
 
     /**
-     * 重放指标——单线程 HashMap 计数 + 防御拷贝快照（无需 LongAdder/CHM，spec §3
-     * 单线程直通；Task 15 的指标只读面消费 {@link #snapshot()}）。
+     * 重放指标——单写者计数（重放线程 {@code inc}）+ 跨线程只读快照（Task 15 的
+     * 指标面消费 {@link #snapshot()}）。counters 用 {@link ConcurrentHashMap}：
+     * {@code get}/{@code snapshot} 与重放线程的 {@code inc} 并发时弱一致（读到
+     * 稍旧的计数）但不抛 CME；无需 LongAdder（计数面无竞争写）。
      *
      * <p>键为静态常量字符串；未触及的键在 {@link #snapshot()} 中不出现（调用方用
      * {@code getOrDefault} 取 0 默认）。</p>
@@ -209,7 +216,7 @@ public final class CatalogStores {
         /** 计数键：INPLACE 就地更新（TRUNCATE/ANALYZE 改 relfilenode/toast）的行数。 */
         public static final String INPLACE_UPDATES = "inplaceUpdates";
 
-        private final Map<String, Long> counters = new HashMap<>();
+        private final Map<String, Long> counters = new ConcurrentHashMap<>();
 
         /**
          * 指定键计数 +1（不存在即从 1 起）。

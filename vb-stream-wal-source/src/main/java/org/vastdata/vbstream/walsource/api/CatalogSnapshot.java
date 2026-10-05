@@ -16,9 +16,11 @@ import java.util.OptionalLong;
 public interface CatalogSnapshot {
 
     /**
-     * 本快照的前沿 LSN——字典内容已重放至该位点（下一条未施加记录的起点）。
+     * 本快照的前沿 LSN——字典内容已重放至该位点（下一条未施加记录的起点）；同步器
+     * 启动后自流起点（槽 P₀ 与引导 flush LSN 的较大值）起算，首条记录施加前即引导
+     * 一致点而非 0。
      *
-     * @return 已消费前沿（打包 long；引导完成前为 0）
+     * @return 已消费前沿（打包 long；同步器未启动为 0）
      */
     long lsn();
 

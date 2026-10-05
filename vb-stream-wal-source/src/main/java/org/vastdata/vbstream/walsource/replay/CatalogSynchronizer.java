@@ -31,16 +31,19 @@ import java.util.StringJoiner;
  * REPEATABLE READ 单事务内灌满两目录并返回同事务 flush LSN（B）→ ③ 流起点
  * max(P₀, B)（页对齐由接收器内部下取整）——窗口重叠由 ctid 键控 upsert 幂等消化。</p>
  *
- * <p><strong>凭据移交限制（v1 已知）</strong>：接收器自建物理复制连接，而 JDBC
- * {@link Connection} 不暴露密码——复制连接的凭据取自引导连接 URL 的 query 参数
- * （{@code ?user=..&amp;password=..}），缺省 user 取 metadata 用户名、password 为空串
- * （trust 认证）。目标环境为密码认证（scram）时，调用方须以携带凭据的 URL 建立引导
- * 连接。</p>
+ * <p><strong>凭据移交（控制器裁定）</strong>：接收器自建物理复制连接，而 JDBC
+ * {@link Connection} 不暴露密码。带凭据重载
+ * {@link #start(Connection, String, WalLayout, String, String, long...)} 显式传
+ * user/password（密码认证/scram 环境的推荐档，Task 15 WalSource 接线用）；原四参
+ * 签名为无凭据回落——凭据取引导连接 URL 的 query 参数（{@code ?user=..&amp;password=..}，
+ * 缺省 user 取 metadata 用户名、password 空串即 trust 认证）并 WARN 一行提示。</p>
  *
- * <p>线程约束：{@link #apply} 在接收线程（wal-receiver）单写者执行；stores 集合均按
- * 单写者假设（Task 10 契约）；{@link #snapshot()}/{@link #consumedLsn()}/{@link #metrics()}
- * 为只读观测面——v1 执行模型单线程直通，跨线程读为尽力一致（apply 中前沿经 volatile
- * 先于字典更新发布，读方可能看到略旧字典 + 新前沿，spec §7 检查点取天然一致点）。
+ * <p>线程约束：{@link #apply} 在接收线程（wal-receiver）单写者执行；stores 行字典
+ * /tail 存储为 ConcurrentHashMap（跨线程快照迭代弱一致、不抛 CME，复合搬迁仍按单
+ * 写者假设，见 {@link CatalogStores}）；{@link #snapshot()}/{@link #consumedLsn()}/
+ * {@link #metrics()} 为只读观测面——跨线程读为尽力一致：apply 先写字典后经 volatile
+ * 发布前沿，happens-before 保证读方<strong>见新前沿必见新字典</strong>，良性的交错是
+ * 旧前沿 + 新字典（重放推进中的瞬时窗口；spec §7 检查点取单线程天然一致点）。
  * {@link #stop()} 幂等，可从任意线程调用。</p>
  */
 public final class CatalogSynchronizer {
@@ -81,17 +84,12 @@ public final class CatalogSynchronizer {
     }
 
     /**
-     * v1 组装入口：槽确保 → 一致性引导 → 起接收流（sink = 本实例 apply）。
+     * v1 组装入口（无凭据回落档）：凭据从引导连接 URL 派生（query 参数优先，缺省
+     * user 取 metadata 用户名、password 空串——trust 认证），并 WARN 一行提示密码
+     * 认证环境改用带凭据重载。组装序与 {@link #start(Connection, String, WalLayout,
+     * String, String, long...)} 完全一致，见其 javadoc。
      *
-     * <p>关键步骤：① interest oid 注册进 stores（引导据此定位 tracked 双 ctid；v1
-     * 注册 0 个合法——纯字典同步形态）；② ensureSlot 得 P₀；③ bootstrap 得种子 +
-     * 同事务 flush LSN（B）；④ 由引导连接的 metadata URL 解析接收器连接参数（见类
-     * javadoc 凭据限制）；⑤ {@code receiver.start(this::apply, max(P0, B))}——页对齐
-     * 由接收器内取整，sink 在接收线程同步执行。边界与异常语义：SQLException/ISE
-     * 原样上抛（半建资源由接收器自有生命周期兜底，未 start 的接收器无需停机）；
-     * 重复/前置失败由各组件自身 fail-fast。</p>
-     *
-     * @param sql            引导用 SQL 会话（普通连接；凭据限制见类 javadoc）
+     * @param sql            引导用 SQL 会话（普通连接；凭据派生见类 javadoc）
      * @param slotName       物理槽名
      * @param layout         版本布局描述符（重放引擎与接收器共用）
      * @param interestRelOid 需要列字典/toast 跟踪的关系 oid（v1 tracked 面单表，可空）
@@ -100,6 +98,36 @@ public final class CatalogSynchronizer {
      */
     public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
             long... interestRelOid) throws SQLException {
+        ConnInfo ci = ConnInfo.from(sql);
+        LOG.warn("CatalogSynchronizer 未显式传凭据——复制连接按派生凭据建立（URL 参数优先、"
+                + "否则 user=metadata 用户名/password 空）；密码认证环境请用带凭据重载 start(..., user, password, ...)");
+        return start(sql, slotName, layout, ci.user(), ci.pass(), interestRelOid);
+    }
+
+    /**
+     * v1 组装入口（带凭据档，密码认证环境的推荐形态）：槽确保 → 一致性引导 → 起接收
+     * 流（sink = 本实例 apply）。
+     *
+     * <p>关键步骤：① interest oid 注册进 stores（引导据此定位 tracked 双 ctid；v1
+     * 注册 0 个合法——纯字典同步形态）；② ensureSlot 得 P₀；③ bootstrap 得种子 +
+     * 同事务 flush LSN（B）；④ 接收器连接参数 host/port/db 取引导连接 metadata URL
+     * 派生 + 显式 user/password 覆盖；⑤ {@code receiver.start(this::apply, max(P0, B))}
+     * ——页对齐由接收器内取整，sink 在接收线程同步执行；⑥ 已施加前沿种子化为流起点
+     * max(P₀, B)——引导后首条记录施加前 snapshot().lsn() 即引导一致点而非 0。
+     * 边界与异常语义：SQLException/ISE 原样上抛（半建资源由接收器自有生命周期兜底，
+     * 未 start 的接收器无需停机）；重复/前置失败由各组件自身 fail-fast。</p>
+     *
+     * @param sql            引导用 SQL 会话（普通连接；host/port/db 取其 URL 派生）
+     * @param slotName       物理槽名
+     * @param layout         版本布局描述符（重放引擎与接收器共用）
+     * @param user           复制连接用户（覆盖 URL 派生值）
+     * @param password       复制连接密码（trust 认证环境可传空串）
+     * @param interestRelOid 需要列字典/toast 跟踪的关系 oid（v1 tracked 面单表，可空）
+     * @return 已运行的同步器（apply 消费面 + snapshot 查询面）
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
+            String user, String password, long... interestRelOid) throws SQLException {
         CatalogStores stores = new CatalogStores();
         for (long oid : interestRelOid) {
             stores.interestRelOids().add(oid);
@@ -108,11 +136,12 @@ public final class CatalogSynchronizer {
         long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
         long start = Math.max(p0, bootstrapLsn);
 
-        ConnInfo ci = ConnInfo.from(sql);
+        ConnInfo ci = ConnInfo.from(sql).withCredentials(user, password);
         WalStreamReceiver receiver = new WalStreamReceiver(
                 ci.host(), ci.port(), ci.database(), ci.user(), ci.pass(), layout, slotName);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout)), receiver);
+        sync.appliedLsn = start;    // 前沿种子化：引导一致点而非 0（首条 apply 前的 as-of）
         receiver.start(sync::apply, start);
         LOG.info("CatalogSynchronizer 启动: slot={} 流起点 max(P0={}, bootstrap={}) = {}（interest {} 个）",
                 slotName, Lsn.format(p0), Lsn.format(bootstrapLsn), Lsn.format(start), interestRelOid.length);
@@ -177,7 +206,8 @@ public final class CatalogSynchronizer {
     }
 
     /**
-     * 引导连接的 metadata URL 解析产物（接收器复制连接的四件 + 凭据）。
+     * 引导连接的 metadata URL 解析产物（接收器复制连接的四件 + 凭据）。包可见以便
+     * 离线单测（{@link #parseUrl(String, String)}）。
      *
      * @param host     主机（多宿主取首个，v1 限制）
      * @param port     端口（缺省 5432）
@@ -185,84 +215,113 @@ public final class CatalogSynchronizer {
      * @param user     用户（URL 参数优先，回落 metadata 用户名）
      * @param pass     密码（仅取 URL 参数；缺省空串——trust 认证，见类 javadoc）
      */
-    private record ConnInfo(String host, int port, String database, String user, String pass) {
+    record ConnInfo(String host, int port, String database, String user, String pass) {
 
         /**
-         * 从 JDBC Connection 的 metadata 解析连接参数：URL 即 pgjdbc 建连时的原串
-         * （{@code PgConnection.getURL()} 返回 creatingURL），形如
-         * {@code jdbc:postgresql://host[:port][/db][?k=v&..]}。
+         * 显式凭据覆盖（带凭据重载用）：host/port/db 保持 URL 派生值。
          *
-         * <p>边界与异常语义：非 postgresql URL / 端口非数字抛 ISE（fail-fast 优于
-         * 静默连错目标）；IPv6 字面量与多宿主列表取首段（v1 限制）；URL 参数值不做
-         * 百分号解码（pgjdbc URL 参数即明文 properties，官方语义）。</p>
+         * @param user 覆盖用户
+         * @param pass 覆盖密码
+         * @return 覆盖后的解析产物
+         */
+        ConnInfo withCredentials(String user, String pass) {
+            return new ConnInfo(host, port, database, user, pass);
+        }
+
+        /**
+         * 从 JDBC Connection 的 metadata 解析连接参数（URL 即 pgjdbc 建连原串，
+         * {@code PgConnection.getURL()} 返回 creatingURL），回落用户取
+         * {@code getMetaData().getUserName()}——纯解析逻辑委派 {@link #parseUrl}。
          *
          * @param c 引导连接
          * @return 解析产物
          * @throws SQLException metadata 读取失败
          */
         static ConnInfo from(Connection c) throws SQLException {
-            String url = c.getMetaData().getURL();
-            String prefix = "jdbc:postgresql:";
-            if (!url.startsWith(prefix)) {
-                throw new IllegalStateException("非 postgresql URL，无法派生复制连接: " + url);
-            }
-            String rest = url.substring(prefix.length());
-            Map<String, String> params = new HashMap<>();
-            int q = rest.indexOf('?');
-            if (q >= 0) {
-                for (String kv : rest.substring(q + 1).split("&")) {
-                    int eq = kv.indexOf('=');
-                    if (eq > 0) {
-                        params.put(kv.substring(0, eq), kv.substring(eq + 1));
-                    }
-                }
-                rest = rest.substring(0, q);
-            }
-            String host = "localhost";
-            int port = 5432;
-            String db = null;
-            if (rest.startsWith("//")) {
-                rest = rest.substring(2);
-                int slash = rest.indexOf('/');
-                String hostPort = slash >= 0 ? rest.substring(0, slash) : rest;
-                db = slash >= 0 ? rest.substring(slash + 1) : null;
-                int colon = hostPort.indexOf(':');
-                if (colon >= 0) {
-                    host = hostPort.substring(0, colon);
-                    String portText = hostPort.substring(colon + 1);
-                    try {
-                        port = Integer.parseInt(portText);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalStateException("URL 端口非数字: " + url);
-                    }
-                } else {
-                    host = hostPort;
-                }
-            } else if (!rest.isEmpty()) {
-                db = rest;    // jdbc:postgresql:dbname 形态（全默认主机）
-            }
-            int comma = host.indexOf(',');
-            if (comma >= 0) {
-                host = host.substring(0, comma);    // 多宿主取首个（v1 限制）
-            }
-            String user = params.getOrDefault("user", c.getMetaData().getUserName());
-            if (db == null || db.isEmpty()) {
-                db = user;    // pgjdbc 缺省库 = 用户名
-            }
-            return new ConnInfo(host, port, db, user, params.getOrDefault("password", ""));
+            return parseUrl(c.getMetaData().getURL(), c.getMetaData().getUserName());
         }
     }
 
     /**
-     * {@link CatalogSnapshot} 的内部视图实现——活引用 stores（不冻结拷贝，v1 单线程
-     * 直通下的天然一致；跨协议方法逐查询直读，见接口 javadoc 的尽力一致语义）。
+     * pgjdbc URL 解析（纯函数，包可见供离线单测）：形如
+     * {@code jdbc:postgresql://host[:port][/db][?k=v&..]} 或
+     * {@code jdbc:postgresql:dbname}（全默认主机形态）。
+     *
+     * <p>关键步骤：前缀校验 → query 参数切出（凭据面：user/password）→ 主机段
+     * <strong>先切多宿主逗号再切端口冒号</strong>（{@code //h1:5432,h2:5433} 形态
+     * 若先切冒号会把端口解析成 "5432,h2:5433"——审查修复锚）→ 缺省回落（host
+     * localhost、port 5432、db=用户名、password 空串）。边界与异常语义：非
+     * postgresql URL / 端口非数字抛 ISE（fail-fast 优于静默连错目标）；IPv6 字面量
+     * 不支持（v1 限制）；URL 参数值不做百分号解码（pgjdbc URL 参数即明文
+     * properties，官方语义）。线程约束：纯函数。</p>
+     *
+     * @param url          pgjdbc 建连 URL
+     * @param fallbackUser URL 无 user 参数时的回落用户（metadata 用户名）
+     * @return 解析产物
+     */
+    static ConnInfo parseUrl(String url, String fallbackUser) {
+        String prefix = "jdbc:postgresql:";
+        if (!url.startsWith(prefix)) {
+            throw new IllegalStateException("非 postgresql URL，无法派生复制连接: " + url);
+        }
+        String rest = url.substring(prefix.length());
+        Map<String, String> params = new HashMap<>();
+        int q = rest.indexOf('?');
+        if (q >= 0) {
+            for (String kv : rest.substring(q + 1).split("&")) {
+                int eq = kv.indexOf('=');
+                if (eq > 0) {
+                    params.put(kv.substring(0, eq), kv.substring(eq + 1));
+                }
+            }
+            rest = rest.substring(0, q);
+        }
+        String host = "localhost";
+        int port = 5432;
+        String db = null;
+        if (rest.startsWith("//")) {
+            rest = rest.substring(2);
+            int slash = rest.indexOf('/');
+            String hostPort = slash >= 0 ? rest.substring(0, slash) : rest;
+            db = slash >= 0 ? rest.substring(slash + 1) : null;
+            int comma = hostPort.indexOf(',');
+            if (comma >= 0) {
+                hostPort = hostPort.substring(0, comma);    // 多宿主取首个（先于端口切分）
+            }
+            int colon = hostPort.indexOf(':');
+            if (colon >= 0) {
+                host = hostPort.substring(0, colon);
+                String portText = hostPort.substring(colon + 1);
+                try {
+                    port = Integer.parseInt(portText);
+                } catch (NumberFormatException e) {
+                    throw new IllegalStateException("URL 端口非数字: " + url);
+                }
+            } else {
+                host = hostPort;
+            }
+        } else if (!rest.isEmpty()) {
+            db = rest;    // jdbc:postgresql:dbname 形态（全默认主机）
+        }
+        String user = params.getOrDefault("user", fallbackUser);
+        if (db == null || db.isEmpty()) {
+            db = user;    // pgjdbc 缺省库 = 用户名
+        }
+        return new ConnInfo(host, port, db, user, params.getOrDefault("password", ""));
+    }
+
+    /**
+     * {@link CatalogSnapshot} 的内部视图实现——活引用 stores（不冻结拷贝；行字典为
+     * ConcurrentHashMap，跨线程迭代弱一致不抛 CME——与重放线程并发的尽力一致语义，
+     * 见接口 javadoc 与类 javadoc 线程约束节）。
      */
     private final class SnapshotView implements CatalogSnapshot {
 
         /**
-         * 已施加前沿（最近一次 apply 完成的记录末尾）——字典内容的 as-of 位点。
+         * 已施加前沿（start 种子化为流起点 max(P₀, 引导 LSN)，此后 = 最近一次 apply
+         * 完成的记录末尾）——字典内容的 as-of 位点。
          *
-         * @return 打包 LSN（未施加任何记录为 0）
+         * @return 打包 LSN（未 start 的纯逻辑缝实例为 0）
          */
         @Override
         public long lsn() {

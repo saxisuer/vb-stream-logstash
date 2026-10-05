@@ -83,7 +83,10 @@ public final class CatalogBootstrap {
      * 多个命中取最小 oid 并 WARN）；⑤ 同事务内查 flush LSN → commit 复原 autoCommit
      * → 返回。边界与异常语义：任一 SQLException 走 rollback + 复原 autoCommit 后原样
      * 上抛（半灌状态不留在 stores——调用方废弃本 stores 重建）；interest oid 查无行
-     * WARN 后跳过（关系尚未创建）。线程约束：装配线程单次调用。</p>
+     * WARN 后跳过（关系尚未创建）。<strong>会话副作用</strong>：本方法临时接管调用方
+     * 会话的事务边界——关闭 autoCommit、置 REPEATABLE READ、结束时 commit——调用方
+     * 在传入连接上若有<strong>未决事务会被一并 commit</strong>（请以干净会话传入）。
+     * 线程约束：装配线程单次调用。</p>
      *
      * @param stores 引导目标状态容器（本方法为首个也是唯一写者）
      * @return 引导完成时点的 {@code pg_current_wal_flush_lsn()}（打包 long）
@@ -207,8 +210,8 @@ public final class CatalogBootstrap {
      */
     private void locateTracked(CatalogStores stores) throws SQLException {
         List<long[]> existing = new ArrayList<>();    // 元素 {oid, tableCtid, toastOid}
-        for (long oid : stores.interestRelOids()) {
-            try (PreparedStatement ps = connection.prepareStatement(INTEREST_CLASS_SQL)) {
+        try (PreparedStatement ps = connection.prepareStatement(INTEREST_CLASS_SQL)) {
+            for (long oid : stores.interestRelOids()) {
                 ps.setLong(1, oid);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
