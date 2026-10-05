@@ -63,11 +63,21 @@ public class WalParseSpike {
 
     // heapam_xlog.h opcodes (low nibble reserved, opmask 0x70)
     static final int XLOG_HEAP_INSERT = 0x00;
+    static final int XLOG_HEAP_DELETE = 0x10;
+    static final int XLOG_HEAP_UPDATE = 0x20;
+    static final int XLOG_HEAP_HOT_UPDATE = 0x40;
     static final int XLOG_HEAP2_MULTI_INSERT = 0x50;
     static final int XLOG_HEAP_INIT_PAGE = 0x80;
     static final int XLOG_XACT_COMMIT = 0x00;
     static final int XLOG_XACT_ABORT = 0x20;
     static final int XLOG_XACT_OPMASK = 0x70;
+
+    // xl_heap_update / xl_heap_delete flag bits (heapam_xlog.h)
+    static final int XLH_UPDATE_CONTAINS_OLD = 0x04 | 0x08; // OLD_TUPLE|OLD_KEY
+    static final int XLH_UPDATE_TRUNCATION = 0x20 | 0x40;   // PREFIX|SUFFIX_FROM_OLD
+    static final int XLH_DELETE_CONTAINS_OLD = 0x02 | 0x04; // OLD_TUPLE|OLD_KEY
+    static final int SIZEOF_HEAP_UPDATE = 14;                // offsetof(new_offnum)+2
+    static final int SIZEOF_HEAP_DELETE = 8;
 
     // xlogrecord.h block/data header ids and flags
     static final int BKPBLOCK_HAS_IMAGE = 0x10;
@@ -611,7 +621,34 @@ public class WalParseSpike {
             expected.add(List.of(renderRow(ra1), renderRow(ra2)));
             expected.add(List.of(renderRow(rb1), renderRow(rb2)));
         }
+        // S4: UPDATE/DELETE — default replica identity first (no old tuple in WAL),
+        // then REPLICA IDENTITY FULL (whole old row rides in main data)
+        try (Statement st = setup.createStatement()) {
+            String r20 = row(20), r21 = row(21), r22 = row(22);
+            st.execute("INSERT INTO t_wal_spike VALUES " + r20 + ", " + r21 + ", " + r22);
+            expected.add(List.of(renderRow(r20), renderRow(r21), renderRow(r22)));
+
+            String upd1 = literal(120, "upd-def-π", 1200, false, "2027-01-01 10:00:00.000001");
+            st.execute("UPDATE t_wal_spike SET id=120, s='upd-def-π', f=1200.5, b=false,"
+                    + " ts='2027-01-01 10:00:00.000001' WHERE id=20");
+            expected.add(List.of("U(none)>(" + renderRow(upd1) + ")"));
+
+            st.execute("ALTER TABLE t_wal_spike REPLICA IDENTITY FULL");
+
+            String upd2 = literal(121, "upd-full-π", 1210, true, "2027-01-01 10:00:00.000002");
+            st.execute("UPDATE t_wal_spike SET id=121, s='upd-full-π', f=1210.5, b=true,"
+                    + " ts='2027-01-01 10:00:00.000002' WHERE id=21");
+            expected.add(List.of("U(" + renderRow(r21) + ")>(" + renderRow(upd2) + ")"));
+
+            st.execute("DELETE FROM t_wal_spike WHERE id=22");
+            expected.add(List.of("D(" + renderRow(r22) + ")"));
+        }
         return expected;
+    }
+
+    /** Row literal with explicit values (for S4 mutation expectations). */
+    static String literal(int id, String text, int fInt, boolean b, String ts) {
+        return String.format("(%d, '%s', %d.5, %s, '%s')", id, text, fInt, b, ts);
     }
 
     /** Deterministic row literal for the given id. */
@@ -622,11 +659,12 @@ public class WalParseSpike {
 
     /** The rendering the decoder is expected to produce for a row literal. */
     static String renderRow(String rowLiteral) {
-        // (id, 's-...-π', f.5, bool, 'ts') -> decode gives: id, text, double, "true"/"false", ISO ts
+        // (id, 'text', f.5, bool, 'YYYY-MM-DD hh:mm:ss.ffffff') -> decoder output form
         java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "\\((\\d+), '(s-\\d+-π)', (\\d+)\\.5, (true|false), '\\d+-\\d+-\\d+ (\\d+):(\\d+):(\\d+)\\.(\\d+)'\\)").matcher(rowLiteral);
+                "\\((\\d+), '([^']+)', (\\d+)\\.5, (true|false), '(\\d+)-(\\d+)-(\\d+) (\\d+):(\\d+):(\\d+)\\.(\\d+)'\\)").matcher(rowLiteral);
         if (!m.matches()) throw new IllegalArgumentException(rowLiteral);
-        String ts = String.format("2026-10-05T%s:%s:%s.%s", m.group(5), m.group(6), m.group(7), m.group(8));
+        String ts = String.format("%s-%s-%sT%s:%s:%s.%s",
+                m.group(5), m.group(6), m.group(7), m.group(8), m.group(9), m.group(10), m.group(11));
         return "(" + m.group(1) + ", " + m.group(2) + ", " + m.group(3) + ".5, " + m.group(4) + ", " + ts + ")";
     }
 
@@ -678,6 +716,34 @@ public class WalParseSpike {
                     }
                 }
                 rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>()).add(decoded);
+            } else if (rec.rmid() == RM_HEAP_ID
+                    && ((rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_UPDATE
+                        || (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_HOT_UPDATE)) {
+                BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relNode);
+                if (b0 == null) continue;
+                int upFlags = rec.raw()[rec.mainOff() + 7];
+                if ((upFlags & XLH_UPDATE_TRUNCATION) != 0)
+                    throw new IllegalStateException("prefix/suffix truncation not supported in spike (flags=0x"
+                            + Integer.toHexString(upFlags) + ")");
+                // old tuple (replica identity), when present, sits in MAIN data
+                // right after the xl_heap_update struct
+                String oldStr = "none";
+                if ((upFlags & XLH_UPDATE_CONTAINS_OLD) != 0)
+                    oldStr = tupleFromPayload(rec.raw(), rec.mainOff() + SIZEOF_HEAP_UPDATE).toString();
+                // new tuple is block 0's data, same shape as insert
+                String newStr = tupleFromPayload(rec.raw(), b0.dataOff()).toString();
+                singleInsertRecords++; // same payload shape as insert for bookkeeping
+                rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>())
+                        .add("U(" + oldStr + ")>(" + newStr + ")");
+            } else if (rec.rmid() == RM_HEAP_ID && (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP_DELETE) {
+                BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relNode);
+                if (b0 == null) continue;
+                int delFlags = rec.raw()[rec.mainOff() + 7];
+                String oldStr = "none";
+                if ((delFlags & XLH_DELETE_CONTAINS_OLD) != 0)
+                    oldStr = tupleFromPayload(rec.raw(), rec.mainOff() + SIZEOF_HEAP_DELETE).toString();
+                rowsByXid.computeIfAbsent(rec.xid(), k -> new ArrayList<>())
+                        .add("D(" + oldStr + ")");
             } else if (rec.rmid() == RM_HEAP2_ID && (rec.info() & XLOG_XACT_OPMASK) == XLOG_HEAP2_MULTI_INSERT) {
                 BlockRef b0 = findHeapBlock(rec, spcOid, dbOid, relNode);
                 if (b0 == null) continue;
@@ -753,6 +819,19 @@ public class WalParseSpike {
             if (b.fork() == 0 && b.spc() == spc && b.db() == db && b.relNode() == relNode) return b;
         }
         return null;
+    }
+
+    /**
+     * Decodes one tuple from a WAL payload region laid out as
+     * [xl_heap_header (5B)][tuple bytes from heap-tuple offset 23] — the common
+     * shape used by insert/update/delete records (each may embed several).
+     */
+    static Row tupleFromPayload(byte[] raw, int off) {
+        int infomask2 = u16(raw, off);
+        int infomask = u16(raw, off + 2);
+        int tHoff = raw[off + 4] & 0xFF;
+        int tupleStart = off + 5 - TUPLE_BITS_OFFSET;
+        return decodeTupleData(raw, tupleStart, tHoff, infomask, infomask2);
     }
 
     // ---- jdbc helpers -----------------------------------------------------------

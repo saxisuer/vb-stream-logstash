@@ -11,8 +11,9 @@
 
 ## 结论：主干成立（PASS，连续多次稳定复现）
 
-8 个事务 16 行全部解出且与写入值**逐字节一致**（含 UTF-8 文本 π、float8、bool、
-timestamp 微秒精度）；事务分组与提交序全对。验证覆盖：
+12 个事务 22 个变更全部解出且与写入值**逐字节一致**（INSERT 行值、UPDATE 新旧整行、
+DELETE 前像；含 UTF-8 文本 π、float8、bool、timestamp 微秒精度）；事务分组与提交序
+全对。验证覆盖：
 
 | 场景 | 结果 |
 |---|---|
@@ -20,6 +21,7 @@ timestamp 微秒精度）；事务分组与提交序全对。验证覆盖：
 | S1c：COPY 3 行 → 真 multi-insert 记录（HEAP2 0x50，3 tuple 单记录） | ✓ 逐 tuple 解码正确 |
 | S2：CHECKPOINT 后 INSERT → FPW 记录（跨页 contrecord + 页镜像） | ✓ 记录拼接成功；页镜像重建（hole 拼接）→ ItemId 走读 → 页内 tuple 解码交叉验证 1/1 通过 |
 | S3：两连接交错事务（A1,B1,A2,B2；先 commit A 后 B） | ✓ 按 xid 分组不串、提交序正确 |
+| S4：默认 replica identity 的 UPDATE（无前像）→ `REPLICA IDENTITY FULL` 后 UPDATE（新旧整行）/ DELETE（前像整行） | ✓ 默认 RI 无 old tuple（与逻辑解码同约束，实证）；FULL 下 `U(old)>(new)`、`D(old)` 逐字节正确；HOT 更新（0x40）与普通更新同构解码 |
 
 ## 过程中钉死的关键事实（正式模块的资产）
 
@@ -46,9 +48,17 @@ timestamp 微秒精度）；事务分组与提交序全对。验证覆盖：
    = XLogLogicalInfoActive && NeedsWAL && 非外播非 catalog——insert 设
    REGBUF_KEEP_DATA（FPW 时也保留数据）、multi-insert 仅在此时注册 tuple 数据。
    `wal_level=replica` 下 FPW 记录**不含** block data，必须走页镜像提取（可行，镜像即页）。
-10. 记录形态普查（本次窗口）：heap 0x00/0x40/0x70/0x80、heap2 0x50/0x70、XACT 0x00~0x80
-    （含 INVALIDATIONS 0x60）、XLOG_FPI 0xB0、btree、standby、smgr create——正式模块的
-    过滤白名单以外的形态只需识别即可跳过。
+10. 记录形态普查（本次窗口）：heap 0x00/0x10/0x20/0x40/0x70/0x80、heap2 0x50/0x70、
+    XACT 0x00~0x80（含 INVALIDATIONS 0x60）、XLOG_FPI 0xB0、btree、standby、smgr
+    create——正式模块的过滤白名单以外的形态只需识别即可跳过。
+12. **UPDATE/DELETE 的前像位置**：old tuple（replica identity 产出）拼在 **main data**
+    尾部——`xl_heap_update`（14B：old_xmax u32/old_offnum u16/old_infobits u8/flags u8/
+    new_xmax u32/new_offnum u16）之后、`xl_heap_delete`（8B）之后，格式同 insert 的
+    `[xl_heap_header 5B][从 tuple offset 23 起的字节]`；new tuple 在 block 0 data（同
+    insert）。HOT 更新（0x40）与普通更新（0x20）记录同构。
+13. **prefix/suffix 截断**（`XLH_UPDATE_PREFIX/SUFFIX_FROM_OLD`）：更新未变更的首/尾列
+    字节不落盘，需用 old tuple 重建——spike 以断言拦截（S4 通过改全列规避），正式模块
+    必须实现（old tuple 可得时重建平凡）。
 11. 流起始的**孤立续体**（contrecord 头在窗口之前）需静默跳过；起始 LSN 向下对齐到页边界
     后首个页可能是续体页。记录跨页拼接要按"当前页剩余空间"取数，不能把累计消耗与页内
     偏移混在同一坐标系（多页记录必踩）。
@@ -63,8 +73,9 @@ timestamp 微秒精度）；事务分组与提交序全对。验证覆盖：
 
 ## 正式模块第二梯队验证清单（按风险排序）
 
-1. UPDATE / DELETE 记录 + replica identity 前像提取（delete 前像仅 replica identity 非
-   default 时在 WAL）
+1. ~~UPDATE / DELETE 记录 + replica identity 前像提取~~ **已验证**（S4，2026-10-05 补强）：
+   RI FULL 下前像整行在 main data 尾、HOT 同构、默认 RI 无前像；遗留仅 prefix/suffix
+   截断重建（见发现 13）
 2. catalog 重放器：pg_attribute/pg_class 的 heap 记录按 ctid 索引重建行集 + JDBC 引导快照
    的重叠窗口幂等性
 3. relfilenode 生命周期：TRUNCATE/VACUUM FULL/rewrite 的 SMGR 记录映射 + pg_filenode.map
