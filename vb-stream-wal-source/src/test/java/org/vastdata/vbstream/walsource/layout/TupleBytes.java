@@ -220,6 +220,134 @@ public final class TupleBytes {
     }
 
     /**
+     * text 列写行内压缩 varlena（4B 头 tag 0x02 + u32 tcinfo + 纯字面量 pglz 流——
+     * 真实 pglz 的合法子集：control byte 0x00 后跟 ≤8 个字面量字节逐组重复）。
+     *
+     * @param s 被压缩的原文（UTF-8）
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 text
+     */
+    public TupleBytes compressedText(String s) {
+        byte[] raw = s.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeU32(out, (4L + 4 + pglzLiteralSize(raw.length)) << 2 | 0x02);   // 4B_C 头：总长<<2|tag
+        writeU32(out, raw.length);                                            // tcinfo：exhdrlen 低 30 位（pglz 方法=0）
+        for (int off = 0; off < raw.length; off += 8) {
+            out.write(0x00);                                                  // control byte：8 个字面量位
+            out.write(raw, off, Math.min(8, raw.length - off));
+        }
+        return scalar("text", 4, out.toByteArray());
+    }
+
+    /**
+     * 纯字面量 pglz 流的字节数（每 8 个字面量一组，每组前缀 1 控制字节）。
+     */
+    private static int pglzLiteralSize(int rawLen) {
+        return rawLen + (rawLen + 7) / 8;
+    }
+
+    /**
+     * date 列（i32 天数自 2000-01-01，小端，4 对齐）。
+     *
+     * @param days 自 2000-01-01 起的天数（可为负）
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 date
+     */
+    public TupleBytes date(int days) {
+        return scalar("date", 4, le32(days));
+    }
+
+    /**
+     * time 列（i64 微秒自当日零点，小端，8 对齐）。
+     *
+     * @param micros 微秒数
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 time
+     */
+    public TupleBytes timeMicros(long micros) {
+        return scalar("time", 8, le64(micros));
+    }
+
+    /**
+     * timetz 列（i64 微秒 + i32 区偏移秒，共 12B 定宽，8 对齐）。
+     *
+     * @param micros      时间微秒
+     * @param zoneSeconds 区偏移秒（PG TimeZoneADT.zone）
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 timetz
+     */
+    public TupleBytes timetzMicros(long micros, int zoneSeconds) {
+        byte[] cell = new byte[12];
+        byte[] t = le64(micros);
+        byte[] z = le32(zoneSeconds);
+        System.arraycopy(t, 0, cell, 0, 8);
+        System.arraycopy(z, 0, cell, 8, 4);
+        return scalar("timetz", 8, cell);
+    }
+
+    /**
+     * timestamptz 列（i64 微秒 epoch 2000 UTC，小端，8 对齐）。
+     *
+     * @param micros 自 2000-01-01T00:00:00Z 起微秒
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 timestamptz
+     */
+    public TupleBytes tstz(long micros) {
+        return scalar("timestamptz", 8, le64(micros));
+    }
+
+    /**
+     * uuid 列（16 字节网络序原文，'c' 对齐即 1 字节对齐）。
+     *
+     * @param b 16 字节 uuid
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 uuid
+     */
+    public TupleBytes uuidBytes(byte[] b) {
+        if (b.length != 16) {
+            throw new IllegalStateException("uuid must be 16 bytes: " + b.length);
+        }
+        return scalar("uuid", 1, b.clone());
+    }
+
+    /**
+     * numeric 列（varlena 内容 = 已剥头的磁盘格式，恒 4B varlena 头包裹——首 u16 的
+     * flag 位自证短/长/特殊格式）。
+     *
+     * @param content 磁盘格式内容字节（短格式 ≥2B / 长格式 ≥4B）
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 numeric
+     */
+    public TupleBytes numericContent(byte[] content) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeU32(out, (4L + content.length) << 2);
+        out.writeBytes(content);
+        return scalar("numeric", 4, out.toByteArray());
+    }
+
+    /**
+     * text 列写 18B external 短指针（0x01/0x12 + 四 u32——行内 TOAST 接线用例的
+     * 手造形态，对齐 'i' 即 4）。
+     *
+     * @param rawsize    原始 varlena 总长（载荷 + 4B 头）
+     * @param extsize    外部存储字节数（== chunk 拼接总长）
+     * @param valueid    toast chunk_id
+     * @param toastrelid toast 关系 oid
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 text
+     */
+    public TupleBytes externalPointer(long rawsize, long extsize, long valueid, long toastrelid) {
+        byte[] cell = new byte[18];
+        cell[0] = 0x01;
+        cell[1] = 0x12;
+        put32(cell, 2, rawsize);
+        put32(cell, 6, extsize);
+        put32(cell, 10, valueid);
+        put32(cell, 14, toastrelid);
+        return scalar("text", 4, cell);
+    }
+
+    /**
      * text 列（强制 4B varlena 头）——直击解码端 {@code u32le>>>2} 读长的防 BE 回归用例。
      *
      * @param s 文本（UTF-8 编码）
@@ -467,6 +595,20 @@ public final class TupleBytes {
      */
     private static byte[] le32(int v) {
         return new byte[]{(byte) v, (byte) (v >>> 8), (byte) (v >>> 16), (byte) (v >>> 24)};
+    }
+
+    /**
+     * 就地写 little-endian u32（external 指针四字段）。
+     *
+     * @param target 目标数组
+     * @param offset 起始偏移
+     * @param v      32 位值
+     */
+    private static void put32(byte[] target, int offset, long v) {
+        target[offset] = (byte) (v & 0xFF);
+        target[offset + 1] = (byte) ((v >>> 8) & 0xFF);
+        target[offset + 2] = (byte) ((v >>> 16) & 0xFF);
+        target[offset + 3] = (byte) ((v >>> 24) & 0xFF);
     }
 
     /**

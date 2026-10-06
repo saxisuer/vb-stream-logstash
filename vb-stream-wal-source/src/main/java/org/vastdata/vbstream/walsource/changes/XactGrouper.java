@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
 import org.vastdata.vbstream.walsource.layout.BlockRef;
+import org.vastdata.vbstream.walsource.layout.DecodeKinds;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.HeapViews;
 import org.vastdata.vbstream.walsource.layout.PageImages;
@@ -68,15 +69,18 @@ import java.util.Set;
  * <p><b>TOAST 接线</b>：toast 关系（relkind 't'）上的 INSERT/MULTI_INSERT 解码为
  * 三列 chunk 行喂 {@link ToastAssembler#onChunkRow}；每个事务终态记录（COMMIT/ABORT/
  * PREPARE/两阶段确认）后调 {@link ToastAssembler#clear()}（控制器裁定全清——valueid
- * 全局唯一依据与交错风险面见其 javadoc）。<b>已知限制</b>：用户表元组内的 external/
- * compressed varlena 由 v1 {@link TupleDecoder} 的拒绝面 ISE fail-fast（词典扩展 +
- * {@code resolveExternal} 的行内接线属后续任务——发射层只完成 chunk 采集与淘汰）。</p>
+ * 全局唯一依据与交错风险面见其 javadoc）。<b>行内 external 接线（Task 7 硬前置②）
+ * </b>：本类构造的 {@link TupleDecoder} 注入 {@code toast::resolveExternal}——用户表
+ * 元组内首字节 0x01 的 external 短指针经已归集 chunk 拼装/解压/回查兜底重建原值
+ * （缺值降级 {@code toast-unavailable} 不 fail 流）；toast=null（采集禁用）时保持
+ * v1 拒绝面。行内 compressed varlena（tag 0x02）仍 ISE——非 TOAST 重组面。</p>
  *
- * <p><b>类型词典限制</b>：列 kind 由 typeOid 映射 {@link TupleDecoder} 既有词汇
- * （bool/整族/浮族/文本族/bytea/name/char/timestamp），date/time/timestamptz/
- * numeric/uuid 等矩阵外 oid 解码即 ISE（走读对位无法维持）——词典扩展属双路对拍
- * （MS3+）前置任务。UPDATE 前缀/后缀截断（XLH_UPDATE_TRUNCATION）的新元组重建
- * 同为 v2 未落面（spike 遗留，撞上即解码失败 fail-fast 而非静默错位）。</p>
+ * <p><b>类型词典</b>：列 kind 由 typeOid 经 {@link DecodeKinds#forTypeOid} 单源派生
+ * ——Task 7 硬前置①扩容后与渲染矩阵 oid 集合对齐（含 date/time/timetz/
+ * timestamptz/numeric/uuid 的 datum 字节形态），enum/域/jsonb/组合类型等矩阵外
+ * oid 解码即 ISE（走读对位无法维持——双路对拍 MS3+ 的扩面输入）。UPDATE 前缀/
+ * 后缀截断（XLH_UPDATE_TRUNCATION）的新元组重建同为 v2 未落面（spike 遗留，
+ * 撞上即解码失败 fail-fast 而非静默错位）。</p>
  *
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程顺序喂 onRecord，与 v1 replay 组件
  * 同假设）；listener 回调与 TOAST 组装同线程发生。跨重启安全依赖调用方保证：本类
@@ -147,6 +151,12 @@ public final class XactGrouper {
     /** 护栏 WARN 已发标记（计数节流：超阈值只告警一次，回落不重置）。 */
     private boolean preparedOverflowWarned;
 
+    /** 已发射事务桶计数（emitBucket 递增——Main 周期 smoke 行的 DML 观测面，volatile 跨线程读）。 */
+    private volatile long emittedBuckets;
+
+    /** 已发射行计数（过滤后实付口径，emitBucket 累加 emitted——volatile 跨线程读）。 */
+    private volatile long emittedRows;
+
     /**
      * 装配组装器。
      *
@@ -165,7 +175,7 @@ public final class XactGrouper {
         this.snapshot = snapshot;
         this.filter = new TableFilter(snapshot, whitelist);
         this.layout = layout;
-        this.decoder = new TupleDecoder(layout);
+        this.decoder = new TupleDecoder(layout, toast);
         this.toast = toast;
         this.out = out;
     }
@@ -668,6 +678,31 @@ public final class XactGrouper {
             emitted++;
         }
         out.onEnd(new ChangeOutputListener.BatchEnd(b.xid, emitted, expected));
+        emittedBuckets++;
+        emittedRows += emitted;
+    }
+
+    /**
+     * DML 观测面：已发射事务桶数（提交时批量发射的 Begin-End 批次数）。
+     *
+     * <p>单写者递增（发射线程）、volatile 读——Main 周期 smoke 行与宿主轮询安全。
+     * 回滚/无行事务不计。</p>
+     *
+     * @return 已发射桶数（会话累计）
+     */
+    public long emittedBuckets() {
+        return emittedBuckets;
+    }
+
+    /**
+     * DML 观测面：已发射行数（aborted 过滤后的实付口径）。
+     *
+     * <p>单写者递增、volatile 读；与 {@link #emittedBuckets()} 同批更新。</p>
+     *
+     * @return 已发射行数（会话累计）
+     */
+    public long emittedRows() {
+        return emittedRows;
     }
 
     /**
@@ -758,12 +793,13 @@ public final class XactGrouper {
     }
 
     /**
-     * 表的列词典派生：typeOid → {@link TupleDecoder} kind 映射（词汇面 = v1 既有
-     * 13 kind；dropped 列 → "dropped" 零消耗占位）。
+     * 表的列词典派生：typeOid → {@link TupleDecoder} kind 映射（词汇面 =
+     * {@link DecodeKinds#forTypeOid} 渲染矩阵全集——Task 7 硬前置①扩容后单源派生，
+     * 不在本类复刻 switch；dropped 列 → "dropped" 零消耗占位）。
      *
-     * <p>边界与异常语义：矩阵外 oid（date/time/timestamptz/numeric/uuid 等——渲染
-     * 矩阵已覆盖但解码词典未扩的面）抛 ISE fail-fast：继续解码只会列错位，静默
-     * 产出错值。线程约束：纯函数。</p>
+     * <p>边界与异常语义：词典外 oid（enum/域/jsonb/组合类型等动态格式）抛 ISE
+     * fail-fast（包装 {@link DecodeKinds#forTypeOid} 的拒绝并补列名上下文）：继续
+     * 解码只会列错位，静默产出错值。线程约束：纯函数。</p>
      *
      * @param meta 表身份 + 列序
      * @return 逐列 kind 词典
@@ -778,23 +814,12 @@ public final class XactGrouper {
                 kinds[i] = "dropped";
                 continue;
             }
-            kinds[i] = switch ((int) col.typeOid()) {
-                case 16 -> "bool";                       // bool
-                case 21 -> "int2";                       // int2
-                case 23 -> "int4";                       // int4
-                case 20 -> "int8";                       // int8
-                case 26, 28, 29 -> "oid";                // oid/xid/cid（同 u32 面）
-                case 700 -> "float4";                    // float4
-                case 701 -> "float8";                    // float8
-                case 18 -> "char";                       // "char"
-                case 19 -> "name";                       // name
-                case 25, 114, 1042, 1043 -> "text";      // text/json/bpchar/varchar
-                case 17 -> "bytea";                      // bytea
-                case 1114 -> "timestamp";                // timestamp
-                default -> throw new IllegalStateException("列 " + col.name() + " 的类型 oid="
-                        + col.typeOid() + " 超出 TupleDecoder 词典面（date/time/numeric/uuid 等"
-                        + "的解码扩展属 v2 后续任务），继续解码只会列错位");
-            };
+            try {
+                kinds[i] = DecodeKinds.forTypeOid(col.typeOid());
+            } catch (IllegalStateException e) {
+                throw new IllegalStateException("列 " + col.name() + " 的类型 oid=" + col.typeOid()
+                        + " 超出解码词典面（enum/域/jsonb 等动态格式属矩阵外），继续解码只会列错位", e);
+            }
         }
         return kinds;
     }

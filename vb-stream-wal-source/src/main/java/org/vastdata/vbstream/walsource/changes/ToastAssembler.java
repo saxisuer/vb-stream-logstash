@@ -2,6 +2,7 @@ package org.vastdata.vbstream.walsource.changes;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -54,7 +55,7 @@ import java.util.TreeMap;
  * Task 5 的 XactGrouper 接线；bytea 等 TOAST 宽值经 UTF-8 {@link String} 交付对
  * 非文本类型有损（首发矩阵 TOAST 面只覆盖文本族）。</p>
  */
-public final class ToastAssembler {
+public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
 
     private static final Logger LOG = LoggerFactory.getLogger(ToastAssembler.class);
 
@@ -212,6 +213,41 @@ public final class ToastAssembler {
             return new String(raw, StandardCharsets.UTF_8);
         }
         return new String(concat, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 行内压缩 varlena 的解压面（{@link TupleDecoder.VarlenaResolver} 契约，Task 7
+     * 行内接线）——payload 即剥去 4B varlena 头的
+     * {@code [u32 tcinfo = exhdrlen 低 30 位 | 方法&lt;&lt;30][pglz 流]}，与 external
+     * 压缩值的 chunk 拼接体<b>同构</b>（同一 pglz_compress 产出面，2026-10-07 实测：
+     * 64000 字符 repeat 型宽值压缩至 779B 行内落盘、头上 30 位承载总长）。
+     *
+     * <p>关键步骤：载荷 &lt;4B 抛 ISE（缺 tcinfo 头）；tcinfo 方法位判定——lz4 ISE
+     * fail-fast（无 lz4 解压面，静默只会产出错值）；剥 4B tcinfo 后
+     * {@link Pglz#decompress} 解至低 30 位声明的原长。边界与异常语义：tcinfo/pglz
+     * 数据不符抛 ISE（走读错位信号）；与 {@link #resolveExternal} 不同，本面无降级
+     * 形态（行内数据自包含，缺值不可能发生）。线程约束：单写者（与解码同线程）。</p>
+     *
+     * @param payload 行内压缩载荷（4B varlena 头已剥，≥4B 才含 tcinfo）
+     * @return 解压后的原载荷字节
+     * @throws IllegalStateException tcinfo 头缺失/lz4 方法码/pglz 数据不符
+     */
+    @Override
+    public byte[] decompressInlineCompressed(byte[] payload) {
+        if (payload.length < 4) {
+            throw new IllegalStateException("行内压缩 varlena 缺 tcinfo 头: 载荷 " + payload.length + "B");
+        }
+        int tcinfo = (int) u32le(payload, 0);
+        int rawLen = tcinfo & EXTSIZE_MASK;
+        int method = tcinfo >>> EXTSIZE_BITS;
+        if (method != METHOD_PGLZ) {
+            throw new IllegalStateException(method == METHOD_LZ4
+                    ? "lz4 压缩的行内 varlena 不受支持（无 lz4 解压面）"
+                    : "未知行内压缩方法码 " + method);
+        }
+        byte[] pglz = new byte[payload.length - 4];
+        System.arraycopy(payload, 4, pglz, 0, pglz.length);
+        return Pglz.decompress(pglz, rawLen);
     }
 
     /**

@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.StringJoiner;
+import java.util.function.Consumer;
 
 /**
  * 伪备库 catalog 同步器（spec §5 组件四）：JDBC 一致性引导 + 物理流接收 + ctid 重放
@@ -174,7 +175,7 @@ public final class CatalogSynchronizer {
         ConnInfo ci = ConnInfo.from(sql);
         LOG.warn("CatalogSynchronizer 未显式传凭据——复制连接按派生凭据建立（URL 参数优先、"
                 + "否则 user=metadata 用户名/password 空）；密码认证环境请用带凭据重载 start(..., user, password, ...)");
-        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, null, 0L, interestRelOid);
+        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, null, 0L, null, interestRelOid);
     }
 
     /**
@@ -211,7 +212,7 @@ public final class CatalogSynchronizer {
         // SelfHealer 真接线（Task 13 装配裁定）：带凭据档 = 生产推荐形态，探测复用引导会话
         // ——probe 在接收线程单写者上下文调用，引导会话自此归同步器独占（调用方不得并发使用）
         return startInternal(sql, slotName, layout, user, password,
-                new SelfHealer(new JdbcProbeImpl(sql)), null, 0L, interestRelOid);
+                new SelfHealer(new JdbcProbeImpl(sql)), null, 0L, null, interestRelOid);
     }
 
     /**
@@ -258,7 +259,40 @@ public final class CatalogSynchronizer {
             String user, String password, StateConfig state, long forcedStartLsn,
             long... interestRelOid) throws SQLException {
         return startInternal(sql, slotName, layout, user, password,
-                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, interestRelOid);
+                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, null, interestRelOid);
+    }
+
+    /**
+     * v2 组装入口（带凭据 + 检查点 + <b>post-apply 分发接缝</b>，Task 7）：全参档之上
+     * 给接收器 sink 串接第二消费者——每条记录先 {@link #apply}（catalog 字典施加）
+     * 再 {@code postApply.accept(rec)}（典型 {@code ChangeStream::onRecord} 用户表变更
+     * 组装），<b>次序固定</b>：先字典后解码，保证变更面读到施加本记录后的 as-of 快照
+     * （预检裁定 #1：分发改造优先在 WalSource 层做，本接缝是 WalSource 拿不到接收器
+     * sink 的最小让步——同步器内部逻辑零改动，只是 sink 组合点）。
+     *
+     * <p>关键步骤：与全参档共用 {@link #startInternal}（healer/state/续传决策一致），
+     * 仅 {@code receiver.start} 的 sink 由 {@code sync::apply} 换为两段串联。边界与
+     * 异常语义：postApply 抛异常即接收线程失败面（与 apply 同生共死——fail-fast 不
+     * 吞）；postApply 与 apply 在同一 wal-receiver 线程逐条串行，共享引导会话（如
+     * TOAST probe）属单写者上下文的既有契约允许形态。线程约束：wal-receiver 单写者。</p>
+     *
+     * @param sql             引导用 SQL 会话（probe 与槽推进复用，归同步器独占）
+     * @param slotName        物理槽名
+     * @param layout          版本布局描述符
+     * @param user            复制连接用户
+     * @param password        复制连接密码
+     * @param state           检查点配置（null 或 dir=null = 禁用）
+     * @param forcedStartLsn  显式流起点（0 = 按决策；&gt;0 = 覆盖，诊断接缝）
+     * @param postApply       apply 之后的第二消费者（null = 等价全参档；每条记录同步调用）
+     * @param interestRelOid  tracked 面 oid
+     * @return 已运行的同步器
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
+            String user, String password, StateConfig state, long forcedStartLsn,
+            Consumer<WalRecord> postApply, long... interestRelOid) throws SQLException {
+        return startInternal(sql, slotName, layout, user, password,
+                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, postApply, interestRelOid);
     }
 
     /**
@@ -275,6 +309,7 @@ public final class CatalogSynchronizer {
      * @param healer         截断自愈校验器（null = 禁用）
      * @param state          检查点配置（null = 禁用）
      * @param forcedStartLsn 显式流起点（0 = 按决策；&gt;0 = 覆盖）
+     * @param postApply      apply 之后的第二消费者（null = 纯 catalog 形态；Task 7 接缝）
      * @param interestRelOid tracked 面 oid
      * @return 已运行的同步器
      * @throws SQLException 槽管理或引导查询失败
@@ -282,7 +317,7 @@ public final class CatalogSynchronizer {
      */
     private static CatalogSynchronizer startInternal(Connection sql, String slotName, WalLayout layout,
             String user, String password, SelfHealer healer, StateConfig state, long forcedStartLsn,
-            long... interestRelOid) throws SQLException {
+            Consumer<WalRecord> postApply, long... interestRelOid) throws SQLException {
         // 版本交叉校验（审查 Med-3）：连接端 server_version_num 与 layout 双向核对——
         // 错配的常量会让页遍历/记录解析/投影槽位整体错位（如 V18 layout 读 V17 的
         // reltoastrelid@112 会读进 relallvisible），必须在任何槽/流副作用之前 fail-fast
@@ -360,7 +395,12 @@ public final class CatalogSynchronizer {
             sync.lastCheckpointWallMs = System.currentTimeMillis();
             sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
         }
-        receiver.start(sync::apply, start);
+        receiver.start(postApply == null
+                ? sync::apply
+                : rec -> {
+                    sync.apply(rec);            // 先施加字典——变更面读到的即施加本记录后的 as-of 快照
+                    postApply.accept(rec);
+                }, start);
         LOG.info("CatalogSynchronizer 启动: slot={} 流起点 {}（interest {} 个, selfHeal={}, state={}, resumed={}）",
                 slotName, Lsn.format(start), interestRelOid.length, healer != null,
                 state != null && state.enabled(), resumed);

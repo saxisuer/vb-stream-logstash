@@ -3,6 +3,7 @@ package org.vastdata.vbstream.walsource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.WalSource;
+import org.vastdata.vbstream.walsource.changes.OutputRenderer;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 
@@ -47,19 +48,22 @@ public final class Main {
     }
 
     /**
-     * 冒烟入口：收集配置 → 起门面 → 周期统计行循环 → hook 优雅停。
+     * 冒烟入口：收集配置 → 起门面（DML 面默认开——OutputRenderer 注入）→ 周期统计行
+     * 循环 → hook 优雅停。
      *
-     * <p>关键步骤：① 六键逐一 {@code System.getProperty} 非 null 才入 Properties（null 不覆盖
-     * 门面默认值）；② {@link WalSource#start()} 失败（连不上/版本不支持/权限不足）ERROR 记
-     * 录后 close 释放半开资源并 {@code System.exit(1)}；③ shutdown hook（名 wal-source-shutdown）
-     * 调 close + countDown——主线程 await 以 10s 分片睡，被打断即退出循环由 hook 收尾；
-     * 每个分片醒来打一行 {@link #logSmokeLine(WalSource)}。边界：主线程被中断（非 hook 路径）
-     * 恢复中断位后主动 {@code source.close()} 兜底（close 幂等——hook 再触发为 no-op）。</p>
+     * <p>关键步骤：① 六键 + state 三键 + v2 两键（tables/dml）逐一
+     * {@code System.getProperty} 非 null 才入 Properties（null 不覆盖门面默认值）；
+     * ② {@link WalSource#start()} 失败（连不上/版本不支持/权限不足）ERROR 记录后
+     * close 释放半开资源并 {@code System.exit(1)}；③ shutdown hook（名
+     * wal-source-shutdown）调 close + countDown——主线程 await 以 10s 分片睡，被打断
+     * 即退出循环由 hook 收尾；每个分片醒来打一行 {@link #logSmokeLine(WalSource)}。
+     * 边界：主线程被中断（非 hook 路径）恢复中断位后主动 {@code source.close()} 兜底
+     * （close 幂等——hook 再触发为 no-op）。</p>
      *
      * @param args 未用（配置全部走 -D 系统属性）
      */
     public static void main(String[] args) {
-        WalSource source = new WalSource(collectConfig());
+        WalSource source = new WalSource(collectConfig(), new OutputRenderer());
         try {
             source.start();
         } catch (Exception e) {
@@ -96,7 +100,7 @@ public final class Main {
     }
 
     /**
-     * 收集 {@code vb.wal.*} 六键 + state 三键系统属性为门面配置。
+     * 收集 {@code vb.wal.*} 六键 + state 三键 + v2 两键（tables/dml）系统属性为门面配置。
      *
      * <p>关键步骤：逐键 {@code System.getProperty}，仅非 null 值入 Properties——缺键留给
      * {@link WalSource} 构造器取默认值（单一默认值来源，Main 不复刻）。</p>
@@ -114,6 +118,8 @@ public final class Main {
         copySysProp(WalSource.KEY_STATE_DIR, cfg);
         copySysProp(WalSource.KEY_STATE_INTERVAL_MS, cfg);
         copySysProp(WalSource.KEY_STATE_EVENTS, cfg);
+        copySysProp(WalSource.KEY_TABLES, cfg);
+        copySysProp(WalSource.KEY_DML, cfg);
         return cfg;
     }
 
@@ -132,12 +138,14 @@ public final class Main {
 
     /**
      * 打一行周期统计：消费前沿 LSN + 三计数 + census 前 3 形态（+ state 启用时的
-     * checkpoint/槽推进观测）。
+     * checkpoint/槽推进观测 + DML 面启用时的发射计数）。
      *
      * <p>关键步骤：census 快照（不可变副本）按值降序取前 3，{@code 键=条数} 逗号拼接——
      * 快照为空（尚无记录交付）时 censusTop3 渲染为空串；{@code vb.wal.state.dir} 配置时
      * 追加 {@code ckpt=LSN adv=LSN}（检查点与槽推进前沿——二者相等即"落盘后必推过"，
-     * 落后即推进失败被 WARN 吞掉的形态）。数据面均只读（volatile 镜像 +
+     * 落后即推进失败被 WARN 吞掉的形态）；DML 面启用时追加
+     * {@code dml=[buckets=N rows=M]}（ChangeStream 的会话累计发射计数——纯 v1 形态
+     * {@code vb.wal.dml=false} 下不追加）。数据面均只读（volatile 镜像 +
      * {@code sum()} 快照），任意时点打行安全。</p>
      *
      * @param source 运行中的门面
@@ -152,12 +160,16 @@ public final class Main {
         String state = source.stateDir() == null ? ""
                 : " ckpt=" + Lsn.format(source.lastCheckpointLsn())
                         + " adv=" + Lsn.format(source.lastSlotAdvanceLsn());
-        LOG.info("smoke: lsn={} records={} resyncs={} reconnects={} censusTop3=[{}]{}",
+        String dml = source.dmlEnabled()
+                ? " dml=[buckets=" + source.dmlEmittedBuckets() + " rows=" + source.dmlEmittedRows() + "]"
+                : "";
+        LOG.info("smoke: lsn={} records={} resyncs={} reconnects={} censusTop3=[{}]{}{}",
                 Lsn.format(source.consumedLsn()),
                 m.records.sum(),
                 m.resyncs.sum(),
                 m.reconnects.sum(),
                 censusTop3,
-                state);
+                state,
+                dml);
     }
 }
