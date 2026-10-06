@@ -317,6 +317,28 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
+     * DML 观测面：截断 UPDATE 行级跳过计数（liveness guard 观测面，Task 8——对拍 IT
+     * 的回归哨兵；停机后读安全：close 含接收线程 join，happens-before 成立）。
+     *
+     * @return 会话累计跳过的截断 UPDATE 行数（DML 面未装配/尚无记录为 0）
+     */
+    public long dmlSkippedTruncatedRows() {
+        ChangeStream cs = changeStream;
+        return cs == null ? 0L : cs.skippedTruncatedRows();
+    }
+
+    /**
+     * DML 观测面：截断 UPDATE 重建成功计数（Task 8.5，与
+     * {@link #dmlSkippedTruncatedRows()} 互补的观测面）。
+     *
+     * @return 会话累计重建的截断 UPDATE 行数（DML 面未装配/尚无记录为 0）
+     */
+    public long dmlReconstructedTruncatedRows() {
+        ChangeStream cs = changeStream;
+        return cs == null ? 0L : cs.reconstructedTruncatedRows();
+    }
+
+    /**
      * 已消费 LSN 前沿（透传 {@link CatalogSynchronizer#consumedLsn()}）。
      *
      * @return 下一个未消费字节的 LSN；未 start 时为 0

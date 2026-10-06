@@ -14,6 +14,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +51,10 @@ class XactGrouperTest {
 
     /** 用户表：oid == relfilenode == 24600，public.t_stream（id int4 / name text）。 */
     private static final long USER_REL = 24600L;
+
+    /** 用户表二：oid == relfilenode == 24601，public.t_wide（id int4 / flag bool / name text
+     * ——三列形态使截断 UPDATE 的 prefix/suffix/mid 三段坐标皆非平凡，Task 8.5）。 */
+    private static final long WIDE_REL = 24601L;
 
     /** toast 关系：oid == relfilenode == 33657（relkind 't'）。 */
     private static final long TOAST_REL = 33657L;
@@ -298,14 +303,16 @@ class XactGrouperTest {
     }
 
     /**
-     * UPDATE 截断 liveness guard（Task 8 控制器裁定）：XLH_UPDATE_TRUNCATION 置位的
-     * UPDATE 行<b>行级跳过</b>——不发射、不解码短元组（尾列假 NULL 的静默错值面封口）、
+     * UPDATE 截断 liveness guard——<b>非 FULL 身份形态</b>（Task 8 裁定 + Task 8.5 范围
+     * 收窄）：XLH_UPDATE_TRUNCATION 置位且<b>无</b> CONTAINS_OLD_TUPLE（DEFAULT/KEY 身份，
+     * 或块无 data 的畸形形态）的 UPDATE 行<b>行级跳过</b>——记录内没有全列旧元组可拼装
+     * （KEY 元组非键列全 null，拼装只会产出错值），跳过是有痕丢弃：不发射、
      * {@code skippedTruncatedRows} 计数递增、流不死（后续正常行照常入桶发射）。
      */
     @Test
-    void truncatedUpdateRowSkippedWithCounterAndStreamSurvives() {
+    void truncatedUpdateWithoutFullIdentitySkippedWithCounterAndStreamSurvives() {
         Fixture fx = fixture();
-        fx.truncatedUpdate(100, 0, 1, "old-full", 2, "new-truncated");
+        fx.truncatedUpdateKeyIdentity(100, 0, 1, "old-key", 2, "new-truncated");
         fx.insert(100, 0, 7, "after-guard");
         fx.commit(100);
 
@@ -315,6 +322,52 @@ class XactGrouperTest {
                 "END xid=100 emitted=1 exp=1"), fx.listener.events,
                 "截断行不入桶，同事务后续正常行照常发射");
         assertEquals(1, fx.grouper.skippedTruncatedRows(), "guard 观测计数恰一次");
+    }
+
+    /**
+     * 截断 UPDATE 重建（Task 8.5 主面）——prefix&gt;0 且 suffix&gt;0 双段省略形态：
+     * t_wide 三列表 UPDATE 只改中段 bool 列，首列 id（4B 数据区前缀）与尾列 name
+     * （varlena 尾段）字节不变——块 data 按 heapam.c {@code log_heap_update} 实源形态
+     * 手造（[prefix u16][suffix u16][xl_heap_header][位图+垫][mid 段]），main 尾带
+     * FULL 身份整行旧元组。断言：重建后像值全等（非跳过、非短元组假 NULL）、前像
+     * 解码自旧元组、guard 计数不递增。
+     */
+    @Test
+    void truncatedUpdateFullIdentityPrefixAndSuffixReconstructsRowValues() {
+        Fixture fx = fixture();
+        fx.truncatedUpdateFull(100, 0, 1, false, "old-name", 1, true, "old-name");
+        fx.commit(100);
+
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=1",
+                "ROW UPDATE public.t_wide before={id=1, flag=f, name=old-name}"
+                        + " after={id=1, flag=t, name=old-name}",
+                "END xid=100 emitted=1 exp=1"), fx.listener.events,
+                "截断新元组经旧元组字节拼装重建——首尾列来自旧元组、中段来自记录");
+        assertEquals(0, fx.grouper.skippedTruncatedRows(), "FULL 身份不走 guard 跳过");
+        assertEquals(1, fx.grouper.reconstructedTruncatedRows(), "重建观测计数恰一次");
+    }
+
+    /**
+     * 截断 UPDATE 重建——prefix=0、suffix&gt;0 只截后缀形态（任务书双形态之二）：UPDATE
+     * 只改首列 id（数据区首字节即变，无公共前缀），尾段 bool+text 与旧元组逐字节相同
+     * ——块 data 形态 [suffix u16][xl_heap_header][tail 减后缀段]，重建走"整段取记录 +
+     * 旧元组尾段回接"分支。
+     */
+    @Test
+    void truncatedUpdateFullIdentitySuffixOnlyReconstructsRowValues() {
+        Fixture fx = fixture();
+        fx.truncatedUpdateFull(200, 0, 1, true, "keep-tail", 2, true, "keep-tail");
+        fx.commit(200);
+
+        assertEquals(List.of(
+                "BEGIN xid=200 2p=false gid=null exp=1",
+                "ROW UPDATE public.t_wide before={id=1, flag=t, name=keep-tail}"
+                        + " after={id=2, flag=t, name=keep-tail}",
+                "END xid=200 emitted=1 exp=1"), fx.listener.events,
+                "只截后缀形态：记录整段 + 旧元组尾 suffix 字节回接重建");
+        assertEquals(0, fx.grouper.skippedTruncatedRows(), "FULL 身份不走 guard 跳过");
+        assertEquals(1, fx.grouper.reconstructedTruncatedRows(), "重建观测计数恰一次");
     }
 
     /** TableMeta 缓存失效：pg_attribute 上的 heap 记录到达即全清缓存，DDL 后新列即时可见。 */
@@ -353,6 +406,10 @@ class XactGrouperTest {
         snapshot.table(USER_REL, "public", "t_stream", "r",
                 new CatalogSnapshot.Column(1, "id", 23, false),
                 new CatalogSnapshot.Column(2, "name", 25, false));
+        snapshot.table(WIDE_REL, "public", "t_wide", "r",
+                new CatalogSnapshot.Column(1, "id", 23, false),
+                new CatalogSnapshot.Column(2, "flag", 16, false),
+                new CatalogSnapshot.Column(3, "name", 25, false));
         snapshot.table(TOAST_REL, "pg_toast", "pg_toast_24600", "t");
         snapshot.table(PG_ATTRIBUTE_RELNODE, "pg_catalog", "pg_attribute", "r");
         RecordingListener listener = new RecordingListener();
@@ -413,23 +470,74 @@ class XactGrouperTest {
         }
 
         /**
-         * 一条带前缀截断标志的 UPDATE（liveness guard 锚）：flags 置
-         * XLH_UPDATE_TRUNCATION（0x20）+ CONTAINS_OLD，新元组只有首列（natts=1，
+         * 一条带前缀截断标志、<b>非 FULL 身份</b>的 UPDATE（liveness guard 锚，Task 8.5
+         * 范围收窄后 guard 只吃该形态）：flags 置 PREFIX_FROM_OLD + CONTAINS_OLD_KEY
+         * （无 CONTAINS_OLD_TUPLE——记录内无全列旧元组），新元组只有首列（natts=1，
          * 短于两列词典——无 guard 时会静默产出尾列假 NULL 的错值行）。
          */
-        WalRecord truncatedUpdate(int xid, int toplevel, int oldId, String oldName, int newId, String ignoredName) {
+        WalRecord truncatedUpdateKeyIdentity(int xid, int toplevel, int oldId, String oldName, int newId, String ignoredName) {
             byte[] before = TupleBytes.of("int4", "text").i32(oldId).text(oldName).payload();
             byte[] after = TupleBytes.of("int4").i32(newId).payload();
             ByteArrayOutputStream m = new ByteArrayOutputStream();
             put32(m, 0x11223344L);                              // old_xmax u32@0
             put16(m, 5);                                        // old_offnum u16@4
             m.write(0);                                         // old_infobits u8@6
-            m.write(0x04 | 0x08 | 0x20);                        // flags = CONTAINS_OLD | PREFIX_FROM_OLD
+            m.write(HeapOps.XLH_UPDATE_CONTAINS_OLD_KEY | HeapOps.XLH_UPDATE_PREFIX_FROM_OLD);
             put32(m, 0x55667788L);                              // new_xmax u32@8
             put16(m, 9);                                        // new_offnum u16@12
             m.writeBytes(before);
             return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, xid)
                     .toplevel(toplevel).block(0, SPC, DB, USER_REL, 0).data(after)
+                    .main(m.toByteArray()).build());
+        }
+
+        /**
+         * 一条字节忠实的<b>截断 + FULL 身份</b> UPDATE（Task 8.5 重建面锚）：由完整
+         * 旧/新元组字节按 heapam.c {@code log_heap_update} 的省略规则（数据区公共
+         * 前缀/后缀）推导 prefix/suffix，再按实源注册形态组装——块 data =
+         * {@code [prefix u16?][suffix u16?][xl_heap_header 5B][位图+垫 (t_hoff-23)][mid 段]}
+         * （prefix=0 时为 tail 减后缀的连续段），main = 14B xl_heap_update（flags 置
+         * CONTAINS_OLD_TUPLE + 截断位）+ 整行旧元组载荷殿后。
+         */
+        WalRecord truncatedUpdateFull(int xid, int toplevel, int oldId, boolean oldFlag, String oldName,
+                int newId, boolean newFlag, String newName) {
+            byte[] oldPayload = TupleBytes.of("int4", "bool", "text")
+                    .i32(oldId).bool(oldFlag).text(oldName).payload();
+            byte[] newPayload = TupleBytes.of("int4", "bool", "text")
+                    .i32(newId).bool(newFlag).text(newName).payload();
+            byte[] oldTail = tailBytes(oldPayload);
+            byte[] newTail = tailBytes(newPayload);
+            int dataStart = (newPayload[4] & 0xFF) - 23;   // 位图+垫区长（t_hoff-23）
+            int prefix = commonPrefix(newTail, oldTail, dataStart);
+            int suffix = commonSuffix(newTail, oldTail, dataStart, prefix);
+            int flags = HeapOps.XLH_UPDATE_CONTAINS_OLD_TUPLE;
+            ByteArrayOutputStream data = new ByteArrayOutputStream();
+            if (prefix > 0) {
+                flags |= HeapOps.XLH_UPDATE_PREFIX_FROM_OLD;
+                put16(data, prefix);
+            }
+            if (suffix > 0) {
+                flags |= HeapOps.XLH_UPDATE_SUFFIX_FROM_OLD;
+                put16(data, suffix);
+            }
+            data.write(newPayload, 0, 5);                  // xl_heap_header 5B
+            if (prefix > 0) {
+                data.write(newTail, 0, dataStart);         // 位图 + 垫
+                data.write(newTail, dataStart + prefix,
+                        newTail.length - dataStart - prefix - suffix);   // mid 段
+            } else {
+                data.write(newTail, 0, newTail.length - suffix);         // tail 减后缀整段
+            }
+            ByteArrayOutputStream m = new ByteArrayOutputStream();
+            put32(m, 0x11223344L);                         // old_xmax u32@0
+            put16(m, 5);                                   // old_offnum u16@4
+            m.write(0);                                    // old_infobits u8@6
+            m.write(flags);                                // flags u8@7
+            put32(m, 0x55667788L);                         // new_xmax u32@8
+            put16(m, 9);                                   // new_offnum u16@12
+            m.writeBytes(oldPayload);                      // FULL 旧元组殿后
+            return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, xid)
+                    .toplevel(toplevel).block(0, SPC, DB, WIDE_REL, 0).data(data.toByteArray())
                     .main(m.toByteArray()).build());
         }
 
@@ -600,6 +708,37 @@ class XactGrouperTest {
     /** MAXALIGN 到 8。 */
     private static long align8(int len) {
         return ((long) len + 7) / 8 * 8;
+    }
+
+    /** 载荷（[xl_heap_header 5B][tail]）剥 5B 头得 tail（自 tuple offset 23 起字节）。 */
+    private static byte[] tailBytes(byte[] payload) {
+        return Arrays.copyOfRange(payload, 5, payload.length);
+    }
+
+    /**
+     * 两 tail 自 dataStart 起（数据区，t_hoff 之后）的公共前缀字节数——heapam.c
+     * {@code log_heap_update} 的 prefix 计算同规则（位图+垫区不参与比较）。
+     */
+    private static int commonPrefix(byte[] a, byte[] b, int dataStart) {
+        int n = 0;
+        int max = Math.min(a.length, b.length) - dataStart;
+        while (n < max && a[dataStart + n] == b[dataStart + n]) {
+            n++;
+        }
+        return n;
+    }
+
+    /**
+     * 两 tail 的公共后缀字节数（自尾端反向比较，越过 prefix 段即停）——heapam.c 的
+     * suffix 计算同规则；尾端即数据区末端（tuple 末端），坐标系与实源一致。
+     */
+    private static int commonSuffix(byte[] a, byte[] b, int dataStart, int prefix) {
+        int n = 0;
+        int max = Math.min(a.length, b.length) - dataStart - prefix;
+        while (n < max && a[a.length - n - 1] == b[b.length - n - 1]) {
+            n++;
+        }
+        return n;
     }
 
     /** 18B external 指针（ToastAssemblerTest 同布局：01 12 | rawsize | extinfo | valueid | toastrelid）。 */

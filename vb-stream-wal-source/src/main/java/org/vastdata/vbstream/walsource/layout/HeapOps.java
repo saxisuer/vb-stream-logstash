@@ -74,8 +74,25 @@ public final class HeapOps {
     /** heapam_xlog.h：xl_heap_update 含旧 tuple 全行或旧键（CONTAINS_OLD_TUPLE|OLD_KEY = 0x04|0x08）。 */
     public static final int XLH_UPDATE_CONTAINS_OLD = 0x04 | 0x08;
 
+    /** heapam_xlog.h：XLH_UPDATE_CONTAINS_OLD_TUPLE（1&lt;&lt;2 = 0x04——REPLICA IDENTITY FULL
+     * 的整行旧元组，ExtractReplicaIdentity 全列形态；截断重建的合法拼装源，Task 8.5）。 */
+    public static final int XLH_UPDATE_CONTAINS_OLD_TUPLE = 0x04;
+
+    /** heapam_xlog.h：XLH_UPDATE_CONTAINS_OLD_KEY（1&lt;&lt;3 = 0x08——DEFAULT/INDEX 身份的
+     * 旧键元组，非键列全 null（ExtractReplicaIdentity heap_form_tuple 形态）——字节拼装
+     * 会产出错值，截断重建的拒绝面，Task 8.5）。 */
+    public static final int XLH_UPDATE_CONTAINS_OLD_KEY = 0x08;
+
     /** heapam_xlog.h：xl_heap_update 新 tuple 前缀/后缀截断（PREFIX_FROM_OLD|SUFFIX_FROM_OLD = 0x20|0x40）。 */
     public static final int XLH_UPDATE_TRUNCATION = 0x20 | 0x40;
+
+    /** heapam_xlog.h：XLH_UPDATE_PREFIX_FROM_OLD（1&lt;&lt;5 = 0x20——新元组数据区与旧元组
+     * 公共前缀省略，块 data 首部携带 prefix u16；Task 8.5 拼装坐标之一）。 */
+    public static final int XLH_UPDATE_PREFIX_FROM_OLD = 0x20;
+
+    /** heapam_xlog.h：XLH_UPDATE_SUFFIX_FROM_OLD（1&lt;&lt;6 = 0x40——新元组数据区与旧元组
+     * 公共后缀省略，块 data 首部携带 suffix u16；Task 8.5 拼装坐标之一）。 */
+    public static final int XLH_UPDATE_SUFFIX_FROM_OLD = 0x40;
 
     /** heapam_xlog.h：xl_heap_delete 含旧 tuple 全行或旧键（CONTAINS_OLD_TUPLE|OLD_KEY = 0x02|0x04）。 */
     public static final int XLH_DELETE_CONTAINS_OLD = 0x02 | 0x04;

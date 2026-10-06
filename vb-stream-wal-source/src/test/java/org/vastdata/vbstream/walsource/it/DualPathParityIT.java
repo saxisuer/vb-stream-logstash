@@ -23,6 +23,7 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -39,15 +40,18 @@ import static org.junit.jupiter.api.Assertions.fail;
  * 子事务行从未到达组装器），wal 取桶记账（过滤前）——SAVEPOINT 场景 engine N=实付、
  * wal N=记账，断言按 "engine.changes == 行数 && wal.changes >= 行数" 归一化。</p>
  *
- * <p><b>截断规避（liveness guard 的对拍面配合）</b>：UPDATE 语句全列赋值（首列与尾列都
- * 变）——PG 对新元组做前缀/后缀截断当且仅当首列前缀或尾列后缀与旧元组字节相同，全列赋值
- * 使两个截断条件都不成立，wal 路不触发 {@code XactGrouper} 的截断行级跳过（guard 的
- * 离线锚在 {@code XactGrouperTest}，本 IT 不构造截断形态）。</p>
+ * <p><b>截断 UPDATE 面（Task 8.5 更新）</b>：截断新元组的重建在 {@code XactGrouper} 已
+ * 落（FULL 身份经旧元组字节拼装，离线锚在 {@code XactGrouperTest} 手造字节用例）；场景
+ * 2 的 UPDATE 全列赋值保留（首尾列都变的对照形态），场景 6 追加中段列 UPDATE（首尾列
+ * 不变——截断诱发值形态 + {@code skippedTruncatedRows==0} 哨兵）。<b>真实 PG 分布注记
+ * （REL_18 heapam.c 实源钉）</b>：前缀/后缀省略门是 {@code !RelationIsLogicallyLogged}
+ * （wal_level &lt; logical），与 CONTAINS_OLD 旧元组记录（需 ≥ logical）互斥——本环境
+ * 逻辑流下用户表 UPDATE 恒全量记录，截断重建/跳过双计数恒 0 作回归哨兵。</p>
  *
- * <p>场景组（任务书场景矩阵第 1 组）：单行事务 / 单事务多语句（I+U+D）/ 双连接交错事务 /
- * 回滚零输出 / 子事务 SAVEPOINT 回滚剔除。表形态 {@code REPLICA IDENTITY FULL}——UPDATE
- * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要本机
- * Docker。</p>
+ * <p>场景组（任务书场景矩阵第 1 组 + Task 8.5 场景 6）：单行事务 / 单事务多语句（I+U+D）/
+ * 双连接交错事务 / 回滚零输出 / 子事务 SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列。表形态
+ * {@code REPLICA IDENTITY FULL}——UPDATE 与 DELETE 双路恒携带整行前像（replica identity
+ * 面对称，BEFORE 渲染可对拍）。需要本机 Docker。</p>
  */
 class DualPathParityIT {
 
@@ -142,10 +146,10 @@ class DualPathParityIT {
 
     // ---- 场景 5：子事务 SAVEPOINT 回滚剔除 ----
 
-    /** SAVEPOINT 子事务行被剔除（两路都只见 s1/s3）；头行 changes=N 按语义归一化（engine=实付、wal=记账）。 */
+    /** SAVEPOINT 子事务行被剔除（两路都只见 s1/s3）；头行 changes=N 按语义归一化（engine=实付、wal=记账=实付+1）。 */
     @Test
     void savepointSubTxnFilteredRowsParity() throws Exception {
-        runParity("子事务 SAVEPOINT", 1, conn -> {
+        runParity("子事务 SAVEPOINT", 1, 1L, conn -> {
             conn.setAutoCommit(false);
             exec(conn, "INSERT INTO parity.t_parity VALUES (1, 's1', true, 1.0, '2026-10-07',"
                     + " timestamptz '2026-10-07 01:01:01+00')");
@@ -159,7 +163,48 @@ class DualPathParityIT {
         });
     }
 
+    // ---- 场景 6：截断 UPDATE 形态（中段列变更，Task 8.5）----
+
+    /**
+     * 截断 UPDATE 对拍（Task 8.5 场景 C）：UPDATE 只 SET 中段列（首列 id 与尾列 ts 不变
+     * ——正是 PG 对新元组做前缀/后缀省略的值形态），REPLICA IDENTITY FULL 表双路 diff
+     * 空 + wal 路 {@code skippedTruncatedRows==0}（截断行未被跳过——重建生效面或全量
+     * 记录面，皆不出缺行）。
+     *
+     * <p><b>真实 PG 分布注记（REL_18 heapam.c 实源钉，2026-10 curl）</b>：前缀/后缀省略
+     * 的门是 {@code oldbuf==newbuf && !RelationIsLogicallyLogged && !XLogCheckBufferNeedsBackup}
+     * ——本环境 wal_level=logical 下用户表 UPDATE <b>恒全量记录新元组</b>（且 CONTAINS_OLD
+     * 与截断在实源门上互斥）。故本场景实际钉住的是：中段列 UPDATE 的 FULL 前像/后像双路
+     * 渲染逐字节等价 + 截断跳过计数零的回归哨兵；截断重建本体（拼装坐标/前缀取旧元组自身
+     * t_hoff）由 {@code XactGrouperTest} 手造字节用例离线钉。</p>
+     */
+    @Test
+    void midColumnUpdateFullIdentityParityAndZeroTruncationSkips() throws Exception {
+        long skipped = runParity("截断 UPDATE 中段列", 1, conn -> {
+            conn.setAutoCommit(false);
+            exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'alice', true, 12.345,"
+                    + " '2026-10-07', timestamptz '2026-10-07 04:34:56.789012+00')");
+            exec(conn, "UPDATE parity.t_parity SET name = 'alice-mid', flag = false, val = 99.5,"
+                    + " d = '2026-11-01' WHERE id = 1");   // 首列 id / 尾列 ts 不变
+            conn.commit();
+        });
+        assertEquals(0, skipped, "截断 UPDATE 跳过计数应为 0（重建生效/全量记录，不出缺行）");
+    }
+
     // ---- 对拍骨架 ----
+
+    /**
+     * 单场景对拍骨架（无 aborted 形态——walAborted=0 委派全参档）。
+     *
+     * @param scenario     场景名（断言消息上下文）
+     * @param expectedTxns 场景内已提交（产生用户表行）的事务数——两路各自的追平目标
+     * @param dml          DML 执行器（收一条普通连接，语句异常即测试失败）
+     * @return wal 路会话累计的截断 UPDATE 跳过计数（停流后读——close 含接收线程 join）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private long runParity(String scenario, long expectedTxns, SqlConsumer<Connection> dml) throws Exception {
+        return runParity(scenario, expectedTxns, 0L, dml);
+    }
 
     /**
      * 单场景对拍骨架：重置环境（槽/发布/表重建）→ 两路起流 → 执行 DML → 各自等待追平
@@ -170,15 +215,19 @@ class DualPathParityIT {
      * （{@link WalSource} + {@link OutputRenderer}）各挂各的 CDC logger 捕获 appender 后
      * 依次启动；③DML 执行器跑场景语句；④engine 路等待 emittedTxns 达标、wal 路等待
      * dmlEmittedBuckets 达标（volatile 计数轮询）；⑤先停 wal 再停 engine（engine 停机含
-     * 毒丸排干——已提交未输出事务不丢）；⑥{@link #assertParity(List, List, String)} 归一化
-     * 对拍。边界与异常语义：任一路等待超时/启动失败即 fail（消息带场景名）。</p>
+     * 毒丸排干——已提交未输出事务不丢）；⑥{@link #assertParity(List, List, String, long)}
+     * 归一化对拍。边界与异常语义：任一路等待超时/启动失败即 fail（消息带场景名）。</p>
      *
      * @param scenario      场景名（断言消息上下文）
      * @param expectedTxns  场景内已提交（产生用户表行）的事务数——两路各自的追平目标
+     * @param walAborted    场景内被回滚的子事务行数（wal 记账上界断言的期望差）
      * @param dml           DML 执行器（收一条普通连接，语句异常即测试失败）
+     * @return wal 路会话累计的截断 UPDATE 跳过计数（停流后读——close 含接收线程 join，
+     *                     happens-before 成立；场景断言回归哨兵用）
      * @throws Exception 连接/启动/等待路径的底层异常
      */
-    private void runParity(String scenario, long expectedTxns, SqlConsumer<Connection> dml) throws Exception {
+    private long runParity(String scenario, long expectedTxns, long walAborted, SqlConsumer<Connection> dml)
+            throws Exception {
         ParityEnv.resetScenario(TABLE_DDL);
         EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig());
         ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
@@ -211,7 +260,8 @@ class DualPathParityIT {
             fail(scenario + ": 对拍前置失败——" + primary + "\nengine 捕获=" + engineLines
                     + "\nwal 捕获=" + walLines, primary);
         }
-        assertParity(engineLines, walLines, scenario);
+        assertParity(engineLines, walLines, scenario, walAborted);
+        return wal.dmlSkippedTruncatedRows();
     }
 
     /**
@@ -229,8 +279,11 @@ class DualPathParityIT {
      * @param engineLines engine 路捕获行（logger org.vastdata.vbstream.cdc）
      * @param walLines    wal 路捕获行（logger org.vastdata.vbstream.walsource.cdc）
      * @param scenario    场景名（失败消息上下文）
+     * @param walAborted  场景内被回滚的子事务行数（wal 桶记账与实付的期望差；无 aborted 为 0
+     *                    ——Task 8.5 上界补丁：记账 = 实付 + aborted 恰等式，越过即记账异常）
      */
-    private static void assertParity(List<String> engineLines, List<String> walLines, String scenario) {
+    private static void assertParity(List<String> engineLines, List<String> walLines, String scenario,
+            long walAborted) {
         Map<Long, TxBlock> engine = parse(engineLines);
         Map<Long, TxBlock> wal = parse(walLines);
         Set<Long> intersection = new LinkedHashSet<>(engine.keySet());
@@ -247,6 +300,7 @@ class DualPathParityIT {
             TxBlock e = engine.get(xid);
             TxBlock w = wal.get(xid);
             assertEquals(e.rows, w.rows, () -> scenario + ": xid=" + xid + " 行序列 diff");
+            assertEquals(e.endLine, w.endLine, () -> scenario + ": xid=" + xid + " TXN-END 尾行整行 diff");
             assertEquals(e.kind, w.kind, () -> scenario + ": xid=" + xid + " kind diff");
             assertEquals(e.gid, w.gid, () -> scenario + ": xid=" + xid + " gid diff");
             assertEquals(e.commitLsnHex, w.commitLsnHex, () -> scenario + ": xid=" + xid + " commitLsn diff");
@@ -254,8 +308,9 @@ class DualPathParityIT {
                     + "（engine=" + e.commitTs + ", wal=" + w.commitTs + "）");
             assertEquals(e.rows.size(), (int) e.changes, () -> scenario + ": xid=" + xid
                     + " engine changes 应等于实付行数（非流式形态到达面即实付面）");
-            assertTrue(w.changes >= w.rows.size(), () -> scenario + ": xid=" + xid
-                    + " wal changes=" + w.changes + " 小于实付行数 " + w.rows.size() + "（记账异常）");
+            assertEquals(w.rows.size() + walAborted, (int) w.changes, () -> scenario + ": xid=" + xid
+                    + " wal changes 记账异常: 期望=实付 " + w.rows.size() + " + 场景 aborted "
+                    + walAborted + "，实得 " + w.changes);
         }
         // 窗口外事务集合说明：不作断言失败，但两路捕获了交集外事务时在控制台留痕（起停窗口差异归因面）
         if (!engineOnly.isEmpty() || !walOnly.isEmpty()) {
@@ -288,9 +343,13 @@ class DualPathParityIT {
                 cur.rows.add(line);
             } else if (line.startsWith("TXN-END")) {
                 assertNotNull(cur, "TXN-END 先于 TXN-BEGIN: " + line);
+                cur.endLine = line;
                 cur = null;
+            } else {
+                fail("未知 CDC 行格式（TXN-BEGIN / \"  [n] \" / TXN-END 三前缀均不匹配）: " + line);
             }
         }
+        assertNull(cur, "事务块未闭合（TXN-END 缺失）");
         assertFalse(out.isEmpty(), "捕获行无任何事务块: " + lines);
         return out;
     }
@@ -337,7 +396,9 @@ class DualPathParityIT {
 
     /**
      * 对拍事务块：头行解析字段（xid/kind/gid/commitLsn hex/commitTs/changes）+ 行文本序列
-     * （保持两路输出原样——含行号前缀，行号由各自 flush 期独立分配但序列同构）。
+     * （保持两路输出原样——含行号前缀，行号由各自 flush 期独立分配但序列同构）+ 尾行整行
+     * （TXN-END——Task 8.5 补丁：整行保存参与逐字节比，两路格式恒同
+     * {@code TXN-END   xid=N}，engine 尾行无 emitted 字段故无字段级归一化）。
      */
     private static final class TxBlock {
         final long xid;
@@ -347,6 +408,7 @@ class DualPathParityIT {
         final String commitTs;
         final long changes;
         final List<String> rows = new ArrayList<>();
+        String endLine;
 
         TxBlock(long xid, String kind, String gid, String commitLsnHex, String commitTs, long changes) {
             this.xid = xid;

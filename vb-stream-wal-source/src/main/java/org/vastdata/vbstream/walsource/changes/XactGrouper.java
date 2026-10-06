@@ -9,6 +9,7 @@ import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.HeapViews;
 import org.vastdata.vbstream.walsource.layout.PageImages;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
+import org.vastdata.vbstream.walsource.layout.TruncatedUpdateSplice;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 
@@ -82,10 +83,14 @@ import java.util.Set;
  * ——Task 7 硬前置①扩容后与渲染矩阵 oid 集合对齐（含 date/time/timetz/
  * timestamptz/numeric/uuid 的 datum 字节形态），enum/域/jsonb/组合类型等矩阵外
  * oid 解码即 ISE（走读对位无法维持——双路对拍 MS3+ 的扩面输入）。UPDATE 前缀/
- * 后缀截断（XLH_UPDATE_TRUNCATION）的新元组重建为未落面（spike 遗留）——
- * <b>Task 8 liveness guard</b>：截断行经 {@link #skipTruncatedUpdate} 行级跳过 +
- * WARN（每表节流）+ {@link #skippedTruncatedRows()} 计数，有痕丢弃而非静默错值
- * /fail-fast 杀流。</p>
+ * 后缀截断（XLH_UPDATE_TRUNCATION）的新元组重建<b>已落（Task 8.5）</b>：FULL 身份
+ * （CONTAINS_OLD_TUPLE——main 尾整行旧元组）经 {@link TruncatedUpdateSplice} 旧元组
+ * 字节拼装重建 + {@link #noteReconstructedTruncatedUpdate} 计数；非 FULL（KEY/无 old）
+ * 保留 <b>Task 8 liveness guard</b>——{@link #skipTruncatedUpdate} 行级跳过 + WARN
+ * （每表节流）+ {@link #skippedTruncatedRows()} 计数，有痕丢弃而非静默错值/fail-fast
+ * 杀流。<b>真实 PG 分布注记</b>：截断省略与 CONTAINS_OLD 记录在 heapam.c 的门互斥
+ * （前者需 wal_level &lt; logical、后者需 ≥ logical），见 {@link #skipTruncatedUpdate}
+ * javadoc——双计数在逻辑流下恒 0 作哨兵，非逻辑流的跨记录行态正解 v3 记档。</p>
  *
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程顺序喂 onRecord，与 v1 replay 组件
  * 同假设）；listener 回调与 TOAST 组装同线程发生。跨重启安全依赖调用方保证：本类
@@ -165,8 +170,14 @@ public final class XactGrouper {
     /** 截断 UPDATE 行级跳过计数（liveness guard 观测面——Task 8；volatile 跨线程读）。 */
     private volatile long skippedTruncatedRows;
 
+    /** 截断 UPDATE 重建成功计数（Task 8.5 观测面——与 skipped 互补；volatile 跨线程读）。 */
+    private volatile long reconstructedTruncatedRows;
+
     /** 截断 WARN 节流：已告警表全名集（单写者线程内使用——每表只告警一次）。 */
     private final Set<String> truncationWarnedTables = new HashSet<>();
+
+    /** 截断重建 INFO 节流：已留痕表全名集（单写者线程内使用——每表只 INFO 一次）。 */
+    private final Set<String> truncationRebuiltTables = new HashSet<>();
 
     /**
      * 装配组装器。
@@ -434,14 +445,26 @@ public final class XactGrouper {
             }
             case HeapOps.XLOG_HEAP_UPDATE, HeapOps.XLOG_HEAP_HOT_UPDATE -> {
                 HeapViews.HeapUpdateView v = HeapViews.HeapUpdateView.parse(rec, layout);
-                if ((v.flags() & HeapOps.XLH_UPDATE_TRUNCATION) != 0) {
-                    // liveness guard（控制器裁定 2026-10-07，Task 8）：截断新元组的前缀/后缀
-                    // 重建（旧元组字节拼装）不在本面——解码短元组只会静默产出错值/尾列假 NULL，
-                    // 改为行级跳过 + WARN（每表节流一次）+ skippedTruncatedRows 计数，不静默丢行
-                    skipTruncatedUpdate(res);
+                int updFlags = v.flags();
+                if ((updFlags & HeapOps.XLH_UPDATE_TRUNCATION) != 0) {
+                    // Task 8.5 双路裁定：FULL 身份（CONTAINS_OLD_TUPLE——main 尾整行旧元组，
+                    // ExtractReplicaIdentity 全列形态）→ 旧元组字节拼装重建新元组；
+                    // KEY/无 old（DEFAULT 身份）或块无 data（截断形态下不可解码的畸形）→
+                    // 保留 Task 8 的 liveness guard 跳过 + 计数（KEY 元组非键列全 null，
+                    // 拼装只会产出错值）
+                    if ((updFlags & HeapOps.XLH_UPDATE_CONTAINS_OLD_TUPLE) == 0 || !blk.hasData()) {
+                        skipTruncatedUpdate(res);
+                        return;
+                    }
+                    int oldOff = rec.mainOff() + layout.sizeOfHeapUpdate();
+                    Object[] before = decoder.decodePayload(rec.raw(), oldOff, res.kinds());
+                    Object[] after = TruncatedUpdateSplice.reconstructNewTuple(decoder, rec.raw(), blk,
+                            updFlags, oldOff, rec.mainLen() - layout.sizeOfHeapUpdate() - 5, res.kinds());
+                    noteReconstructedTruncatedUpdate(res);
+                    appendRow(top, origin, res, ChangeOutputListener.DmlKind.UPDATE, before, after);
                     return;
                 }
-                Object[] before = (v.flags() & HeapOps.XLH_UPDATE_CONTAINS_OLD) != 0
+                Object[] before = (updFlags & HeapOps.XLH_UPDATE_CONTAINS_OLD) != 0
                         ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapUpdate(), res.kinds())
                         : null;
                 appendRow(top, origin, res, ChangeOutputListener.DmlKind.UPDATE,
@@ -638,14 +661,21 @@ public final class XactGrouper {
     }
 
     /**
-     * 截断 UPDATE 的行级跳过（liveness guard，Task 8 控制器裁定）：递增
+     * 截断 UPDATE 的行级跳过（liveness guard，Task 8 裁定 + Task 8.5 范围收窄）：递增
      * {@code skippedTruncatedRows} 计数 + WARN（每表节流一次——大事务批量截断行只留
      * 首条告警，防刷屏），行不入桶、不发射。
      *
-     * <p>语义边界：跳过是<b>有痕丢弃</b>而非静默丢行——计数经
-     * {@link #skippedTruncatedRows()} 观测、首条 WARN 带 liveness 归因说明；正解
-     * （旧元组前缀/后缀字节重建）不在本面（old tuple 虽常同记录自包含——CONTAINS_OLD
-     * 形态——但重建需字节级拼装，属后续任务）。线程约束：单写者。</p>
+     * <p>语义边界（Task 8.5 后 guard 只吃该形态）：触发前提是<b>无 FULL 身份旧元组可
+     * 拼装</b>——KEY/DEFAULT 身份（KEY 元组非键列全 null，拼装只会产出错值）或块无
+     * data 的畸形形态。<b>真实 PG 分布注记（REL_18 实源钉）</b>：截断省略的门是
+     * {@code !RelationIsLogicallyLogged}（wal_level &lt; logical），而 CONTAINS_OLD 旧元组
+     * 的记录门恰是 {@code need_tuple_data}（wal_level ≥ logical）——两者在真实流里
+     * <b>互斥</b>，故 wal_level=logical 下用户表 UPDATE 恒全量记录新元组（skipped 与
+     * reconstructed 双计数恒 0 作回归哨兵）；wal_level &lt; logical 下截断记录<b>不携带</b>
+     * 旧元组、也不带 FPW（省略与镜像互斥），记录内拼装源不存在——跳过是有痕丢弃的
+     * 保底面，跨记录行态（v1 rawTailStore 形态）的迁移正解属 v3 记档。</p>
+     *
+     * <p>线程约束：单写者。</p>
      *
      * @param res 表解析结果（meta 用于告警去重键）
      */
@@ -654,22 +684,58 @@ public final class XactGrouper {
         TableMeta meta = res.meta();
         String table = meta.schema() + "." + meta.table();
         if (truncationWarnedTables.add(table)) {
-            LOG.warn("UPDATE 新元组带前缀/后缀截断（XLH_UPDATE_TRUNCATION），重建未落——该行跳过不发射: "
-                    + "table={}（同表后续跳过不再重复告警；观测面 skippedTruncatedRows 计数递增）", table);
+            LOG.warn("UPDATE 新元组带前缀/后缀截断（XLH_UPDATE_TRUNCATION）且无 FULL 身份旧元组可拼装"
+                    + "——该行跳过不发射: table={}（同表后续跳过不再重复告警；观测面 skippedTruncatedRows"
+                    + " 计数递增；正解需跨记录行态，v3 记档）", table);
         } else {
             LOG.debug("截断 UPDATE 行跳过: table={}", table);
         }
     }
 
     /**
+     * 截断 UPDATE 重建成功的记账与留痕（Task 8.5）：递增
+     * {@code reconstructedTruncatedRows} 计数，首表 INFO（后续 DEBUG——大事务批量
+     * 重建不刷屏）。
+     *
+     * <p>线程约束：单写者（与行入桶同缝）。</p>
+     *
+     * @param res 表解析结果（meta 用于留痕去重键）
+     */
+    private void noteReconstructedTruncatedUpdate(Resolved res) {
+        reconstructedTruncatedRows++;
+        TableMeta meta = res.meta();
+        String table = meta.schema() + "." + meta.table();
+        if (truncationRebuiltTables.add(table)) {
+            LOG.info("UPDATE 截断新元组已按 FULL 身份旧元组拼装重建: table={}（同表后续重建走 DEBUG；"
+                    + "观测面 reconstructedTruncatedRows 计数递增）", table);
+        } else {
+            LOG.debug("截断 UPDATE 重建: table={}", table);
+        }
+    }
+
+    /**
      * DML 观测面：截断 UPDATE 行级跳过计数（liveness guard 的有痕丢弃观测面，Task 8）。
      *
-     * <p>单写者递增、volatile 读；正解重建落地后该值应恒为 0（计数保留作回归哨兵）。</p>
+     * <p>单写者递增、volatile 读；wal_level=logical 形态下恒 0（截断与 CONTAINS_OLD
+     * 互斥，见 {@link #skipTruncatedUpdate} 注记）——计数保留作回归哨兵。</p>
      *
      * @return 会话累计跳过的截断 UPDATE 行数
      */
     public long skippedTruncatedRows() {
         return skippedTruncatedRows;
+    }
+
+    /**
+     * DML 观测面：截断 UPDATE 重建成功计数（Task 8.5，与
+     * {@link #skippedTruncatedRows()} 互补的观测面）。
+     *
+     * <p>单写者递增、volatile 读；wal_level=logical 形态下恒 0（同上互斥注记）——
+     * 双计数在真实逻辑流下作"截断面未被触碰"的回归哨兵对。</p>
+     *
+     * @return 会话累计重建的截断 UPDATE 行数
+     */
+    public long reconstructedTruncatedRows() {
+        return reconstructedTruncatedRows;
     }
 
     /**
@@ -701,9 +767,10 @@ public final class XactGrouper {
      * null（占位语义），其余经静态 {@link DiskValueRenderer#render} 取 PG text 形态。
      *
      * <p>短数组尾列补 null 的<b>唯一合法来源</b>是 ADD COLUMN 前的存量元组（旧元组缺
-     * 尾列，PG 语义读作 NULL——补 null 恰是正确值）；截断 UPDATE 新元组（曾会走到此
-     * 处产出尾列假 NULL）已在 {@code dispatchHeap} 被 liveness guard 前置拦截
-     * （XLH_UPDATE_TRUNCATION 行级跳过，Task 8 封口裁定）——静默错值面不可达。</p>
+     * 尾列，PG 语义读作 NULL——补 null 恰是正确值）；截断 UPDATE 新元组不经此面——
+     * FULL 身份经 {@link TruncatedUpdateSplice} 重建出全列长数组、非 FULL 被
+     * {@code dispatchHeap} 的 liveness guard 前置拦截（Task 8 封口 + Task 8.5 重建
+     * 分流）——短数组假 NULL 面不可达。</p>
      *
      * @param meta 表身份 + 列序
      * @param vals 解码值数组（可短于列数——仅 ADD COLUMN 前存量元组合法，见上）

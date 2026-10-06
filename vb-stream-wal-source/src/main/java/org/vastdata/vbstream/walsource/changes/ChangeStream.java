@@ -90,4 +90,15 @@ public final class ChangeStream {
     public long skippedTruncatedRows() {
         return grouper.skippedTruncatedRows();
     }
+
+    /**
+     * DML 观测面：截断 UPDATE 重建成功计数（Task 8.5，与
+     * {@link #skippedTruncatedRows()} 互补——透传
+     * {@link XactGrouper#reconstructedTruncatedRows()}）。
+     *
+     * @return 会话累计重建的截断 UPDATE 行数（任意线程可读）
+     */
+    public long reconstructedTruncatedRows() {
+        return grouper.reconstructedTruncatedRows();
+    }
 }
