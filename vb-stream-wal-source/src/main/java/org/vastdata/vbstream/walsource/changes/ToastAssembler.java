@@ -232,6 +232,24 @@ public final class ToastAssembler {
     }
 
     /**
+     * 全清 chunk 归集面——事务终态（COMMIT/ABORT/PREPARE/两阶段确认）后由
+     * {@code XactGrouper} 调用的淘汰面（2026-10 控制器裁定：全清是最简可靠形态）。
+     *
+     * <p>全清安全性依据：<b>valueid 全局唯一</b>——valueid 是 TOAST 写路径经 oid 计数器
+     * 分配的新 oid（tuptoaster.c toast_save_datum 的 GetNewOid），跨事务不复用（计数器
+     * 单调，wraparound 需 4G 个值后才发生且 PG 侧同面对待），故清空不会使后续到达的
+     * chunk 与残留归集语义错位；反之不清理会让 aborted/已解码事务的 chunk 无限滞留
+     * （内存泄漏面）。调用时机语义：终态即清 <b>早于</b> 行引用解码的场景只剩"进行中
+     * 事务的行引用了本次被清掉的早期 chunk"（交错事务的终态夹在 chunk 写入与引用行
+     * 到达之间）——该形态落入 {@link #resolveExternal} 的回查兜底路径（JDBC 末态），
+     * 回查不可得时降级 {@code toast-unavailable}，不 fail 流。线程约束：单写者
+     * （与 {@link #onChunkRow} 同线程）。</p>
+     */
+    public void clear() {
+        chunksByToast.clear();
+    }
+
+    /**
      * 取指定值的 chunk 归集（含 relfilenode/oid 分叉的 valueid 兜底扫描）。
      *
      * <p>关键步骤：先按指针 toastrelid 直查（无重写时归集键即 oid）；未命中再遍历

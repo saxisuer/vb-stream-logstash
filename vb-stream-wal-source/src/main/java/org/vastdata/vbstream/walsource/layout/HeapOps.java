@@ -46,11 +46,30 @@ public final class HeapOps {
     /** xact.h：XLOG_XACT_COMMIT（opcode 位段 0x00，RM_XACT_ID 下）。 */
     public static final int XLOG_XACT_COMMIT = 0x00;
 
+    /** xact.h：XLOG_XACT_PREPARE（opcode 位段 0x10，RM_XACT_ID 下——两阶段准备，
+     * main data 是 72B 两阶段状态文件头 + gid，见 XactGrouper 的布局注记）。 */
+    public static final int XLOG_XACT_PREPARE = 0x10;
+
     /** xact.h：XLOG_XACT_ABORT（opcode 位段 0x20，RM_XACT_ID 下）。 */
     public static final int XLOG_XACT_ABORT = 0x20;
 
+    /** xact.h：XLOG_XACT_COMMIT_PREPARED（opcode 位段 0x30——两阶段提交确认，
+     * 归属键是 main data 的 twophase chunk xid 而非记录头 xid，见 XactGrouper）。 */
+    public static final int XLOG_XACT_COMMIT_PREPARED = 0x30;
+
+    /** xact.h：XLOG_XACT_ABORT_PREPARED（opcode 位段 0x40——两阶段回滚，归属键同上）。 */
+    public static final int XLOG_XACT_ABORT_PREPARED = 0x40;
+
+    /** xact.h：XLOG_XACT_ASSIGNMENT（opcode 位段 0x50——子事务归并映射兜底，
+     * main = xl_xact_assignment {xtop u32, nsubxacts i32, subxacts u32[]}）。 */
+    public static final int XLOG_XACT_ASSIGNMENT = 0x50;
+
     /** opcode 掩码（heap 与 xact 同值 0x70；info 低 nibble 保留）。 */
     public static final int XLOG_XACT_OPMASK = 0x70;
+
+    /** xact.h：XLOG_XACT_HAS_INFO（info 附加位 0x80——main 区在 xact_time 后携带
+     * xinfo u32 与块链；commit/abort/两阶段确认记录共用）。 */
+    public static final int XLOG_XACT_HAS_INFO = 0x80;
 
     /** heapam_xlog.h：xl_heap_update 含旧 tuple 全行或旧键（CONTAINS_OLD_TUPLE|OLD_KEY = 0x04|0x08）。 */
     public static final int XLH_UPDATE_CONTAINS_OLD = 0x04 | 0x08;

@@ -231,6 +231,27 @@ public final class TupleBytes {
     }
 
     /**
+     * bytea 列（varlena，按总长自动选 1B 头或 4B 头——与 {@link #text(String)} 同一
+     * 头逻辑，载荷不解码直接写原文）。
+     *
+     * @param b 载荷字节（原样写入 varlena 载荷区）
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 bytea
+     */
+    public TupleBytes bytes(byte[] b) {
+        if (1 + b.length <= VARLENA_1B_MAX_TOTAL) {
+            byte[] cell = new byte[1 + b.length];
+            cell[0] = (byte) ((1 + b.length) << 1 | 0x01);   // 1B 头：总长<<1|tag
+            System.arraycopy(b, 0, cell, 1, b.length);
+            return scalar("bytea", 4, cell);
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeU32(out, (4L + b.length) << 2);
+        out.writeBytes(b);
+        return scalar("bytea", 4, out.toByteArray());
+    }
+
+    /**
      * skip 列：写一个 varlena 供解码端走读消耗（值不物化）。
      *
      * @param s 被跳过的文本（UTF-8 编码）

@@ -1,6 +1,7 @@
 package org.vastdata.vbstream.walsource.layout;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -69,6 +70,24 @@ public final class WalBytes {
 
     /** 页头 info 位 XLP_LONG_HEADER：段首长页头（额外 16B 段创始信息）。 */
     public static final int XLP_LONG_HEADER = 0x0002;
+
+    /** rmgrlist.h 枚举序：RM_XACT_ID（xact 助手自持常量——与被测 HeapOps 双源互证）。 */
+    private static final int RM_XACT_ID = 1;
+
+    /** xact.h：XLOG_XACT_PREPARE（opcode 位段 0x10——两阶段准备）。 */
+    private static final int XLOG_XACT_PREPARE = 0x10;
+
+    /** xact.h：XLOG_XACT_ASSIGNMENT（opcode 位段 0x50——子事务归并映射）。 */
+    private static final int XLOG_XACT_ASSIGNMENT = 0x50;
+
+    /** xact.h：XLOG_XACT_HAS_INFO（info 附加位 0x80——main 携带 xinfo 块链）。 */
+    private static final int XLOG_XACT_HAS_INFO = 0x80;
+
+    /** xact.h：XACT_XINFO_HAS_TWOPHASE（1<<4——twophase chunk 存在）。 */
+    private static final int XINFO_HAS_TWOPHASE = 1 << 4;
+
+    /** xact.h：XACT_XINFO_HAS_GID（1<<7——gid 字符串跟随 twophase chunk）。 */
+    private static final int XINFO_HAS_GID = 1 << 7;
 
     private static final byte[] EMPTY = {};
 
@@ -344,6 +363,112 @@ public final class WalBytes {
     }
 
     /**
+     * 拼一条 RM_XACT_ID 记录（COMMIT/ABORT/ASSIGNMENT 之外的极简档）——main data 仅
+     * {@code xact_time i64}（MinSizeOfXactCommit=8，REL_18 xact.h 的 xl_xact_commit
+     * 首成员），可选 TOPLEVEL_XID 标记（子事务 ABORT 归并用）。
+     *
+     * <p>布局钉（REL_18_STABLE src/backend/access/rmgrdesc/xact.c ParseCommitRecord）：
+     * 无 HAS_INFO 位的 commit/abort main 就是裸 8B 时间戳；带附加块的形态走
+     * {@link #xactRecordWithGid}。</p>
+     *
+     * @param opcode        XLOG_XACT_* 操作码（调用方传 HeapOps 常量）
+     * @param xid           记录头 xid
+     * @param xactTimeMicros 提交/中止时间戳（自 2000-01-01 起微秒）
+     * @param toplevelXid   顶层事务 id（0 = 不写 TOPLEVEL_XID 标记）
+     * @return 完整记录字节数组
+     */
+    public static byte[] xactRecord(int opcode, int xid, long xactTimeMicros, int toplevelXid) {
+        ByteArrayOutputStream m = new ByteArrayOutputStream();
+        put64(m, xactTimeMicros);
+        WalBytes b = record(RM_XACT_ID, opcode, xid).main(m.toByteArray());
+        return toplevelXid != 0 ? b.toplevel(toplevelXid).build() : b.build();
+    }
+
+    /**
+     * 拼一条 COMMIT_PREPARED / ABORT_PREPARED 记录——info 置 XLOG_XACT_HAS_INFO(0x80)，
+     * main 走 {@code [xact_time i64][xinfo u32][twophase chunk: xid u32][gid NUL 结尾]}。
+     *
+     * <p>布局钉（xactdesc.c ParseCommitRecord 的块链走读）：xinfo 仅置
+     * XACT_XINFO_HAS_TWOPHASE(1&lt;&lt;4)|HAS_GID(1&lt;&lt;7)——中间块（dbinfo/subxacts/
+     * relfilelocators/stats/invals）全缺位，游标直达 twophase chunk。<b>归属键 =
+     * twophase chunk 的 xid</b>（xact_redo_commit 用 parsed.twophase_xid 而非记录头
+     * xid——COMMIT PREPARED 在新事务里执行，记录头是新 xid）。</p>
+     *
+     * @param opcode       XLOG_XACT_COMMIT_PREPARED / XLOG_XACT_ABORT_PREPARED
+     * @param headerXid    记录头 xid（真实形态下是执行命令的新事务 xid，非归属键）
+     * @param xactTimeMicros 时间戳（自 2000-01-01 起微秒）
+     * @param twophaseXid  被确认/回滚的已准备事务 xid（归属键）
+     * @param gid          两阶段全局事务名
+     * @return 完整记录字节数组
+     */
+    public static byte[] xactRecordWithGid(int opcode, int headerXid, long xactTimeMicros,
+                                           int twophaseXid, String gid) {
+        ByteArrayOutputStream m = new ByteArrayOutputStream();
+        put64(m, xactTimeMicros);
+        put32(m, XINFO_HAS_TWOPHASE | XINFO_HAS_GID);
+        put32(m, twophaseXid & 0xFFFFFFFFL);
+        byte[] gidBytes = gid.getBytes(StandardCharsets.UTF_8);
+        m.writeBytes(gidBytes);
+        m.write(0);                                             // NUL 结尾（块链注释原文）
+        return record(RM_XACT_ID, opcode | XLOG_XACT_HAS_INFO, headerXid)
+                .main(m.toByteArray()).build();
+    }
+
+    /**
+     * 拼一条 PREPARE 记录——main data = 两阶段状态文件头（xl_xact_prepare，
+     * sizeof=72B）+ gid（gidlen 字节，<b>非 NUL 结尾</b>——twophase.c PrepareRedoAdd 用
+     * {@code strncpy(gidlen)} 截取、xactdesc.c ParsePrepareRecord 同面）。
+     *
+     * <p>头布局钉（REL_18 xact.h xl_xact_prepare = TwoPhaseFileHeader，C 对齐后）：
+     * magic u32@0、total_len u32@4、xid u32@8、database u32@12、prepared_at i64@16、
+     * owner u32@24、nsubxacts@28、ncommitrels@32、nabortrels@36、ncommitstats@40、
+     * nabortstats@44、ninvalmsgs@48、initfileinval u8@52（+1B 对齐垫）、gidlen u16@54、
+     * origin_lsn u64@56、origin_timestamp i64@64；gid 自 MAXALIGN(72)=72 起。</p>
+     *
+     * @param xid             被准备的事务 xid（头 xid@8 与记录头 xid 同值）
+     * @param preparedAtMicros 准备时间戳（自 2000-01-01 起微秒）
+     * @param gid             两阶段全局事务名（≤200B）
+     * @return 完整记录字节数组
+     */
+    public static byte[] prepareRecord(int xid, long preparedAtMicros, String gid) {
+        byte[] gidBytes = gid.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream m = new ByteArrayOutputStream();
+        put32(m, 0x140601L);                                    // magic（TWO_PHASE_MAGIC 位形）
+        put32(m, 72L + gidBytes.length);                        // total_len
+        put32(m, xid & 0xFFFFFFFFL);                            // xid@8
+        put32(m, 16385L);                                       // database@12
+        put64(m, preparedAtMicros);                             // prepared_at@16
+        put32(m, 10L);                                          // owner@24
+        for (int i = 28; i < 52; i += 4) {
+            put32(m, 0L);                                       // 六个计数全零 @28..48
+        }
+        m.write(0);                                             // initfileinval@52 + 1B 垫
+        put16(m, gidBytes.length);                              // gidlen@54
+        put64(m, 0L);                                           // origin_lsn@56
+        put64(m, 0L);                                           // origin_timestamp@64
+        m.writeBytes(gidBytes);                                 // gid@72（gidlen 字节）
+        return record(RM_XACT_ID, XLOG_XACT_PREPARE, xid).main(m.toByteArray()).build();
+    }
+
+    /**
+     * 拼一条 ASSIGNMENT 记录——main = {@code xl_xact_assignment {xtop u32@0,
+     * nsubxacts i32@4, subxacts u32[]@8}（spike 发现 25 的子 xid 归并兜底通道）。
+     *
+     * @param topXid 顶层事务 id
+     * @param subxids 被归并的子事务 xid 列表
+     * @return 完整记录字节数组
+     */
+    public static byte[] assignmentRecord(int topXid, int... subxids) {
+        ByteArrayOutputStream m = new ByteArrayOutputStream();
+        put32(m, topXid & 0xFFFFFFFFL);
+        put32(m, subxids.length);
+        for (int sub : subxids) {
+            put32(m, sub & 0xFFFFFFFFL);
+        }
+        return record(RM_XACT_ID, XLOG_XACT_ASSIGNMENT, topXid).main(m.toByteArray()).build();
+    }
+
+    /**
      * 断言当前存在可落 image/data 的块，否则 DSL 误用即刻失败。
      *
      * @throws IllegalStateException 尚未调用 block/sameRel
@@ -376,6 +501,18 @@ public final class WalBytes {
         out.write((int) (v >>> 8) & 0xFF);
         out.write((int) (v >>> 16) & 0xFF);
         out.write((int) (v >>> 24) & 0xFF);
+    }
+
+    /**
+     * 向流写 little-endian u64（xact 记录的 i64 时间戳用）。
+     *
+     * @param out 目标流
+     * @param v   64 位值
+     */
+    private static void put64(ByteArrayOutputStream out, long v) {
+        for (int i = 0; i < 8; i++) {
+            out.write((int) ((v >>> (8 * i)) & 0xFF));
+        }
     }
 
     /**
