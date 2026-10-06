@@ -119,6 +119,9 @@ public final class XactGrouper {
     /** toast chunk 表的三列解码词典（chunk_id oid / chunk_seq int4 / chunk_data bytea）。 */
     private static final String[] TOAST_CHUNK_KINDS = {"oid", "int4", "bytea"};
 
+    /** 未决 2PC 挂起桶的 WARN 护栏阈值（正常业务挂起窗口秒级，持续增长 = 终态泄漏信号）。 */
+    private static final int PREPARED_PENDING_WARN_THRESHOLD = 1000;
+
     private final CatalogSnapshot snapshot;
     private final TableFilter filter;
     private final WalLayout layout;
@@ -137,6 +140,12 @@ public final class XactGrouper {
 
     /** toast 关系判定缓存：relfilenode → 是否 relkind 't'。 */
     private final Map<Long, Boolean> toastRels = new HashMap<>();
+
+    /** 未决 2PC 挂起桶计数（PREPARE 递增、终态弃桶递减——WARN 护栏的观测面）。 */
+    private int preparedPending;
+
+    /** 护栏 WARN 已发标记（计数节流：超阈值只告警一次，回落不重置）。 */
+    private boolean preparedOverflowWarned;
 
     /**
      * 装配组装器。
@@ -217,7 +226,7 @@ public final class XactGrouper {
     private void onCommit(WalRecord rec, boolean twoPhase) {
         CommitView c = parseCommitMain(rec);
         long xid = c.twophaseXid() != 0 ? c.twophaseXid() : rec.xid() & 0xFFFFFFFFL;
-        Bucket b = buckets.remove(xid);
+        Bucket b = removeBucket(xid);
         if (b != null) {
             String gid = c.gid() != null ? c.gid() : b.gid;
             emitBucket(b, twoPhase, gid, rec.lsn(), endLsnOf(rec), c.commitTs());
@@ -246,7 +255,7 @@ public final class XactGrouper {
             }
             return;
         }
-        Bucket b = buckets.remove(xid);
+        Bucket b = removeBucket(xid);
         if (b != null) {
             out.onAborted(new ChangeOutputListener.BatchAborted(xid));
         }
@@ -256,10 +265,11 @@ public final class XactGrouper {
     /**
      * PREPARE：桶标记挂起（记 gid，零发射）——行值已在到达期物化，挂起仅悬置终态。
      *
-     * <p>关键步骤：main 按 72B 文件头解 xid@8 / prepared_at@16 / gidlen@54 / gid@72
-     * （gidlen 字节截取，非 NUL 结尾——布局钉见类 javadoc）；有桶则记 gid。
-     * 边界与异常语义：main &lt; 72 或 gidlen 越界抛 ISE；无桶（无用户表行）仅 INFO
-     * 观测。线程约束：单写者。</p>
+     * <p>关键步骤：main 按 72B 文件头解 xid@8 / prepared_at@16 / gidlen@54 / gid@72；
+     * gid 取 gidlen 字节并<b>剥尾 NUL</b>（真实 gidlen = strlen+1，twophase.c
+     * SaveTransactionState 同面）；有桶则记 gid 并递增未决计数（超过护栏阈值 WARN 一次
+     * ——终态悬置泄漏的观测信号）。边界与异常语义：main &lt; 72 或 gidlen 越界抛
+     * ISE；无桶（无用户表行）仅跳过。线程约束：单写者。</p>
      *
      * @param rec 准备记录
      */
@@ -276,10 +286,24 @@ public final class XactGrouper {
             throw new IllegalStateException("prepare gid 越界: gidlen=" + gidlen
                     + ", mainLen=" + rec.mainLen());
         }
-        String gid = new String(raw, off + SIZE_OF_XACT_PREPARE, gidlen, StandardCharsets.UTF_8);
+        // 真实 gidlen = strlen+1 含尾 NUL（twophase.c SaveTransactionState 的
+        // hdr->gidlen = strlen(gid) + 1）——剥尾 NUL 才得原 gid；无 NUL 形态（gidlen 即
+        // strlen 的手造/异源字节）不受影响
+        int gidStrLen = gidlen;
+        if (gidStrLen > 0 && raw[off + SIZE_OF_XACT_PREPARE + gidStrLen - 1] == 0) {
+            gidStrLen--;
+        }
+        String gid = new String(raw, off + SIZE_OF_XACT_PREPARE, gidStrLen, StandardCharsets.UTF_8);
         Bucket b = buckets.get(xid);
         if (b != null) {
             b.gid = gid;
+            preparedPending++;
+            if (preparedPending > PREPARED_PENDING_WARN_THRESHOLD && !preparedOverflowWarned) {
+                preparedOverflowWarned = true;
+                LOG.warn("未决 2PC 挂起桶数 {} 超过 {}——PREPARE 终态悬置泄漏的观测信号"
+                        + "（正常业务下挂起窗口为秒级，持续增长指向终态记录丢失/消费停滞）",
+                        preparedPending, PREPARED_PENDING_WARN_THRESHOLD);
+            }
             LOG.info("两阶段事务挂起: xid={}, gid={}, 行数={}", xid, gid, b.rows.size());
         }
         terminalCleanup(xid);
@@ -294,11 +318,29 @@ public final class XactGrouper {
     private void onAbortPrepared(WalRecord rec) {
         CommitView c = parseCommitMain(rec);
         long xid = c.twophaseXid() != 0 ? c.twophaseXid() : rec.xid() & 0xFFFFFFFFL;
-        Bucket b = buckets.remove(xid);
+        Bucket b = removeBucket(xid);
         if (b != null) {
             out.onAborted(new ChangeOutputListener.BatchAborted(xid));
         }
         terminalCleanup(xid);
+    }
+
+    /**
+     * 终态取桶的公共面：摘桶 + 未决 2PC 计数递减（挂起后被确认/回滚）+ 桶缺位的
+     * DEBUG 观测（无用户表行的事务属常态——catalog-only/全过滤，不打 INFO 防刷屏，
+     * DEBUG 供消费停滞排查时定位"记录到达但无桶"形态）。
+     *
+     * @param xid 终态归属事务 id
+     * @return 摘出的桶；无桶为 null
+     */
+    private Bucket removeBucket(long xid) {
+        Bucket b = buckets.remove(xid);
+        if (b == null) {
+            LOG.debug("终态记录无待决桶（事务无用户表行或已终结）: xid={}", xid);
+        } else if (b.gid != null) {
+            preparedPending--;
+        }
+        return b;
     }
 
     /**
@@ -430,7 +472,8 @@ public final class XactGrouper {
     /**
      * toast 关系上的行记录采集为 chunk（INSERT 单行 / MULTI_INSERT 逐 entry，三列
      * 词典 oid/int4/bytea）——chunk_data 是 plain varlena（chunk ≤1996B 恒行内），
-     * external/compressed 拒绝面不触发。非 toast 关系或非行承载 opcode 静默跳过。
+     * external/compressed 拒绝面不触发。非 toast 关系、非行承载 opcode 或无块 data
+     * （INIT_PAGE 镜像形态）静默跳过——缺 chunk 落回查兜底。
      *
      * @param rec     heap/heap2 记录
      * @param blk     首块（relfilenode 归集键）
@@ -443,6 +486,10 @@ public final class XactGrouper {
         int op = rec.info() & HeapOps.XLOG_XACT_OPMASK;
         if (op != HeapOps.XLOG_HEAP_INSERT && op != HeapOps.XLOG_HEAP2_MULTI_INSERT) {
             return;   // chunk 删除（DELETE/PRUNE）不采集——归集面由终态全清承担
+        }
+        if (!blk.hasData()) {
+            return;   // INIT_PAGE+镜像无 data 形态：chunk 载荷在镜像内，采集面跳过
+            //（对齐 dispatchHeap2 的 hasData 判定；缺 chunk 落 resolveExternal 回查兜底）
         }
         if (op == HeapOps.XLOG_HEAP_INSERT) {
             Object[] row = decoder.decodePayload(rec.raw(), blk.dataOff(), TOAST_CHUNK_KINDS);

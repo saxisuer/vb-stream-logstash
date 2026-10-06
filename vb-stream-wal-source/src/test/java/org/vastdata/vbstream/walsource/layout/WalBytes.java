@@ -388,53 +388,58 @@ public final class WalBytes {
      * 拼一条 COMMIT_PREPARED / ABORT_PREPARED 记录——info 置 XLOG_XACT_HAS_INFO(0x80)，
      * main 走 {@code [xact_time i64][xinfo u32][twophase chunk: xid u32][gid NUL 结尾]}。
      *
-     * <p>布局钉（xactdesc.c ParseCommitRecord 的块链走读）：xinfo 仅置
-     * XACT_XINFO_HAS_TWOPHASE(1&lt;&lt;4)|HAS_GID(1&lt;&lt;7)——中间块（dbinfo/subxacts/
-     * relfilelocators/stats/invals）全缺位，游标直达 twophase chunk。<b>归属键 =
-     * twophase chunk 的 xid</b>（xact_redo_commit 用 parsed.twophase_xid 而非记录头
-     * xid——COMMIT PREPARED 在新事务里执行，记录头是新 xid）。</p>
+     * <p>布局钉（xactdesc.c ParseCommitRecord 的块链走读）：xinfo 置
+     * XACT_XINFO_HAS_TWOPHASE(1&lt;&lt;4)，gid 非 null 再置 HAS_GID(1&lt;&lt;7)——中间块
+     * （dbinfo/subxacts/relfilelocators/stats/invals）全缺位，游标直达 twophase chunk。
+     * <b>归属键 = twophase chunk 的 xid</b>（xact_redo_commit 用 parsed.twophase_xid 而非
+     * 记录头 xid——COMMIT PREPARED 在新事务里执行，记录头是新 xid）。gid 传 null = 无
+     * GID chunk 形态（wal_level&lt;logical 的真实形态——gid 归 PREPARE 记录侧承载，
+     * 确认侧回落桶上挂起值）。</p>
      *
      * @param opcode       XLOG_XACT_COMMIT_PREPARED / XLOG_XACT_ABORT_PREPARED
      * @param headerXid    记录头 xid（真实形态下是执行命令的新事务 xid，非归属键）
      * @param xactTimeMicros 时间戳（自 2000-01-01 起微秒）
      * @param twophaseXid  被确认/回滚的已准备事务 xid（归属键）
-     * @param gid          两阶段全局事务名
+     * @param gid          两阶段全局事务名（null = 不携带 GID chunk）
      * @return 完整记录字节数组
      */
     public static byte[] xactRecordWithGid(int opcode, int headerXid, long xactTimeMicros,
                                            int twophaseXid, String gid) {
         ByteArrayOutputStream m = new ByteArrayOutputStream();
         put64(m, xactTimeMicros);
-        put32(m, XINFO_HAS_TWOPHASE | XINFO_HAS_GID);
+        put32(m, XINFO_HAS_TWOPHASE | (gid != null ? XINFO_HAS_GID : 0));
         put32(m, twophaseXid & 0xFFFFFFFFL);
-        byte[] gidBytes = gid.getBytes(StandardCharsets.UTF_8);
-        m.writeBytes(gidBytes);
-        m.write(0);                                             // NUL 结尾（块链注释原文）
+        if (gid != null) {
+            m.writeBytes(gid.getBytes(StandardCharsets.UTF_8));
+            m.write(0);                                         // NUL 结尾（块链注释原文）
+        }
         return record(RM_XACT_ID, opcode | XLOG_XACT_HAS_INFO, headerXid)
                 .main(m.toByteArray()).build();
     }
 
     /**
      * 拼一条 PREPARE 记录——main data = 两阶段状态文件头（xl_xact_prepare，
-     * sizeof=72B）+ gid（gidlen 字节，<b>非 NUL 结尾</b>——twophase.c PrepareRedoAdd 用
-     * {@code strncpy(gidlen)} 截取、xactdesc.c ParsePrepareRecord 同面）。
+     * sizeof=72B）+ gid（<b>真实形态：gidlen = strlen+1 含尾 NUL</b>，twophase.c
+     * SaveTransactionState 的 {@code hdr->gidlen = strlen(gid) + 1} 同面——解侧须剥尾
+     * NUL 才得原 gid）。
      *
      * <p>头布局钉（REL_18 xact.h xl_xact_prepare = TwoPhaseFileHeader，C 对齐后）：
      * magic u32@0、total_len u32@4、xid u32@8、database u32@12、prepared_at i64@16、
      * owner u32@24、nsubxacts@28、ncommitrels@32、nabortrels@36、ncommitstats@40、
-     * nabortstats@44、ninvalmsgs@48、initfileinval u8@52（+1B 对齐垫）、gidlen u16@54、
-     * origin_lsn u64@56、origin_timestamp i64@64；gid 自 MAXALIGN(72)=72 起。</p>
+     * nabortstats@44、ninvalmsgs@48、initfileinval u8@52、<b>1B C 对齐垫@53</b>、
+     * gidlen u16@54、origin_lsn u64@56、origin_timestamp i64@64；gid 自 MAXALIGN(72)=72
+     * 起（gidlen 字节，含尾 NUL）。</p>
      *
      * @param xid             被准备的事务 xid（头 xid@8 与记录头 xid 同值）
      * @param preparedAtMicros 准备时间戳（自 2000-01-01 起微秒）
-     * @param gid             两阶段全局事务名（≤200B）
+     * @param gid             两阶段全局事务名（≤199B，留尾 NUL 位）
      * @return 完整记录字节数组
      */
     public static byte[] prepareRecord(int xid, long preparedAtMicros, String gid) {
         byte[] gidBytes = gid.getBytes(StandardCharsets.UTF_8);
         ByteArrayOutputStream m = new ByteArrayOutputStream();
         put32(m, 0x140601L);                                    // magic（TWO_PHASE_MAGIC 位形）
-        put32(m, 72L + gidBytes.length);                        // total_len
+        put32(m, 72L + gidBytes.length + 1);                    // total_len
         put32(m, xid & 0xFFFFFFFFL);                            // xid@8
         put32(m, 16385L);                                       // database@12
         put64(m, preparedAtMicros);                             // prepared_at@16
@@ -442,11 +447,13 @@ public final class WalBytes {
         for (int i = 28; i < 52; i += 4) {
             put32(m, 0L);                                       // 六个计数全零 @28..48
         }
-        m.write(0);                                             // initfileinval@52 + 1B 垫
-        put16(m, gidBytes.length);                              // gidlen@54
+        m.write(0);                                             // initfileinval u8@52
+        m.write(0);                                             // C 对齐垫@53（gidlen 对齐至 54）
+        put16(m, gidBytes.length + 1);                          // gidlen@54 = strlen+1（含尾 NUL）
         put64(m, 0L);                                           // origin_lsn@56
         put64(m, 0L);                                           // origin_timestamp@64
-        m.writeBytes(gidBytes);                                 // gid@72（gidlen 字节）
+        m.writeBytes(gidBytes);                                 // gid@72
+        m.write(0);                                             // 尾 NUL（gidlen 计入）
         return record(RM_XACT_ID, XLOG_XACT_PREPARE, xid).main(m.toByteArray()).build();
     }
 

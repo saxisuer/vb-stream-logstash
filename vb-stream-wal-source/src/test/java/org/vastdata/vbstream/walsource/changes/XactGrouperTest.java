@@ -165,6 +165,26 @@ class XactGrouperTest {
         assertEquals(List.of("ABORTED xid=700"), fx.listener.events);
     }
 
+    /**
+     * PREPARE 半边 gid 直测（审查修复面）：PREPARE 记录的 gid 经 72B 头 gidlen 解出并
+     * <b>剥尾 NUL</b>（真实 gidlen=strlen+1，twophase.c 同面）挂到桶上；确认记录无
+     * GID chunk（wal_level&lt;logical 真实形态）时回落桶值——gid 断言来源是 PREPARE 侧
+     * 而非 COMMIT_PREPARED 侧（审查 High/Medium-1：此前测试⑤的 gid 断言全来自确认侧，
+     * PREPARE 解析从未被验证）。
+     */
+    @Test
+    void prepareRecordGidDirectlyPendsOnBucketWithNulStripped() {
+        Fixture fx = fixture();
+        fx.insert(700, 0, 1, "p1");
+        fx.feed(WalBytes.prepareRecord(700, COMMIT_MICROS, "gt-direct"));
+        fx.feed(WalBytes.xactRecordWithGid(HeapOps.XLOG_XACT_COMMIT_PREPARED, 890, COMMIT_MICROS, 700, null));
+
+        assertEquals(List.of(
+                "BEGIN xid=700 2p=true gid=gt-direct exp=1",
+                "ROW INSERT public.t_stream before=null after={id=1, name=p1}",
+                "END xid=700 emitted=1 exp=1"), fx.listener.events);
+    }
+
     /** 任务书 ⑦：TOPLEVEL_XID 标记归并——多个子 xid 的行并进同一顶层桶，单批量发射。 */
     @Test
     void toplevelXidMarkerMergesSubxactRows() {
