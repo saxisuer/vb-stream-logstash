@@ -49,7 +49,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  *   <tr><td>{@code 'NaN'/'Infinity'/'-Infinity'::numeric::text}</td><td>{@code NaN} / {@code Infinity} / {@code -Infinity}</td></tr>
  *   <tr><td>{@code 'NaN'/'Infinity'/'-Infinity'::float8::text}</td><td>{@code NaN} / {@code Infinity} / {@code -Infinity}</td></tr>
  *   <tr><td>{@code '1.5'::float8::text} / {@code '1.5'::float4::text}</td><td>{@code 1.5} / {@code 1.5}</td></tr>
- *   <tr><td>{@code '1e20'::float8::text}</td><td>{@code 1e+20}（<b>已知分叉</b>：Java 最短表示 {@code 1.0E20}，与 engine BinaryValueDecoder 同一取舍）</td></tr>
+ *   <tr><td>{@code '1e20'::float8::text} / {@code '4.5e-8'::float8::text} / {@code '1e6'::float4::text}</td><td>{@code 1e+20} / {@code 4.5e-08} / {@code 1e+06}（Task 9 起经 PgFloatFormat 与 PG 逐字同形，细则与锚见 PgFloatFormatTest）</td></tr>
+ *   <tr><td>{@code '24:00:00'::time::text}</td><td>{@code 24:00:00}（域闭上端特判——java.time 无 24 点）</td></tr>
+ *   <tr><td>{@code '12:34:56.123456+05:30' / '00:00:00+00' / '23:59:59.999999-08:00'::timetz::text}</td><td>{@code 12:34:56.123456+05:30} / {@code 00:00:00+00} / {@code 23:59:59.999999-08}</td></tr>
  *   <tr><td>{@code decode('00ff','hex')::text} / 空 bytea</td><td>{@code \x00ff} / {@code \x}</td></tr>
  *   <tr><td>{@code 't'::bool::text}（cast 形态）</td><td>{@code true}——<b>bool_out（pgoutput text 模式）是 {@code t}</b>，渲染取后者对齐 engine</td></tr>
  *   <tr><td>{@code 'a0b1c2d3-e4f5-6789-abcd-ef0123456789'::uuid::text}</td><td>原样小写连字符</td></tr>
@@ -80,6 +82,7 @@ class DiskValueRendererTest {
     private static final int OID_VARCHAR = 1043;
     private static final int OID_DATE = 1082;
     private static final int OID_TIME = 1083;
+    private static final int OID_TIMETZ = 1266;
     private static final int OID_TIMESTAMP = 1114;
     private static final int OID_TIMESTAMPTZ = 1184;
     private static final int OID_NUMERIC = 1700;
@@ -138,20 +141,25 @@ class DiskValueRendererTest {
     // ---- 浮点族 ----
 
     /**
-     * float4/float8 用 Java 最短表示——普通值与 PG 逐字一致（1.5/NaN/Infinity 实测钉），
-     * 科学计数法区段有已知格式差（PG {@code 1e+20} vs Java {@code 1.0E20}，与 engine
-     * BinaryValueDecoder 同一取舍，见类 javadoc 样本表）。
+     * float4/float8 经 {@code PgFloatFormat} 渲染 PG text 形态（Task 9 接线——
+     * 补上 {@code Double.toString} 的 {@code 1.0E20} vs PG {@code 1e+20} 分叉，规则
+     * 细则与 docker 实测锚见 PgFloatFormatTest）：普通值/特值与 PG 逐字一致，
+     * 科学计数法区段同形（含 float4 的低门限 {@code 1e+06}）。
      */
     @Test
-    void floatFamilyRendersJavaShortestForm() {
+    void floatFamilyRendersPgTextForm() {
         assertEquals("1.5", DiskValueRenderer.render(1.5f, OID_FLOAT4));
+        assertEquals("1e+06", DiskValueRenderer.render(1_000_000f, OID_FLOAT4));
         assertEquals("NaN", DiskValueRenderer.render(Float.NaN, OID_FLOAT4));
         assertEquals("1.5", DiskValueRenderer.render(1.5d, OID_FLOAT8));
         assertEquals("-1.5", DiskValueRenderer.render(-1.5d, OID_FLOAT8));
         assertEquals("NaN", DiskValueRenderer.render(Double.NaN, OID_FLOAT8));
         assertEquals("Infinity", DiskValueRenderer.render(Double.POSITIVE_INFINITY, OID_FLOAT8));
         assertEquals("-Infinity", DiskValueRenderer.render(Double.NEGATIVE_INFINITY, OID_FLOAT8));
-        assertEquals("1.0E20", DiskValueRenderer.render(1e20d, OID_FLOAT8));
+        assertEquals("1e+20", DiskValueRenderer.render(1e20d, OID_FLOAT8));
+        assertEquals("4.5e-08", DiskValueRenderer.render(4.5e-8d, OID_FLOAT8));
+        assertEquals("-2.5e+15", DiskValueRenderer.render(-2.5e15d, OID_FLOAT8));
+        assertEquals("-0", DiskValueRenderer.render(-0d, OID_FLOAT8));
     }
 
     // ---- 文本族与 bytea ----
@@ -197,6 +205,46 @@ class DiskValueRendererTest {
         assertEquals("12:34:56.1", DiskValueRenderer.render(timeMicros(LocalTime.of(12, 34, 56, 100_000_000)), OID_TIME));
         assertEquals("12:34:56", DiskValueRenderer.render(timeMicros(LocalTime.of(12, 34, 56)), OID_TIME));
         assertEquals("12:34:00", DiskValueRenderer.render(timeMicros(LocalTime.of(12, 34, 0)), OID_TIME));
+    }
+
+    /**
+     * time 的合法边界值 {@code 24:00:00}（PG time 域的闭上端，微秒恰
+     * 86_400_000_000）——java.time 的 LocalTime 不接受 24 点，须特判直出
+     * {@code 24:00:00}（docker 实测 {@code SELECT '24:00:00'::time::text} =
+     * {@code 24:00:00}；Task 2 疑虑记档的遗留 minor，Task 9 清账）。小数
+     * {@code 24:00:00.000001} 非法（PG 拒收），无对应字节面可造。
+     */
+    @Test
+    void timeEndOfDayRendersTwentyFour() {
+        assertEquals("24:00:00", DiskValueRenderer.render(i64le(86_400_000_000L), OID_TIME));
+    }
+
+    // ---- timetz ----
+
+    /**
+     * timetz：i64 微秒 + i32 区偏移（12B，小端）→ PG text 形态 {@code HH:mm:ss[.frac]±HH[:MM]}。
+     * 区偏移<b>存储为西正秒</b>（date.c 的 {@code t1 = time1->time + time1->zone *
+     * USECS_PER_SEC} 折 UTC），输出经 EncodeTimezone 反号排版（{@code tz <= 0 ? '+' : '-'}）；
+     * 形态三档：整小时 {@code +00}/{@code -08}、半时 {@code +05:30}、带秒偏移
+     * {@code +00:00:15}（docker 实测：{@code '12:34:56.123456+05:30'::timetz::text} /
+     * {@code '00:00:00+00'} / {@code '23:59:59.999999-08:00'}）。
+     */
+    @Test
+    void timetzRendersPgTextWithStoredZoneOffset() {
+        // '12:34:56.123456+05:30'：zone = -19800（西正）
+        assertEquals("12:34:56.123456+05:30",
+                DiskValueRenderer.render(timetzBytes(12, 34, 56, 123_456_000, -19_800), OID_TIMETZ));
+        // '00:00:00+00'：zone = 0（整小时偏移不带分钟段）
+        assertEquals("00:00:00+00",
+                DiskValueRenderer.render(timetzBytes(0, 0, 0, 0, 0), OID_TIMETZ));
+        // '23:59:59.999999-08:00'：zone = +28800
+        assertEquals("23:59:59.999999-08",
+                DiskValueRenderer.render(timetzBytes(23, 59, 59, 999_999_000, 28_800), OID_TIMETZ));
+        // 带秒偏移（LMT 历史区形态）：EncodeTimezone 的 ±HH:MM:SS 档
+        assertEquals("10:00:00+00:00:15",
+                DiskValueRenderer.render(timetzBytes(10, 0, 0, 0, -15), OID_TIMETZ));
+        // 载荷长度不符 → ISE fail-fast
+        assertThrows(IllegalStateException.class, () -> DiskValueRenderer.render(new byte[11], OID_TIMETZ));
     }
 
     // ---- timestamp（无时区）----
@@ -403,6 +451,26 @@ class DiskValueRendererTest {
      */
     private static byte[] timeMicros(LocalTime t) {
         return i64le(t.toNanoOfDay() / 1_000);
+    }
+
+    /**
+     * timetz 的磁盘 datum 手造：i64 当日微秒（小端）+ i32 区偏移（西正秒，小端）。
+     *
+     * @param h       时
+     * @param m       分
+     * @param s       秒
+     * @param ns      纳秒分量
+     * @param zoneSec 区偏移秒（西正：+05:30 输入即 -19800）
+     * @return 12 字节小端磁盘 datum
+     */
+    private static byte[] timetzBytes(int h, int m, int s, int ns, int zoneSec) {
+        long micros = (h * 3_600L + m * 60L + s) * 1_000_000L + ns / 1_000L;
+        byte[] out = new byte[12];
+        byte[] t = i64le(micros);
+        byte[] z = i32le(zoneSec);
+        System.arraycopy(t, 0, out, 0, 8);
+        System.arraycopy(z, 0, out, 8, 4);
+        return out;
     }
 
     /**

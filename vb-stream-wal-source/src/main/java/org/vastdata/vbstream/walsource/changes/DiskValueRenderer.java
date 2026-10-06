@@ -36,12 +36,14 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p><b>渲染规则与实测锚</b>（样本 2026-10-07 docker PG 18.6 容器 {@code ::text} 实测
  * 钉死，全文见测试类 javadoc 样本表）：bool 取 bool_out 的 {@code t}/{@code f}
  * （<b>非</b> {@code ::text} cast 的 {@code true}——pgoutput text 模式即 bool_out）；
- * 整数十进制；浮点 Java 最短表示（1.5/NaN/Infinity 与 PG 逐字一致，科学计数法区段
- * 有 {@code 1e+20} vs {@code 1.0E20} 的已知格式差——与 engine {@code BinaryValueDecoder}
- * 同一取舍）；文本族原文透传；bytea {@code \x}+小写 hex；时间类恒 {@code HH:mm:ss}
- * （秒 0 不省略）+ 微秒<b>去尾零</b>小数（实测裁定：{@code .100000} 渲染 {@code .1}）；
- * timestamptz 按 JVM 默认时区渲染并带数字偏移（对齐 pgjdbc 把复制会话时区设为 JVM
- * 默认的 engine 侧 text 行为）；numeric 精度无损、永不科学计数法。</p>
+ * 整数十进制；浮点经 {@link PgFloatFormat}（Task 9 起 PG 逐字同形——含科学计数法
+ * {@code 1e+20}/{@code 4.5e-08} 与 float4 低门限 {@code 1e+06}，Task 2 记档的
+ * {@code 1.0E20} 分叉已清）；文本族原文透传；bytea {@code \x}+小写 hex；时间类恒
+ * {@code HH:mm:ss}（秒 0 不省略）+ 微秒<b>去尾零</b>小数（实测裁定：
+ * {@code .100000} 渲染 {@code .1}）+ {@code 24:00:00} 闭上端特判；timetz 存储西正秒、
+ * 输出反号三档偏移文本；timestamptz 按 JVM 默认时区渲染并带数字偏移（对齐 pgjdbc
+ * 把复制会话时区设为 JVM 默认的 engine 侧 text 行为）；numeric 精度无损、永不科学
+ * 计数法。</p>
  *
  * <p><b>矩阵外 oid</b>（enum/域/jsonb/组合类型等动态或复杂格式）降级 {@code 0x}+小写
  * 十六进制，每 oid 仅 WARN 一次（类级 logger，观测节流防大事务刷屏）。定长类型载荷
@@ -76,6 +78,7 @@ public final class DiskValueRenderer {
     private static final int OID_VARCHAR = 1043;
     private static final int OID_DATE = 1082;
     private static final int OID_TIME = 1083;
+    private static final int OID_TIMETZ = 1266;
     private static final int OID_TIMESTAMP = 1114;
     private static final int OID_TIMESTAMPTZ = 1184;
     private static final int OID_NUMERIC = 1700;
@@ -83,6 +86,9 @@ public final class DiskValueRenderer {
 
     /** date 纪元 2000-01-01 相对 LocalDate 纪元（1970-01-01）的天数。 */
     private static final long PG_EPOCH_DAY = 10957L;
+
+    /** time 域的闭上端常量：{@code 24:00:00} = 86_400_000_000 微秒（java.time 不接受 24 点，特判直出）。 */
+    private static final long END_OF_DAY_MICROS = 86_400_000_000L;
 
     /** timestamp 家族的 PostgreSQL epoch（2000-01-01T00:00:00Z）折算微秒数。 */
     private static final long EPOCH_2000_MICROS = 946_684_800_000_000L;
@@ -154,12 +160,13 @@ public final class DiskValueRenderer {
         return switch ((int) typeOid) {
             case OID_BOOL -> renderBool(decoded);
             case OID_INT2, OID_INT4, OID_INT8, OID_OID, OID_XID, OID_CID -> renderInt(decoded);
-            case OID_FLOAT4 -> Float.toString(expectNumber(decoded, typeOid).floatValue());
-            case OID_FLOAT8 -> Double.toString(expectNumber(decoded, typeOid).doubleValue());
+            case OID_FLOAT4 -> PgFloatFormat.format(expectNumber(decoded, typeOid).floatValue());
+            case OID_FLOAT8 -> PgFloatFormat.format(expectNumber(decoded, typeOid).doubleValue());
             case OID_TEXT, OID_VARCHAR, OID_BPCHAR, OID_NAME, OID_CHAR, OID_JSON -> renderTextFamily(decoded);
             case OID_BYTEA -> "\\x" + HexFormat.of().formatHex(expectBytes(decoded, typeOid));
             case OID_DATE -> renderDate(expectBytes(decoded, typeOid));
             case OID_TIME -> renderTime(expectBytes(decoded, typeOid));
+            case OID_TIMETZ -> renderTimetz(expectBytes(decoded, typeOid));
             case OID_TIMESTAMP -> renderTimestamp(decoded);
             case OID_TIMESTAMPTZ -> renderTimestamptz(expectBytes(decoded, typeOid));
             case OID_NUMERIC -> renderNumeric(expectBytes(decoded, typeOid));
@@ -278,18 +285,83 @@ public final class DiskValueRenderer {
      *
      * <p>实测锚：docker {@code '12:34:56.123456'::time::text} = {@code 12:34:56.123456}、
      * {@code '12:34:56.100000'} → {@code 12:34:56.1}（<b>尾零截断</b>——任务书疑点
-     * 实测裁定）。恒 HH:mm:ss（秒 0 不省略）。边界：长度≠8 或微秒越出一日抛 ISE/
-     * 异常 fail-fast。线程约束：纯函数。</p>
+     * 实测裁定）、{@code '24:00:00'} → {@code 24:00:00}（域闭上端——java.time 无 24 点，
+     * 特判直出，Task 2 minor 清账；小数 24:00:00.000001 为 PG 非法值，无对应字节面）。
+     * 恒 HH:mm:ss（秒 0 不省略）。边界：长度≠8 或微秒越出一日抛 ISE/异常 fail-fast。
+     * 线程约束：纯函数。</p>
      *
      * @param raw 磁盘 datum（8 字节小端）
-     * @return HH:mm:ss[.frac]
+     * @return HH:mm:ss[.frac] / 24:00:00
      * @throws IllegalStateException 长度不符
      */
     private static String renderTime(byte[] raw) {
         if (raw.length != 8) {
             throw malformed(OID_TIME, raw.length, "8 字节");
         }
-        return pgTimePart(LocalTime.ofNanoOfDay(u64le(raw, 0) * 1_000L));
+        return pgTimeOfDay(u64le(raw, 0));
+    }
+
+    /**
+     * timetz：i64 当日微秒 + i32 区偏移（12B，小端）→ PG text 形态
+     * {@code HH:mm:ss[.frac]±HH[:MM[:SS]]}。
+     *
+     * <p>关键步骤：区偏移<b>存储为西正秒</b>（date.c 的 {@code time + zone *
+     * USECS_PER_SEC} 折 UTC），输出经 EncodeTimezone 反号排版（源码注释原话
+     * "TZ is negated compared to sign we wish to display"）——符号 {@code tz <= 0
+     * ? '+' : '-'}；形态三档：偏移秒分量非零 {@code ±HH:MM:SS}、分钟非零
+     * {@code ±HH:MM}、整小时 {@code ±HH}。实测锚：docker
+     * {@code '12:34:56.123456+05:30'::timetz::text} = {@code 12:34:56.123456+05:30}、
+     * {@code '00:00:00+00'} = {@code 00:00:00+00}、{@code '23:59:59.999999-08:00'} =
+     * {@code 23:59:59.999999-08}。边界：长度≠12 抛 ISE；时间面复用
+     * {@link #pgTimeOfDay}（含 24:00:00 特判）。线程约束：纯函数。</p>
+     *
+     * @param raw 磁盘 datum（12 字节小端：i64 微秒 + i32 西正秒）
+     * @return 时间 + 区偏移文本
+     * @throws IllegalStateException 长度不符
+     */
+    private static String renderTimetz(byte[] raw) {
+        if (raw.length != 12) {
+            throw malformed(OID_TIMETZ, raw.length, "12 字节");
+        }
+        int zone = (int) u32le(raw, 8);
+        return pgTimeOfDay(u64le(raw, 0)) + pgZoneText(zone);
+    }
+
+    /**
+     * 当日微秒 → PG 时间文本：恒 {@code HH:mm:ss}（秒 0 不省略）+ 去尾零微秒小数；
+     * 恰一日（86_400_000_000 微秒）特判 {@code 24:00:00}（time/timetz 共用——
+     * java.time 的 LocalTime 无 24 点，越值直接抛 DateTimeException）。
+     *
+     * @param micros 当日微秒（0..86_400_000_000）
+     * @return HH:mm:ss[.frac] / 24:00:00
+     */
+    private static String pgTimeOfDay(long micros) {
+        if (micros == END_OF_DAY_MICROS) {
+            return "24:00:00";
+        }
+        return pgTimePart(LocalTime.ofNanoOfDay(micros * 1_000L));
+    }
+
+    /**
+     * 西正秒区偏移 → PG EncodeTimezone 文本：反号定符号，秒分量非零打三段、
+     * 分钟非零打两段、整小时打一段（零偏移 {@code +00}——PG 不打 "Z"）。
+     *
+     * @param zoneSec 西正秒（存储形态；+05:30 输入即 -19800）
+     * @return ±HH / ±HH:MM / ±HH:MM:SS
+     */
+    private static String pgZoneText(int zoneSec) {
+        int abs = Math.abs(zoneSec);
+        int sec = abs % 60;
+        int min = (abs / 60) % 60;
+        int hour = abs / 3600;
+        char sign = zoneSec <= 0 ? '+' : '-';
+        if (sec != 0) {
+            return "%c%02d:%02d:%02d".formatted(sign, hour, min, sec);
+        }
+        if (min != 0) {
+            return "%c%02d:%02d".formatted(sign, hour, min);
+        }
+        return "%c%02d".formatted(sign, hour);
     }
 
     /**

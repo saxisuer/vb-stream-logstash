@@ -56,6 +56,10 @@ class XactGrouperTest {
      * ——三列形态使截断 UPDATE 的 prefix/suffix/mid 三段坐标皆非平凡，Task 8.5）。 */
     private static final long WIDE_REL = 24601L;
 
+    /** 用户表三：oid == relfilenode == 24602，public.t_bitmap（十列 int4——natts=10 使
+     * null 位图 2B、t_hoff=32 与无位图的 24 拉开位图宽差，Task 9 补例）。 */
+    private static final long BITMAP_REL = 24602L;
+
     /** toast 关系：oid == relfilenode == 33657（relkind 't'）。 */
     private static final long TOAST_REL = 33657L;
 
@@ -370,6 +374,34 @@ class XactGrouperTest {
         assertEquals(1, fx.grouper.reconstructedTruncatedRows(), "重建观测计数恰一次");
     }
 
+    /**
+     * 截断 UPDATE 重建——<b>新旧位图宽不同（t_hoff 不同）</b>形态（Task 9 补例，
+     * Task 8.5 minor 清账）：t_bitmap 十列表 UPDATE 把旧元组的 NULL 列 c2 置为值
+     * ——旧元组带 2B null 位图（t_hoff=32）、新元组全列活无位图（t_hoff=24），
+     * <b>prefix 按 heapam 语义自各自 t_hoff 起比</b>（实源 L9160-9166：oldp/newp 各
+     * 加<b>自己</b>的 t_hoff），本用例 prefix=c1 4B、suffix=c3..c10 32B、mid=新 c2
+     * 4B。断言：重建后像十列全等（prefix 取旧元组数据区而非错切进位图垫段）、
+     * 前像 c2=null、重建计数恰一次——钉死 {@code TruncatedUpdateSplice} 的
+     * "旧 tail 自 (旧t_hoff-23) 起取 prefix"坐标与 v1"用新 tHoff 切旧 tail"的
+     * 错误形态分界。
+     */
+    @Test
+    void truncatedUpdateFullDifferentBitmapWidthReconstructsRowValues() {
+        Fixture fx = fixture();
+        fx.truncatedUpdateFullDifferentTHoff(300, 777);
+        fx.commit(300);
+
+        assertEquals(List.of(
+                "BEGIN xid=300 2p=false gid=null exp=1",
+                "ROW UPDATE public.t_bitmap before={c1=1, c2=null, c3=3, c4=4, c5=5, c6=6,"
+                        + " c7=7, c8=8, c9=9, c10=10}"
+                        + " after={c1=1, c2=777, c3=3, c4=4, c5=5, c6=6, c7=7, c8=8, c9=9, c10=10}",
+                "END xid=300 emitted=1 exp=1"), fx.listener.events,
+                "位图宽不同形态：prefix 自旧元组自己的 t_hoff 起取，十列重建全等");
+        assertEquals(0, fx.grouper.skippedTruncatedRows(), "FULL 身份不走 guard 跳过");
+        assertEquals(1, fx.grouper.reconstructedTruncatedRows(), "重建观测计数恰一次");
+    }
+
     /** TableMeta 缓存失效：pg_attribute 上的 heap 记录到达即全清缓存，DDL 后新列即时可见。 */
     @Test
     void catalogHeapRecordInvalidatesTableMetaCache() {
@@ -410,6 +442,17 @@ class XactGrouperTest {
                 new CatalogSnapshot.Column(1, "id", 23, false),
                 new CatalogSnapshot.Column(2, "flag", 16, false),
                 new CatalogSnapshot.Column(3, "name", 25, false));
+        snapshot.table(BITMAP_REL, "public", "t_bitmap", "r",
+                new CatalogSnapshot.Column(1, "c1", 23, false),
+                new CatalogSnapshot.Column(2, "c2", 23, false),
+                new CatalogSnapshot.Column(3, "c3", 23, false),
+                new CatalogSnapshot.Column(4, "c4", 23, false),
+                new CatalogSnapshot.Column(5, "c5", 23, false),
+                new CatalogSnapshot.Column(6, "c6", 23, false),
+                new CatalogSnapshot.Column(7, "c7", 23, false),
+                new CatalogSnapshot.Column(8, "c8", 23, false),
+                new CatalogSnapshot.Column(9, "c9", 23, false),
+                new CatalogSnapshot.Column(10, "c10", 23, false));
         snapshot.table(TOAST_REL, "pg_toast", "pg_toast_24600", "t");
         snapshot.table(PG_ATTRIBUTE_RELNODE, "pg_catalog", "pg_attribute", "r");
         RecordingListener listener = new RecordingListener();
@@ -538,6 +581,58 @@ class XactGrouperTest {
             m.writeBytes(oldPayload);                      // FULL 旧元组殿后
             return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, xid)
                     .toplevel(toplevel).block(0, SPC, DB, WIDE_REL, 0).data(data.toByteArray())
+                    .main(m.toByteArray()).build());
+        }
+
+        /**
+         * 一条<b>新旧位图宽不同（t_hoff 不同）</b>的截断 + FULL 身份 UPDATE（Task 9
+         * 补例，Task 8.5 minor 清账）：t_bitmap 十列 int4 表，旧元组 c2 为 NULL
+         * （null 位图 2B → t_hoff=32）、新元组把 c2 置为 {@code newC2} 且全列活
+         * （无位图 → t_hoff=24）——prefix/suffix 按实源语义自<b>各自</b> t_hoff 起的
+         * <b>数据区</b>比（heapam.c L9160-9166，见 {@link #commonPrefixAt} 的前提
+         * 注记），块 data 双截断头 + 新元组头 + 新位图垫段（本形态 1B 垫）+ mid 段
+         * （新 c2），main 尾 FULL 整行旧元组。
+         */
+        WalRecord truncatedUpdateFullDifferentTHoff(int xid, int newC2) {
+            String[] kinds = new String[10];
+            Arrays.fill(kinds, "int4");
+            TupleBytes oldB = TupleBytes.of(kinds).nullAt(1);
+            oldB.i32(1);
+            for (int v = 3; v <= 10; v++) {
+                oldB.i32(v);
+            }
+            TupleBytes newB = TupleBytes.of(kinds);
+            newB.i32(1).i32(newC2);
+            for (int v = 3; v <= 10; v++) {
+                newB.i32(v);
+            }
+            byte[] oldPayload = oldB.payload();
+            byte[] newPayload = newB.payload();
+            byte[] oldTail = tailBytes(oldPayload);
+            byte[] newTail = tailBytes(newPayload);
+            int newDataStart = (newPayload[4] & 0xFF) - 23;   // 1：无位图，1B 垫
+            int oldDataStart = (oldPayload[4] & 0xFF) - 23;   // 9：位图 2B + 垫 5B
+            int prefix = commonPrefixAt(newTail, newDataStart, oldTail, oldDataStart);
+            int suffix = commonSuffixAt(newTail, newDataStart, oldTail, oldDataStart, prefix);
+            int flags = HeapOps.XLH_UPDATE_CONTAINS_OLD_TUPLE
+                    | HeapOps.XLH_UPDATE_PREFIX_FROM_OLD | HeapOps.XLH_UPDATE_SUFFIX_FROM_OLD;
+            ByteArrayOutputStream data = new ByteArrayOutputStream();
+            put16(data, prefix);
+            put16(data, suffix);
+            data.write(newPayload, 0, 5);                     // xl_heap_header 5B
+            data.write(newTail, 0, newDataStart);             // 新元组自己的位图+垫
+            data.write(newTail, newDataStart + prefix,
+                    newTail.length - newDataStart - prefix - suffix);   // mid 段（新 c2）
+            ByteArrayOutputStream m = new ByteArrayOutputStream();
+            put32(m, 0x11223344L);                            // old_xmax u32@0
+            put16(m, 5);                                      // old_offnum u16@4
+            m.write(0);                                       // old_infobits u8@6
+            m.write(flags);                                   // flags u8@7
+            put32(m, 0x55667788L);                            // new_xmax u32@8
+            put16(m, 9);                                      // new_offnum u16@12
+            m.writeBytes(oldPayload);                         // FULL 旧元组殿后
+            return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, xid)
+                    .toplevel(0).block(0, SPC, DB, BITMAP_REL, 0).data(data.toByteArray())
                     .main(m.toByteArray()).build());
         }
 
@@ -718,11 +813,25 @@ class XactGrouperTest {
     /**
      * 两 tail 自 dataStart 起（数据区，t_hoff 之后）的公共前缀字节数——heapam.c
      * {@code log_heap_update} 的 prefix 计算同规则（位图+垫区不参与比较）。
+     *
+     * <p><b>前提注记（Task 9 补）</b>：本形态假设<b>新旧元组位图宽相同</b>（t_hoff
+     * 相等，单一 dataStart 对两侧同用）。实源（heapam.c L9160-9166）是各自加
+     * <b>自己的</b> t_hoff 后逐字节比——位图宽不同（旧有 null 位图/新无，或 natts
+     * 段不同）时须用 {@link #commonPrefixAt} 的双起点形态，否则算出的"前缀"会把
+     * 一侧的位图/垫段错切进数据区。</p>
      */
     private static int commonPrefix(byte[] a, byte[] b, int dataStart) {
+        return commonPrefixAt(a, dataStart, b, dataStart);
+    }
+
+    /**
+     * 两 tail 自<b>各自</b>数据区起点的公共前缀字节数——heapam.c 的 prefix 计算实源
+     * 语义（oldp = 旧元组 + 旧 t_hoff、newp = 新元组 + 新 t_hoff，位图宽可不同）。
+     */
+    private static int commonPrefixAt(byte[] a, int aStart, byte[] b, int bStart) {
         int n = 0;
-        int max = Math.min(a.length, b.length) - dataStart;
-        while (n < max && a[dataStart + n] == b[dataStart + n]) {
+        int max = Math.min(a.length - aStart, b.length - bStart);
+        while (n < max && a[aStart + n] == b[bStart + n]) {
             n++;
         }
         return n;
@@ -731,10 +840,22 @@ class XactGrouperTest {
     /**
      * 两 tail 的公共后缀字节数（自尾端反向比较，越过 prefix 段即停）——heapam.c 的
      * suffix 计算同规则；尾端即数据区末端（tuple 末端），坐标系与实源一致。
+     *
+     * <p><b>前提注记</b>：与 {@link #commonPrefix} 同——单 dataStart 假设位图宽相同；
+     * 位图宽不同时用 {@link #commonSuffixAt}。</p>
      */
     private static int commonSuffix(byte[] a, byte[] b, int dataStart, int prefix) {
+        return commonSuffixAt(a, dataStart, b, dataStart, prefix);
+    }
+
+    /**
+     * 两 tail 自<b>各自</b>数据区起点的公共后缀字节数（自尾端反向比较，尾端即数据区
+     * 末端——起点差异不影响尾端坐标；上限按两侧各自的数据区余量取小，越过 prefix
+     * 段即停）。
+     */
+    private static int commonSuffixAt(byte[] a, int aStart, byte[] b, int bStart, int prefix) {
         int n = 0;
-        int max = Math.min(a.length, b.length) - dataStart - prefix;
+        int max = Math.min(a.length - aStart, b.length - bStart) - prefix;
         while (n < max && a[a.length - n - 1] == b[b.length - n - 1]) {
             n++;
         }

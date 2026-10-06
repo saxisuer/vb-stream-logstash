@@ -71,6 +71,30 @@ class DualPathParityIT {
             "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
     };
 
+    /**
+     * 场景 2 表 DDL（Task 9）：17 类型列全集（两路渲染矩阵交面——wal 侧
+     * {@code DecodeKinds}/{@code DiskValueRenderer} 与 engine 侧 pgoutput text 模式
+     * 的公共覆盖面）+ FULL 前像。列类型含 task 书边界值所需的 float4/float8（科学
+     * 计数法区段）、numeric（深 dscale/极大值/NaN）、timetz（Task 9 补的渲染面）、
+     * time（{@code 24:00:00} 闭上端）、bytea/json/bpchar/uuid 与文本族多字节。
+     */
+    private static final String[] TYPES_TABLE_DDL = {
+            "CREATE TABLE parity.t_types (id int4 NOT NULL,"
+                    + " c_bool bool, c_int2 int2, c_int8 int8,"
+                    + " c_float4 float4, c_float8 float8, c_numeric numeric,"
+                    + " c_text text, c_varchar varchar(100), c_bpchar bpchar(10), c_json json,"
+                    + " c_bytea bytea, c_date date, c_time time, c_timetz timetz,"
+                    + " c_timestamp timestamp, c_timestamptz timestamptz, c_uuid uuid,"
+                    + " PRIMARY KEY (id))",
+            "ALTER TABLE parity.t_types REPLICA IDENTITY FULL",
+    };
+
+    /** 场景 4 表 DDL（Task 9）：两列起步——事务内 ADD COLUMN 扩到三列，as-of 前后段分界。 */
+    private static final String[] DDLIN_TABLE_DDL = {
+            "CREATE TABLE parity.t_ddlin (id int4 NOT NULL, name text, PRIMARY KEY (id))",
+            "ALTER TABLE parity.t_ddlin REPLICA IDENTITY FULL",
+    };
+
     /** 头行解析模式：TXN-BEGIN xid=.. kind=.. gid=.. commitLsn=0x.. commitTs=.. changes=..（两路同格式）。 */
     private static final Pattern HEADER = Pattern.compile(
             "TXN-BEGIN xid=(\\d+) kind=(\\S+) gid=(\\S+) commitLsn=0x([0-9a-f]+) commitTs=(\\S+) changes=(\\d+)");
@@ -191,10 +215,92 @@ class DualPathParityIT {
         assertEquals(0, skipped, "截断 UPDATE 跳过计数应为 0（重建生效/全量记录，不出缺行）");
     }
 
+    // ---- 场景 7：类型矩阵边界值（Task 9 Step 1）----
+
+    /**
+     * 17 类型边界值对拍（Task 9 场景 2）：单事务内 INSERT 边界值行（负数全族/
+     * float4·float8 科学计数法区段/numeric 深小数与 NaN/UTF-8 π 与多字节/bytea hex/
+     * 微秒精度 timestamp·timestamptz/time {@code 24:00:00} 闭上端/timetz 存储区偏移/
+     * uuid/负纪元日）+ 全 NULL 行 + NaN·Infinity 特值行 → UPDATE 全列赋值（长文本
+     * &gt;64 触发渲染层截断形态，尾零时间、空 bytea、float4 低门限 {@code 1e+06}）→
+     * DELETE 两行——双路 diff 空。
+     *
+     * <p><b>值面裁定（任务书要点）</b>：① 浮点科学计数法分叉（PG {@code 1e+20} vs
+     * Java {@code 1.0E20}，Task 2 疑虑 2 遗留）由 {@code PgFloatFormat} 在本任务清账
+     * ——engine text 档的浮点值是服务端 float4/8out 渲染，wal 侧经格式化器逐字复刻
+     * （规则面 REL_18 d2s.c/f2s.c 源码钉 + docker 实测锚，离线归
+     * {@code PgFloatFormatTest}）；② time {@code 24:00:00} 是 PG 合法值（Task 2
+     * minor 清账——特判直出，java.time 无 24 点）；③ 长文本截断是<b>渲染层</b>规则
+     * （两路同为 64 字符 + {@code ...(<原长>B)}，diff 天然一致）；④ numeric 走 text
+     * 档不经 engine {@code BinaryValueDecoder}（其 1E-70 同型缺陷 ledger 记档，
+     * ParityEnv.engineConfig 的 binary=false 钉住）。</p>
+     */
+    @Test
+    void typeMatrixBoundaryRowsParityAcrossPaths() throws Exception {
+        runParity("类型矩阵边界值", 1, TYPES_TABLE_DDL, conn -> {
+            conn.setAutoCommit(false);
+            exec(conn,
+                    "INSERT INTO parity.t_types VALUES (1, true, -32768, -9223372036854775808,"
+                            + " '3.4028235e38'::float4, '1e20'::float8, '1E-70'::numeric,"
+                            + " 'π α β γ δ', '你好 wörld', 'abc', '{\"k\":\"v\",\"n\":[1,2,3]}'::json,"
+                            + " decode('deadbeef00ff','hex'), '1999-12-31', '24:00:00',"
+                            + " '12:34:56.123456+05:30', '2026-10-07 12:34:56.123456',"
+                            + " '2026-10-07 04:34:56.789012+00', 'a0b1c2d3-e4f5-6789-abcd-ef0123456789')");
+            exec(conn, "INSERT INTO parity.t_types VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL,"
+                    + " NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+            exec(conn,
+                    "INSERT INTO parity.t_types VALUES (3, false, 0, 0, 'Infinity'::float4, 'NaN'::float8,"
+                            + " 'NaN'::numeric, '', '', '', 'null'::json, decode('','hex'),"
+                            + " '2000-01-01', '00:00:00', '00:00:00+00', '2000-01-01 00:00:00',"
+                            + " '2000-01-01 00:00:00+00', '00000000-0000-0000-0000-000000000000')");
+            exec(conn,
+                    "UPDATE parity.t_types SET id = 11, c_bool = false, c_int2 = 32767,"
+                            + " c_int8 = 9223372036854775807, c_float4 = '1e6'::float4,"
+                            + " c_float8 = '4.5e-8'::float8,"
+                            + " c_numeric = '123456789012345678901234567890.1234567890',"
+                            + " c_text = repeat('π', 100), c_varchar = '-42.5', c_bpchar = 'xyz',"
+                            + " c_json = '[1, \"two\", null]'::json, c_bytea = decode('ab','hex'),"
+                            + " c_date = '2026-10-07', c_time = '12:34:56.1',"
+                            + " c_timetz = '23:59:59.999999-08:00', c_timestamp = '2026-10-07 12:34',"
+                            + " c_timestamptz = '2026-10-07 23:59:59.999999+00',"
+                            + " c_uuid = 'ffffffff-ffff-ffff-ffff-ffffffffffff' WHERE id = 1");
+            exec(conn, "DELETE FROM parity.t_types WHERE id = 2");
+            exec(conn, "DELETE FROM parity.t_types WHERE id = 3");
+            conn.commit();
+        });
+    }
+
+    // ---- 场景 8：事务内 ADD COLUMN 前后段 as-of（Task 9 Step 2）----
+
+    /**
+     * DDL-in-txn as-of 对拍（Task 9 场景 4）：单事务内先 INSERT 旧列形态行（两列）→
+     * {@code ALTER TABLE ADD COLUMN} → INSERT 新列形态行（三列）→ 再 UPDATE 旧行
+     * （前像是 DDL 前存储的<b>两列元组</b>、后像三列）——COMMIT 后双路 diff 空。
+     *
+     * <p><b>验证面</b>：① wal 路"字典 as-of（catalog 先应用）"的端到端正确性——
+     * {@code pg_attribute} 的 INSERT WAL 记录先于第二条 INSERT 到达，重放序内字典
+     * 先扩列、行后解码（首行两列/次行三列各按变更时刻的词典渲染）；② 旧行
+     * UPDATE 的前像短元组（natts=2 &lt; 词典 3）尾列补 null 恰是正确值（ADD COLUMN
+     * 无默认值语义即 NULL）；③ engine 路经 relation 版本日志 as-of 渲染同形（DDL
+     * 后新 'R' 版本不追溯首行）。两路行序与列集逐字节对齐。</p>
+     */
+    @Test
+    void inTxnAddColumnAsOfRenderingParity() throws Exception {
+        runParity("事务内 ADD COLUMN as-of", 1, DDLIN_TABLE_DDL, conn -> {
+            conn.setAutoCommit(false);
+            exec(conn, "INSERT INTO parity.t_ddlin VALUES (1, 'before-ddl')");
+            exec(conn, "ALTER TABLE parity.t_ddlin ADD COLUMN extra text");
+            exec(conn, "INSERT INTO parity.t_ddlin VALUES (2, 'after-ddl', 'new-col')");
+            exec(conn, "UPDATE parity.t_ddlin SET name = 'before-ddl-upd', extra = 'filled'"
+                    + " WHERE id = 1");
+            conn.commit();
+        });
+    }
+
     // ---- 对拍骨架 ----
 
     /**
-     * 单场景对拍骨架（无 aborted 形态——walAborted=0 委派全参档）。
+     * 单场景对拍骨架（无 aborted 形态——walAborted=0 委派全参档；场景 1 系列表 DDL）。
      *
      * @param scenario     场景名（断言消息上下文）
      * @param expectedTxns 场景内已提交（产生用户表行）的事务数——两路各自的追平目标
@@ -203,7 +309,23 @@ class DualPathParityIT {
      * @throws Exception 连接/启动/等待路径的底层异常
      */
     private long runParity(String scenario, long expectedTxns, SqlConsumer<Connection> dml) throws Exception {
-        return runParity(scenario, expectedTxns, 0L, dml);
+        return runParity(scenario, expectedTxns, TABLE_DDL, dml);
+    }
+
+    /**
+     * 单场景对拍骨架（无 aborted 形态——walAborted=0 委派全参档，自定义表 DDL——
+     * 场景 2 类型矩阵表 / 场景 4 DDL-in-txn 表）。
+     *
+     * @param scenario     场景名（断言消息上下文）
+     * @param expectedTxns 场景内已提交事务数
+     * @param tableDdl     本场景建表语句（parity schema 内）
+     * @param dml          DML 执行器
+     * @return wal 路会话累计的截断 UPDATE 跳过计数
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private long runParity(String scenario, long expectedTxns, String[] tableDdl, SqlConsumer<Connection> dml)
+            throws Exception {
+        return runParity(scenario, expectedTxns, 0L, tableDdl, dml);
     }
 
     /**
@@ -228,7 +350,27 @@ class DualPathParityIT {
      */
     private long runParity(String scenario, long expectedTxns, long walAborted, SqlConsumer<Connection> dml)
             throws Exception {
-        ParityEnv.resetScenario(TABLE_DDL);
+        return runParity(scenario, expectedTxns, walAborted, TABLE_DDL, dml);
+    }
+
+    /**
+     * 单场景对拍骨架全参档：重置环境（槽/发布/表重建）→ 两路起流 → 执行 DML → 各自
+     * 等待追平（expectedTxns 个已提交事务输出完毕）→ 停流取捕获行 → 归一化对拍。
+     *（关键步骤与边界语义见 {@link #runParity(String, long, long, SqlConsumer)} 的
+     * 委派源——本档仅把表 DDL 参数化，供场景 2/4 的自定义表形态。）
+     *
+     * @param scenario      场景名（断言消息上下文）
+     * @param expectedTxns  场景内已提交（产生用户表行）的事务数——两路各自的追平目标
+     * @param walAborted    场景内被回滚的子事务行数（wal 记账上界断言的期望差）
+     * @param tableDdl      本场景建表语句（parity schema 内，{@link ParityEnv#resetScenario}）
+     * @param dml           DML 执行器（收一条普通连接，语句异常即测试失败）
+     * @return wal 路会话累计的截断 UPDATE 跳过计数（停流后读——close 含接收线程 join，
+     *                     happens-before 成立；场景断言回归哨兵用）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private long runParity(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
+            SqlConsumer<Connection> dml) throws Exception {
+        ParityEnv.resetScenario(tableDdl);
         EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig());
         ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
         WalSource wal = new WalSource(ParityEnv.walSourceConfig(), new OutputRenderer());
