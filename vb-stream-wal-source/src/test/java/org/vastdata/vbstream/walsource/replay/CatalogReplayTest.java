@@ -41,6 +41,9 @@ class CatalogReplayTest {
     /** 测试用 pg_class relfilenode。 */
     private static final long CLASS_RELNODE = 6002;
 
+    /** 测试用 pg_namespace relfilenode（第三 watched 目录，块匹配面）。 */
+    private static final long NSP_RELNODE = 6003;
+
     /** 测试用表空间 oid（任意合法值，走读不校验）。 */
     private static final long SPC = 1663;
 
@@ -118,7 +121,7 @@ class CatalogReplayTest {
         replay.applyCatalogRecord(upd, stores);
 
         assertNull(stores.classRows().get(oldKey), "UPD 后旧 ctid 行必须消失");
-        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0),
+        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0, "r"),
                 stores.classRows().get(newKey));
         assertFalse(stores.rawClassTails().containsKey(oldKey), "UPD 后旧 raw tail 必须消失");
         assertTrue(stores.rawClassTails().containsKey(newKey));
@@ -153,7 +156,7 @@ class CatalogReplayTest {
         replay.applyCatalogRecord(rec, stores);
 
         assertNull(stores.classRows().get(oldKey));
-        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 201, 0),
+        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 201, 0, "r"),
                 stores.classRows().get(newKey), "prefix=88 应由已知行值编码重建出全行");
 
         // 期望 tail = [bitmap+pad] + 旧行读区编码前 88B + 新行中段（数据区 88 起）
@@ -180,7 +183,7 @@ class CatalogReplayTest {
         long oldKey = CatalogReplay.ctidKey(3, 1);
         long newKey = CatalogReplay.ctidKey(5, 2);
         // 旧行值模型带非默认标识值（77/88/66 + filenode 200/toast 900）——回填判别面
-        CatalogRow.ClassRow oldRow = new CatalogRow.ClassRow(100, "t1", 77, 88, 0, 66, 0, 200, 900);
+        CatalogRow.ClassRow oldRow = new CatalogRow.ClassRow(100, "t1", 77, 88, 0, 66, 0, 200, 900, "r");
         stores.classRows().put(oldKey, oldRow);
 
         TupleBytes newTuple = classTuple(100, "t1x", 201, 0, 1);
@@ -194,7 +197,7 @@ class CatalogReplayTest {
 
         // 中段只含新 relname 尾段;读区 [68,116) 全部来自旧行回填（suffix 截断的
         // 定义:省略段与旧元组逐字节相同）——filenode/toast 取旧行值而非新行 DSL 值
-        assertEquals(new CatalogRow.ClassRow(100, "t1x", 77, 88, 0, 66, 0, 200, 900),
+        assertEquals(new CatalogRow.ClassRow(100, "t1x", 77, 88, 0, 66, 0, 200, 900, "r"),
                 stores.classRows().get(newKey), "RENAME 形态读区段须按旧行回填而非零填充");
         assertNull(stores.classRows().get(oldKey));
     }
@@ -220,7 +223,7 @@ class CatalogReplayTest {
                 3, 1, 5, 2, truncatedData(newTuple, 96, 8)));
         replay.applyCatalogRecord(rec, stores);
 
-        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 900),
+        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 900, "r"),
                 stores.classRows().get(newKey), "prefix=96 应由 rawTail splice 重建");
         assertNull(stores.classRows().get(oldKey));
         assertTrue(stores.rawClassTails().containsKey(newKey));
@@ -319,7 +322,7 @@ class CatalogReplayTest {
                 .build());
         replay.applyCatalogRecord(rec, stores);
 
-        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 777, 888),
+        assertEquals(new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 777, 888, "r"),
                 stores.classRows().get(key), "INPLACE 应就地更新 relfilenode/reltoastrelid");
         assertFalse(stores.rawClassTails().containsKey(key), "INPLACE 后 raw tail 必须置失效");
         assertEquals(1L, stores.metrics().snapshot()
@@ -335,13 +338,13 @@ class CatalogReplayTest {
         CatalogStores stores = freshStores();
         long a = CatalogReplay.ctidKey(7, 1);
         long b = CatalogReplay.ctidKey(7, 2);
-        CatalogRow.ClassRow rowA = new CatalogRow.ClassRow(101, "ra", 11, 12, 0, 10, 0, 300, 0);
-        CatalogRow.ClassRow rowB = new CatalogRow.ClassRow(102, "rb", 11, 12, 0, 10, 0, 301, 0);
+        CatalogRow.ClassRow rowA = new CatalogRow.ClassRow(101, "ra", 11, 12, 0, 10, 0, 300, 0, "r");
+        CatalogRow.ClassRow rowB = new CatalogRow.ClassRow(102, "rb", 11, 12, 0, 10, 0, 301, 0, "r");
         stores.classRows().put(a, rowA);
         stores.classRows().put(b, rowB);
         for (int off : new int[]{10, 11, 12, 13}) {
             stores.classRows().put(CatalogReplay.ctidKey(7, off),
-                    new CatalogRow.ClassRow(200 + off, "d" + off, 11, 12, 0, 10, 0, off, 0));
+                    new CatalogRow.ClassRow(200 + off, "d" + off, 11, 12, 0, 10, 0, off, 0, "r"));
         }
         byte[] tailA = tailOf(classTuple(101, "ra", 300, 0, 1));
         stores.rawClassTails().put(a, tailA);
@@ -446,6 +449,87 @@ class CatalogReplayTest {
                 "attr 侧截断 skip 须计入 skippedTruncated");
     }
 
+    /**
+     * 用例 7a（pg_namespace 扩链）：INS data 路径——块属 pg_namespace relfilenode 的
+     * INSERT 解出 NspRow 落 nspRows、raw tail 落 rawNspTails（第三 watched 目录的
+     * 常规行事件面，v2 schema 解析的字典源）。
+     */
+    @Test
+    void nspInsertReplaysIntoNspRows() {
+        CatalogStores stores = freshStores();
+        WalRecord rec = rec(insertRecord(NSP_RELNODE, 0, 1, nspTuple(500, "public").payload()));
+        replay.applyCatalogRecord(rec, stores);
+
+        assertEquals(new CatalogRow.NspRow(500, "public"),
+                stores.nspRows().get(CatalogReplay.ctidKey(0, 1)), "nsp INS 应落 NspRow");
+        assertTrue(stores.rawNspTails().containsKey(CatalogReplay.ctidKey(0, 1)),
+                "nsp data 路径 INS 应落 raw tail（后续截断 splice 面）");
+        assertEquals(1L, stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED));
+    }
+
+    /**
+     * 用例 7b（pg_namespace 扩链）：截断 RENAME 形态的<strong>值编码重建</strong>——
+     * 种子行无 raw tail（bootstrap JDBC 种子无 tail），prefix 落读区（≤72：oid 4B +
+     * nspname 64B + nspowner 4B）时由已知 NspRow 重编码前缀 + 后缀起点越入读区的
+     * 重叠段回填（语义同 pg_class 的 High-1），RENAME 后 nspname 取记录中段新值、
+     * nspOid 取前缀区旧值，旧 ctid 键消失。
+     */
+    @Test
+    void nspTruncatedRenameRebuildsByValueEncoding() {
+        CatalogStores stores = freshStores();
+        long oldKey = CatalogReplay.ctidKey(3, 1);
+        long newKey = CatalogReplay.ctidKey(5, 2);
+        stores.nspRows().put(oldKey, new CatalogRow.NspRow(500, "abc"));
+
+        TupleBytes newTuple = nspTuple(500, "abx");
+        int prefix = 4 + 2;    // oid + 共有名前缀 "ab"
+        int suffix = (newTuple.payload().length - 5 - (newTuple.tHoff() - 23)) - (4 + 3);
+        WalRecord rec = rec(updateRecord(NSP_RELNODE, HeapOps.XLH_UPDATE_TRUNCATION,
+                3, 1, 5, 2, truncatedData(newTuple, prefix, suffix)));
+        replay.applyCatalogRecord(rec, stores);
+
+        assertNull(stores.nspRows().get(oldKey), "RENAME 后旧 ctid 键必须消失");
+        assertEquals(new CatalogRow.NspRow(500, "abx"), stores.nspRows().get(newKey),
+                "prefix ≤ 72 应由已知行值编码重建（中段新 nspname + 读区回填）");
+        assertEquals(0L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED));
+    }
+
+    /**
+     * 用例 7c（pg_namespace 扩链，采纳护栏）：截断更新旧行值与 raw tail 皆无、且
+     * healer 已注入——必须纯 skip（计数 +1、nspRows 零行），<strong>不得</strong>把
+     * attr 面的 ctid 精确采纳误触到 pg_namespace 面（stub probe 对该 ctid 恒返回一条
+     * pg_attribute 行：误触会把 AttrRow 值行当 NspRow 解出垃圾行——本用例钉死护栏）。
+     */
+    @Test
+    void nspTruncatedWithoutOldStateSkipsQuietlyNeverAdoptsAttrRow() {
+        CatalogStores stores = freshStores();
+        // stub probe：attr 探测恒返回一条确定性 AttrRow（误触诱饵），class 探测 null
+        JdbcProbe bait = new JdbcProbe() {
+            @Override
+            public ProbedRow currentClassRow(long relOid) {
+                return null;
+            }
+
+            @Override
+            public CatalogRow.AttrRow currentAttrRowByCtid(String ctidText) {
+                return new CatalogRow.AttrRow(55, "c1", 23, 1, false);
+            }
+
+            @Override
+            public ProbedRow currentClassRowByCtid(String ctidText) {
+                return null;
+            }
+        };
+        CatalogReplay healing = new CatalogReplay(layout, new TupleDecoder(layout), new SelfHealer(bait));
+        TupleBytes newTuple = nspTuple(500, "abx");
+        WalRecord rec = rec(updateRecord(NSP_RELNODE, HeapOps.XLH_UPDATE_TRUNCATION,
+                3, 1, 5, 2, truncatedData(newTuple, 6, 0)));
+
+        assertDoesNotThrow(() -> healing.applyCatalogRecord(rec, stores));
+        assertTrue(stores.nspRows().isEmpty(), "无旧行无 tail 须纯 skip——attr 采纳不得串面产出垃圾行");
+        assertEquals(1L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED));
+    }
+
     // ---- 测试基建：记录拼装（WalBytes DSL 之上的 heap 家族便捷档） ----------------
 
     /**
@@ -457,6 +541,7 @@ class CatalogReplayTest {
         CatalogStores stores = new CatalogStores();
         stores.pgAttrRelfilenode(ATTR_RELNODE);
         stores.pgClassRelfilenode(CLASS_RELNODE);
+        stores.pgNspRelnode(NSP_RELNODE);
         return stores;
     }
 
@@ -489,8 +574,9 @@ class CatalogReplayTest {
     }
 
     /**
-     * XLOG_HEAP_UPDATE 记录（跨页）：14B main（old_offnum u16@4、flags u8@7、
-     * new_offnum u16@12）+ 块 0（新页）data + 块 1（旧页，SAME_REL）无载荷。
+     * XLOG_HEAP_UPDATE 记录（pg_class 固定档，跨页）——委派
+     * {@link #updateRecord(long, int, int, int, int, int, byte[])} 的 relnode 档
+     * （CLASS_RELNODE），记录形态见其 javadoc。
      *
      * @param flags     xl_heap_update flags（截断位组等）
      * @param oldBlock  旧页块号
@@ -501,6 +587,24 @@ class CatalogReplayTest {
      * @return 记录字节
      */
     private byte[] updateRecord(int flags, int oldBlock, int oldOffnum, int newBlock, int newOffnum, byte[] newData) {
+        return updateRecord(CLASS_RELNODE, flags, oldBlock, oldOffnum, newBlock, newOffnum, newData);
+    }
+
+    /**
+     * XLOG_HEAP_UPDATE 记录（指定 watched relfilenode 档）：块 0（新页）落在传入
+     * relfilenode 上——pg_namespace 等第三 watched 目录的 UPDATE 拼装入口；其余
+     * 形态与 {@link #updateRecord(int, int, int, int, int, byte[])} 一致。
+     *
+     * @param relnode  watched relfilenode（新页块所属关系）
+     * @param flags    xl_heap_update flags（截断位组等）
+     * @param oldBlock 旧页块号
+     * @param oldOffnum 旧行行号
+     * @param newBlock 新页块号
+     * @param newOffnum 新行行号
+     * @param newData   新 tuple 载荷
+     * @return 记录字节
+     */
+    private byte[] updateRecord(long relnode, int flags, int oldBlock, int oldOffnum, int newBlock, int newOffnum, byte[] newData) {
         byte[] main = new byte[14];
         main[4] = (byte) oldOffnum;
         main[5] = (byte) (oldOffnum >>> 8);
@@ -508,7 +612,7 @@ class CatalogReplayTest {
         main[12] = (byte) newOffnum;
         main[13] = (byte) (newOffnum >>> 8);
         return WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, 1)
-                .block(0, SPC, DB, CLASS_RELNODE, newBlock)
+                .block(0, SPC, DB, relnode, newBlock)
                 .data(newData)
                 .sameRel(0, oldBlock)
                 .main(main)
@@ -667,6 +771,23 @@ class CatalogReplayTest {
                 .skipVarlena("a")   // relacl
                 .skipVarlena("b")   // reloptions
                 .skipVarlena("c");  // relpartbound
+    }
+
+    /**
+     * pg_namespace 全 4 列 tuple DSL（词典取 {@link CatalogRow.NspRow#kinds()}，
+     * oid/nspname 参数面 + nspowner 固定填充；nspacl 恒 null——内置模式无 ACL 的
+     * 真实形态，值编码重建面不触 varlena 列）。
+     *
+     * @param oidV nspoid（列 1）
+     * @param name nspname（列 2，定宽 64B name）
+     * @return 已写满全部列的 DSL
+     */
+    private TupleBytes nspTuple(long oidV, String name) {
+        return TupleBytes.of(CatalogRow.NspRow.kinds())
+                .oid(oidV)          // oid
+                .name(name)         // nspname @4
+                .oid(10)            // nspowner @68
+                .nullAt(3);         // nspacl @72（null 位图占位，零数据消耗）
     }
 
     /**

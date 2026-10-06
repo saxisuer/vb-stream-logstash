@@ -78,11 +78,20 @@ public final class WalLayoutV17 implements WalLayout {
      * relallfrozen int4 为 112——两版差恰 4B（单列差），88 锚定法以此自检。 */
     private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 108;
 
+    /** pg_class 数据区 relkind 偏移 115——推算依据：reltoastrelid 自占 [108,112)，
+     * 其后 relhasindex bool + relisshared bool + relpersistence char 各 1B 占
+     * [112,115)，relkind 紧随（V18 为 119——两版差恰 4B 与 toast 偏移自洽）。 */
+    private static final int PGCLASS_RELKIND_DATA_OFFSET = 115;
+
     /** pg_attribute 词典槽位：attisdropped=17（V17 含 attcacheoff@5，其后列整体后移）。 */
     private static final int ATTR_DROPPED_INDEX = 17;
 
     /** pg_class 词典槽位：reltoastrelid=12（V17 无 relallfrozen，较 V18 前移一位）。 */
     private static final int CLASS_TOAST_RELID_INDEX = 12;
+
+    /** pg_class 词典槽位：relkind=16（relpersistence@15 后一位；V18 增 relallfrozen
+     * 使其后移至 17——数据区偏移 V17 115 / V18 119，差恰 4B 与 toast 偏移自洽）。 */
+    private static final int CLASS_RELKIND_INDEX = 16;
 
     /**
      * pg_attribute 列解码词典（26 项），逐行转录自 pg_attribute.h (REL_17_STABLE)
@@ -238,6 +247,12 @@ public final class WalLayoutV17 implements WalLayout {
         return PGCLASS_RELTOASTRELID_DATA_OFFSET;
     }
 
+    /** {@inheritDoc}——115（reltoastrelid@108 自占 4B 后三个单字节列；V18 为 119）。 */
+    @Override
+    public int pgClassRelkindDataOffset() {
+        return PGCLASS_RELKIND_DATA_OFFSET;
+    }
+
     /** {@inheritDoc}——17（attcacheoff@5 使 attisdropped 后移一位；V18 为 16）。 */
     @Override
     public int attrDroppedIndex() {
@@ -248,6 +263,12 @@ public final class WalLayoutV17 implements WalLayout {
     @Override
     public int classToastRelidIndex() {
         return CLASS_TOAST_RELID_INDEX;
+    }
+
+    /** {@inheritDoc}——16（relpersistence@15 后一位；V18 为 17）。 */
+    @Override
+    public int classRelkindIndex() {
+        return CLASS_RELKIND_INDEX;
     }
 
     /** {@inheritDoc}——170000-179999 全区间（含小版本位）。 */

@@ -41,11 +41,20 @@ public final class WalLayoutV18 implements WalLayout {
      * spike replayInplace 以 dataOff+112 实读新 reltoastrelid 实证锚定。 */
     private static final int PGCLASS_RELTOASTRELID_DATA_OFFSET = 112;
 
+    /** pg_class 数据区 relkind 偏移 119——推算依据：reltoastrelid 自占 [112,116)，
+     * 其后 relhasindex bool + relisshared bool + relpersistence char 各 1B 占
+     * [116,119)，relkind 紧随（V17 同推算为 115——两版差恰 4B 与 toast 偏移自洽）。 */
+    private static final int PGCLASS_RELKIND_DATA_OFFSET = 119;
+
     /** pg_attribute 词典槽位：attisdropped=16（V18 无 attcacheoff——PG 18 删除该列）。 */
     private static final int ATTR_DROPPED_INDEX = 16;
 
     /** pg_class 词典槽位：reltoastrelid=13（relallfrozen@12 后移一位，PG 18 增列）。 */
     private static final int CLASS_TOAST_RELID_INDEX = 13;
+
+    /** pg_class 词典槽位：relkind=17（reltoastrelid@13 后 relhasindex/relisshared/
+     * relpersistence 三列，与 V17 的 16 恰差 relallfrozen 一位——数据区偏移 119）。 */
+    private static final int CLASS_RELKIND_INDEX = 17;
 
     /**
      * pg_attribute 列解码词典（25 项），逐行转录自 spike PGATTR_KINDS，
@@ -204,10 +213,22 @@ public final class WalLayoutV18 implements WalLayout {
         return CLASS_TOAST_RELID_INDEX;
     }
 
+    /** {@inheritDoc}——17（relkind；relpersistence@16 后一位，V17 为 16）。 */
+    @Override
+    public int classRelkindIndex() {
+        return CLASS_RELKIND_INDEX;
+    }
+
     /** {@inheritDoc}——112（relfilenode@88 后 5 个定宽列各 4B 合计 20B，spike 实证）。 */
     @Override
     public int pgClassReltoastrelidDataOffset() {
         return PGCLASS_RELTOASTRELID_DATA_OFFSET;
+    }
+
+    /** {@inheritDoc}——119（reltoastrelid@112 自占 4B 后三个单字节列；V17 为 115）。 */
+    @Override
+    public int pgClassRelkindDataOffset() {
+        return PGCLASS_RELKIND_DATA_OFFSET;
     }
 
     /** {@inheritDoc}——180000-189999 全区间（含小版本位）。 */

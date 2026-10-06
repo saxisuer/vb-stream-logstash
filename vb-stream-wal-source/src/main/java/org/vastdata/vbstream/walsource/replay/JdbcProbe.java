@@ -17,7 +17,7 @@ public interface JdbcProbe {
      * 该行的现居位。
      *
      * <p>查询形如 {@code SELECT ctid::text, relname, relnamespace, reltype, reloftype,
-     * relowner, relam, relfilenode, reltoastrelid FROM pg_class WHERE oid=?}
+     * relowner, relam, relfilenode, reltoastrelid, relkind::text FROM pg_class WHERE oid=?}
      * （注意拼写 reloftype）。边界与异常语义：行不存在返回 null（关系已删，候选
      * 直接拒绝）；基础设施失败由实现方抛非受检异常（fail-fast，见
      * {@link JdbcProbeImpl}）。</p>
@@ -49,10 +49,10 @@ public interface JdbcProbe {
      * 前缀源重建会写出时代错位的行且可能不被后续事件纠正）。
      *
      * <p>查询形如 {@code SELECT ctid::text, oid, relname, relnamespace, reltype,
-     * reloftype, relowner, relam, relfilenode, reltoastrelid FROM pg_class
-     * WHERE ctid = ?::tid}（pg_class 无 ctid 索引，走小表顺序扫描——点查代价可忽略）。
-     * 边界与异常语义：该位无行返回 null（行已再迁移——采纳拒绝）；基础设施失败抛
-     * 非受检异常（fail-fast，同 {@link #currentClassRow}）。</p>
+     * reloftype, relowner, relam, relfilenode, reltoastrelid, relkind::text
+     * FROM pg_class WHERE ctid = ?::tid}（pg_class 无 ctid 索引，走小表顺序扫描——
+     * 点查代价可忽略）。边界与异常语义：该位无行返回 null（行已再迁移——采纳拒绝）；
+     * 基础设施失败抛非受检异常（fail-fast，同 {@link #currentClassRow}）。</p>
      *
      * @param ctidText ctid 文本形态（"(block,off)"，与记录 new 位同源渲染）
      * @return 末态行（ctid 键 + 行模型）；该位无行 null

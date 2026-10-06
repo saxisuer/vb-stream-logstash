@@ -62,7 +62,7 @@ class SelfHealerTest {
         stores.trackedTableCtid(staleCtid);
         stores.interestRelOids().add(100L);
 
-        CatalogRow.ClassRow probed = new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0);
+        CatalogRow.ClassRow probed = new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0, "r");
         Map<String, JdbcProbe.ProbedRow> byCtid = new HashMap<>();
         byCtid.put("(5,2)", new JdbcProbe.ProbedRow(newCtid, probed));
         CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout),
@@ -117,7 +117,7 @@ class SelfHealerTest {
         stores.interestRelOids().add(100L);
         stores.staleOids().add(100L);
 
-        CatalogRow.ClassRow probed = new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0);
+        CatalogRow.ClassRow probed = new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0, "r");
         Map<String, JdbcProbe.ProbedRow> byCtid = new HashMap<>();
         byCtid.put("(9,1)", new JdbcProbe.ProbedRow(newCtid, probed));
         CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout),
@@ -157,7 +157,7 @@ class SelfHealerTest {
         // 成功采纳：ctid 探测命中 → 计数清零 + stale 撤回
         long adoptCtid = CatalogReplay.ctidKey(9, 1);
         byCtid.put("(9,1)", new JdbcProbe.ProbedRow(adoptCtid,
-                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0)));
+                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 205, 0, "r")));
         replay.applyCatalogRecord(rec(updateRecord(4, 4, 9, 1, data)), stores);
         assertTrue(stores.staleOids().isEmpty(), "采纳须撤回 stale 标记");
 

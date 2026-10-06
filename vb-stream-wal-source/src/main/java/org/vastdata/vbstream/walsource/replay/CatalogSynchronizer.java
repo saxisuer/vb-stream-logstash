@@ -781,7 +781,85 @@ public final class CatalogSynchronizer {
         }
 
         /**
-         * 诊断用字符串形态（前沿 + 两字典行数 + tracked 双 ctid）。
+         * 模式名查询（v2 扩链面）：class 行取 relnamespace，再经 nsp 行字典值域解析
+         * nspname——两段线性扫描（字典规模 pg_namespace 恒几十行，class 行首配即止，
+         * 与 {@link #columnsOf} 的 attr 值域扫描同口径）。
+         *
+         * @param relOid 关系 oid
+         * @return 模式名；关系不在字典、或其 relnamespace 无对应 nsp 行（字典半损）empty
+         */
+        @Override
+        public Optional<String> schemaOf(long relOid) {
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relOid() == relOid) {
+                    for (CatalogRow.NspRow nsp : stores.nspRows().values()) {
+                        if (nsp.nspOid() == row.relnamespace()) {
+                            return Optional.of(nsp.nspname());
+                        }
+                    }
+                    return Optional.empty();
+                }
+            }
+            return Optional.empty();
+        }
+
+        /**
+         * relkind 查询（v2 扩链面）：class 行投影直供（裸单字符，如 "r"）。
+         *
+         * @param relOid 关系 oid
+         * @return relkind 单字符；不在字典 empty
+         */
+        @Override
+        public Optional<String> relkindOf(long relOid) {
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relOid() == relOid) {
+                    return Optional.ofNullable(row.relkind());
+                }
+            }
+            return Optional.empty();
+        }
+
+        /**
+         * 表名查询（v2 扩链面）：class 行投影直供。
+         *
+         * @param relOid 关系 oid
+         * @return relname；不在字典 empty
+         */
+        @Override
+        public Optional<String> nameOf(long relOid) {
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relOid() == relOid) {
+                    return Optional.of(row.relname());
+                }
+            }
+            return Optional.empty();
+        }
+
+        /**
+         * relfilenode/oid 双入口归一（v2 扩链面）：先按 relfilenode 反查（heap 块
+         * 形态），miss 再按 oid 直认（元数据形态）——两遍线性扫描，relfilenode 命中
+         * 即止（同库引导下唯一，v1 块匹配同口径）。
+         *
+         * @param relNodeOrOid relfilenode 或关系 oid
+         * @return 关系 oid；字典无匹配 empty
+         */
+        @Override
+        public OptionalLong relOidOf(long relNodeOrOid) {
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relfilenode() == relNodeOrOid) {
+                    return OptionalLong.of(row.relOid());
+                }
+            }
+            for (CatalogRow.ClassRow row : stores.classRows().values()) {
+                if (row.relOid() == relNodeOrOid) {
+                    return OptionalLong.of(relNodeOrOid);
+                }
+            }
+            return OptionalLong.empty();
+        }
+
+        /**
+         * 诊断用字符串形态（前沿 + 三字典行数 + tracked 双 ctid）。
          *
          * @return 概要文本
          */
@@ -791,6 +869,7 @@ public final class CatalogSynchronizer {
                     .add("lsn=" + Lsn.format(appliedLsn))
                     .add("attrRows=" + stores.attrRows().size())
                     .add("classRows=" + stores.classRows().size())
+                    .add("nspRows=" + stores.nspRows().size())
                     .add("trackedTable=" + stores.trackedTableCtid())
                     .add("trackedToast=" + stores.trackedToastCtid())
                     .toString();

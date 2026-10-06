@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.AttrRow;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.ClassRow;
+import org.vastdata.vbstream.walsource.replay.CatalogRow.NspRow;
 import org.vastdata.vbstream.walsource.replay.CatalogStores;
 
 import java.io.IOException;
@@ -12,6 +13,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
+import java.util.zip.CRC32;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -20,13 +22,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * StateStore 原子持久化（spec §7）的失败先行测试——VBWS 检查点格式的六断言面：
- * ①roundtrip 全等（attr/class 两行字典 + 双 tail 存储 + tracked 双 ctid + 两
+ * ①roundtrip 全等（attr/class/nsp 三行字典 + 三 tail 存储 + tracked 双 ctid + 三
  * relfilenode + interest/stale 全字段，并经 restoreInto 灌回新 stores 逐面复核）；
  * ②正文中翻一位字节 → 全文件 CRC 拒载 empty；③header formatVersion 改写 → 拒载
  * empty；④只剩 {@code .part} 半成品 → 不 load 且 {@code exists()} 为 false；
  * ⑤连写两次检查点 → 旧检查点被原子替换（load 到第二次内容、无 .part 残留）；
- * ⑥class 表最小行宽形态（relname 空串 ×50）→ 计数防线不误拒（审查修复钉）；
- * ⑦pgVersion 参数化（终审 I1）——17 写 17 / 18 写 18，跨版本 load 错配拒载 empty。
+ * ⑥class 表最小行宽形态（relname/relkind 空串 ×50）→ 计数防线不误拒（审查修复钉）；
+ * ⑦pgVersion 参数化（终审 I1）——17 写 17 / 18 写 18，跨版本 load 错配拒载 empty；
+ * ⑧formatVersion=1（v1 检查点）即便双 CRC 同步修正一致也拒载 empty（v2 扩链裁定：
+ * v1 缺 nsp 表段不迁移，拒载回落全新引导）。
  *
  * <p>byte[] tail 值不参与 record equals（数组恒一性），断言经
  * {@link #assertTailsEqual} 手工逐键比较；其余字段用 record/集合 equals。</p>
@@ -43,8 +47,8 @@ class StateStoreTest {
     Path dir;
 
     /**
-     * 用例 ①：灌满全字段 stores（两行字典各含 dropped 占位行与 toast 行、双 tail、
-     * tracked 双 ctid、两 relfilenode、interest/stale 各一）→ checkpoint → load →
+     * 用例 ①：灌满全字段 stores（attr/class/nsp 三行字典含 dropped 占位行与 toast 行、
+     * 三 tail、tracked 双 ctid、三 relfilenode、interest/stale 各一）→ checkpoint → load →
      * StoredState 逐面全等；再 restoreInto 新 CatalogStores 复核四 map/tracked/
      * relfilenode/两集合全回填（Task 15 续传路径的灌回契约）。
      */
@@ -67,6 +71,9 @@ class StateStoreTest {
         assertEquals(stores.trackedToastCtid(), s.trackedToastCtid(), "tracked toast ctid 应全等");
         assertEquals(stores.pgAttrRelfilenode(), s.pgAttrRelfilenode());
         assertEquals(stores.pgClassRelfilenode(), s.pgClassRelfilenode());
+        assertEquals(stores.pgNspRelnode(), s.pgNspRelnode(), "pg_namespace relfilenode 应 roundtrip 全等");
+        assertEquals(stores.nspRows(), s.nspRows(), "nsp 行字典应 roundtrip 全等");
+        assertTailsEqual(stores.rawNspTails(), s.rawNspTails());
         assertEquals(stores.interestRelOids(), s.interestRelOids());
         assertEquals(stores.staleOids(), s.staleOids());
 
@@ -76,10 +83,13 @@ class StateStoreTest {
         assertEquals(stores.classRows(), restored.classRows(), "restoreInto 应回填 class 行字典");
         assertTailsEqual(stores.rawAttrTails(), restored.rawAttrTails());
         assertTailsEqual(stores.rawClassTails(), restored.rawClassTails());
+        assertTailsEqual(stores.rawNspTails(), restored.rawNspTails());
+        assertEquals(stores.nspRows(), restored.nspRows(), "restoreInto 应回填 nsp 行字典");
         assertEquals(stores.trackedTableCtid(), restored.trackedTableCtid());
         assertEquals(stores.trackedToastCtid(), restored.trackedToastCtid());
         assertEquals(stores.pgAttrRelfilenode(), restored.pgAttrRelfilenode());
         assertEquals(stores.pgClassRelfilenode(), restored.pgClassRelfilenode());
+        assertEquals(stores.pgNspRelnode(), restored.pgNspRelnode());
         assertEquals(stores.interestRelOids(), restored.interestRelOids());
         assertEquals(stores.staleOids(), restored.staleOids());
     }
@@ -159,18 +169,19 @@ class StateStoreTest {
     }
 
     /**
-     * 用例 ⑥（审查修复钉）：class 表最小行宽形态——relname 全空串的 class 行 50 条
-     * （每行恰最小宽 74B：ctid 8 + 8 个落盘 long 64 + UTF 空串前缀 2）且文件其余段
-     * 保持最小 → 文件实长 74n+86 &lt; 83n。防线常量若过严（如 83）会把"计数×最小
-     * 行宽 &gt; 文件实长"误判损坏而拒载合法检查点——本用例钉死 74 不误拒，roundtrip
-     * 全等可 load。
+     * 用例 ⑥（审查修复钉）：class 表最小行宽形态——relname/relkind 全空串的 class 行 50 条
+     * （每行恰最小宽 76B：ctid 8 + 8 个落盘 long 64 + relname/relkind 两个 UTF 空串
+     * 前缀各 2）且文件其余段
+     * 保持最小 → 文件实长 76n+86 &lt; 83n。防线常量若过严（如 83）会把"计数×最小
+     * 行宽 &gt; 文件实长"误判损坏而拒载合法检查点——本用例钉死 76 不误拒，roundtrip
+     * 全等可 load（v2 起 class 行增落 relkind，最小行宽随之 +2）。
      */
     @Test
     void minimalWidthClassRowsRoundtripWithoutOverStrictGuard() throws IOException {
         StateStore store = new StateStore(dir, 18);
         CatalogStores stores = new CatalogStores();
         for (int i = 0; i < 50; i++) {
-            stores.classRows().put(100L + i, new ClassRow(20000 + i, "", 0, 0, 0, 0, 0, 30000 + i, 0));
+            stores.classRows().put(100L + i, new ClassRow(20000 + i, "", 0, 0, 0, 0, 0, 30000 + i, 0, ""));
         }
         store.checkpoint(stores, LSN);
 
@@ -197,9 +208,30 @@ class StateStoreTest {
     }
 
     /**
+     * 用例 ⑧（formatVersion v2 拒载 v1，控制器裁定）：把 v2 检查点的 header
+     * formatVersion 字段改写回 1 并<strong>同步修正 header CRC 与全文件 CRC</strong>
+     * （隔离 CRC 拒载路径——唯一残差是版本号本身）→ load 必须 empty（v1 状态文件
+     * 缺 nsp 表段，语义不完整，不迁移不回退兼容解读，拒载回落全新引导）。
+     */
+    @Test
+    void v1FormatCheckpointIsRejectedEvenWithConsistentCrcs() throws IOException {
+        StateStore store = new StateStore(dir, 18);
+        store.checkpoint(filledStores(), LSN);
+        Path file = dir.resolve(FILE_NAME);
+        byte[] bytes = Files.readAllBytes(file);
+        bytes[4] = 0;
+        bytes[5] = 1;    // formatVersion 2 → 1
+        patchCrc(bytes, 0, 20, 20);    // header CRC 覆盖前 20 字节，写回偏移 20
+        patchCrc(bytes, 0, bytes.length - 4, bytes.length - 4);    // 全文件 CRC 写回尾 4B
+        Files.write(file, bytes);
+        assertTrue(store.load().isEmpty(), "v1（formatVersion=1）检查点应拒载 empty——回落全新引导");
+    }
+
+    /**
      * 构造全字段灌满的 stores（确定性数据）：attr 三行（含 dropped 占位行）、class
-     * 两行（用户表 + toast 关系行）、双 tail 各一条、tracked 双 ctid、两
-     * relfilenode、interest/stale 各一 oid——覆盖持久化面的全部字段形态。
+     * 两行（用户表 'r' + toast 关系行 't'——relkind 两形态）、nsp 两行（public +
+     * pg_catalog）、三 tail 各一条、tracked 双 ctid、三 relfilenode、interest/stale
+     * 各一 oid——覆盖持久化面（v2）的全部字段形态。
      *
      * @return 灌满的 stores（ctid 键为任意合法 long，持久化面键值不透明）
      */
@@ -208,17 +240,40 @@ class StateStoreTest {
         stores.attrRows().put(1L, new AttrRow(16384, "id", 20, 1, false));
         stores.attrRows().put(2L, new AttrRow(16384, "........pg.dropped.2........", 0, 2, true));
         stores.attrRows().put(3L, new AttrRow(16385, "payload", 25, 1, false));
-        stores.classRows().put(10L, new ClassRow(16384, "t_stream", 2200, 16386, 0, 10, 2, 16400, 16401));
-        stores.classRows().put(11L, new ClassRow(16401, "pg_toast_16400", 99, 16402, 0, 10, 2, 16405, 0));
+        stores.classRows().put(10L, new ClassRow(16384, "t_stream", 2200, 16386, 0, 10, 2, 16400, 16401, "r"));
+        stores.classRows().put(11L, new ClassRow(16401, "pg_toast_16400", 99, 16402, 0, 10, 2, 16405, 0, "t"));
+        stores.nspRows().put(20L, new NspRow(11, "public"));
+        stores.nspRows().put(21L, new NspRow(13, "pg_catalog"));
         stores.rawAttrTails().put(1L, new byte[] {1, 2, 3, 4});
         stores.rawClassTails().put(10L, new byte[] {9, 8, 7});
+        stores.rawNspTails().put(20L, new byte[] {5, 6});
         stores.trackedTableCtid(10);
         stores.trackedToastCtid(11);
         stores.pgAttrRelfilenode(6001);
         stores.pgClassRelfilenode(6002);
+        stores.pgNspRelnode(6003);
         stores.interestRelOids().add(16384L);
         stores.staleOids().add(9999L);
         return stores;
+    }
+
+    /**
+     * 重算指定区间的 CRC32 并以大端 u32 写回目标偏移（v1 拒载用例的 CRC 同步修正面
+     * ——隔离版本号残差，避免用例被 CRC 拒载路径假绿）。
+     *
+     * @param bytes   整文件字节（就地改写）
+     * @param from    CRC 覆盖区起点
+     * @param to      CRC 覆盖区终点（不含）
+     * @param writeAt CRC 值写回偏移
+     */
+    private static void patchCrc(byte[] bytes, int from, int to, int writeAt) {
+        CRC32 crc = new CRC32();
+        crc.update(bytes, from, to);
+        int v = (int) crc.getValue();
+        bytes[writeAt] = (byte) (v >>> 24);
+        bytes[writeAt + 1] = (byte) (v >>> 16);
+        bytes[writeAt + 2] = (byte) (v >>> 8);
+        bytes[writeAt + 3] = (byte) v;
     }
 
     /**

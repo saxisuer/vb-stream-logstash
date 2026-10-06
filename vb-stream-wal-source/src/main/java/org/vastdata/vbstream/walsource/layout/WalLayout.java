@@ -141,6 +141,17 @@ public interface WalLayout {
     int classToastRelidIndex();
 
     /**
+     * pg_class 解码词典中 relkind 的槽位（0 起）。
+     *
+     * <p>行投影（ClassRow）按本槽位取 relkind（v2 表过滤的分派键）；槽位随
+     * reltoastrelid 同步漂移（V17=16 / V18=17——PG 18 增列 relallfrozen 所致），
+     * 禁止跨版本硬编码。词典 kind 为 "char"（解码为左引号单字符，投影时剥引号）。</p>
+     *
+     * @return relkind 槽位（V17 16 / V18 17）
+     */
+    int classRelkindIndex();
+
+    /**
      * pg_class 数据区 relfilenode 列偏移（自 t_hoff 起）。
      *
      * <p>列 1-7（oid + name64B + 5×oid）共 88 字节定宽，relfilenode 紧随其后；
@@ -159,6 +170,19 @@ public interface WalLayout {
      * @return 数据区偏移（112）
      */
     int pgClassReltoastrelidDataOffset();
+
+    /**
+     * pg_class 数据区 relkind 列偏移（自 t_hoff 起）。
+     *
+     * <p>reltoastrelid 后跟 relhasindex bool + relisshared bool + relpersistence
+     * char（各 1B）后 relkind 落位：V17=115（reltoastrelid@108）、V18=119（@112）
+     * ——两版差恰 4B 与 reltoastrelid 偏移自洽。与 {@link #classRelkindIndex()}
+     * 成对（同列的词典槽位与数据区偏移两副面孔）；消费面：值编码读区的末列
+     * （ClassRow.relkind 投影的重建），INPLACE 路径不读（relkind 不因原地改写变化）。</p>
+     *
+     * @return 数据区偏移（V17 115 / V18 119）
+     */
+    int pgClassRelkindDataOffset();
 
     /**
      * 判定本描述符是否覆盖给定服务端版本号。

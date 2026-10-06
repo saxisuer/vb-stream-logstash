@@ -17,6 +17,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -186,12 +187,14 @@ abstract class WalSyncItBase {
         probe.setAutoCommit(false);
         Map<Long, CatalogRow.ClassRow> jdbcClass;
         Map<Long, CatalogRow.AttrRow> jdbcAttr;
+        Map<Long, String> jdbcSchemas;
         try (Statement tx = probe.createStatement()) {
             tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
             jdbcClass = queryClassRows(probe, scope);
             scope.addAll(discoverToastOidsJdbc(jdbcClass, baseOids));
             jdbcClass = queryClassRows(probe, scope);
             jdbcAttr = queryAttrRows(probe, scope);
+            jdbcSchemas = querySchemaNames(probe, scope);
             probe.commit();
         } finally {
             probe.setAutoCommit(oldAutoCommit);
@@ -234,6 +237,21 @@ abstract class WalSyncItBase {
             if (toast.isEmpty() || toast.getAsLong() != jdbcRow.reltoastrelid()) {
                 problems.add("oid " + oid + " toastOf=" + describe(toast)
                         + " 期望 " + jdbcRow.reltoastrelid());
+            }
+            // v2 扩链面（Task 4）：schema（relnamespace→pg_namespace.nspname）/relkind/
+            // name 三查询与 JDBC 末态对拍——第三 watched 表与 ClassRow relkind 投影的
+            // 端到端锚（bootstrap 种子 + 流内重放两来源在此收敛）
+            Optional<String> schema = snapshot.schemaOf(oid);
+            if (schema.isEmpty() || !schema.get().equals(jdbcSchemas.get(oid))) {
+                problems.add("oid " + oid + " schemaOf=" + schema + " 期望 " + jdbcSchemas.get(oid));
+            }
+            Optional<String> relkind = snapshot.relkindOf(oid);
+            if (relkind.isEmpty() || !relkind.get().equals(jdbcRow.relkind())) {
+                problems.add("oid " + oid + " relkindOf=" + relkind + " 期望 " + jdbcRow.relkind());
+            }
+            Optional<String> name = snapshot.nameOf(oid);
+            if (name.isEmpty() || !name.get().equals(jdbcRow.relname())) {
+                problems.add("oid " + oid + " nameOf=" + name + " 期望 " + jdbcRow.relname());
             }
             assertColumnOrderAscending(snapshot, oid);
         }
@@ -344,12 +362,13 @@ abstract class WalSyncItBase {
             throws SQLException {
         Map<Long, CatalogRow.ClassRow> out = new TreeMap<>();
         String sql = "SELECT ctid::text, oid, relname, relnamespace, reltype, reloftype,"
-                + " relowner, relam, relfilenode, reltoastrelid FROM pg_class WHERE oid IN " + inList(oids);
+                + " relowner, relam, relfilenode, reltoastrelid, relkind::text"
+                + " FROM pg_class WHERE oid IN " + inList(oids);
         try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
                 out.put(parseCtidKey(rs.getString(1)), new CatalogRow.ClassRow(
                         rs.getLong(2), rs.getString(3), rs.getLong(4), rs.getLong(5), rs.getLong(6),
-                        rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10)));
+                        rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10), rs.getString(11)));
             }
         }
         return out;
@@ -372,6 +391,26 @@ abstract class WalSyncItBase {
             while (rs.next()) {
                 out.put(parseCtidKey(rs.getString(1)), new CatalogRow.AttrRow(
                         rs.getLong(2), rs.getString(3), rs.getLong(4), rs.getInt(5), rs.getBoolean(6)));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * JDBC 实查对拍范围的 schema 名（pg_class⋈pg_namespace，v2 扩链对拍面）。
+     *
+     * @param c    连接（REPEATABLE READ 事务内）
+     * @param oids 对拍 oid 集
+     * @return oid → nspname
+     * @throws SQLException 查询失败
+     */
+    private static Map<Long, String> querySchemaNames(Connection c, TreeSet<Long> oids) throws SQLException {
+        Map<Long, String> out = new TreeMap<>();
+        String sql = "SELECT c.oid, n.nspname FROM pg_class c"
+                + " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid IN " + inList(oids);
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                out.put(rs.getLong(1), rs.getString(2));
             }
         }
         return out;

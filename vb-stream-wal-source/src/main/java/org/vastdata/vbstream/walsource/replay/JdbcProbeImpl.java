@@ -14,18 +14,21 @@ import java.sql.SQLException;
  */
 public final class JdbcProbeImpl implements JdbcProbe {
 
-    /** 点查语句（列序与 {@link CatalogRow.ClassRow} 组件序严格对应，ctid 居首）。 */
+    /** 点查语句（列序与 {@link CatalogRow.ClassRow} 组件序严格对应，ctid 居首；
+     * v2 增选 relkind——char 输出经 ::text 为裸单字符）。 */
     private static final String SQL = "SELECT ctid::text, relname, relnamespace, reltype, reloftype, "
-            + "relowner, relam, relfilenode, reltoastrelid FROM pg_class WHERE oid=?";
+            + "relowner, relam, relfilenode, reltoastrelid, relkind::text FROM pg_class WHERE oid=?";
 
     /** pg_attribute 按 ctid 点查语句（attr 面精确采纳探测，列序与 AttrRow 组件序对应）。 */
     private static final String ATTR_BY_CTID_SQL =
             "SELECT ctid::text, attrelid, attname, atttypid, attnum, attisdropped"
                     + " FROM pg_attribute WHERE ctid = ?::tid";
 
-    /** pg_class 按 ctid 点查语句（class 面精确采纳探测，列序与 ClassRow 组件序对应）。 */
+    /** pg_class 按 ctid 点查语句（class 面精确采纳探测，列序与 ClassRow 组件序对应；
+     * v2 增选 relkind）。 */
     private static final String CLASS_BY_CTID_SQL = "SELECT ctid::text, oid, relname, relnamespace, reltype,"
-            + " reloftype, relowner, relam, relfilenode, reltoastrelid FROM pg_class WHERE ctid = ?::tid";
+            + " reloftype, relowner, relam, relfilenode, reltoastrelid, relkind::text"
+            + " FROM pg_class WHERE ctid = ?::tid";
 
     private final Connection connection;
 
@@ -60,7 +63,7 @@ public final class JdbcProbeImpl implements JdbcProbe {
                 }
                 return ProbedRow.parse(rs.getString(1), new CatalogRow.ClassRow(relOid,
                         rs.getString(2), rs.getLong(3), rs.getLong(4), rs.getLong(5),
-                        rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9)));
+                        rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getString(10)));
             }
         } catch (SQLException e) {
             throw new IllegalStateException("pg_class 末态探测失败: oid=" + relOid, e);
@@ -115,7 +118,7 @@ public final class JdbcProbeImpl implements JdbcProbe {
                 }
                 return ProbedRow.parse(rs.getString(1), new CatalogRow.ClassRow(rs.getLong(2),
                         rs.getString(3), rs.getLong(4), rs.getLong(5), rs.getLong(6),
-                        rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10)));
+                        rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10), rs.getString(11)));
             }
         } catch (SQLException e) {
             throw new IllegalStateException("pg_class ctid 探测失败: " + ctidText, e);

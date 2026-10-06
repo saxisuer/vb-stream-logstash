@@ -335,6 +335,11 @@ class WalLifecycleIT extends WalSyncItBase {
         Optional<StoredState> stored = new StateStore(stateDir, layout.majorVersion()).load();
         assertTrue(stored.isPresent(), "close 的最终检查点应落盘可加载");
         assertSlotAdvancedTo(slot, stored.get().lsn());
+        // v2 扩链锚（Task 4）：检查点含 pg_namespace 种子段（bootstrap 全行灌入 +
+        // StateStore v2 序列化），public 等内置模式在列——schema 解析的字典源端到端可见
+        assertTrue(stored.get().nspRows().values().stream().anyMatch(r -> "public".equals(r.nspname())),
+                "检查点 nsp 段应含 public 模式（bootstrap 种子 + v2 序列化）");
+        assertTrue(stored.get().pgNspRelnode() > 0, "pg_namespace relfilenode 应已回填");
 
         // 同配置第二轮：续传形态起停干净（启停面回归，不重复对拍）
         WalSource second = new WalSource(cfg);

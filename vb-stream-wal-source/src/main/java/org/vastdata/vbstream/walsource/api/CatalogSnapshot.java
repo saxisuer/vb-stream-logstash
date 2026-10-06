@@ -1,12 +1,13 @@
 package org.vastdata.vbstream.walsource.api;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 /**
  * 伪备库 catalog 的 as-of 快照查询契约（api 包输出面，spec §5）——v2 engine 与冒烟
- * Main 经本接口读 {@code CatalogSynchronizer} 维护的 pg_attribute / pg_class 字典，
- * 不感知 ctid 重放实现。
+ * Main 经本接口读 {@code CatalogSynchronizer} 维护的 pg_attribute / pg_class /
+ * pg_namespace 字典（v2 起三张 watched 目录），不感知 ctid 重放实现。
  *
  * <p>一致性语义：一次调用内的各查询相对同一 {@link #lsn()} 前沿（v1 = 最近一次
  * 已施加记录的 MAXALIGN 末尾）；跨调用随消费推进单调不减。线程约束：实现按
@@ -53,6 +54,44 @@ public interface CatalogSnapshot {
      * @return toast 关系 oid（无 toast 为 of(0)）；关系不在字典中为 empty
      */
     OptionalLong toastOf(long relOid);
+
+    /**
+     * 指定关系的模式名（pg_class.relnamespace 经 pg_namespace 解析为 nspname 的
+     * as-of 视图，v2 扩链面——schema 名即 pg_namespace 解析，"public" 等）。
+     *
+     * @param relOid 关系 oid
+     * @return 模式名；关系不在字典中、或其 relnamespace 无对应 nsp 行（字典半损）为 empty
+     */
+    Optional<String> schemaOf(long relOid);
+
+    /**
+     * 指定关系的 relkind（pg_class.relkind 的 as-of 视图，单字符——'r' 普通表 /
+     * 'p' 分区表 / 't' toast / 'i' 索引 / 'v' 视图 / 'S' 序列等，v2 表过滤的分派键）。
+     *
+     * @param relOid 关系 oid
+     * @return relkind 单字符（如 "r"）；关系不在字典中为 empty
+     */
+    Optional<String> relkindOf(long relOid);
+
+    /**
+     * 指定关系的表名（pg_class.relname 的 as-of 视图——白名单 {@code schema.table}
+     * 匹配与 TableMeta 组装面）。
+     *
+     * @param relOid 关系 oid
+     * @return relname；关系不在字典中为 empty
+     */
+    Optional<String> nameOf(long relOid);
+
+    /**
+     * 把 relfilenode 或关系 oid 归一解析为关系 oid（双入口）：先按 relfilenode
+     * 反查（heap 块头形态——块只携带 relfilenode），miss 再按 oid 直认（元数据
+     * 形态）。oid 在 pg_class 内唯一、relfilenode 同库引导下唯一（跨库碰撞为
+     * 理论残留，v1 块匹配同口径）。
+     *
+     * @param relNodeOrOid relfilenode 或关系 oid
+     * @return 关系 oid；字典无匹配为 empty
+     */
+    OptionalLong relOidOf(long relNodeOrOid);
 
     /**
      * 一列的字典投影（pg_attribute 行的最小值面）。

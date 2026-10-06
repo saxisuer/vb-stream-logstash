@@ -15,9 +15,10 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * JDBC 一致性引导（spec §6①）——把 pg_attribute / pg_class 两张 watched 目录的全行
- * 快照（含物理 ctid）灌入 {@link CatalogStores}，回填两目录 relfilenode，并按
- * interest oid 定位 tracked 双 ctid。
+ * JDBC 一致性引导（spec §6①）——把 pg_attribute / pg_class / pg_namespace 三张
+ * watched 目录的全行快照（含物理 ctid）灌入 {@link CatalogStores}，回填三目录
+ * relfilenode，并按 interest oid 定位 tracked 双 ctid（v2 扩第三目录 pg_namespace
+ * ——schema 名解析的字典源）。
  *
  * <p><strong>一致性顺序（调用方契约）</strong>：槽 P₀ 须已由调用方先经
  * {@code PhysicalSlotManager.ensureSlot} 取得（建槽自身的 WAL 写入落在引导快照之前）
@@ -44,10 +45,15 @@ public final class CatalogBootstrap {
             "SELECT ctid::text, attrelid, attname, atttypid, attnum, attisdropped"
                     + " FROM pg_attribute WHERE attnum > 0";
 
-    /** pg_class 全行种子查询（不限 relkind：toast/index 行也在跟踪面）。 */
+    /** pg_class 全行种子查询（不限 relkind：toast/index 行也在跟踪面；v2 增选 relkind——
+     * 表过滤的分派键，char 输出经 getText 为裸单字符）。 */
     private static final String CLASS_SEED_SQL =
             "SELECT ctid::text, oid, relname, relnamespace, reltype, reloftype,"
-                    + " relowner, relam, relfilenode, reltoastrelid FROM pg_class";
+                    + " relowner, relam, relfilenode, reltoastrelid, relkind::text FROM pg_class";
+
+    /** pg_namespace 全行种子查询（v2 扩链第三 watched 目录，schema 名解析源）。 */
+    private static final String NSP_SEED_SQL =
+            "SELECT ctid::text, oid, nspname FROM pg_namespace";
 
     /** interest 关系的 pg_class 行定位（tracked 表行位 + toast oid 顺取）。 */
     private static final String INTEREST_CLASS_SQL =
@@ -109,12 +115,14 @@ public final class CatalogBootstrap {
             seedRelfilenodes(stores);
             int attrCount = seedAttrRows(stores);
             int classCount = seedClassRows(stores);
+            int nspCount = seedNspRows(stores);
             locateTracked(stores);
             connection.commit();
-            LOG.info("catalog 引导完成 (layout PG{}): pg_attribute {} 行 / pg_class {} 行, pgAttrRelnode={}, pgClassRelnode={},"
+            LOG.info("catalog 引导完成 (layout PG{}): pg_attribute {} 行 / pg_class {} 行 / pg_namespace {} 行,"
+                            + " pgAttrRelnode={}, pgClassRelnode={}, pgNspRelnode={},"
                             + " trackedTable={}, trackedToast={}, 首句 flush LSN={}（≤ 种子快照时点）",
-                    layout.majorVersion(), attrCount, classCount,
-                    stores.pgAttrRelfilenode(), stores.pgClassRelfilenode(),
+                    layout.majorVersion(), attrCount, classCount, nspCount,
+                    stores.pgAttrRelfilenode(), stores.pgClassRelfilenode(), stores.pgNspRelnode(),
                     stores.trackedTableCtid(), stores.trackedToastCtid(), Lsn.format(flushLsn));
             return flushLsn;
         } catch (SQLException e) {
@@ -148,7 +156,8 @@ public final class CatalogBootstrap {
     }
 
     /**
-     * 回填两目录的 relfilenode（重放引擎的块匹配面，spec §6① 步骤②）。
+     * 回填三目录的 relfilenode（重放引擎的块匹配面，spec §6① 步骤②；v2 增
+     * pg_namespace）。
      *
      * @param stores 状态容器
      * @throws SQLException 查询失败
@@ -157,6 +166,7 @@ public final class CatalogBootstrap {
         try (Statement st = connection.createStatement()) {
             stores.pgAttrRelfilenode(queryLong(st, "SELECT pg_relation_filenode('pg_attribute'::regclass)"));
             stores.pgClassRelfilenode(queryLong(st, "SELECT pg_relation_filenode('pg_class'::regclass)"));
+            stores.pgNspRelnode(queryLong(st, "SELECT pg_relation_filenode('pg_namespace'::regclass)"));
         }
     }
 
@@ -183,7 +193,7 @@ public final class CatalogBootstrap {
 
     /**
      * pg_class 全行种子：ctid 折键 + ClassRow 落 classRows（不限 relkind——toast/index
-     * 行也在跟踪面，INPLACE 对象与 tracked toast 依赖它们）。
+     * 行也在跟踪面，INPLACE 对象与 tracked toast 依赖它们；v2 增投影 relkind）。
      *
      * @param stores 状态容器
      * @return 灌入行数
@@ -196,7 +206,29 @@ public final class CatalogBootstrap {
             while (rs.next()) {
                 stores.classRows().put(parseCtidKey(rs.getString(1)), new CatalogRow.ClassRow(
                         rs.getLong(2), rs.getString(3), rs.getLong(4), rs.getLong(5),
-                        rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10)));
+                        rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9),
+                        rs.getLong(10), rs.getString(11)));
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * pg_namespace 全行种子：ctid 折键 + NspRow 落 nspRows（v2 扩链——schema 名解析
+     * 的字典源；CREATE SCHEMA/DROP SCHEMA 经流内重放增量维护）。
+     *
+     * @param stores 状态容器
+     * @return 灌入行数
+     * @throws SQLException 查询失败
+     */
+    private int seedNspRows(CatalogStores stores) throws SQLException {
+        int count = 0;
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(NSP_SEED_SQL)) {
+            while (rs.next()) {
+                stores.nspRows().put(parseCtidKey(rs.getString(1)),
+                        new CatalogRow.NspRow(rs.getLong(2), rs.getString(3)));
                 count++;
             }
         }

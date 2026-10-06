@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.AttrRow;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.ClassRow;
+import org.vastdata.vbstream.walsource.replay.CatalogRow.NspRow;
 import org.vastdata.vbstream.walsource.replay.CatalogStores;
 
 import java.io.ByteArrayInputStream;
@@ -34,17 +35,20 @@ import java.util.zip.CheckedOutputStream;
  * {@code .part→rename} publish 范式同一语义：目录里无 {@code .part} 后缀的
  * {@value #FILE_NAME} 即完整检查点）。
  *
- * <p><strong>文件布局（formatVersion=1，大端，DataOutputStream 原生序）</strong>：
+ * <p><strong>文件布局（formatVersion=2，大端，DataOutputStream 原生序；v2 增
+ * pg_namespace 面——nsp 表/nsp tail 表/pgNspRelnode 标量，class 行增 relkind）</strong>：
  * <pre>
  * header 24B: magic "VBWS" 4B + formatVersion u16 + pgVersion u16（大版本，与构造
  *             入参 layout.majorVersion() 同源——17 写 17、18 写 18，load 校验同源）
  *             + lsn u64 + headerLen u32(=24) + headerCrc32 u32（前 20 字节）
  * body:       attr 表（rowCount u32 + 行[ctid u64 + attrelid u64 + atttypid u64
  *               + attnum u32 + attisdropped u8 + attname u16 前缀 UTF]×n）
- *           → class 表（rowCount u32 + 行[ctid u64 + 8 个 long 字段 + relname UTF]×n）
+ *           → class 表（rowCount u32 + 行[ctid u64 + 8 个 long 字段 + relname UTF
+ *               + relkind UTF]×n）
+ *           → nsp 表（rowCount u32 + 行[ctid u64 + nspOid u64 + nspname UTF]×n）
  *           → attr tail 表（count u32 + 条目[ctid u64 + len u32 + bytes]×n）
- *           → class tail 表（同上）
- *           → tracked 双 ctid u64×2 + pgAttr/pgClass relfilenode u64×2
+ *           → class tail 表（同上）→ nsp tail 表（同上）
+ *           → tracked 双 ctid u64×2 + pgAttr/pgClass/pgNsp relfilenode u64×3
  *           → staleOids（count u32 + oid u64×n）+ interestRelOids（同上）
  * footer 12B: lsn u64（header 复述双验）+ fileCrc32 u32（[0, len-4) 全文件）
  * </pre></p>
@@ -52,7 +56,9 @@ import java.util.zip.CheckedOutputStream;
  * <p><strong>拒载语义</strong>：任一校验不符（magic / formatVersion / pgVersion /
  * headerLen / header CRC / 全文件 CRC / lsn 双验 / 尾部余量）或解析期
  * EOF——{@link #load()} 一律 {@code Optional.empty()} + ERROR 日志，回落重引导
- * 由 caller 决定；{@code .part} 残留永不 load（{@link #exists()} 亦只认正名文件）。
+ * 由 caller 决定；<strong>v1（formatVersion=1）检查点一律拒载</strong>（v2 扩链
+ * 裁定：v1 缺 nsp 表段语义不完整，不迁移——拒载回落全新引导是安全侧）；{@code .part}
+ * 残留永不 load（{@link #exists()} 亦只认正名文件）。
  * 持久化面 = 完整 CatalogStores 可重建态除 metrics 外全部字段（裁定见
  * {@link StoredState}）。<strong>契约（Med-3）：一个目录同一时刻仅一个活实例写
  * 检查点</strong>——两实例共用目录时后停机者以陈旧状态覆盖新检查点（文件锁后续）。
@@ -69,8 +75,12 @@ public final class StateStore {
     /** 半成品暂存后缀（fsync 完成后原子换名去后缀）。 */
     private static final String PART_SUFFIX = ".part";
 
-    /** 格式版本（header u16——不符拒载，不回退兼容解读）。 */
-    private static final int FORMAT_VERSION = 1;
+    /**
+     * 格式版本（header u16——不符拒载，不回退兼容解读）。v2（Task 4 扩链）：增
+     * pg_namespace 面（nsp 表/nsp tail/pgNspRelnode）+ class 行 relkind 字段；
+     * v1 文件（版本 1）拒载回落全新引导（裁定不迁移）。
+     */
+    private static final int FORMAT_VERSION = 2;
 
     /** header 定长 24B（4+2+2+8+4+4——版本演进的前向兼容跳读锚）。 */
     private static final int HEADER_LEN = 24;
@@ -136,8 +146,9 @@ public final class StateStore {
             LOG.warn("文件系统不支持 ATOMIC_MOVE，检查点换名回落非原子 move: {}", target, e);
             Files.move(part, target, StandardCopyOption.REPLACE_EXISTING);
         }
-        LOG.info("StateStore 检查点落盘: {} lsn={} attr={} class={} stale={}（原子换名完成）",
-                target, lsn, stores.attrRows().size(), stores.classRows().size(), stores.staleOids().size());
+        LOG.info("StateStore 检查点落盘: {} lsn={} attr={} class={} nsp={} stale={}（原子换名完成）",
+                target, lsn, stores.attrRows().size(), stores.classRows().size(),
+                stores.nspRows().size(), stores.staleOids().size());
     }
 
     /**
@@ -222,7 +233,7 @@ public final class StateStore {
     }
 
     /**
-     * 写 body 段（四表 + 标量 + 两 oid 集，布局见类 javadoc）。
+     * 写 body 段（六表 + 标量 + 两 oid 集，布局见类 javadoc）。
      *
      * @param out    目标流（已处全文件 CRC 计数面）
      * @param stores 数据源
@@ -252,13 +263,23 @@ public final class StateStore {
             out.writeLong(r.relfilenode());
             out.writeLong(r.reltoastrelid());
             out.writeUTF(r.relname());
+            out.writeUTF(r.relkind() == null ? "" : r.relkind());
+        }
+        out.writeInt(stores.nspRows().size());
+        for (Map.Entry<Long, NspRow> e : stores.nspRows().entrySet()) {
+            NspRow r = e.getValue();
+            out.writeLong(e.getKey());
+            out.writeLong(r.nspOid());
+            out.writeUTF(r.nspname());
         }
         writeTails(out, stores.rawAttrTails());
         writeTails(out, stores.rawClassTails());
+        writeTails(out, stores.rawNspTails());
         out.writeLong(stores.trackedTableCtid());
         out.writeLong(stores.trackedToastCtid());
         out.writeLong(stores.pgAttrRelfilenode());
         out.writeLong(stores.pgClassRelfilenode());
+        out.writeLong(stores.pgNspRelnode());
         writeOids(out, stores.staleOids());
         writeOids(out, stores.interestRelOids());
     }
@@ -296,7 +317,7 @@ public final class StateStore {
     /**
      * 校验并解码检查点字节。校验序：<strong>先验后解</strong>——header 五项
      * （magic/formatVersion/pgVersion/headerLen/header CRC）与全文件 CRC 先行
-     * （CRC 达标才进 body 解析，垃圾 rowCount 不会驱动解析循环），再顺序解码四表
+     * （CRC 达标才进 body 解析，垃圾 rowCount 不会驱动解析循环），再顺序解码六表
      * 与标量，最后 lsn 复述双验 + 尾部余量恰为 0（多余尾字节视为损坏拒载）。
      *
      * @param bytes 整文件字节
@@ -343,12 +364,15 @@ public final class StateStore {
 
         Map<Long, AttrRow> attrs = readAttrTable(in, bytes.length);
         Map<Long, ClassRow> classes = readClassTable(in, bytes.length);
+        Map<Long, NspRow> nspRows = readNspTable(in, bytes.length);
         Map<Long, byte[]> rawAttrTails = readTails(in, bytes.length);
         Map<Long, byte[]> rawClassTails = readTails(in, bytes.length);
+        Map<Long, byte[]> rawNspTails = readTails(in, bytes.length);
         long trackedTableCtid = in.readLong();
         long trackedToastCtid = in.readLong();
         long pgAttrRelfilenode = in.readLong();
         long pgClassRelfilenode = in.readLong();
+        long pgNspRelnode = in.readLong();
         Set<Long> staleOids = readOids(in, bytes.length);
         Set<Long> interestRelOids = readOids(in, bytes.length);
 
@@ -359,8 +383,8 @@ public final class StateStore {
         if (in.available() != 4) {
             throw new IOException("尾部余量不符: " + in.available() + "B（应恰余全文件 CRC 4B）");
         }
-        return new StoredState(lsn, attrs, classes, rawAttrTails, rawClassTails,
-                trackedTableCtid, trackedToastCtid, pgAttrRelfilenode, pgClassRelfilenode,
+        return new StoredState(lsn, attrs, classes, nspRows, rawAttrTails, rawClassTails, rawNspTails,
+                trackedTableCtid, trackedToastCtid, pgAttrRelfilenode, pgClassRelfilenode, pgNspRelnode,
                 interestRelOids, staleOids);
     }
 
@@ -392,9 +416,9 @@ public final class StateStore {
     }
 
     /**
-     * 读 class 行表（计数防线同 {@link #readAttrTable}——每行至少 74B：ctid u64=8 +
-     * 8 个落盘 long 字段 64 + relname UTF 空串前缀 u16=2；防线过严会误拒最小行宽
-     * 形态的合法检查点，见 StateStoreTest 用例 ⑥）。
+     * 读 class 行表（计数防线同 {@link #readAttrTable}——v2 起每行至少 76B：ctid
+     * u64=8 + 8 个落盘 long 字段 64 + relname/relkind 两个 UTF 空串前缀各 u16=2；
+     * 防线过严会误拒最小行宽形态的合法检查点，见 StateStoreTest 用例 ⑥）。
      *
      * @param in      输入流
      * @param fileLen 文件实长
@@ -403,7 +427,7 @@ public final class StateStore {
      */
     private static Map<Long, ClassRow> readClassTable(DataInputStream in, int fileLen) throws IOException {
         int rowCount = in.readInt();
-        if (rowCount < 0 || (long) rowCount * 74 > fileLen) {
+        if (rowCount < 0 || (long) rowCount * 76 > fileLen) {
             throw new IOException("class 表计数损坏: " + rowCount);
         }
         Map<Long, ClassRow> classes = new LinkedHashMap<>(Math.max(16, rowCount));
@@ -418,10 +442,35 @@ public final class StateStore {
             long relfilenode = in.readLong();
             long reltoastrelid = in.readLong();
             String relname = in.readUTF();    // 写序最后（u16 前缀 UTF）
+            String relkind = in.readUTF();    // v2 增（裸单字符；防御空串容忍）
             classes.put(ctid, new ClassRow(relOid, relname, relnamespace, reltype, reloftype,
-                    relowner, relam, relfilenode, reltoastrelid));
+                    relowner, relam, relfilenode, reltoastrelid, relkind));
         }
         return classes;
+    }
+
+    /**
+     * 读 nsp 行表（v2 扩链段；计数防线同 {@link #readAttrTable}——每行至少 18B：
+     * ctid u64=8 + nspOid u64=8 + nspname UTF 空串前缀 u16=2）。
+     *
+     * @param in      输入流（已处 class 表之后）
+     * @param fileLen 文件实长（计数防线锚）
+     * @return ctid 键控行字典（保持落盘序）
+     * @throws IOException 解析失败/截断
+     */
+    private static Map<Long, NspRow> readNspTable(DataInputStream in, int fileLen) throws IOException {
+        int rowCount = in.readInt();
+        if (rowCount < 0 || (long) rowCount * 18 > fileLen) {
+            throw new IOException("nsp 表计数损坏: " + rowCount);
+        }
+        Map<Long, NspRow> nspRows = new LinkedHashMap<>(Math.max(16, rowCount));
+        for (int i = 0; i < rowCount; i++) {
+            long ctid = in.readLong();
+            long nspOid = in.readLong();
+            String nspname = in.readUTF();
+            nspRows.put(ctid, new NspRow(nspOid, nspname));
+        }
+        return nspRows;
     }
 
     /**

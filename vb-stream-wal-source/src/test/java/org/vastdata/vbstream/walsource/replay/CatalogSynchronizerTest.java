@@ -14,6 +14,7 @@ import org.vastdata.vbstream.walsource.layout.WalRecordParser;
 import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -37,6 +38,9 @@ class CatalogSynchronizerTest {
 
     /** 测试用 pg_class relfilenode。 */
     private static final long CLASS_RELNODE = 6102;
+
+    /** 测试用 pg_namespace relfilenode（第三 watched 目录）。 */
+    private static final long NSP_RELNODE = 6103;
 
     /** 测试用表空间 oid（任意合法值，走读不校验）。 */
     private static final long SPC = 1663;
@@ -66,7 +70,7 @@ class CatalogSynchronizerTest {
         TupleBytes newTuple = classTuple(100, "t2", 205, 0, 1);
         WalRecord upd = rec(updateRecord(0, 0, 1, 2, 3, newTuple.payload()), 0x200000L);
         sync.apply(upd);
-        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0),
+        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0, "r"),
                 stores.classRows().get(newKey));
         assertNull(stores.classRows().get(oldKey), "UPD 后旧 ctid 行必须消失");
         assertEquals(newKey, stores.trackedTableCtid(), "tracked 须随 UPD 移动");
@@ -161,7 +165,7 @@ class CatalogSynchronizerTest {
     @Test
     void relfilenodeAndToastOfUnknownOidReturnEmpty() {
         CatalogStores stores = freshStores();
-        stores.classRows().put(CatalogReplay.ctidKey(0, 1), new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 0));
+        stores.classRows().put(CatalogReplay.ctidKey(0, 1), new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 0, "r"));
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout)));
 
@@ -267,12 +271,47 @@ class CatalogSynchronizerTest {
         // 紧邻种子的窗口记录（起点恰 = 种子、末尾 > 种子）——引导窗口 (B,S] 内的形态，必须施加
         WalRecord window = rec(updateRecord(0, 0, 1, 2, 3, classTuple(100, "t2", 205, 0, 1).payload()), seed);
         sync.apply(window);
-        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0),
+        assertEquals(new CatalogRow.ClassRow(100, "t2", 11, 12, 0, 10, 0, 205, 0, "r"),
                 stores.classRows().get(newKey), "紧邻种子后的窗口记录必须施加（upsert 幂等消化重叠）");
         assertEquals(newKey, stores.trackedTableCtid(), "窗口记录施加后 tracked 须随 UPD 移动");
         assertEquals(endLsn(window), sync.snapshot().lsn());
         assertEquals(1L, sync.metrics().getOrDefault(CatalogStores.CatalogMetrics.REPLAYED, 0L),
                 "仅窗口记录计入已施加事件");
+    }
+
+    /**
+     * 用例 9（pg_namespace 扩链 + TableFilter 支撑面）：快照的 schema/relkind/name/
+     * oid 四查询——schemaOf 经 class 行 relnamespace→nspRows 值域解析（"public" 等），
+     * relkindOf/nameOf 直供 ClassRow 投影，relOidOf 按 relfilenode 反查与 oid 直认
+     * 双入口归一到关系 oid；未知关系四面皆 empty（不臆造）。
+     */
+    @Test
+    void snapshotResolvesSchemaRelkindNameAndOidAcrossNamespaceJoin() {
+        CatalogStores stores = freshStores();
+        stores.classRows().put(CatalogReplay.ctidKey(0, 1),
+                new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 0, "r"));
+        stores.classRows().put(CatalogReplay.ctidKey(0, 2),
+                new CatalogRow.ClassRow(101, "t_part", 11, 13, 0, 10, 0, 201, 0, "p"));
+        // relnamespace 99 无对应 nsp 行（nspRows 缺行形态）——schemaOf 须 empty 而非臆造
+        stores.classRows().put(CatalogReplay.ctidKey(0, 3),
+                new CatalogRow.ClassRow(102, "t_orphan", 99, 14, 0, 10, 0, 202, 0, "r"));
+        stores.nspRows().put(CatalogReplay.ctidKey(1, 1), new CatalogRow.NspRow(11, "public"));
+        CatalogSynchronizer sync = new CatalogSynchronizer(stores,
+                new CatalogReplay(layout, new TupleDecoder(layout)));
+
+        CatalogSnapshot snapshot = sync.snapshot();
+        assertEquals(Optional.of("public"), snapshot.schemaOf(100), "schemaOf 经 relnamespace→nspname 解析");
+        assertEquals(Optional.of("r"), snapshot.relkindOf(100));
+        assertEquals(Optional.of("p"), snapshot.relkindOf(101), "分区表 relkind 'p' 保真");
+        assertEquals(Optional.of("t1"), snapshot.nameOf(100));
+        assertEquals(OptionalLong.of(100L), snapshot.relOidOf(200), "relOidOf 按 relfilenode 反查");
+        assertEquals(OptionalLong.of(100L), snapshot.relOidOf(100), "relOidOf 按 oid 直认");
+
+        assertEquals(Optional.empty(), snapshot.schemaOf(9999), "未知关系 schemaOf 为 empty");
+        assertEquals(Optional.empty(), snapshot.relkindOf(9999));
+        assertEquals(Optional.empty(), snapshot.nameOf(9999));
+        assertEquals(OptionalLong.empty(), snapshot.relOidOf(9999));
+        assertEquals(Optional.empty(), snapshot.schemaOf(102), "relnamespace 无对应 nsp 行时 schemaOf 为 empty");
     }
 
     // ---- 测试基建：记录拼装（CatalogReplayTest 同源转录，双源互证） ----------------
@@ -286,6 +325,7 @@ class CatalogSynchronizerTest {
         CatalogStores stores = new CatalogStores();
         stores.pgAttrRelfilenode(ATTR_RELNODE);
         stores.pgClassRelfilenode(CLASS_RELNODE);
+        stores.pgNspRelnode(NSP_RELNODE);
         return stores;
     }
 

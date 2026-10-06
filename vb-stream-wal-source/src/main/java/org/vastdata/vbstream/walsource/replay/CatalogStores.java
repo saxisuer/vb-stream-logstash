@@ -6,17 +6,18 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * catalog ctid 重放的状态容器——pg_attribute / pg_class 两张 watched 目录的行字典
- * 与 raw tail 存储（按物理 ctid 键控），加 tracked 双 ctid（用户表与其 toast 关系
- * 在 pg_class 中的行位，0=无）与引导/自愈所需的关系登记面。
+ * catalog ctid 重放的状态容器——pg_attribute / pg_class / pg_namespace 三张 watched
+ * 目录的行字典与 raw tail 存储（按物理 ctid 键控），加 tracked 双 ctid（用户表与
+ * 其 toast 关系在 pg_class 中的行位，0=无）与引导/自愈所需的关系登记面。
  *
  * <p>控制器裁定：本类随 Task 10（重放核心）交付，Task 11（CatalogSynchronizer/
- * 引导）只消费。生命周期约定：Task 11 的 {@code CatalogBootstrap} 在 REPEATABLE READ
- * 单事务内灌入全行含 ctid 并回填两 relfilenode，此后由重放引擎增量维护。
+ * 引导）只消费；v2（Task 4）扩第三张 watched 目录 pg_namespace（schema 名解析的
+ * 字典源）。生命周期约定：Task 11 的 {@code CatalogBootstrap} 在 REPEATABLE READ
+ * 单事务内灌入全行含 ctid 并回填三 relfilenode，此后由重放引擎增量维护。
  * <strong>线程约束：单写者 + 弱一致并发读</strong>——spec §3 执行模型为单线程直通
  * （接收→解析→重放→周期落盘），put/remove/跟随类复合迁移（先 remove 后 put 的
  * ctid 搬迁）仍按单写者假设（读线程在搬迁间隙可能瞬时看不到该行，属"尽力一致"
- * 口径内的窗口）；四个行字典/tail 存储用 {@link ConcurrentHashMap}——跨线程快照
+ * 口径内的窗口）；六个行字典/tail 存储用 {@link ConcurrentHashMap}——跨线程快照
  * 查询（{@code CatalogSynchronizer.snapshot()} 的迭代）与重放线程写入并发时弱一致
  * 迭代、不抛 CME；tracked 双 ctid/interest/stale 等标量与小集合仅装配/引导线程
  * 触碰，保持普通字段/HashSet；持久化与指标快照走 {@link CatalogMetrics#snapshot()}
@@ -26,8 +27,10 @@ public final class CatalogStores {
 
     private final Map<Long, CatalogRow.AttrRow> attrRows = new ConcurrentHashMap<>();
     private final Map<Long, CatalogRow.ClassRow> classRows = new ConcurrentHashMap<>();
+    private final Map<Long, CatalogRow.NspRow> nspRows = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawAttrTails = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawClassTails = new ConcurrentHashMap<>();
+    private final Map<Long, byte[]> rawNspTails = new ConcurrentHashMap<>();
     // interest 集 CHM：重放线程的 ctid 寻址精确采纳与消费方的中途登记（新关系出现时）并发——弱一致不抛 CME
     private final Set<Long> interestRelOids = ConcurrentHashMap.newKeySet();
     private final Set<Long> staleOids = new HashSet<>();
@@ -36,6 +39,7 @@ public final class CatalogStores {
     private long trackedToastCtid;
     private long pgAttrRelfilenode;
     private long pgClassRelfilenode;
+    private long pgNspRelnode;
 
     /**
      * pg_attribute 行字典（ctid 键 → 行模型）——活引用，重放引擎与引导直接读写。
@@ -73,6 +77,26 @@ public final class CatalogStores {
      */
     public Map<Long, byte[]> rawClassTails() {
         return rawClassTails;
+    }
+
+    /**
+     * pg_namespace 行字典（ctid 键 → 行模型，v2 扩链第三 watched 目录）——schema
+     * 名解析的字典源（relnamespace → nspname）；活引用。
+     *
+     * @return 键控字典（非拷贝）
+     */
+    public Map<Long, CatalogRow.NspRow> nspRows() {
+        return nspRows;
+    }
+
+    /**
+     * pg_namespace 的 raw tail 存储——语义同 {@link #rawAttrTails()}（nsp 面无
+     * INPLACE，失效面不存在）；活引用。
+     *
+     * @return 键控字典（非拷贝）
+     */
+    public Map<Long, byte[]> rawNspTails() {
+        return rawNspTails;
     }
 
     /**
@@ -161,6 +185,24 @@ public final class CatalogStores {
      */
     public void pgClassRelfilenode(long relfilenode) {
         this.pgClassRelfilenode = relfilenode;
+    }
+
+    /**
+     * pg_namespace 的 relfilenode（块匹配面，引导回填，v2 扩链）。
+     *
+     * @return relfilenode（未引导为 0——重放引擎按 0 不匹配处理）
+     */
+    public long pgNspRelnode() {
+        return pgNspRelnode;
+    }
+
+    /**
+     * 回填 pg_namespace relfilenode。
+     *
+     * @param relfilenode 引导查询值
+     */
+    public void pgNspRelnode(long relfilenode) {
+        this.pgNspRelnode = relfilenode;
     }
 
     /**
