@@ -110,8 +110,15 @@ public final class WalSource implements AutoCloseable {
     /** 同步器全管线装配用 SQL 会话（start 建，close 关；probe 与槽推进复用）。 */
     private Connection sqlConnection;
 
-    /** 同步器（start 建；null = 未 start）。 */
-    private CatalogSynchronizer sync;
+    /**
+     * 同步器（start 建；null = 未 start）。<b>volatile（Task 8 JMM 修复）</b>：接收
+     * 线程在 {@code CatalogSynchronizer.start} 内部启动、而 {@code sync} 字段赋值在
+     * start 返回路径上——原声明无 HB 边可依（线程启动序只覆盖 start 调用<b>前</b>的
+     * 写），接收线程首条记录到达时理论上可见 null/陈旧引用；volatile 补齐可见性，
+     * {@link #awaitSync()} 的有界自旋再收窄时间窗（赋值在 start 返回前完成，正常
+     * 路径自旋零次通过）。
+     */
+    private volatile CatalogSynchronizer sync;
 
     /** start/close 的单程闸门。 */
     private boolean started;
@@ -247,8 +254,11 @@ public final class WalSource implements AutoCloseable {
      * {@link #dmlEmittedBuckets()} 读到非 null 引用即见安全构造）。
      *
      * <p>惰性的原因：ChangeStream 需要 {@code sync.snapshot()} 活视图，而 sink 接线
-     * 发生在 {@code CatalogSynchronizer.start} 内部（先于 start 返回、sync 字段赋值）；
-     * 首条记录到达时 sync 必已构造完毕（happens-before 经线程启动序传递）。</p>
+     * 发生在 {@code CatalogSynchronizer.start} 内部（先于 start 返回、sync 字段赋值）。
+     * <b>Task 8 JMM 修复</b>：原注释"happens-before 经线程启动序传递"不成立——接收
+     * 线程在 start 内部启动，赋值发生在其后，线程启动 HB 边覆盖不到；现 sync 已
+     * volatile（可见性）+ {@link #awaitSync()} 有界自旋（时间窗——赋值与接收线程首条
+     * postApply 之间只有 start 的返回路径，正常路径零自旋通过）。</p>
      *
      * @param layout start 解析的版本布局（闭包捕获，避免字段化）
      * @return 变更流门面
@@ -256,10 +266,34 @@ public final class WalSource implements AutoCloseable {
     private ChangeStream changeStreamOrInit(WalLayout layout) {
         ChangeStream cs = changeStream;
         if (cs == null) {
-            cs = new ChangeStream(sync.snapshot(), sqlConnection, layout, tables, dmlOut);
+            cs = new ChangeStream(awaitSync().snapshot(), sqlConnection, layout, tables, dmlOut);
             changeStream = cs;
         }
         return cs;
+    }
+
+    /**
+     * 等待 {@code sync} 字段就绪（接收线程调用）：volatile 读 + 有界自旋（上限 10s）。
+     *
+     * <p>时间窗语义：{@code CatalogSynchronizer.start} 在返回前已完成全部装配且
+     * {@code sync = start(...)} 赋值紧随其后——接收线程即便立即收到首条记录，等待
+     * 也只是微秒级；上限 10s 防御 start 返回与首条记录之间的极端调度延迟，超时抛
+     * ISE（装配序破坏的 fail-fast 信号而非重试面）。</p>
+     *
+     * @return 已就绪的同步器
+     * @throws IllegalStateException 期限内 sync 仍未赋值（start 装配序被破坏）
+     */
+    private CatalogSynchronizer awaitSync() {
+        CatalogSynchronizer s = sync;
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (s == null) {
+            if (System.nanoTime() - deadline > 0) {
+                throw new IllegalStateException("WalSource.start 装配序破坏：接收线程等待 sync 字段超时");
+            }
+            Thread.onSpinWait();
+            s = sync;
+        }
+        return s;
     }
 
     /**

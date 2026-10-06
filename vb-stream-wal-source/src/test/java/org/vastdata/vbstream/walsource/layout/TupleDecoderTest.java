@@ -57,6 +57,52 @@ class TupleDecoderTest {
     }
 
     /**
+     * 短（1B 头）varlena <b>未对齐落位</b>（PG att_align_pointer 同面，双路对拍 Task 8
+     * 实测钉）：bool 列之后的 text 短 varlena 直接紧跟（相对偏移未 4 对齐、首字节非零），
+     * 不先对齐直接起读；对照 int2 之后的 4B 头 varlena 走填充字节 + 4 对齐路径。
+     * 手工直拼字节（TupleBytes DSL 恒 4 对齐，构造不出该形态）。
+     */
+    @Test
+    void shortVarlenaAfterBoolStaysUnaligned() {
+        // 形态 A：bool(true) + 短 varlena "hi"（3B：b0=(3<<1)|1=7）+ int4——text 落在
+        // 相对偏移 25（未对齐），随后 int4 恰回对齐边界（28）
+        byte[] payload = new byte[5 + 1 + 1 + 3 + 4];
+        payload[0] = 3;    // infomask2 = natts 3
+        payload[4] = 24;   // t_hoff；payload[5] = t_bits 区垫字节
+        payload[6] = 1;                            // bool true（相对 24）
+        payload[7] = 7;                            // 短 varlena 1B 头（相对 25，未对齐）
+        payload[8] = 'h';
+        payload[9] = 'i';
+        payload[10] = 0x56;                        // int4 = 0x00000056（相对 28，已对齐）
+        payload[11] = 0;
+        payload[12] = 0;
+        payload[13] = 0;
+        String[] kinds = {"bool", "text", "int4"};
+        Object[] vals = decoder.decodePayload(payload, 0, kinds);
+        assertEquals(Boolean.TRUE, vals[0]);
+        assertEquals("hi", vals[1], "bool 后的短 varlena 不做 4 对齐直接起读");
+        assertEquals(0x56, vals[2]);
+
+        // 形态 B：int2 + 4B 头 varlena "ok"（总长 6，u32le=6<<2）——int2 结束在相对 26，
+        // 两粒 0 填充字节后 4 对齐落位（相对 28）
+        byte[] padded = new byte[5 + 1 + 2 + 2 + 6];
+        padded[0] = 2;    // natts 2
+        padded[4] = 24;
+        padded[6] = (byte) 0xD6;                   // int2 = -42（相对 24，LE 低字节）
+        padded[7] = (byte) 0xFF;
+        padded[10] = (byte) ((6 << 2) & 0xFF);     // 4B 头（相对 28）
+        padded[11] = 0;
+        padded[12] = 0;
+        padded[13] = 0;
+        padded[14] = 'o';
+        padded[15] = 'k';
+        String[] kindsB = {"int2", "text"};
+        Object[] valsB = decoder.decodePayload(padded, 0, kindsB);
+        assertEquals((short) -42, valsB[0]);
+        assertEquals("ok", valsB[1], "零填充字节路径仍按 4 对齐起读");
+    }
+
+    /**
      * 用例 2：null 位图 + dropped 占位——natts=4 而活列只 2（dropped 恒 null 不占字节、
      * bool 列显式 null），int4/text 两活列跨过占位仍按各自对齐解对（spike 发现 26）。
      */

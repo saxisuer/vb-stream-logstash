@@ -86,9 +86,9 @@ class ToastAssemblerTest {
         byte[] payload = text.getBytes(StandardCharsets.UTF_8);
         feedChunks(assembler, TOAST_REL, VALUE_ID, payload, 10);
 
-        String resolved = assembler.resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
+        byte[] resolved = assembler.resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
 
-        assertEquals(text, resolved);
+        assertEquals(text, new String(resolved, StandardCharsets.UTF_8));
     }
 
     /**
@@ -106,9 +106,9 @@ class ToastAssemblerTest {
         assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 0, chunk0));
         assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 1, chunk1));
 
-        String resolved = assembler.resolveExternal(pointer(15, 10, 0, VALUE_ID, TOAST_REL), 0);
+        byte[] resolved = assembler.resolveExternal(pointer(15, 10, 0, VALUE_ID, TOAST_REL), 0);
 
-        assertEquals("abcabcabcab", resolved);
+        assertEquals("abcabcabcab", new String(resolved, StandardCharsets.UTF_8));
     }
 
     /**
@@ -127,9 +127,9 @@ class ToastAssemblerTest {
         ToastAssembler assembler = new ToastAssembler(probe);
         assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 0, copyOfRange(payload, 0, 10)));
 
-        String resolved = assembler.resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
+        byte[] resolved = assembler.resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
 
-        assertEquals(text, resolved);
+        assertEquals(text, new String(resolved, StandardCharsets.UTF_8));
         assertEquals(TOAST_REL, probe.lastToastOid);
         assertEquals(VALUE_ID, probe.lastValueid);
     }
@@ -146,9 +146,9 @@ class ToastAssemblerTest {
         probe.serve(TOAST_REL, VALUE_ID, partial);
         ToastAssembler assembler = new ToastAssembler(probe);
 
-        String resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
+        byte[] resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
 
-        assertEquals("toast-unavailable", resolved);
+        assertEquals("toast-unavailable", new String(resolved, StandardCharsets.UTF_8));
         List<ILoggingEvent> warns = appender.list.stream().filter(e -> e.getLevel() == Level.WARN).toList();
         assertEquals(1, warns.size());
         assertTrue(warns.get(0).getFormattedMessage().contains(String.valueOf(VALUE_ID)), "WARN 行含 valueid 上下文");
@@ -165,9 +165,9 @@ class ToastAssemblerTest {
         probe.failWith(new IllegalStateException("toast probe connection down"));
         ToastAssembler assembler = new ToastAssembler(probe);
 
-        String resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
+        byte[] resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
 
-        assertEquals("toast-unavailable", resolved);
+        assertEquals("toast-unavailable", new String(resolved, StandardCharsets.UTF_8));
         assertEquals(1, appender.list.stream().filter(e -> e.getLevel() == Level.WARN).count());
     }
 
@@ -245,9 +245,9 @@ class ToastAssemblerTest {
         byte[] payload = "divergent-key tolerance".getBytes(StandardCharsets.UTF_8);
         feedChunks(assembler, TOAST_REL + 7, VALUE_ID, payload, 10);   // 归集键 != 指针 toastrelid
 
-        String resolved = assembler.resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
+        byte[] resolved = assembler.resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
 
-        assertEquals("divergent-key tolerance", resolved);
+        assertEquals("divergent-key tolerance", new String(resolved, StandardCharsets.UTF_8));
     }
 
     // ---- 手造字节辅助（布局锚见类 javadoc） ----

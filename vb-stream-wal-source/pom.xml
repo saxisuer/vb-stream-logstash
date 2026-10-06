@@ -44,6 +44,18 @@
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- 双路对拍（Task 8）：engine 管线仅 test-scope 引入——in-process 起 PgReplicationSession +
+             TransactionAssembler + ConsoleRenderer 作对拍基准路。运行依赖面仍是 pgjdbc + slf4j-api
+             （依赖方向不变：将来 engine 依赖本模块，不是反过来）；engine 的编译依赖
+             （chronicle-queue/HdrHistogram/logback-classic）经 test classpath 传递可用。
+             Chronicle mmap 所需的 surefire argLine 的 add-opens 五件继承自 parent pom 的
+             surefire 配置（与 engine 模块同源，engine pom 自身未重复声明）。 -->
+        <dependency>
+            <groupId>org.vastdata</groupId>
+            <artifactId>vb-stream-engine</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

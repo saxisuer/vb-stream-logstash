@@ -428,8 +428,11 @@ class DiskValueRendererTest {
 
     /**
      * timestamptz 期望文本的独立 oracle：java.time DateTimeFormatter 按 JVM 默认时区
-     * 排版（yyyy-MM-dd HH:mm:ss + 去尾零微秒 + 数字偏移；ZoneOffset 的 "Z" 特例翻成
-     * PG 的 "+00"）——不经过被测代码的任何格式化路径。
+     * 排版（yyyy-MM-dd HH:mm:ss + 去尾零微秒 + 数字偏移）——不经过被测代码的任何
+     * 格式化路径。偏移文本按 <b>PG timestamptz_out 形态</b>手工排版（整小时
+     * {@code +08}、半时 {@code +05:30}、零偏移 {@code +00}——Task 8 双路对拍实测
+     * 裁定：{@code ZoneOffset.toString()} 本 JDK 打 {@code +08:00} 与 PG 分叉，
+     * 首版 oracle 用 toString 与被测代码同源掩蔽了该分叉）。
      *
      * @param inst 目标绝对时刻
      * @return PG 文本形态期望值
@@ -449,7 +452,13 @@ class DiskValueRendererTest {
             frac = "." + digits.substring(0, end);
         }
         ZoneOffset off = zdt.getOffset();
-        String offText = off.getTotalSeconds() == 0 ? "+00" : off.toString();
+        int total = off.getTotalSeconds();
+        int abs = Math.abs(total);
+        int hours = abs / 3600;
+        int minutes = (abs % 3600) / 60;
+        String offText = minutes == 0
+                ? String.format("%s%02d", total < 0 ? "-" : "+", hours)
+                : String.format("%s%02d:%02d", total < 0 ? "-" : "+", hours, minutes);
         return base + frac + offText;
     }
 }

@@ -40,8 +40,11 @@ import java.util.Set;
  * javadoc 的"Begin 时点值"在本形态下即终值）。</p>
  *
  * <p><b>子事务归并</b>：heap 记录的记录头 xid 是产生行的（子）事务，TOPLEVEL_XID
- * 标记（spike 发现 25）优先归并到顶层；无标记时 ASSIGNMENT(0x50) 记录的 subxid→top
- * 映射兜底。aborted 过滤按行的<b>来源 xid</b>（桶内私有记账，不泄漏进
+ * 标记（spike 发现 25）优先归并到顶层；映射来源双通道——①行记录到达时顺路收割进
+ * {@code subToTop}（<b>Task 8 实测发现</b>：子回滚的 ABORT 记录不带 252 块、真实
+ * 流里 ASSIGNMENT 也常缺席，收割使子 ABORT 仍能归并回顶层桶）；
+ * ②ASSIGNMENT(0x50) 记录兜底。aborted 过滤按行的<b>来源 xid</b>（桶内私有记账，
+ * 不泄漏进
  * {@code RowChange}——预检 #5 裁定）：子回滚把子 xid 记入桶的 abortedSubxids，
  * 发射期扣减该来源的行；顶层 ABORT 则整桶弃（onAborted，零 Begin/End）。</p>
  *
@@ -79,8 +82,10 @@ import java.util.Set;
  * ——Task 7 硬前置①扩容后与渲染矩阵 oid 集合对齐（含 date/time/timetz/
  * timestamptz/numeric/uuid 的 datum 字节形态），enum/域/jsonb/组合类型等矩阵外
  * oid 解码即 ISE（走读对位无法维持——双路对拍 MS3+ 的扩面输入）。UPDATE 前缀/
- * 后缀截断（XLH_UPDATE_TRUNCATION）的新元组重建同为 v2 未落面（spike 遗留，
- * 撞上即解码失败 fail-fast 而非静默错位）。</p>
+ * 后缀截断（XLH_UPDATE_TRUNCATION）的新元组重建为未落面（spike 遗留）——
+ * <b>Task 8 liveness guard</b>：截断行经 {@link #skipTruncatedUpdate} 行级跳过 +
+ * WARN（每表节流）+ {@link #skippedTruncatedRows()} 计数，有痕丢弃而非静默错值
+ * /fail-fast 杀流。</p>
  *
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程顺序喂 onRecord，与 v1 replay 组件
  * 同假设）；listener 回调与 TOAST 组装同线程发生。跨重启安全依赖调用方保证：本类
@@ -157,6 +162,12 @@ public final class XactGrouper {
     /** 已发射行计数（过滤后实付口径，emitBucket 累加 emitted——volatile 跨线程读）。 */
     private volatile long emittedRows;
 
+    /** 截断 UPDATE 行级跳过计数（liveness guard 观测面——Task 8；volatile 跨线程读）。 */
+    private volatile long skippedTruncatedRows;
+
+    /** 截断 WARN 节流：已告警表全名集（单写者线程内使用——每表只告警一次）。 */
+    private final Set<String> truncationWarnedTables = new HashSet<>();
+
     /**
      * 装配组装器。
      *
@@ -185,15 +196,25 @@ public final class XactGrouper {
      * 记录解码行入桶（或 toast chunk 采集），其余 rmid（PRUNE 已含在 heap2 内过滤、
      * XLOG 等）静默忽略。
      *
-     * <p>关键步骤：rmid 三路分发；XACT 下按 opcode 六态（COMMIT/ABORT/PREPARE/
-     * COMMIT_PREPARED/ABORT_PREPARED/ASSIGNMENT，INVALIDATIONS 等其余 opcode 忽略）；
-     * heap 下先经 TableFilter 解析（缓存），命中用户表才解码。边界与异常语义：无块
-     * 引用或无事务归属（xid=0）的 heap 记录跳过；解码/走读错位抛 ISE fail-fast。
-     * 线程约束：单写者（wal-receiver 线程）。</p>
+     * <p>关键步骤：①<b>子事务归并映射收割</b>——记录头带 TOPLEVEL_XID 块（id 252）
+     * 且 xid ≠ toplevel 时把 {@code subToTop[xid]=toplevel} 学入映射（双路对拍
+     * Task 8 实测发现：子回滚的 ABORT 记录<b>不带</b> 252 块，单靠 ASSIGNMENT 兜底
+     * 在真实流里缺席——子事务写过 WAL 其行记录必先于 ABORT 到达并携带 toplevel，
+     * 顺路收割使 {@link #onAbort} 能把子 ABORT 归并回顶层桶做行级扣减）；②rmid
+     * 三路分发；XACT 下按 opcode 六态（COMMIT/ABORT/PREPARE/COMMIT_PREPARED/
+     * ABORT_PREPARED/ASSIGNMENT，INVALIDATIONS 等其余 opcode 忽略）；heap 下先经
+     * TableFilter 解析（缓存），命中用户表才解码。边界与异常语义：无块引用或无事务
+     * 归属（xid=0）的 heap 记录跳过；解码/走读错位抛 ISE fail-fast。线程约束：
+     * 单写者（wal-receiver 线程）。</p>
      *
      * @param rec 走读完成的记录（raw 契约只读）
      */
     public void onRecord(WalRecord rec) {
+        long xid = rec.xid() & 0xFFFFFFFFL;
+        long toplevel = rec.toplevelXid() & 0xFFFFFFFFL;
+        if (toplevel != 0 && toplevel != xid) {
+            subToTop.putIfAbsent(xid, toplevel);
+        }
         if (rec.rmid() == HeapOps.RM_XACT_ID) {
             dispatchXact(rec);
         } else if (rec.rmid() == HeapOps.RM_HEAP_ID) {
@@ -413,6 +434,13 @@ public final class XactGrouper {
             }
             case HeapOps.XLOG_HEAP_UPDATE, HeapOps.XLOG_HEAP_HOT_UPDATE -> {
                 HeapViews.HeapUpdateView v = HeapViews.HeapUpdateView.parse(rec, layout);
+                if ((v.flags() & HeapOps.XLH_UPDATE_TRUNCATION) != 0) {
+                    // liveness guard（控制器裁定 2026-10-07，Task 8）：截断新元组的前缀/后缀
+                    // 重建（旧元组字节拼装）不在本面——解码短元组只会静默产出错值/尾列假 NULL，
+                    // 改为行级跳过 + WARN（每表节流一次）+ skippedTruncatedRows 计数，不静默丢行
+                    skipTruncatedUpdate(res);
+                    return;
+                }
                 Object[] before = (v.flags() & HeapOps.XLH_UPDATE_CONTAINS_OLD) != 0
                         ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapUpdate(), res.kinds())
                         : null;
@@ -610,6 +638,41 @@ public final class XactGrouper {
     }
 
     /**
+     * 截断 UPDATE 的行级跳过（liveness guard，Task 8 控制器裁定）：递增
+     * {@code skippedTruncatedRows} 计数 + WARN（每表节流一次——大事务批量截断行只留
+     * 首条告警，防刷屏），行不入桶、不发射。
+     *
+     * <p>语义边界：跳过是<b>有痕丢弃</b>而非静默丢行——计数经
+     * {@link #skippedTruncatedRows()} 观测、首条 WARN 带 liveness 归因说明；正解
+     * （旧元组前缀/后缀字节重建）不在本面（old tuple 虽常同记录自包含——CONTAINS_OLD
+     * 形态——但重建需字节级拼装，属后续任务）。线程约束：单写者。</p>
+     *
+     * @param res 表解析结果（meta 用于告警去重键）
+     */
+    private void skipTruncatedUpdate(Resolved res) {
+        skippedTruncatedRows++;
+        TableMeta meta = res.meta();
+        String table = meta.schema() + "." + meta.table();
+        if (truncationWarnedTables.add(table)) {
+            LOG.warn("UPDATE 新元组带前缀/后缀截断（XLH_UPDATE_TRUNCATION），重建未落——该行跳过不发射: "
+                    + "table={}（同表后续跳过不再重复告警；观测面 skippedTruncatedRows 计数递增）", table);
+        } else {
+            LOG.debug("截断 UPDATE 行跳过: table={}", table);
+        }
+    }
+
+    /**
+     * DML 观测面：截断 UPDATE 行级跳过计数（liveness guard 的有痕丢弃观测面，Task 8）。
+     *
+     * <p>单写者递增、volatile 读；正解重建落地后该值应恒为 0（计数保留作回归哨兵）。</p>
+     *
+     * @return 会话累计跳过的截断 UPDATE 行数
+     */
+    public long skippedTruncatedRows() {
+        return skippedTruncatedRows;
+    }
+
+    /**
      * 行入桶：值渲染（静态 {@link DiskValueRenderer}）+ RowChange 组装 + 桶记账
      * expectedChanges++（aborted 过滤前口径）。
      *
@@ -637,8 +700,13 @@ public final class XactGrouper {
      * 值数组 → 列名→渲染值 map（列序保持 attnum 序——LinkedHashMap）：dropped 列恒
      * null（占位语义），其余经静态 {@link DiskValueRenderer#render} 取 PG text 形态。
      *
+     * <p>短数组尾列补 null 的<b>唯一合法来源</b>是 ADD COLUMN 前的存量元组（旧元组缺
+     * 尾列，PG 语义读作 NULL——补 null 恰是正确值）；截断 UPDATE 新元组（曾会走到此
+     * 处产出尾列假 NULL）已在 {@code dispatchHeap} 被 liveness guard 前置拦截
+     * （XLH_UPDATE_TRUNCATION 行级跳过，Task 8 封口裁定）——静默错值面不可达。</p>
+     *
      * @param meta 表身份 + 列序
-     * @param vals 解码值数组（可短于列数——尾列补 null）
+     * @param vals 解码值数组（可短于列数——仅 ADD COLUMN 前存量元组合法，见上）
      * @return 有序值 map
      */
     private static Map<String, Object> renderRow(TableMeta meta, Object[] vals) {

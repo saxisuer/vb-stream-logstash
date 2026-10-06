@@ -11,7 +11,10 @@ import java.time.ZoneOffset;
  * entry 中的 tuple 字节解为 {@code Object[]} 值行。
  *
  * <p>三入口共享同一核心走读（{@link #decodeTupleData}，spike {@code decodeTupleData}
- * 移植）：datum 对齐相对 tuple 起点（spike 发现 7）；null 位图在 tuple offset 23
+ * 移植）：datum 对齐相对 tuple 起点（spike 发现 7）；<b>varlena 列的落位取
+ * {@link #varlenaStart}（PG att_align_pointer 同面）——短（1B 头）varlena 可紧跟
+ * 定宽列未对齐落盘（当前字节非零即 datum 起点），只有 4B 头形态才有 4 对齐保证
+ * （双路对拍 Task 8 实测钉）</b>；null 位图在 tuple offset 23
  * （t_bits），natts 取 infomask2 &amp; 0x07FF；varlena 双头——1B 头总长
  * {@code (b>>1)&0x7F}、4B 头总长 {@code u32le>>>2}（spike 发现 21，小端是实测锚，
  * 防大端误读回归）；dropped 列恒 null 零消耗（spike 发现 26）、skip 列消耗 varlena
@@ -215,8 +218,8 @@ public final class TupleDecoder {
                     vals[i] = renderTimestamp(u64(src, c));
                     c += 8;
                 }
-                case "text" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; vals[i] = readTextDatum(src, c, next); c = next[0]; }
-                case "bytea", "numeric" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; vals[i] = readDatumBytes(src, c, next); c = next[0]; }
+                case "text" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i] = readTextDatum(src, c, next); c = next[0]; }
+                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i] = readDatumBytes(src, c, next); c = next[0]; }
                 case "date" -> {   // i32 天（epoch 2000-01-01）——datum 原始字节，解读在渲染矩阵
                     c = tupleStart + align(c - tupleStart, 4);
                     vals[i] = slice(src, c, 4);
@@ -236,7 +239,7 @@ public final class TupleDecoder {
                     vals[i] = slice(src, c, 16);
                     c += 16;
                 }
-                case "skip" -> { c = tupleStart + align(c - tupleStart, 4); int[] next = {c}; skipVarlena(src, c, next); c = next[0]; }
+                case "skip" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; skipVarlena(src, c, next); c = next[0]; }
                 case "dropped" -> { /* attisdropped 列存储恒 NULL：零字节消耗（发现 26） */ }
                 default -> throw new IllegalStateException("unregistered kind " + kinds[i]);
             }
@@ -245,7 +248,28 @@ public final class TupleDecoder {
     }
 
     /**
-     * 读一个文本 datum（text kind）——external 短指针先走 resolver 重组，其余经
+     * varlena 列的落位起点（<b>PG att_align_pointer 同面</b>，双路对拍 Task 8 实测钉）：
+     * 当前偏移的字节<b>非零</b>即短（1B 头）varlena 未对齐落位——直接在此起读；为零即
+     * 填充字节——按 4 对齐后是 4B 头（或 external/压缩）形态。
+     *
+     * <p>存在动机：PG 存储层只对 4B 头 varlena 保证 4 对齐——<b>短 varlena 可紧跟定宽
+     * 列（如 bool）未对齐落盘</b>（1B 头恒 bit0=1、首字节不可能为 0；填充字节恒 0，
+     * 二者由此无歧义）。原实现一律先 4 对齐，撞上"bool 后未对齐 numeric 短值"即走读
+     * 错位（对拍 IT 首跑 AIOOBE 实证：text "alice"(6B) + bool 后 numeric 12.345 落
+     * 相对偏移 35）。已 4 对齐的偏移两分支等价（对齐幂等）。线程约束：纯读。</p>
+     *
+     * @param src        源缓冲
+     * @param c          当前游标（前一 datum 之后的首偏移，可能未对齐）
+     * @param tupleStart tuple 起始偏移（对齐的相对基准，spike 发现 7）
+     * @return varlena datum 的实际起点
+     */
+    private static int varlenaStart(byte[] src, int c, int tupleStart) {
+        return src[c] != 0 ? c : tupleStart + align(c - tupleStart, 4);
+    }
+
+    /**
+     * 读一个文本 datum（text kind）——external 短指针先走 resolver 重组（返回字节经
+     * UTF-8 解码——文本族的解释在此、且仅在此发生，Task 8 保真裁定），其余经
      * plain varlena 读文本。
      *
      * <p>边界与异常语义：external 且未注入 resolver 抛 ISE（v1 拒绝面）；
@@ -258,7 +282,7 @@ public final class TupleDecoder {
      */
     private String readTextDatum(byte[] src, int c, int[] next) {
         if (isExternalPointer(src, c)) {
-            return resolveExternalString(src, c, next);
+            return new String(resolveExternalBytes(src, c, next), StandardCharsets.UTF_8);
         }
         if (isInlineCompressed(src, c)) {
             return decompressInlineString(src, c, next);
@@ -268,9 +292,9 @@ public final class TupleDecoder {
 
     /**
      * 读一个字节 datum（bytea/numeric kind）——external 短指针先走 resolver 重组
-     * （String 经 UTF-8 还原字节——文本族无损，二进制载荷的已知有损面见
-     * {@code ToastAssembler} 类 javadoc），其余经 plain varlena 取<b>已剥头的载荷</b>
-     * （numeric 的渲染矩阵输入契约即此形态）。
+     * （返回字节<b>直达</b>本方法——Task 8 保真裁定：不再经 String UTF-8 往返，
+     * 二进制载荷无损），其余经 plain varlena 取<b>已剥头的载荷</b>（numeric 的渲染
+     * 矩阵输入契约即此形态）。
      *
      * <p>边界与异常语义：external 且未注入 resolver 抛 ISE；compressed varlena 恒 ISE。
      * 线程约束：纯读。</p>
@@ -278,11 +302,11 @@ public final class TupleDecoder {
      * @param src  源缓冲
      * @param c    datum 起点（已按 4 对齐）
      * @param next 单元素游标：返回值 = 整个 datum 之后的首偏移
-     * @return 载荷字节（external 形态为重组原值的 UTF-8 字节）
+     * @return 载荷字节（external 形态为重组后的原值字节）
      */
     private byte[] readDatumBytes(byte[] src, int c, int[] next) {
         if (isExternalPointer(src, c)) {
-            return resolveExternalString(src, c, next).getBytes(StandardCharsets.UTF_8);
+            return resolveExternalBytes(src, c, next);
         }
         if (isInlineCompressed(src, c)) {
             return decompressInlineBytes(src, c, next);
@@ -331,14 +355,14 @@ public final class TupleDecoder {
     }
 
     /**
-     * 委派 external 重组并推进游标越过 18B 指针（指针 datum 定长 18B，后续列的对齐
-     * 由各 kind 的相对 tupleStart 对齐承担）。
+     * 委派 external 重组（字节形态，Task 8 保真裁定）并推进游标越过 18B 指针（指针
+     * datum 定长 18B，后续列的对齐由各 kind 的相对 tupleStart 对齐承担）。
      *
      * @throws IllegalStateException 指针形态不符 / lz4 / chunk 不齐时降级——由
-     *                               resolver 契约决定（ToastAssembler：形态 ISE、缺值降级）
+     *                               resolver 契约决定（ToastAssembler：形态 ISE、缺值降级字节）
      */
-    private String resolveExternalString(byte[] src, int c, int[] next) {
-        String resolved = externalResolver.resolveExternal(src, c);
+    private byte[] resolveExternalBytes(byte[] src, int c, int[] next) {
+        byte[] resolved = externalResolver.resolveExternal(src, c);
         next[0] = c + EXTERNAL_POINTER_SIZE;
         return resolved;
     }
@@ -522,20 +546,22 @@ public final class TupleDecoder {
      *
      * <p>实现契约：指针/压缩形态不符、lz4 方法码抛 {@link IllegalStateException}
      * （fail-fast 面）；external chunk 不齐等不可得形态<b>不抛</b>，返回降级字面
-     * （{@code toast-unavailable}——不 fail 整条流，v2 设计 §5）。线程约束：与解码
-     * 同线程调用（wal-receiver 单写者上下文）。</p>
+     * （{@code toast-unavailable}——不 fail 整条流，v2 设计 §5）。返回值是<b>原值
+     * 字节</b>（Task 8 保真裁定）——文本解释权归解码器（UTF-8）、字节面直达渲染
+     * 层，不经 String 有损往返。线程约束：与解码同线程调用（wal-receiver 单写者
+     * 上下文）。</p>
      */
     public interface VarlenaResolver {
 
         /**
-         * 自 src 的 off 起剥 18B external 指针并重建原值。
+         * 自 src 的 off 起剥 18B external 指针并重建原值字节。
          *
          * @param src 完整源缓冲（契约只读）
          * @param off 指针起点（已 4 对齐）
-         * @return 重组后的原值文本（不可得时降级字面）
+         * @return 重组后的原值字节（不可得时为降级字面的 UTF-8 字节）
          * @throws IllegalStateException 指针形态/lz4 方法码不符
          */
-        String resolveExternal(byte[] src, int off);
+        byte[] resolveExternal(byte[] src, int off);
 
         /**
          * 解压行内压缩 varlena 的载荷（4B varlena 头已剥——payload 即

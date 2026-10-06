@@ -259,19 +259,62 @@ class XactGrouperTest {
                 "END xid=100 emitted=1 exp=1"), fx.listener.events);
     }
 
-    /** TOAST chunk 采集 + 终态淘汰：multi-insert 喂 chunk → resolveExternal 可拼装；任意终态后归集面全清。 */
+    /** TOAST chunk 采集 + 终态淘汰：multi-insert 喂 chunk → resolveExternal 可拼装（byte[] 契约）；任意终态后归集面全清。 */
     @Test
     void toastChunksCollectedThroughGrouperAndClearedAtTerminal() {
         Fixture fx = fixture();
         fx.toastChunks(900, 4242L, "abcdefghij".getBytes(StandardCharsets.UTF_8), 5);
 
-        String before = fx.toast.resolveExternal(pointer(14, 10, 4242L, TOAST_REL), 0);
-        assertEquals("abcdefghij", before, "终态前 chunk 已归集可拼装");
+        byte[] before = fx.toast.resolveExternal(pointer(14, 10, 4242L, TOAST_REL), 0);
+        assertEquals("abcdefghij", new String(before, StandardCharsets.UTF_8), "终态前 chunk 已归集可拼装");
 
         fx.commit(901);                                         // 无桶事务的终态同样触发淘汰
         assertEquals("toast-unavailable",
-                fx.toast.resolveExternal(pointer(14, 10, 4242L, TOAST_REL), 0),
+                new String(fx.toast.resolveExternal(pointer(14, 10, 4242L, TOAST_REL), 0),
+                        StandardCharsets.UTF_8),
                 "终态后归集面已清、无 probe 回查即降级");
+    }
+
+    /**
+     * 子回滚 ABORT 无 toplevel 标记的归并收割（Task 8 实测发现的真实流形态）：ABORT
+     * 记录不带 252 块（双路对拍 IT 钉）——子 xid → 顶层映射须从行记录到达时收割；
+     * 无收割通道时该 ABORT 会被误判为顶层回滚（整桶弃）或彻底失联（行不扣减）。
+     */
+    @Test
+    void subAbortWithoutToplevelMarkerFilteredViaHarvestedMapping() {
+        Fixture fx = fixture();
+        fx.insert(5, 0, 1, "top-a");
+        fx.insert(7, 5, 2, "sub-b");       // 行记录带 toplevel=5 → 收割 subToTop[7]=5
+        fx.abort(7, 0);                    // ABORT 记录无 toplevel（真实 PG 形态）
+        fx.insert(5, 0, 3, "top-c");
+        fx.commit(5);
+
+        assertEquals(List.of(
+                "BEGIN xid=5 2p=false gid=null exp=3",
+                "ROW INSERT public.t_stream before=null after={id=1, name=top-a}",
+                "ROW INSERT public.t_stream before=null after={id=3, name=top-c}",
+                "END xid=5 emitted=2 exp=3"), fx.listener.events,
+                "无标记 ABORT 经收割映射归并回顶层桶，子行扣减而非整桶弃");
+    }
+
+    /**
+     * UPDATE 截断 liveness guard（Task 8 控制器裁定）：XLH_UPDATE_TRUNCATION 置位的
+     * UPDATE 行<b>行级跳过</b>——不发射、不解码短元组（尾列假 NULL 的静默错值面封口）、
+     * {@code skippedTruncatedRows} 计数递增、流不死（后续正常行照常入桶发射）。
+     */
+    @Test
+    void truncatedUpdateRowSkippedWithCounterAndStreamSurvives() {
+        Fixture fx = fixture();
+        fx.truncatedUpdate(100, 0, 1, "old-full", 2, "new-truncated");
+        fx.insert(100, 0, 7, "after-guard");
+        fx.commit(100);
+
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=1",
+                "ROW INSERT public.t_stream before=null after={id=7, name=after-guard}",
+                "END xid=100 emitted=1 exp=1"), fx.listener.events,
+                "截断行不入桶，同事务后续正常行照常发射");
+        assertEquals(1, fx.grouper.skippedTruncatedRows(), "guard 观测计数恰一次");
     }
 
     /** TableMeta 缓存失效：pg_attribute 上的 heap 记录到达即全清缓存，DDL 后新列即时可见。 */
@@ -364,6 +407,27 @@ class XactGrouperTest {
             put32(m, 0x55667788L);                              // new_xmax u32@8
             put16(m, 9);                                        // new_offnum u16@12
             m.writeBytes(before);                               // 前像载荷殿后（14B 结构之后）
+            return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, xid)
+                    .toplevel(toplevel).block(0, SPC, DB, USER_REL, 0).data(after)
+                    .main(m.toByteArray()).build());
+        }
+
+        /**
+         * 一条带前缀截断标志的 UPDATE（liveness guard 锚）：flags 置
+         * XLH_UPDATE_TRUNCATION（0x20）+ CONTAINS_OLD，新元组只有首列（natts=1，
+         * 短于两列词典——无 guard 时会静默产出尾列假 NULL 的错值行）。
+         */
+        WalRecord truncatedUpdate(int xid, int toplevel, int oldId, String oldName, int newId, String ignoredName) {
+            byte[] before = TupleBytes.of("int4", "text").i32(oldId).text(oldName).payload();
+            byte[] after = TupleBytes.of("int4").i32(newId).payload();
+            ByteArrayOutputStream m = new ByteArrayOutputStream();
+            put32(m, 0x11223344L);                              // old_xmax u32@0
+            put16(m, 5);                                        // old_offnum u16@4
+            m.write(0);                                         // old_infobits u8@6
+            m.write(0x04 | 0x08 | 0x20);                        // flags = CONTAINS_OLD | PREFIX_FROM_OLD
+            put32(m, 0x55667788L);                              // new_xmax u32@8
+            put16(m, 9);                                        // new_offnum u16@12
+            m.writeBytes(before);
             return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, xid)
                     .toplevel(toplevel).block(0, SPC, DB, USER_REL, 0).data(after)
                     .main(m.toByteArray()).build());

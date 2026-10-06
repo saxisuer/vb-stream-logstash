@@ -52,8 +52,9 @@ import java.util.TreeMap;
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程：onChunkRow 与 resolveExternal 同线程
  * 调用）——内部 HashMap/HashSet 非线程安全，与 v1 replay 组件同假设；已知限制：
  * 归集的 chunk 无淘汰面（aborted/删除值的 chunk 会滞留），生命周期管理落在
- * Task 5 的 XactGrouper 接线；bytea 等 TOAST 宽值经 UTF-8 {@link String} 交付对
- * 非文本类型有损（首发矩阵 TOAST 面只覆盖文本族）。</p>
+ * Task 5 的 XactGrouper 接线。{@link #resolveExternal} 返回 <b>byte[]</b>（Task 8
+ * 保真裁定）——文本族由 {@code TupleDecoder} 解码 UTF-8、numeric/bytea 等非文本面
+ * 字节直达渲染矩阵，不经 String 有损往返。</p>
  */
 public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
 
@@ -85,6 +86,10 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
 
     /** 回查仍缺的降级字面（v2 设计 §5：不 fail 整条流）。 */
     private static final String TOAST_UNAVAILABLE = "toast-unavailable";
+
+    /** 降级字面的字节形态（{@link #resolveExternal} 的返回契约是 byte[]——渲染层按需解码）。 */
+    private static final byte[] TOAST_UNAVAILABLE_BYTES =
+            TOAST_UNAVAILABLE.getBytes(StandardCharsets.UTF_8);
 
     private final ToastProbe probe;
 
@@ -133,7 +138,9 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
     }
 
     /**
-     * 剥 18B external 指针并重建原值文本——拼装 chunk、按需回查、pglz 解压、UTF-8 解码。
+     * 剥 18B external 指针并重建原值<b>字节</b>——拼装 chunk、按需回查、pglz 解压，
+     * <b>不做 UTF-8 解码</b>（Task 8 保真裁定：返回 byte[]，文本/字节解释权归渲染层——
+     * numeric/bytea 不再经 String UTF-8 有损往返）。
      *
      * <p>关键步骤：①指针头校验（0x01/0x12 + 越界，形不符 ISE）→ 解 rawsize/extinfo/
      * valueid/toastrelid；②方法位判定——lz4 ISE fail-fast（无解压面，静默只会产出
@@ -141,20 +148,20 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * 重写后 relfilenode 与 oid 分叉的容错）；④拼接总长 != extsize → probe 回查合并
      * 后复检；⑤未压缩（extsize == rawsize-4）拼接即载荷；压缩（&lt;）校验 chunk0 前
      * 4B tcinfo 与指针一致（(rawsize-4)|方法&lt;&lt;30，不符 ISE）后剥 4B 走
-     * {@link Pglz#decompress} 解至 rawsize-4 字节；⑥UTF-8 → String。</p>
+     * {@link Pglz#decompress} 解至 rawsize-4 字节。</p>
      *
      * <p>边界与异常语义：src 过短/tag 不符/tcinfo 不符/pglz 数据损坏抛 ISE；chunk
      * 缺失且回查（probe 为 null、查无、抛异常）仍不齐 → WARN（valueid/toastrelid
-     * 上下文）并返回 {@code toast-unavailable}（不 fail 流）；extsize==0 返回空串。
-     * 线程约束：单写者（与 {@link #onChunkRow} 同线程调用）。</p>
+     * 上下文）并返回降级字面 {@code toast-unavailable} 的 UTF-8 字节（不 fail 流）；
+     * extsize==0 返回空数组。线程约束：单写者（与 {@link #onChunkRow} 同线程调用）。</p>
      *
      * @param src 完整源缓冲（记录/页字节，契约只读）
      * @param off 指针起点（已对齐）
-     * @return 拼装解压后的原文文本（UTF-8）；缺 chunk 不可得时 {@code toast-unavailable}
+     * @return 拼装解压后的原值字节；缺 chunk 不可得时降级字节的 UTF-8 字节
      * @throws IllegalArgumentException src 为 null 或 off 越界
      * @throws IllegalStateException    指针形态/lz4 方法/tcinfo/pglz 数据不符
      */
-    public String resolveExternal(byte[] src, int off) {
+    public byte[] resolveExternal(byte[] src, int off) {
         if (src == null) {
             throw new IllegalArgumentException("source buffer must not be null");
         }
@@ -194,7 +201,7 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
                         + "toastrelid={}, extsize={}, rawsize={}, 已归集块数={}", valueid, toastrelid, extsize,
                         rawsize, collected.size());
             }
-            return TOAST_UNAVAILABLE;
+            return TOAST_UNAVAILABLE_BYTES;
         }
         byte[] concat = concat(collected, (int) extsize);
         if (extsize < rawsize - 4) {
@@ -209,10 +216,9 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
             }
             byte[] pglz = new byte[concat.length - 4];
             System.arraycopy(concat, 4, pglz, 0, pglz.length);
-            byte[] raw = Pglz.decompress(pglz, (int) (rawsize - 4));
-            return new String(raw, StandardCharsets.UTF_8);
+            return Pglz.decompress(pglz, (int) (rawsize - 4));
         }
-        return new String(concat, StandardCharsets.UTF_8);
+        return concat;
     }
 
     /**

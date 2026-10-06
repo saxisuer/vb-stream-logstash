@@ -331,11 +331,13 @@ public final class DiskValueRenderer {
      * = {@code 2026-10-06 12:34:56.123456+00}（+08 输入折算为 {@code 04:34:56...+00}）；
      * 时区选择对齐 engine {@code BinaryValueDecoder}（pgjdbc 把复制会话时区设为 JVM
      * 默认——双路对拍的 engine 侧 text 输出即该时区，两侧同 JVM 时即逐字一致）。
-     * 偏移格式：整小时 {@code +08}、半时 {@code +05:30}（与 ZoneOffset 文本同形），
-     * 零偏移特例 {@code +00}（PG 不打 "Z"）。边界：长度≠8 抛 ISE。线程约束：纯函数。</p>
+     * 偏移格式：整小时 {@code +08}、半时 {@code +05:30}（<b>PG timestamptz_out 同形
+     * ——Task 8 双路对拍实测裁定</b>：本 JDK 的 {@code ZoneOffset.toString()} 打
+     * {@code +08:00} 与 PG 文本分叉，故偏移文本自行排版）。边界：长度≠8 抛 ISE。
+     * 线程约束：纯函数。</p>
      *
      * @param raw 磁盘 datum（8 字节小端）
-     * @return yyyy-MM-dd HH:mm:ss[.frac]±HH[:MM[:SS]]
+     * @return yyyy-MM-dd HH:mm:ss[.frac]±HH[:MM]
      * @throws IllegalStateException 长度不符
      */
     private static String renderTimestamptz(byte[] raw) {
@@ -344,9 +346,30 @@ public final class DiskValueRenderer {
         }
         long micros = u64le(raw, 0);
         LocalDateTime ldt = microsToLocalDateTime(micros, ZoneId.systemDefault());
-        ZoneOffset off = offsetAt(micros);
-        String offText = off.getTotalSeconds() == 0 ? "+00" : off.toString();
-        return pgTimestamp(ldt) + offText;
+        return pgTimestamp(ldt) + pgOffsetText(offsetAt(micros));
+    }
+
+    /**
+     * ZoneOffset → PG timestamptz_out 的偏移文本：符号 + 两位小时，分钟非零才追加
+     * {@code :MM}（整小时 {@code +08}、半时 {@code +05:30}、零偏移 {@code +00}——
+     * PG 不打 "Z"，也不为整小时打 {@code :00}）。
+     *
+     * <p>自行排版的原因：{@code ZoneOffset.toString()} 在本 JDK 输出 {@code +08:00}
+     * 形态（带分钟段），与 PG 服务器文本输出分叉——双路对拍（Task 8）engine 路以
+     * 服务器 text 为准，本渲染必须逐字符对齐。</p>
+     *
+     * @param off 目标时刻的时区偏移
+     * @return PG 文本形态的偏移段
+     */
+    private static String pgOffsetText(ZoneOffset off) {
+        int total = off.getTotalSeconds();
+        int abs = Math.abs(total);
+        int hours = abs / 3600;
+        int minutes = (abs % 3600) / 60;
+        String sign = total < 0 ? "-" : "+";
+        return minutes == 0
+                ? String.format("%s%02d", sign, hours)
+                : String.format("%s%02d:%02d", sign, hours, minutes);
     }
 
     /**

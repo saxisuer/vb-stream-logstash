@@ -80,4 +80,14 @@ public final class ChangeStream {
     public long emittedRows() {
         return grouper.emittedRows();
     }
+
+    /**
+     * DML 观测面：截断 UPDATE 行级跳过计数（liveness guard 的有痕丢弃观测面，
+     * Task 8——透传 {@link XactGrouper#skippedTruncatedRows()}）。
+     *
+     * @return 会话累计跳过的截断 UPDATE 行数（任意线程可读）
+     */
+    public long skippedTruncatedRows() {
+        return grouper.skippedTruncatedRows();
+    }
 }
