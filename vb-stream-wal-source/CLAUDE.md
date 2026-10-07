@@ -124,6 +124,35 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
   skipped 计数）。逻辑流下省略门与 CONTAINS_OLD 互斥（heapam.c 实源钉），双计数恒 0 作
   回归哨兵。
 
+**场景支持矩阵**（v2 终局盘点——支持 = 双路对拍验收过；不支持 = 触发时的处理方式）：
+
+| 场景 | 支持状态 | 不支持时的处理方式 |
+|---|---|---|
+| **INSERT / UPDATE / DELETE**（wal_level=logical + REPLICA IDENTITY FULL） | ✅ 双路对拍逐字节等价 | — |
+| **事务组装**：普通/交错/SAVEPOINT 子事务回滚剔除/整体回滚零输出 | ✅ 场景 1 | — |
+| **两阶段提交**：PREPARE 挂起/COMMIT PREPARED 发射/ROLLBACK PREPARED 弃/挂起重启续传 | ✅ 场景 5（kind=TWO_PHASE + gid 双路一致） | — |
+| **TOAST**：external 重组/pglz 解压/行内压缩/UPDATE 未变列 `<toast-unchanged>`/重启后窗口前指针 probe 回查 | ✅ 场景 3（三存储形态 + 重启回查） | — |
+| **类型矩阵**：bool/int2/4/8/float4/8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp(tz)/uuid | ✅ 场景 2（17 类型 + 边界值 + 浮点 PG 风格格式化） | — |
+| **DDL-in-txn**：事务内 ADD COLUMN 前后段 as-of 渲染 | ✅ 场景 4 | — |
+| **RENAME/TRUNCATE**：catalog 行跟踪（v1 面） | ✅ v1 对拍 | — |
+| **CREATE SCHEMA**：流内 nsp 字典构建 | ✅ 专项场景 | — |
+| **生命周期**：检查点续传/损坏回落/丢页末态追平/at-least-once 重发 | ✅ 场景 6 + v1 生命周期 | — |
+| **PG 17 + PG 18 双版本** | ✅ 全矩阵 | — |
+| **表白名单**（vb.wal.tables）/ relkind 过滤 | ✅ 离线 | — |
+| **UPDATE 未变列前像**（REPLICA IDENTITY FULL） | ✅ 前像恒完整（服务端 toast_flatten_tuple） | — |
+| **replica 形态 UPDATE**（wal_level=replica） | ❌ v3 或非目标 | liveness guard 行级跳过 + WARN/表 + skipped 计数——**系统性缺行**（README 限定 DML 需 logical） |
+| **截断 UPDATE 非 FULL 身份**（wal_level=logical + DEFAULT/KI 身份） | ⚠️ 理论不可达 | 互斥门保证 logical 流下恒 CONTAINS_OLD（heapam.c 实源）——liveness guard 防御面，双计数恒 0 哨兵 |
+| **lz4 压缩值**（external/行内） | ❌ v2 非目标 | 空归集面走哨兵（未变列同 engine 'u'）；非空 ISE fail-fast；字典面 attcompression=='l' 启动 WARN |
+| **矩阵外类型**（enum/域/jsonb/组合等） | ❌ 部分支持 | `0x` 十六进制降级 + WARN 一次/oid——输出可读性降但流不断；双路对拍在该集外会 diff |
+| **dropped 列**（DROP COLUMN 后新 INSERT） | ⚠️ 两路分叉 | wal 渲 `∅` 占位 vs engine pgoutput 'R' 不发 dropped 列——对拍矩阵刻意避开含 dropped 列场景 |
+| **压缩 FPW**（wal_compression 非 off） | ❌ v1 前提外 | ISE fail-fast——运维前提 `wal_compression=off` |
+| **VACUUM FULL / CLUSTER** | ❌ v1 非目标 | 字典面跟踪新 relfilenode 但 DML 语义未承诺（整表重发形态） |
+| **STREAMED kind**（logical_decoding_work_mem 驱逐形态） | ⚠️ 差异面 | wal 侧恒 NORMAL、engine 侧 kind=STREAMED+行尾缀——parity 环境禁驱逐规避；真流式对齐 v3 |
+| **NSP redirect 缺行**（schema DDL 竞态窄面） | ⚠️ v2 限制 | 静默跳过（DEBUG + nspRedirectMisses 计数）→ 该 schema 表从输出消失——fail-safe 方向（漏数据非错数据）、重启全新引导自愈；v3 加精确采纳通道 |
+| **跨停机点 DDL + DDL 前行落重发页**（四重叠加窄缝） | ⚠️ v3 方向 | 重发块渲染用字典末态非行时刻态——对拍判"不等"（假红非静默错值）；v3 按记录 lsn 重建 as-of |
+| **交错事务 B 清掉 A 的 toast 窗口** | ⚠️ v3 方向 | A 行多见 `<toast-unchanged>`（engine 发真值）——fail-safe 方向已知分叉；v3 per-txn 窗口 |
+| **长挂起 2PC + 频繁重启** | ⚠️ 无护栏 | 挂起桶整段重放（floor 不前进）——功能正确但重放成本线性增长；桶快照持久化 v3 |
+
 **已知限制与 v3 方向**：
 
 - **replica 形态 UPDATE 系统性缺行**：`wal_level=replica`（无逻辑日志）下用户表 UPDATE

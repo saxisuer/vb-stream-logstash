@@ -75,6 +75,22 @@ slf4j-api，组件细节与坑位见模块 `CLAUDE.md`。
 - `mvn test -pl vb-stream-wal-source` 单命令全跑（245 用例 = 离线 206 + Testcontainers
   IT 39，后者需本机 Docker）。
 
+## 场景支持速览（详版矩阵见模块 CLAUDE.md）
+
+**✅ 支持（双路对拍验收过）**：INSERT/UPDATE/DELETE（`wal_level=logical` + REPLICA IDENTITY
+FULL）、事务组装（交错/SAVEPOINT/回滚零输出/2PC 四形态）、TOAST 全形态（external 重组/
+pglz 解压/行内压缩/未变列 `<toast-unchanged>`/重启回查）、17 类型矩阵、事务内 DDL as-of、
+RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重发、PG 17+18 双版本。
+
+**❌ 不支持（触发时的行为）**：
+- **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，
+  **DML 面需 `wal_level=logical`**
+- **lz4 压缩值** → ISE fail-fast（未变列空面走哨兵同 engine 'u'）
+- **压缩 FPW** → ISE fail-fast——运维前提 `wal_compression=off`
+- **矩阵外类型**（enum/jsonb/域等）→ `0x` 十六进制降级 + WARN，流不断
+- **VACUUM FULL/CLUSTER** → 字典跟踪但 DML 语义未承诺
+- **dropped 列** → wal `∅` vs engine 不发——已知分叉面
+
 ## 已知限制（详版见模块 CLAUDE.md）
 
 - **DML 面需 `wal_level=logical`**：replica 档下 UPDATE 前缀/后缀省略 + DEFAULT 身份无
