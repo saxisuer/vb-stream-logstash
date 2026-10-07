@@ -1,5 +1,6 @@
 package org.vastdata.vbstream.walsource.it;
 
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
@@ -54,14 +55,17 @@ import static org.junit.jupiter.api.Assertions.fail;
  * 逻辑流下用户表 UPDATE 恒全量记录，截断重建/跳过双计数恒 0 作回归哨兵。</p>
  *
  * <p>场景组（任务书场景矩阵第 1 组 + Task 8.5 场景 6 + Task 9 场景 2/4 + Task 10
- * 场景 3 + Task 11 场景 5）：单行事务 / 单事务多语句（I+U+D）/ 双连接交错事务 /
+ * 场景 3 + Task 11 场景 5 + Task 12 场景 6 与干扰矩阵）：单行事务 / 单事务多语句
+ * （I+U+D）/ 双连接交错事务 /
  * 回滚零输出 / 子事务 SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列 / 17 类型边界值矩阵 /
  * 事务内 ADD COLUMN as-of / TOAST 三存储形态 + 重启续传 unchanged 对齐（external
  * 重组 / external pglz / 行内压缩 / 续传后未变宽列指针双路同渲染
  * {@code <toast-unchanged>}——pgoutput 'u' 同形）/ 2PC 四形态（挂起期零输出 /
  * ROLLBACK PREPARED 弃桶 / COMMIT PREPARED 发射 {@code kind=TWO_PHASE}+gid /
- * 挂起期 wal-source 停机重启续传重放重建桶）。表形态 {@code REPLICA IDENTITY
- * FULL}——UPDATE
+ * 挂起期 wal-source 停机重启续传重放重建桶）/ 普通双段 DML 中途停续（Task 12 场景 6
+ * ——at-least-once 重发双路一致）/ 流内 CREATE SCHEMA nsp 字典面（Task 4 延期项清账）
+ * / 干扰矩阵（Task 12——catalog 风暴线程下场景 1/TOAST 复跑 ×2）。表形态
+ * {@code REPLICA IDENTITY FULL}——UPDATE
  * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要
  * 本机 Docker。</p>
  */
@@ -72,6 +76,12 @@ class DualPathParityIT {
 
     /** 轮询间隔（毫秒）。 */
     private static final long POLL_MS = 200;
+
+    /** 干扰线程持续时长（毫秒）——catalog 风暴在窗口内与场景 DML 并发推进（Task 12 干扰矩阵）。 */
+    private static final long STORM_MS = 5_000;
+
+    /** 干扰线程 join 上限（毫秒）。 */
+    private static final long STORM_JOIN_MS = 12_000;
 
     /** wal 接收器终态失败的堆栈留痕通道（surefire 报告只留 toString，堆栈在此补面）。 */
     private static final Logger LOG_WAL_TERMINAL = LoggerFactory.getLogger(DualPathParityIT.class);
@@ -131,6 +141,10 @@ class DualPathParityIT {
     /** 场景 5（Task 11）挂起期重启续传用例的检查点目录（同上——一目录一活实例契约）。 */
     @TempDir
     Path tpStateDir;
+
+    /** 场景 6（Task 12）生命周期中途停/续传用例的检查点目录（同上——一目录一活实例契约）。 */
+    @TempDir
+    Path lifecycleStateDir;
 
     /** 头行解析模式：TXN-BEGIN xid=.. kind=.. gid=.. commitLsn=0x.. commitTs=.. changes=..（两路同格式）。 */
     private static final Pattern HEADER = Pattern.compile(
@@ -383,6 +397,18 @@ class DualPathParityIT {
             exec(conn, "DELETE FROM parity.t_parity_toast WHERE id = 102");
             conn.commit();
         });
+        assertToastFootprints(walLines);
+    }
+
+    /**
+     * TOAST 三形态场景的输出足迹专项断言（Task 12 从场景 9 抽取——干扰矩阵的
+     * {@link #interferenceCatalogStormToastFormsParity} 复用同一值面锚）：三形态截断
+     * 尾注各按行像数出现 + unchanged 恰 2 处（形态①②的 UPDATE 后像）+ 全程无
+     * {@code toast-unavailable} 降级字面。
+     *
+     * @param walLines wal 路 CDC 捕获行
+     */
+    private static void assertToastFootprints(List<String> walLines) {
         String joined = String.join("\n", walLines);
         assertFalse(joined.contains("toast-unavailable"),
                 "TOAST 三形态场景不应出现 toast-unavailable 降级字面:\n" + joined);
@@ -639,6 +665,188 @@ class DualPathParityIT {
         assertEquals(gidXidEngine, gidXidWal, "gtx 块 xid 双路应同源（同一 PREPARE 事务）");
     }
 
+    // ---- 场景 13：生命周期中途停/续传——普通 DML（Task 12 / 任务书场景 6）----
+
+    /**
+     * 生命周期中途停/续传对拍（Task 12 场景 6）：wal 路<b>两段会话</b>——段一（带检查点
+     * stateDir）捕两笔普通 DML 事务，close 落最终检查点；段二同 stateDir 续传
+     * （{@code resumedFromState} 钉前提），<b>段二内</b>先 {@code ADD COLUMN}（DDL 与
+     * DML 双段——字典经检查点持久化后流内继续演进）再一笔 I/U/D 混合事务。engine 路
+     * 全程单会话，按 xid 交集对拍 diff 空。
+     *
+     * <p><b>at-least-once 重复语义两侧一致</b>：续传流起点按 stored lsn 页对齐下取整，
+     * 段一落在该页的事务会整桶<b>幂等重发</b>——重发块由 {@link #parse} 的重复块容忍面
+     * 吸收（逐字段+行序全等即丢，不等即 fail——重发非幂等即语义破坏信号）。DDL 安排在
+     * 段二的<b>续传之后</b>：段一重发窗口内字典形态与原始发射时一致（检查点持久化的就是
+     * 段一末态的 2 列形态），重发行逐字节全等；若 DDL 落在段一（跨停机点），段一的
+     * DDL 前行重发时会按 3 列字典补尾 null 渲染、与原始 2 列块不等——重发面与 as-of 面
+     * 交叉的已知形态，本场景以 DDL 后置钉确定性。</p>
+     *
+     * <p>专项断言：engine 全程恰 3 块（段 1 两笔 + 段 2 一笔）且 wal 路覆盖 engine 全部
+     * xid——停机窗口无 DML 提交（段间只做 close/start），wal 的超集只能来自重发，
+     * "双路都完整出现"由交集内逐行 diff 空承载。</p>
+     */
+    @Test
+    void midStreamStopResumePlainDmlParityAcrossPaths() throws Exception {
+        ParityEnv.resetScenario(TABLE_DDL);
+        EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig());
+        ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
+        Properties walCfg = ParityEnv.walSourceConfig();
+        walCfg.setProperty(WalSource.KEY_STATE_DIR, lifecycleStateDir.toString());
+        WalSource wal1 = new WalSource(walCfg, new OutputRenderer());
+        WalSource wal2 = new WalSource(walCfg, new OutputRenderer());
+        Throwable primary = null;
+        boolean resumed = false;
+        List<String> engineLines = List.of();
+        List<String> walLines = List.of();
+        try {
+            engine.start();
+            try (wal1) {
+                wal1.start();
+                try (Connection conn = ParityEnv.newSqlConnection()) {
+                    exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'seg1-a', true, 1.0,"
+                            + " '2026-10-07', timestamptz '2026-10-07 01:01:01+00')");
+                    exec(conn, "INSERT INTO parity.t_parity VALUES (2, 'seg1-b', false, 2.0,"
+                            + " '2026-10-07', timestamptz '2026-10-07 02:02:02+00')");
+                }
+                await(() -> engine.emittedTxns() >= 2,
+                        "生命周期停续: 段一 engine 路未输出 2 个事务（emitted="
+                                + engine.emittedTxns() + ", consumerFailed=" + engine.failed() + "）");
+                await(() -> wal1.dmlEmittedBuckets() >= 2,
+                        "生命周期停续: 段一 wal 路未发射 2 个桶（buckets="
+                                + wal1.dmlEmittedBuckets() + ", terminal=" + wal1.receiverTerminalFailure() + "）");
+            }   // close = 最终 best-effort 检查点（段二续传起点）+ 槽推进
+            try (wal2) {
+                wal2.start();
+                resumed = wal2.resumedFromState();
+                try (Connection conn = ParityEnv.newSqlConnection()) {
+                    // 段二 DDL：字典经检查点持久化后流内演进（续传态施加 ADD COLUMN 的 catalog 记录）
+                    exec(conn, "ALTER TABLE parity.t_parity ADD COLUMN extra text");
+                    conn.setAutoCommit(false);
+                    exec(conn, "INSERT INTO parity.t_parity VALUES (3, 'seg2-c', true, 3.0,"
+                            + " '2026-10-07', timestamptz '2026-10-07 03:03:03+00', 'seg2-new')");
+                    exec(conn, "UPDATE parity.t_parity SET name = 'seg1-a-upd', extra = 'backfilled'"
+                            + " WHERE id = 1");   // 前像 = 段一存储的两列元组、尾列补 null（as-of 语义）
+                    exec(conn, "DELETE FROM parity.t_parity WHERE id = 2");
+                    conn.commit();
+                }
+                await(() -> engine.emittedTxns() >= 3,
+                        "生命周期停续: 段二 engine 路未输出段二事务（emitted="
+                                + engine.emittedTxns() + ", consumerFailed=" + engine.failed() + "）");
+                await(() -> wal2.dmlEmittedBuckets() >= 1,
+                        "生命周期停续: 段二 wal 路未发射段二桶（buckets="
+                                + wal2.dmlEmittedBuckets() + ", terminal=" + wal2.receiverTerminalFailure() + "）");
+            }
+        } catch (Throwable t) {
+            primary = t;   // 不在 finally 内断言——finally 的断言失败会吞掉真正的根因
+        } finally {
+            walLines = walCapture.closeAndDrain();
+            engineLines = engine.stopAndDrain();
+        }
+        assertTrue(resumed, "段二应自检查点续传（段一 close 落盘有效检查点）——否则续传前提不成立");
+        if (primary != null) {
+            wal1.receiverTerminalFailure().ifPresent(t -> LOG_WAL_TERMINAL.error(
+                    "wal 段一接收器终态失败堆栈（生命周期停续）", t));
+            wal2.receiverTerminalFailure().ifPresent(t -> LOG_WAL_TERMINAL.error(
+                    "wal 段二接收器终态失败堆栈（生命周期停续）", t));
+            fail("生命周期停续: 对拍前置失败——" + primary + "\nengine 捕获=" + engineLines
+                    + "\nwal 捕获=" + walLines, primary);
+        }
+        assertParity(engineLines, walLines, "生命周期停续", 0);
+
+        // 专项：engine 全程恰 3 块 + wal 覆盖 engine 全部 xid（at-least-once：重发只增不改）
+        Map<Long, TxBlock> engineBlocks = parse(engineLines);
+        Map<Long, TxBlock> walBlocks = parse(walLines);
+        assertEquals(3, engineBlocks.size(), "engine 全程应恰 3 个事务块（段一 2 + 段二 1）:\n"
+                + String.join("\n", engineLines));
+        assertTrue(walBlocks.keySet().containsAll(engineBlocks.keySet()),
+                "wal 两段会话的并集应覆盖 engine 全部 xid（停机窗口无 DML，缺口即丢事务）:\n"
+                        + "engine xids=" + engineBlocks.keySet() + ", wal xids=" + walBlocks.keySet());
+        // 重发观测面（非断言——续传流起点的页对齐下取整使段一同页事务整桶重发，机会性命中；
+        // parse 的重复块全等容忍面已吸收，此处留痕重发是否实际发生供场景质量归因）
+        long beginCount = walLines.stream().filter(l -> l.startsWith("TXN-BEGIN ")).count();
+        LOG_WAL_TERMINAL.info("生命周期停续重发观测: wal TXN-BEGIN 总数={}, 去重 xid 数={}（差>0 即重发发生）",
+                beginCount, walBlocks.size());
+    }
+
+    // ---- 场景 14：CREATE SCHEMA nsp 字典面（Task 4 minor / Task 12 顺手清账）----
+
+    /**
+     * CREATE SCHEMA nsp 字典面对拍（Task 4 延期项，Task 12 顺手清账）：<b>流内</b>
+     * {@code CREATE SCHEMA parity2} + 建表 + FULL 身份 → 单事务 I/I/U/D → 第二笔单行
+     * INSERT，双路 diff 空。验证面：①wal 路 {@code pg_namespace} 的 WAL 重放面——
+     * 引导种子（各路径 start 前）不含 parity2，nsp 字典行只能经流内 INSERT 记录重建；
+     * ②DML 路径的 schema 名解析——行文本 {@code schema.table} 的 schema 段经 nsp 字典
+     * 渲染（专项断言 wal 行含 {@code parity2.t_nsp}）；③engine 路经 pgoutput 'R' 的
+     * namespace id 同源解析同形。reset 段仅清 parity2 残留（CASCADE 连表带 DDL 清），
+     * 不预建——schema 诞生必须在两路起流之后才钉得住重放面。
+     */
+    @Test
+    void createSchemaNamespaceDictionaryParityInStream() throws Exception {
+        List<String> walLines = runParityWal("CREATE SCHEMA nsp 字典面", 2,
+                new String[]{"DROP SCHEMA IF EXISTS parity2 CASCADE"}, conn -> {
+                    exec(conn, "CREATE SCHEMA parity2");
+                    exec(conn, "CREATE TABLE parity2.t_nsp (id int4 NOT NULL, name text,"
+                            + " PRIMARY KEY (id))");
+                    exec(conn, "ALTER TABLE parity2.t_nsp REPLICA IDENTITY FULL");
+                    conn.setAutoCommit(false);
+                    exec(conn, "INSERT INTO parity2.t_nsp VALUES (1, 'nsp-a')");
+                    exec(conn, "INSERT INTO parity2.t_nsp VALUES (2, 'nsp-b')");
+                    exec(conn, "UPDATE parity2.t_nsp SET name = 'nsp-a-upd' WHERE id = 1");
+                    exec(conn, "DELETE FROM parity2.t_nsp WHERE id = 2");
+                    conn.commit();
+                    conn.setAutoCommit(true);
+                    exec(conn, "INSERT INTO parity2.t_nsp VALUES (3, 'nsp-c')");   // 第二笔事务
+                });
+        assertTrue(walLines.stream().anyMatch(l -> l.contains("parity2.t_nsp")),
+                "wal 行文本应含经 nsp 字典解析的 schema 限定名 parity2.t_nsp:\n"
+                        + String.join("\n", walLines));
+    }
+
+    // ---- 场景 15/16：干扰矩阵——catalog 风暴下基础 DML / TOAST 场景复跑（Task 12）----
+
+    /**
+     * 干扰矩阵·基础 DML（Task 12）：场景 1 的单行事务对拍在 <b>catalog 风暴线程</b>
+     * 并发下复跑（对齐 {@code WalAdversarialIT} 的干扰模式——独立连接循环
+     * {@code ALTER TABLE SET (autovacuum_enabled)} 真/假交替 + {@code ANALYZE}，制造
+     * pg_class 截断更新/INPLACE 的 catalog 噪声与目录死元组），×2 重复覆盖竞态。
+     *
+     * <p><b>容器裁定（dispatch 裁决记档）</b>：不换 Interference 容器、不给 ParityEnv
+     * 加 autovacuum 拉满参数——加参数会影响所有场景的基线稳定性；干扰面由测试方法内
+     * 起干扰线程承担（ParityEnv 默认容器）。干扰语句不产生用户表行变更（零事务块），
+     * 捕获面仍只含场景事务——归一化对拍无需静默收尾。</p>
+     */
+    @RepeatedTest(2)
+    void interferenceCatalogStormBasicDmlParity() throws Exception {
+        runParityCore("干扰×基础 DML", 1, 0L, TABLE_DDL, ParityEnv.engineConfig(), conn -> {
+            exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'alice', true, 12.345,"
+                    + " '2026-10-07', timestamptz '2026-10-07 04:34:56.789012+00')");
+        }, new String[]{"parity.t_parity"});
+    }
+
+    /**
+     * 干扰矩阵·TOAST 三形态（Task 12）：场景 9 的三存储形态对拍在 catalog 风暴线程
+     * 并发下复跑（干扰目标含主表与 toast 关系——{@code ANALYZE} 会触 toast 表/
+     * 索引的统计面写放大），×2 重复。值面锚（截断尾注计数/unchanged 占位/无降级字面）
+     * 复用 {@link #assertToastFootprints}——干扰不改发射行，足迹计数与场景 9 同构。
+     */
+    @RepeatedTest(2)
+    void interferenceCatalogStormToastFormsParity() throws Exception {
+        ParityOutcome out = runParityCore("干扰×TOAST 三形态", 1, 0L, TOAST_TABLE_DDL,
+                ParityEnv.engineConfig(), conn -> {
+                    conn.setAutoCommit(false);
+                    exec(conn, "INSERT INTO parity.t_parity_toast VALUES (1,"
+                            + " (SELECT string_agg(md5(i::text),'') FROM generate_series(1,220) i))");
+                    exec(conn, "INSERT INTO parity.t_parity_toast VALUES (2,"
+                            + " (SELECT string_agg(md5(i::text)||repeat('y',50),'') FROM generate_series(1,300) i))");
+                    exec(conn, "INSERT INTO parity.t_parity_toast VALUES (3, repeat('x',10000))");
+                    exec(conn, "UPDATE parity.t_parity_toast SET id = id + 100");
+                    exec(conn, "DELETE FROM parity.t_parity_toast WHERE id = 102");
+                    conn.commit();
+                }, new String[]{"parity.t_parity_toast"});
+        assertToastFootprints(out.walLines());
+    }
+
     // ---- 对拍骨架 ----
 
     /**
@@ -758,8 +966,9 @@ class DualPathParityIT {
      * 对拍，返回截断哨兵与 wal 捕获行的快照。
      *
      * <p>关键步骤与边界语义同 {@link #runParity(String, long, long, SqlConsumer)} 的
-     * 骨架描述（本方法是该骨架的实现体——two_phase=false 档剥离为 no-op，既有场景
-     * 捕获面不变）。</p>
+     * 骨架描述（Task 12 起本档转委派——实现体在无干扰档
+     * {@link #runParityCore(String, long, long, String[], ReplicationConfig, SqlConsumer, String[])}
+     * （stormTables=null），two_phase=false 档剥离为 no-op，既有场景捕获面不变）。</p>
      *
      * @param scenario      场景名（断言消息上下文）
      * @param expectedTxns  场景内已提交事务数——两路各自的追平目标
@@ -772,6 +981,30 @@ class DualPathParityIT {
      */
     private ParityOutcome runParityCore(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
             ReplicationConfig engineCfg, SqlConsumer<Connection> dml) throws Exception {
+        return runParityCore(scenario, expectedTxns, walAborted, tableDdl, engineCfg, dml, null);
+    }
+
+    /**
+     * 单场景对拍核心全参档（Task 12 增干扰面）：在
+     * {@link #runParityCore(String, long, long, String[], ReplicationConfig, SqlConsumer)}
+     * 的骨架上参数化 <b>catalog 风暴线程</b>——{@code stormTables} 非 null 时，两路起流
+     * 之后、DML 之前起 {@link #catalogStormThread(String, String...)}（干扰目标表已由
+     * resetScenario 重建、两路引导已完成——风暴打在稳定的场景形态上），DML 执行完即
+     * join（干扰窗口覆盖整个 DML 期，追平/停机期静默——干扰语句零用户表行变更，捕获面
+     * 仍只含场景事务）；join 超时视为失败。null = 无干扰（既有场景路径不动）。
+     *
+     * @param scenario      场景名（断言消息上下文）
+     * @param expectedTxns  场景内已提交（产生用户表行）的事务数——两路各自的追平目标
+     * @param walAborted    场景内被回滚的子事务行数（wal 记账与实付的期望差）
+     * @param tableDdl      本场景建表语句
+     * @param engineCfg     engine 路复制配置（two_phase 档参数化）
+     * @param dml           DML 执行器
+     * @param stormTables   干扰目标表全名集（null = 无干扰线程）
+     * @return 对拍结局快照（截断跳过哨兵 + wal 捕获行）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private ParityOutcome runParityCore(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
+            ReplicationConfig engineCfg, SqlConsumer<Connection> dml, String[] stormTables) throws Exception {
         ParityEnv.resetScenario(tableDdl);
         EnginePathRunner engine = new EnginePathRunner(engineCfg);
         ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
@@ -779,11 +1012,20 @@ class DualPathParityIT {
         Throwable primary = null;
         List<String> engineLines = List.of();
         List<String> walLines = List.of();
+        Thread storm = null;
         try {
             engine.start();
             wal.start();
+            if (stormTables != null) {
+                storm = catalogStormThread(scenario, stormTables);
+                storm.start();
+            }
             try (Connection conn = ParityEnv.newSqlConnection()) {
                 dml.accept(conn);
+            }
+            if (storm != null) {
+                storm.join(STORM_JOIN_MS);
+                assertTrue(!storm.isAlive(), scenario + ": 干扰线程应在 join 上限内退出");
             }
             await(() -> engine.emittedTxns() >= expectedTxns,
                     scenario + ": engine 路未输出 " + expectedTxns + " 个事务（emitted="
@@ -806,6 +1048,48 @@ class DualPathParityIT {
         }
         assertParity(stripEngineLifecycle(engineLines), walLines, scenario, walAborted);
         return new ParityOutcome(wal.dmlSkippedTruncatedRows(), walLines);
+    }
+
+    /**
+     * catalog 风暴线程工厂（Task 12 干扰矩阵，对齐 {@code WalAdversarialIT} 的干扰模式）
+     * ：独立连接循环 {@link #STORM_MS} 窗口——目标表逐个
+     * {@code ALTER TABLE SET (autovacuum_enabled)} 真/假交替（合法地反复改 pg_class 行，
+     * reloptions 深位列使截断更新走值编码/splice/自愈全路径，目录死元组随之累积）+
+     * {@code ANALYZE} 风暴（pg_class 行 INPLACE + 统计面写放大）。
+     *
+     * <p>容错语义：单条语句失败（表在场景推进中的时间窗交错）仅 DEBUG 记录并继续下一轮；
+     * 连接级失败（会话断）才终止线程并 WARN——干扰不得掩盖主断言。干扰语句不产生
+     * 用户表行变更，两路捕获面不受污染。</p>
+     *
+     * @param scenario 场景名（日志上下文）
+     * @param tables   干扰目标表全名集（已由 resetScenario 重建）
+     * @return 未启动线程（调用方 start，DML 期并发、DML 后 join）
+     */
+    private Thread catalogStormThread(String scenario, String... tables) {
+        return new Thread(() -> {
+            try (Connection c = ParityEnv.newSqlConnection()) {
+                boolean on = true;
+                long deadline = System.currentTimeMillis() + STORM_MS;
+                int rounds = 0;
+                while (System.currentTimeMillis() < deadline) {
+                    String toggle = on ? "true" : "false";
+                    for (String tbl : tables) {
+                        try (Statement st = c.createStatement()) {
+                            st.execute("ALTER TABLE " + tbl + " SET (autovacuum_enabled = " + toggle + ")");
+                            st.execute("ANALYZE " + tbl);
+                        } catch (SQLException e) {
+                            LOG_WAL_TERMINAL.debug("干扰语句跳过（{} 场景时序窗口内正常）: {}",
+                                    tbl, e.getMessage());
+                        }
+                    }
+                    on = !on;
+                    rounds++;
+                }
+                LOG_WAL_TERMINAL.info("干扰线程退出（{}）: {} 轮 toggle+ANALYZE 风暴", scenario, rounds);
+            } catch (SQLException e) {
+                LOG_WAL_TERMINAL.warn("干扰线程连接级失败（{} 风暴提前终止）: {}", scenario, e.getMessage());
+            }
+        }, "parity-catalog-storm");
     }
 
     /**

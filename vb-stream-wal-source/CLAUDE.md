@@ -148,21 +148,29 @@ two_phase 消费均属 v2 非目标。设计全文见
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**131 用例 = 离线 110 + Testcontainers IT 21（需本机 Docker）**。
+**244 用例 = 离线 205 + Testcontainers IT 39（需本机 Docker）**。
 
-- **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 14
+- **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
-  "两版 toast 偏移差恰 4B"自检锚）；`receive` WalStreamWalkerTest 11（锚定协议含
-  mid-stream 漂移免疫）；`replay` CatalogReplayTest 12 / CatalogSynchronizerTest 8（含
+  "两版 toast 偏移差恰 4B"自检锚）；`receive` WalStreamWalkerTest 12（锚定协议含
+  mid-stream 漂移免疫）；`replay` CatalogReplayTest 15 / CatalogSynchronizerTest 9（含
   引导前沿种子过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚）/ SelfHealerTest
-  4；`state` StateStoreTest 7（往返/CRC 拒载/版本拒载/pgVersion 参数化错配拒载——
-  17 写 17、18 写 18，终审 I1）+ StateConfigTest 5；ModuleBuildTest 1。
-- **IT**（postgres:18 `WalTestEnv`/`Interference` + postgres:17 `Wal17TestEnv` 双矩阵，
-  `WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC REPEATABLE READ 实查**逐行
-  全等**）：`WalReceiveTest` 6（接收锚定 + 杀后端原地重连 + 首连失败）、
-  `WalAdversarialIT` 3（autovacuum 拉满/ANALYZE 风暴/随机 CHECKPOINT 干扰下 DDL 全
-  场景对拍，@RepeatedTest(2) + RENAME 最小复现）、`WalLifecycleIT` 5（检查点续传/
-  损坏回落全新引导/丢页末态追平 resyncs==0/门面全装配/引导窗口并发 DDL 不丢行——
-  终审 C1 复测 + Task 16 跟进项第一嫌疑验证，17 侧不复刻[已知风暴丢 INSERT 跟进项
-  会混淆归因，18 侧已验]）、`Wal17SyncIT` 7（17 对抗精简版 + 生命周期 + 跨版本分发
+  4；`state` StateStoreTest 9（往返/CRC 拒载/版本拒载/pgVersion 参数化错配拒载——
+  17 写 17、18 写 18，终审 I1；formatVersion 3 dmlFloorLsn 往返）/ StateConfigTest
+  5；`changes`（v2 DML 面：DiskValueRendererTest 18 / XactGrouperTest 20 /
+  ToastAssemblerTest 11 / OutputRendererTest 7 / TableFilterTest 7 / PgFloatFormatTest
+  7 / PglzTest 5 / ChangeStreamTest 7）；`api` WalSourceConfigTest 5；ModuleBuildTest 1。
+- **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
+  `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
+  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 18（v2 双路对拍——engine
+  逻辑解码路 in-process vs wal 直解路 DML 面同容器对拍，xid 交集逐行 diff 空：场景
+  1 系基础 DML 六形态 + 类型矩阵边界值 + DDL-in-txn as-of + TOAST 三存储形态/重启
+  unchanged + 2PC 四形态 + **普通 DML 中途停续（Task 12——at-least-once 重发双路一致，
+  段一同页事务整桶幂等重发由重复块容忍面吸收）+ 流内 CREATE SCHEMA nsp 字典面
+  （Task 4 延期清账）+ 干扰矩阵（Task 12——catalog 风暴线程[autovacuum toggle +
+  ANALYZE 循环]下场景 1/TOAST 复跑 @RepeatedTest(2)）**）、`WalReceiveTest` 6（接收
+  锚定 + 杀后端原地重连 + 首连失败）、`WalAdversarialIT` 3（autovacuum 拉满/ANALYZE
+  风暴/随机 CHECKPOINT 干扰下 DDL 全场景对拍，@RepeatedTest(2) + RENAME 最小复现）、
+  `WalLifecycleIT` 5（检查点续传/损坏回落全新引导/丢页末态追平 resyncs==0/门面全装配/
+  引导窗口并发 DDL 不丢行）、`Wal17SyncIT` 7（17 对抗精简版 + 生命周期 + 跨版本分发
   拒绝与 V18 注入 fail-fast 零副作用）。
