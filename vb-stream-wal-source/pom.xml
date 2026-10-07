@@ -13,8 +13,8 @@
     <artifactId>vb-stream-wal-source</artifactId>
 
     <!-- 模块定位：PostgreSQL WAL 直解源（spec §4）——绕过逻辑解码输出插件，从 WAL 物理流
-         直接解析变更记录。本 pom 仅最小依赖面（pgjdbc + slf4j），布局/解析/接收组件由
-         后续任务在此之上搭建。 -->
+         直接解析变更记录。本 pom 仅最小依赖面（pgjdbc + slf4j + lz4-java[TOAST lz4 解压]），
+         布局/解析/接收组件在此之上搭建。 -->
     <dependencies>
         <dependency>
             <groupId>org.postgresql</groupId>
@@ -25,6 +25,15 @@
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
             <version>${slf4j-api.version}</version>
+        </dependency>
+        <!-- lz4 解压（ToastAssembler 的 lz4 压缩 TOAST/行内 varlena 值面）——PG 侧
+             toast_decompress_datum 走 liblz4 裸 block 格式（LZ4_decompress_safe），
+             lz4-java 的 safeDecompressor 同格式（JNI 优先、纯 Java 安全回落，零传递依赖）。
+             运行依赖面承诺相应从 pgjdbc+slf4j 扩为 +lz4-java。 -->
+        <dependency>
+            <groupId>org.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
+            <version>${lz4-java.version}</version>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>
