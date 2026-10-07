@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.vastdata.vbstream.replication.ReplicationConfig;
 import org.vastdata.vbstream.walsource.api.WalSource;
 import org.vastdata.vbstream.walsource.changes.OutputRenderer;
 
@@ -53,11 +54,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  * 逻辑流下用户表 UPDATE 恒全量记录，截断重建/跳过双计数恒 0 作回归哨兵。</p>
  *
  * <p>场景组（任务书场景矩阵第 1 组 + Task 8.5 场景 6 + Task 9 场景 2/4 + Task 10
- * 场景 3）：单行事务 / 单事务多语句（I+U+D）/ 双连接交错事务 / 回滚零输出 / 子事务
- * SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列 / 17 类型边界值矩阵 / 事务内 ADD COLUMN
- * as-of / TOAST 三存储形态 + 重启续传 unchanged 对齐（external 重组 / external pglz
- * / 行内压缩 / 续传后未变宽列指针双路同渲染 {@code <toast-unchanged>}——pgoutput 'u'
- * 同形）。表形态 {@code REPLICA IDENTITY FULL}——UPDATE
+ * 场景 3 + Task 11 场景 5）：单行事务 / 单事务多语句（I+U+D）/ 双连接交错事务 /
+ * 回滚零输出 / 子事务 SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列 / 17 类型边界值矩阵 /
+ * 事务内 ADD COLUMN as-of / TOAST 三存储形态 + 重启续传 unchanged 对齐（external
+ * 重组 / external pglz / 行内压缩 / 续传后未变宽列指针双路同渲染
+ * {@code <toast-unchanged>}——pgoutput 'u' 同形）/ 2PC 四形态（挂起期零输出 /
+ * ROLLBACK PREPARED 弃桶 / COMMIT PREPARED 发射 {@code kind=TWO_PHASE}+gid /
+ * 挂起期 wal-source 停机重启续传重放重建桶）。表形态 {@code REPLICA IDENTITY
+ * FULL}——UPDATE
  * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要
  * 本机 Docker。</p>
  */
@@ -124,9 +128,23 @@ class DualPathParityIT {
     @TempDir
     Path toastStateDir;
 
+    /** 场景 5（Task 11）挂起期重启续传用例的检查点目录（同上——一目录一活实例契约）。 */
+    @TempDir
+    Path tpStateDir;
+
     /** 头行解析模式：TXN-BEGIN xid=.. kind=.. gid=.. commitLsn=0x.. commitTs=.. changes=..（两路同格式）。 */
     private static final Pattern HEADER = Pattern.compile(
             "TXN-BEGIN xid=(\\d+) kind=(\\S+) gid=(\\S+) commitLsn=0x([0-9a-f]+) commitTs=(\\S+) changes=(\\d+)");
+
+    /**
+     * engine 生命周期控制行模式（two_phase=true 场景专属）：ConsoleRenderer 把 9 种事务
+     * 生命周期控制消息升 INFO 打到 CDC logger（BEGIN-PREPARE/PREPARE/COMMIT-PREPARED/
+     * ROLLBACK-PREPARED + 流式 5 种——streaming=OFF 下只有前 4 种出现），它们不是事务
+     * 块行，进入 {@link #parse} 会触发行格式 fail——对拍前剥离（wal 路无对应输出面，
+     * 剥离后两路捕获面同构）。
+     */
+    private static final Pattern ENGINE_LIFECYCLE = Pattern.compile(
+            "^(BEGIN-PREPARE|PREPARE|COMMIT-PREPARED|ROLLBACK-PREPARED|STREAM-[A-Z]+)\\s+gid=.*");
 
     // ---- 场景 1：单行事务 ----
 
@@ -477,6 +495,150 @@ class DualPathParityIT {
                 "重启续传场景不应出现 toast-unavailable 降级字面:\n" + String.join("\n", walLines));
     }
 
+    // ---- 场景 11：2PC 挂起零输出 / 弃桶 / COMMIT PREPARED 发射（Task 11 / 任务书场景 5 前三形态）----
+
+    /**
+     * 2PC 前三形态对拍（Task 11 场景 5）：①<b>挂起期零输出</b>——事务 DML 后
+     * {@code PREPARE TRANSACTION 'gt1'}，1.5s 挂起窗口后仍未发射（engine
+     * two_phase=true 下 BeginPrepare/Prepare 只是生命周期 INFO 行、不发事务块；wal 路
+     * PREPARE 记录仅把桶标记挂起——两路挂起期皆零输出）；②<b>弃桶</b>——
+     * {@code ROLLBACK PREPARED 'gt2'} 整桶弃（零 Begin/End）；③<b>COMMIT PREPARED
+     * 发射</b>——{@code COMMIT PREPARED 'gt3'} 双路各发完整事务块且
+     * {@code kind=TWO_PHASE} + {@code gid=gt3} 逐字符一致（engine 的 gid 取自
+     * CommitPrepared 消息、wal 取自 COMMIT_PREPARED 记录 main 的 twophase chunk——
+     * 同一服务端记录同源）。
+     *
+     * <p><b>事务控制面</b>：全程 autoCommit=true + 显式 {@code BEGIN}——PREPARE
+     * TRANSACTION 会在服务端结束会话事务，pgjdbc 的 setAutoCommit(false) 内部记账不
+     * 知情，后续语句不会补发 BEGIN（会退化成逐句自动提交，gt2/gt3 的行在 PREPARE 前
+     * 就被提交）；显式 BEGIN 不经驱动事务状态机，跨 PREPARE 语句次序确定。</p>
+     *
+     * <p>断言面：归一化对拍（交集恰 gt3 块）+ 终态专项——两路捕获各恰一个块、
+     * gid=gt3、kind=TWO_PHASE、gt1/gt2 的 xid 从不出现（挂起/弃桶零输出的终态钉）。
+     * 收尾 {@code ROLLBACK PREPARED 'gt1'} 释放挂起事务（仍零输出）。</p>
+     */
+    @Test
+    void twoPhaseSuspendDiscardAndCommitPreparedParity() throws Exception {
+        ParityOutcome out = runParityTwoPhase("2PC 挂起/弃桶/COMMIT PREPARED", 1, TABLE_DDL, conn -> {
+            exec(conn, "BEGIN");
+            exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'gt1-pending', true, 1.0,"
+                    + " '2026-10-07', timestamptz '2026-10-07 01:01:01+00')");
+            exec(conn, "PREPARE TRANSACTION 'gt1'");
+            Thread.sleep(1500);   // 挂起窗口实宽——若任一路早发（终态未到即出块），计数面即超 1 暴露
+            exec(conn, "BEGIN");
+            exec(conn, "INSERT INTO parity.t_parity VALUES (2, 'gt2-doomed', false, 2.0,"
+                    + " '2026-10-07', timestamptz '2026-10-07 02:02:02+00')");
+            exec(conn, "PREPARE TRANSACTION 'gt2'");
+            exec(conn, "ROLLBACK PREPARED 'gt2'");
+            exec(conn, "BEGIN");
+            exec(conn, "INSERT INTO parity.t_parity VALUES (3, 'gt3-commit', true, 3.0,"
+                    + " '2026-10-07', timestamptz '2026-10-07 03:03:03+00')");
+            exec(conn, "PREPARE TRANSACTION 'gt3'");
+            exec(conn, "COMMIT PREPARED 'gt3'");
+            exec(conn, "ROLLBACK PREPARED 'gt1'");   // 收尾释放 gt1 挂起（弃桶路径二次覆盖）
+        });
+        Map<Long, TxBlock> blocks = parse(out.walLines());
+        assertEquals(1, blocks.size(), "2PC 场景 wal 路应恰一个事务块（gt3）:\n"
+                + String.join("\n", out.walLines()));
+        TxBlock only = blocks.values().iterator().next();
+        assertEquals("TWO_PHASE", only.kind, "COMMIT PREPARED 块 kind 应为 TWO_PHASE");
+        assertEquals("gt3", only.gid, "COMMIT PREPARED 块 gid 应为 gt3");
+        assertEquals(1, only.rows.size(), "gt3 块应恰一行（PREPARE 前的单行 INSERT）");
+    }
+
+    // ---- 场景 12：挂起期重启续传（Task 11 / 任务书场景 5 第四形态）----
+
+    /**
+     * 挂起期重启续传对拍（Task 11 场景 5 收官）：wal 路<b>两段会话</b>——段一捕
+     * DML+{@code PREPARE TRANSACTION 'gtx'}（挂起桶跨检查点存活）后追加 &gt;8KB 的
+     * filler 事务 WAL（250 行 INSERT，把 close 检查点前沿确定性推过 PREPARE 所在
+     * 页——纯页重叠窗口救不回桶，钉"重放重建桶"路径），close 落最终检查点；段二同
+     * stateDir 续传，{@code COMMIT PREPARED 'gtx'} 到达后发射（段二流起点回退到挂起
+     * 桶首记录所在页，重放重建桶 + gid 后补发终态）。engine 路（two_phase=true）全程
+     * 单会话，按 xid 交集对拍 diff 空。
+     *
+     * <p><b>缺陷发现记档（Task 11 实测红→修）</b>：Task 5 XactGrouper javadoc 原述
+     * "检查点 LSN 必然落后 PREPARE 位点"不成立——检查点 lsn = catalog 已施加前沿，
+     * 挂起桶的行记录可落在检查点页之前（filler 场景确定性如此），续传流起点（stored
+     * lsn 页对齐）重放不到桶内行，COMMIT PREPARED 到达即无桶静默零发射 = 静默丢事务。
+     * 修复：XactGrouper 暴露待决桶下界 {@code pendingFloorLsn}（桶首记录 lsn 的最小
+     * 值），检查点随 lsn 一并落盘（StateStore formatVersion 3 增 dmlFloorLsn）、槽
+     * 推进按 floor 封顶，续传时流起点取 min(stored, floor) 页对齐（catalog 过滤线仍
+     * = stored，不二次施加字典）——重放段把桶内行 + PREPARE 记录重新喂给组装器，
+     * 桶与 gid 重建、终态补发。段二重放段会重发已检查点的 filler 事务（幂等重发逐字
+     * 节全等，{@code parse} 重复块容忍面吸收）。</p>
+     */
+    @Test
+    void twoPhasePreparedPendingSurvivesRestartResumeParity() throws Exception {
+        ParityEnv.resetScenario(TABLE_DDL);
+        EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig(true));
+        ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
+        Properties walCfg = ParityEnv.walSourceConfig();
+        walCfg.setProperty(WalSource.KEY_STATE_DIR, tpStateDir.toString());
+        WalSource wal1 = new WalSource(walCfg, new OutputRenderer());
+        WalSource wal2 = new WalSource(walCfg, new OutputRenderer());
+        Throwable primary = null;
+        boolean resumed = false;
+        List<String> engineLines = List.of();
+        List<String> walLines = List.of();
+        try {
+            engine.start();
+            try (wal1) {
+                wal1.start();
+                try (Connection conn = ParityEnv.newSqlConnection()) {
+                    exec(conn, "BEGIN");
+                    exec(conn, "INSERT INTO parity.t_parity VALUES (10, 'gtx-pending', true, 10.0,"
+                            + " '2026-10-07', timestamptz '2026-10-07 05:05:05+00')");
+                    exec(conn, "PREPARE TRANSACTION 'gtx'");
+                    // filler 事务：单语句 250 行（≥8KB WAL）——检查点前沿确定性越过 PREPARE 所在页
+                    exec(conn, "INSERT INTO parity.t_parity SELECT g, 'filler-' || g, true, 0.1,"
+                            + " '2026-10-07', timestamptz '2026-10-07 06:06:06+00'"
+                            + " FROM generate_series(11, 260) g");
+                }
+                await(() -> engine.emittedTxns() >= 1,
+                        "2PC 重启续传: 段一 engine 路未输出 filler 事务（emitted="
+                                + engine.emittedTxns() + ", consumerFailed=" + engine.failed() + "）");
+                await(() -> wal1.dmlEmittedBuckets() >= 1,
+                        "2PC 重启续传: 段一 wal 路未发射 filler 桶（buckets="
+                                + wal1.dmlEmittedBuckets() + ", terminal=" + wal1.receiverTerminalFailure() + "）");
+            }   // close = 最终 best-effort 检查点（前沿已过 PREPARE 所在页）+ 槽推进（按挂起桶 floor 封顶）
+            try (wal2) {
+                wal2.start();
+                resumed = wal2.resumedFromState();
+                try (Connection conn = ParityEnv.newSqlConnection()) {
+                    exec(conn, "COMMIT PREPARED 'gtx'");
+                }
+                await(() -> engine.emittedTxns() >= 2,
+                        "2PC 重启续传: 段二 engine 路未输出 COMMIT PREPARED 事务（emitted="
+                                + engine.emittedTxns() + ", consumerFailed=" + engine.failed() + "）");
+                await(() -> wal2.dmlEmittedBuckets() >= 2,
+                        "2PC 重启续传: 段二 wal 路未发射 COMMIT PREPARED 桶（重放重建桶失效——buckets="
+                                + wal2.dmlEmittedBuckets() + ", terminal=" + wal2.receiverTerminalFailure() + "）");
+            }
+        } catch (Throwable t) {
+            primary = t;   // 不在 finally 内断言——finally 的断言失败会吞掉真正的根因
+        } finally {
+            walLines = walCapture.closeAndDrain();
+            engineLines = engine.stopAndDrain();
+        }
+        assertTrue(resumed, "段二应自检查点续传（段一 close 落盘有效检查点）——否则重启前提不成立");
+        if (primary != null) {
+            wal1.receiverTerminalFailure().ifPresent(t -> LOG_WAL_TERMINAL.error(
+                    "wal 段一接收器终态失败堆栈（2PC 重启续传）", t));
+            wal2.receiverTerminalFailure().ifPresent(t -> LOG_WAL_TERMINAL.error(
+                    "wal 段二接收器终态失败堆栈（2PC 重启续传）", t));
+            fail("2PC 重启续传: 对拍前置失败——" + primary + "\nengine 捕获=" + engineLines
+                    + "\nwal 捕获=" + walLines, primary);
+        }
+        engineLines = stripEngineLifecycle(engineLines);
+        assertParity(engineLines, walLines, "2PC 重启续传", 0);
+
+        // 专项断言：两路各恰一个 gid=gtx 的 TWO_PHASE 块且 xid 同源（重放重建桶的终态钉）
+        long gidXidEngine = soleTwoPhaseBlockXid(parse(engineLines), "gtx", "engine");
+        long gidXidWal = soleTwoPhaseBlockXid(parse(walLines), "gtx", "wal");
+        assertEquals(gidXidEngine, gidXidWal, "gtx 块 xid 双路应同源（同一 PREPARE 事务）");
+    }
+
     // ---- 对拍骨架 ----
 
     /**
@@ -571,11 +733,9 @@ class DualPathParityIT {
     }
 
     /**
-     * 单场景对拍核心（Task 10 抽取）：重置环境 → 两路起流 → 执行 DML → 各自等待追平
-     * → 停流取捕获行 → 归一化对拍，返回截断哨兵与 wal 捕获行的快照。
-     *
-     * <p>关键步骤与边界语义同 {@link #runParity(String, long, long, SqlConsumer)} 的
-     * 骨架描述（本方法是该骨架的唯一实现体——两个委派档分别取哨兵计数/捕获行）。</p>
+     * 单场景对拍核心委派档（Task 10 抽取、Task 11 增 engineCfg 全参档后转委派）：
+     * engine 配置取缺省档（two_phase=false），实现体见
+     * {@link #runParityCore(String, long, long, String[], ReplicationConfig, SqlConsumer)}。
      *
      * @param scenario      场景名（断言消息上下文）
      * @param expectedTxns  场景内已提交事务数——两路各自的追平目标
@@ -587,8 +747,33 @@ class DualPathParityIT {
      */
     private ParityOutcome runParityCore(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
             SqlConsumer<Connection> dml) throws Exception {
+        return runParityCore(scenario, expectedTxns, walAborted, tableDdl, ParityEnv.engineConfig(), dml);
+    }
+
+    /**
+     * 单场景对拍核心（Task 11 增 engineCfg 档）：重置环境 → 两路起流（engine 配置
+     * 参数化——2PC 场景传 two_phase=true 档）→ 执行 DML → 各自等待追平 → 停流取
+     * 捕获行 → 剥离 engine 生命周期控制行（two_phase=true 时 CDC logger 混入
+     * BEGIN-PREPARE 等 INFO 行，非事务块面——见 {@link #ENGINE_LIFECYCLE}）→ 归一化
+     * 对拍，返回截断哨兵与 wal 捕获行的快照。
+     *
+     * <p>关键步骤与边界语义同 {@link #runParity(String, long, long, SqlConsumer)} 的
+     * 骨架描述（本方法是该骨架的实现体——two_phase=false 档剥离为 no-op，既有场景
+     * 捕获面不变）。</p>
+     *
+     * @param scenario      场景名（断言消息上下文）
+     * @param expectedTxns  场景内已提交事务数——两路各自的追平目标
+     * @param walAborted    场景内被回滚的子事务行数（wal 记账与实付的期望差）
+     * @param tableDdl      本场景建表语句
+     * @param engineCfg     engine 路复制配置（two_phase 档参数化）
+     * @param dml           DML 执行器
+     * @return 对拍结局快照（截断跳过哨兵 + wal 捕获行）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private ParityOutcome runParityCore(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
+            ReplicationConfig engineCfg, SqlConsumer<Connection> dml) throws Exception {
         ParityEnv.resetScenario(tableDdl);
-        EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig());
+        EnginePathRunner engine = new EnginePathRunner(engineCfg);
         ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
         WalSource wal = new WalSource(ParityEnv.walSourceConfig(), new OutputRenderer());
         Throwable primary = null;
@@ -619,8 +804,53 @@ class DualPathParityIT {
             fail(scenario + ": 对拍前置失败——" + primary + "\nengine 捕获=" + engineLines
                     + "\nwal 捕获=" + walLines, primary);
         }
-        assertParity(engineLines, walLines, scenario, walAborted);
+        assertParity(stripEngineLifecycle(engineLines), walLines, scenario, walAborted);
         return new ParityOutcome(wal.dmlSkippedTruncatedRows(), walLines);
+    }
+
+    /**
+     * 2PC 场景对拍骨架（Task 11）：engine 路换 two_phase=true 档配置（槽建带
+     * two_phase、PREPARE 期 BeginPrepare/Prepare 生命周期行由对拍核心剥离）。
+     *
+     * @param scenario     场景名（断言消息上下文）
+     * @param expectedTxns 场景内发射的事务块数（两阶段形态下 = COMMIT PREPARED 数）
+     * @param tableDdl     本场景建表语句
+     * @param dml          DML 执行器
+     * @return 对拍结局快照（截断跳过哨兵 + wal 捕获行）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private ParityOutcome runParityTwoPhase(String scenario, long expectedTxns, String[] tableDdl,
+            SqlConsumer<Connection> dml) throws Exception {
+        return runParityCore(scenario, expectedTxns, 0L, tableDdl, ParityEnv.engineConfig(true), dml);
+    }
+
+    /**
+     * 剥离 engine 生命周期控制行（{@link #ENGINE_LIFECYCLE} 匹配面）——two_phase=true
+     * 场景 CDC logger 混入的 BEGIN-PREPARE/PREPARE/COMMIT-PREPARED/ROLLBACK-PREPARED
+     * INFO 行不是事务块行，保留会触发行格式 fail；two_phase=false 档无此类行，本方法
+     * 为恒等映射（输出为新列表，原列表不动）。
+     *
+     * @param lines engine 路捕获行
+     * @return 剥离后的行列表（保持原序）
+     */
+    private static List<String> stripEngineLifecycle(List<String> lines) {
+        return lines.stream().filter(l -> !ENGINE_LIFECYCLE.matcher(l).matches()).toList();
+    }
+
+    /**
+     * 断言捕获块中恰一个指定 gid 的 TWO_PHASE 块并返回其 xid（2PC 专项断言的公共面
+     * ——gid 语义上唯一，多块/零块都是终态面破坏）。
+     *
+     * @param blocks 捕获块（xid 键控）
+     * @param gid    目标两阶段 gid
+     * @param side   路径名（失败消息上下文）
+     * @return 该块的 xid
+     */
+    private static long soleTwoPhaseBlockXid(Map<Long, TxBlock> blocks, String gid, String side) {
+        List<TxBlock> hits = blocks.values().stream()
+                .filter(b -> gid.equals(b.gid) && "TWO_PHASE".equals(b.kind)).toList();
+        assertEquals(1, hits.size(), side + " 路应恰一个 gid=" + gid + " 的 TWO_PHASE 块:\n" + blocks);
+        return hits.get(0).xid;
     }
 
     /**

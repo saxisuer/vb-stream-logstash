@@ -52,8 +52,13 @@ import java.util.Set;
  * <p><b>2PC</b>：PREPARE 把桶标记挂起（记 gid，零发射——行值已在到达期物化）；
  * COMMIT_PREPARED 按 main data 的 <b>twophase chunk xid</b>（非记录头 xid——
  * COMMIT PREPARED 在新事务里执行，记录头是新 xid；REL_18 xact.c xact_redo_commit
- * 即用 parsed.twophase_xid）发射 twoPhase=true + gid；ABORT_PREPARED 弃桶。挂起桶
- * 跨重启安全：检查点 LSN 必然落后 PREPARE 位点，重放重建桶并补发终态。</p>
+ * 即用 parsed.twophase_xid）发射 twoPhase=true + gid；ABORT_PREPARED 弃桶。<b>挂起桶
+ * 跨重启安全（Task 11 修复）</b>：检查点 LSN（catalog 已施加前沿）可以越过挂起桶的
+ * 行记录所在页——续传流起点若只按 stored lsn 页对齐，重放段够不到桶内行，
+ * COMMIT_PREPARED 到达即无桶静默零发射（对拍场景 5 实测红）。修复面：本类暴露
+ * {@link #pendingFloorLsn()}（待决桶首记录 lsn 的最小值，普通进行中事务同面覆盖），
+ * 检查点随 lsn 一并落盘、槽推进按 floor 封顶、续传流起点取 min(stored, floor)——
+ * 重放段把桶内行 + 终态前的全部记录重新喂给本类，桶与 gid 重建、终态补发。</p>
  *
  * <p><b>XACT main 布局钉</b>（REL_18_STABLE src/include/access/xact.h +
  * src/backend/access/rmgrdesc/xact.c ParseCommitRecord / ParsePrepareRecord，2026-10
@@ -444,7 +449,7 @@ public final class XactGrouper {
         switch (op) {
             case HeapOps.XLOG_HEAP_INSERT -> {
                 HeapViews.HeapInsertView v = HeapViews.HeapInsertView.parse(rec, layout);
-                appendRow(top, origin, res, ChangeOutputListener.DmlKind.INSERT,
+                appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
                         null, tupleFromBlock(rec, blk, v.offnum(), res.kinds()));
             }
             case HeapOps.XLOG_HEAP_UPDATE, HeapOps.XLOG_HEAP_HOT_UPDATE -> {
@@ -465,14 +470,14 @@ public final class XactGrouper {
                     Object[] after = TruncatedUpdateSplice.reconstructNewTuple(decoder, rec.raw(), blk,
                             updFlags, oldOff, rec.mainLen() - layout.sizeOfHeapUpdate() - 5, res.kinds());
                     noteReconstructedTruncatedUpdate(res);
-                    appendRow(top, origin, res, ChangeOutputListener.DmlKind.UPDATE, before, after);
+                    appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.UPDATE, before, after);
                     resetToastWindow();
                     return;
                 }
                 Object[] before = (updFlags & HeapOps.XLH_UPDATE_CONTAINS_OLD) != 0
                         ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapUpdate(), res.kinds())
                         : null;
-                appendRow(top, origin, res, ChangeOutputListener.DmlKind.UPDATE,
+                appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.UPDATE,
                         before, tupleFromBlock(rec, blk, v.newOffnum(), res.kinds()));
             }
             case HeapOps.XLOG_HEAP_DELETE -> {
@@ -480,7 +485,7 @@ public final class XactGrouper {
                 Object[] before = (v.flags() & HeapOps.XLH_DELETE_CONTAINS_OLD) != 0
                         ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapDelete(), res.kinds())
                         : null;
-                appendRow(top, origin, res, ChangeOutputListener.DmlKind.DELETE, before, null);
+                appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.DELETE, before, null);
             }
             default -> { /* 未预期 opcode 静默忽略 */ }
         }
@@ -522,7 +527,7 @@ public final class XactGrouper {
                 if (off + 2 + datalen > blk.dataOff() + blk.dataLen()) {
                     throw new IllegalStateException("multi_insert entry 越界: i=" + i + ", datalen=" + datalen);
                 }
-                appendRow(top, origin, res, ChangeOutputListener.DmlKind.INSERT,
+                appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
                         null, decoder.decodeEntry(raw, off, res.kinds()));
                 off += 2 + datalen;
             }
@@ -530,7 +535,7 @@ public final class XactGrouper {
             byte[] page = requireImage(rec, blk);
             for (int i = 0; i < v.ntuples(); i++) {
                 int lp = PageImages.linePointerOffset(page, v.offsetAt(i));
-                appendRow(top, origin, res, ChangeOutputListener.DmlKind.INSERT,
+                appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
                         null, decoder.decodePageTuple(page, lp, res.kinds()));
             }
         }
@@ -786,22 +791,28 @@ public final class XactGrouper {
      *
      * <p>关键步骤：前/后像按 dml 裁剪（INSERT 前 null / DELETE 后 null / UPDATE
      * 双像——replica identity 面由 flags 已定）；旧元组 atts 少于列词典时尾列补
-     * null（ADD COLUMN 前的存量形态）。线程约束：单写者。</p>
+     * null（ADD COLUMN 前的存量形态）；桶新建时记 <b>firstLsn = 本行记录 lsn</b>
+     * （{@link #pendingFloorLsn} 的重放下界源——Task 11）。线程约束：单写者。</p>
      *
      * @param top    归并后的顶层事务 id（桶键）
      * @param origin 行来源 xid（记录头 xid——aborted 过滤键）
      * @param res    表解析结果（meta + kinds）
+     * @param recLsn 本行所在记录的 lsn（桶新建时作 firstLsn——重放下界）
      * @param dml    行操作种类
      * @param before 前像值数组（无为 null）
      * @param after  后像值数组（无为 null）
      */
-    private void appendRow(long top, long origin, Resolved res,
+    private void appendRow(long top, long origin, Resolved res, long recLsn,
                            ChangeOutputListener.DmlKind dml, Object[] before, Object[] after) {
         TableMeta meta = res.meta();
         Map<String, Object> beforeMap = before == null ? null : renderRow(meta, before);
         Map<String, Object> afterMap = after == null ? null : renderRow(meta, after);
-        buckets.computeIfAbsent(top, Bucket::new)
-                .rows.add(new RowEntry(origin, new ChangeOutputListener.RowChange(meta, dml, beforeMap, afterMap)));
+        Bucket b = buckets.get(top);
+        if (b == null) {
+            b = new Bucket(top, recLsn);
+            buckets.put(top, b);
+        }
+        b.rows.add(new RowEntry(origin, new ChangeOutputListener.RowChange(meta, dml, beforeMap, afterMap)));
     }
 
     /**
@@ -904,6 +915,30 @@ public final class XactGrouper {
      */
     public long emittedRows() {
         return emittedRows;
+    }
+
+    /**
+     * 待决桶重放下界：当前待决桶（进行中普通事务 + 2PC 挂起桶）<b>首记录 lsn</b> 的
+     * 最小值——从该记录起（含）重放即可重建全部待决桶；无待决桶为 0。
+     *
+     * <p><b>用途（Task 11 挂起桶跨检查点修复）</b>：检查点把它与 lsn 一并落盘
+     * （StateStore {@code dmlFloorLsn}），槽推进按它封顶（WAL 保留覆盖重放窗口），
+     * 续传时流起点取 min(stored, floor) 页对齐——重放段重新喂桶内行，COMMIT /
+     * COMMIT_PREPARED 到达时桶已重建、终态正常补发。重放段内先于 floor 的同页记录
+     * 与已提交事务的重复块无害（幂等重发逐字节全等，与 at-least-once 语义一致）。
+     * 线程约束：检查点在接收线程（与 onRecord 单写者同线程）或停机 join 后调用——
+     * 无并发写；O(桶数) 线性扫，检查点节拍（30s 档）下开销可忽略。</p>
+     *
+     * @return 待决桶首记录 lsn 最小值；无待决桶为 0
+     */
+    public long pendingFloorLsn() {
+        long floor = 0;
+        for (Bucket b : buckets.values()) {
+            if (floor == 0 || b.firstLsn < floor) {
+                floor = b.firstLsn;
+            }
+        }
+        return floor;
     }
 
     /**
@@ -1119,21 +1154,25 @@ public final class XactGrouper {
 
     /**
      * 待决事务桶：行到达期累积（RowEntry 携带来源 xid 供 aborted 过滤），终态记录
-     * 发射/弃。挂起（PREPARE）= 桶留存 + gid 悬置。
+     * 发射/弃。挂起（PREPARE）= 桶留存 + gid 悬置。firstLsn = 首行记录 lsn
+     * （{@link XactGrouper#pendingFloorLsn()} 的重放下界源——Task 11）。
      */
     private static final class Bucket {
         final long xid;
+        final long firstLsn;
         final List<RowEntry> rows = new ArrayList<>();
         final Set<Long> abortedSubxids = new HashSet<>();
         String gid;
 
         /**
-         * 以桶键（顶层事务 id）建桶。
+         * 以桶键（顶层事务 id）与首记录 lsn 建桶。
          *
-         * @param xid 顶层事务 id
+         * @param xid      顶层事务 id
+         * @param firstLsn 首行所在记录的 lsn（重放下界——续传重放自该记录起可重建本桶）
          */
-        Bucket(long xid) {
+        Bucket(long xid, long firstLsn) {
             this.xid = xid;
+            this.firstLsn = firstLsn;
         }
     }
 

@@ -23,7 +23,7 @@ two_phase 消费均属 v2 非目标。设计全文见
 | `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**）；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立） |
 | `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码） |
 | `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件 |
-| `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
+| `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验；formatVersion 3 增 `dmlFloorLsn`——DML 待决桶重放下界，Task 11），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
 | `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 engine 的接入点 |
 
 单线程直通执行模型（接收 → 解析 → 重放 → 周期落盘全在 wal-receiver 线程，sink 同步
@@ -116,7 +116,14 @@ two_phase 消费均属 v2 非目标。设计全文见
   两张 catalog 表行内无超界值（v2 重组）。
 - **VACUUM FULL 全表重发的 CDC 语义**：v1 非目标——重放面按新 relfilenode 跟踪字典，
   但用户表 DML 语义未承诺。
-- **two_phase（PREPARE/COMMIT PREPARED）记录不消费**：v1 非目标。
+- **two_phase 记录**：v1 不消费；v2（Task 5）起 XactGrouper 已实现 PREPARE 挂起/
+  COMMIT_PREPARED 发射（kind=TWO_PHASE + gid，归属键 = main 的 twophase chunk xid）/
+  ABORT_PREPARED 弃桶，**挂起桶跨检查点安全（Task 11 修复）**：检查点 lsn 可越过挂起
+  （或进行中）桶的行记录所在页——XactGrouper 暴露 `pendingFloorLsn`（待决桶首记录
+  lsn 最小值），检查点把它随 lsn 落盘（StateStore formatVersion 3 `dmlFloorLsn`）、
+  槽推进按 floor 封顶、续传流起点取 min(stored, floor) 页对齐（catalog 过滤线仍 =
+  stored，不二次施加字典）——重放段重建桶后终态补发；对拍验收
+  `DualPathParityIT` 2PC 四形态（挂起零输出/弃桶/COMMIT PREPARED/挂起重启续传）。
 
 ## 配置面（`vb.wal.*` 九键，`WalSource`/`StateConfig` 单一来源）
 

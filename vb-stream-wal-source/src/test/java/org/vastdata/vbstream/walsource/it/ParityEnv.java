@@ -29,7 +29,8 @@ import java.util.Set;
  * 形态钉 NORMAL 路径（无 STREAM-* 流式分段），两路输出面确定性；{@code wal_level=logical}
  * （物理流 + 逻辑槽双兼容）、槽位/walsender 上限 16（两路各占一槽，重跑残留 + 并行测试类
  * 余量）；{@code wal_compression=off}（wal 路 PageImages 不解压压缩 FPW 的运维前提）；
- * {@code max_slot_wal_keep_size=1GB} 兜底。</p>
+ * {@code max_prepared_transactions=16}（2PC 场景的硬前提——0 时 PREPARE TRANSACTION
+ * 直接报错）；{@code max_slot_wal_keep_size=1GB} 兜底。</p>
  *
  * <p><b>场景重置契约</b>（{@link #resetScenario(String...)}）：每场景重建 parity schema
  * + 对拍表 DDL + publication（FOR ALL TABLES——覆盖未来建表），并清两路槽位（先杀
@@ -61,6 +62,7 @@ public final class ParityEnv {
                     "-c", "max_wal_senders=16",
                     "-c", "logical_decoding_work_mem=64MB",
                     "-c", "wal_compression=off",
+                    "-c", "max_prepared_transactions=16",
                     "-c", "max_slot_wal_keep_size=1GB");
 
     static {
@@ -88,18 +90,29 @@ public final class ParityEnv {
     }
 
     /**
-     * engine 路复制配置：proto 4 + <b>streaming OFF</b>（钉 NORMAL 路径——无 STREAM-*
-     * 生命周期行，输出面确定性）+ twoPhase false（场景 1 无 2PC，避免 P/K 生命周期行）+
-     * binary false（text 模式与 wal 路 {@code DiskValueRenderer} 的 PG text 渲染矩阵
-     * 对齐）+ 反馈 2s。
+     * engine 路复制配置（twoPhase=false 缺省档——场景 1 系：无 2PC，避免 P/K 生命周期行）。
      *
      * @return 已指向本容器与 ENGINE_SLOT/PUBLICATION 的配置
      */
     public static ReplicationConfig engineConfig() {
+        return engineConfig(false);
+    }
+
+    /**
+     * engine 路复制配置：proto 4 + <b>streaming OFF</b>（钉 NORMAL 路径——无 STREAM-*
+     * 生命周期行，输出面确定性）+ twoPhase 参数化（true = 2PC 场景——槽建带 two_phase、
+     * PREPARE 期 engine 发 BeginPrepare/Prepare 生命周期 INFO 行但不发事务块，CommitPrepared
+     * 才发块，挂起期零输出与 wal 路对齐）+ binary false（text 模式与 wal 路
+     * {@code DiskValueRenderer} 的 PG text 渲染矩阵对齐）+ 反馈 2s。
+     *
+     * @param twoPhase 槽 two_phase 选项（pgoutput 两阶段消息的前提）
+     * @return 已指向本容器与 ENGINE_SLOT/PUBLICATION 的配置
+     */
+    public static ReplicationConfig engineConfig(boolean twoPhase) {
         return new ReplicationConfig(
                 host(), port(), PG.getDatabaseName(), PG.getUsername(), PG.getPassword(),
                 ENGINE_SLOT, PUBLICATION,
-                4, StreamingMode.OFF, false, false, 2);
+                4, StreamingMode.OFF, twoPhase, false, 2);
     }
 
     /**

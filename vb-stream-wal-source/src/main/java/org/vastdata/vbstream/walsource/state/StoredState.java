@@ -12,7 +12,8 @@ import java.util.Set;
  * {@link StateStore#load()} 的产物——一次成功检查点解出的完整可重建态：attr/class/
  * nsp 三行字典（ctid 键控）、三 raw tail 存储、tracked 双 ctid、pg_attribute/
  * pg_class/pg_namespace 三 relfilenode、interest 与 stale 两 oid 集，加检查点 LSN
- * （v2 扩链：nsp 行字典 + nsp tail + pgNspRelnode，formatVersion bump 1→2）。
+ * （v2 扩链：nsp 行字典 + nsp tail + pgNspRelnode，formatVersion bump 1→2；
+ * v3 扩链：dmlFloorLsn——DML 待决桶重放下界，Task 11 挂起桶跨检查点修复）。
  *
  * <p>控制器裁定：持久化面 = 完整 CatalogStores 可重建态<strong>除 metrics 外全部
  * 字段</strong>（任务书基础 record 的 attr/class 表 + tracked 双 ctid 之上，扩展
@@ -36,6 +37,8 @@ import java.util.Set;
  * @param pgNspRelnode        pg_namespace relfilenode（v2 扩链）
  * @param interestRelOids     兴趣关系 oid 集
  * @param staleOids           自愈失败 stale oid 集
+ * @param dmlFloorLsn         DML 待决桶重放下界（v3 扩链——首记录 lsn 最小值，0 = 无
+ *                            待决桶；续传时流起点按它回退，catalog 过滤线仍 = lsn）
  */
 public record StoredState(long lsn,
                           Map<Long, AttrRow> attrs,
@@ -50,7 +53,8 @@ public record StoredState(long lsn,
                           long pgClassRelfilenode,
                           long pgNspRelnode,
                           Set<Long> interestRelOids,
-                          Set<Long> staleOids) {
+                          Set<Long> staleOids,
+                          long dmlFloorLsn) {
 
     /**
      * 把本状态灌回目标 stores（Task 15 续传路径）：先清空六 map 与 interest/stale

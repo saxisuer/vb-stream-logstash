@@ -30,7 +30,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ⑥class 表最小行宽形态（relname/relkind 空串 ×50）→ 计数防线不误拒（审查修复钉）；
  * ⑦pgVersion 参数化（终审 I1）——17 写 17 / 18 写 18，跨版本 load 错配拒载 empty；
  * ⑧formatVersion=1（v1 检查点）即便双 CRC 同步修正一致也拒载 empty（v2 扩链裁定：
- * v1 缺 nsp 表段不迁移，拒载回落全新引导）。
+ * v1 缺 nsp 表段不迁移，拒载回落全新引导）；
+ * ⑨dmlFloorLsn roundtrip（Task 11 / formatVersion 3 扩链）——三参 checkpoint 带
+ * floor 落盘 load 回原值、二参档落 0（无待决桶面）。
  *
  * <p>byte[] tail 值不参与 record equals（数组恒一性），断言经
  * {@link #assertTailsEqual} 手工逐键比较；其余字段用 record/集合 equals。</p>
@@ -225,6 +227,28 @@ class StateStoreTest {
         patchCrc(bytes, 0, bytes.length - 4, bytes.length - 4);    // 全文件 CRC 写回尾 4B
         Files.write(file, bytes);
         assertTrue(store.load().isEmpty(), "v1（formatVersion=1）检查点应拒载 empty——回落全新引导");
+    }
+
+    /**
+     * 用例 ⑨（Task 11 / formatVersion 3 扩链）：DML 待决桶重放下界 dmlFloorLsn 的
+     * roundtrip——三参 {@code checkpoint(stores, lsn, floor)} 落盘后 load 回原值
+     * （挂起桶跨检查点修复的续传依据：流起点按它回退）；连写一次 floor=0（二参档）
+     * 覆盖为 0（待决桶清空后的回落面——floor 不滞留旧值）。
+     */
+    @Test
+    void dmlFloorLsnRoundtripsAndClearsBackToZero() throws IOException {
+        StateStore store = new StateStore(dir, 18);
+        long floor = LSN - 0x2000;
+        store.checkpoint(filledStores(), LSN, floor);
+        Optional<StoredState> loaded = store.load();
+        assertTrue(loaded.isPresent(), "带 floor 的合法检查点应可 load");
+        assertEquals(floor, loaded.orElseThrow().dmlFloorLsn(), "dmlFloorLsn 应 roundtrip 全等");
+        assertEquals(LSN, loaded.orElseThrow().lsn(), "lsn 不受 floor 影响");
+
+        store.checkpoint(filledStores(), LSN + 0x10);   // 二参档：待决桶清空后 floor 落 0
+        Optional<StoredState> cleared = store.load();
+        assertTrue(cleared.isPresent());
+        assertEquals(0L, cleared.orElseThrow().dmlFloorLsn(), "待决桶清空后落盘的 floor 应回 0");
     }
 
     /**

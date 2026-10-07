@@ -23,6 +23,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /**
  * WAL 直解源全装配门面（Task 15 升级：接收面 → catalog 同步全管线）——把槽管理、
@@ -242,7 +243,11 @@ public final class WalSource implements AutoCloseable {
         int versionNum = queryServerVersionNum(sqlConnection);
         WalLayout layout = WalLayouts.forServerVersion(versionNum);
         Consumer<WalRecord> postApply = dmlEnabled() ? rec -> changeStreamOrInit(layout).onRecord(rec) : null;
-        sync = CatalogSynchronizer.start(sqlConnection, slotName, layout, user, pass, state, 0L, postApply);
+        // 待决桶下界供应者（Task 11 挂起桶跨检查点修复）：检查点落盘/槽推进封顶/续传流起点
+        // 回退三面经同步器消费；changeStream 惰性建（首条记录前为 null → 0，与"无待决桶"同面）
+        LongSupplier pendingFloor = dmlEnabled() ? this::dmlPendingFloorLsn : null;
+        sync = CatalogSynchronizer.start(sqlConnection, slotName, layout, user, pass, state, 0L,
+                postApply, pendingFloor);
         started = true;
         LOG.info("WalSource 启动: server_version_num={} slot={} state={} dml={} tables={} 续传起点 {}",
                 versionNum, slotName, state.enabled() ? state.dir() : "禁用", dmlEnabled(),
@@ -336,6 +341,21 @@ public final class WalSource implements AutoCloseable {
     public long dmlReconstructedTruncatedRows() {
         ChangeStream cs = changeStream;
         return cs == null ? 0L : cs.reconstructedTruncatedRows();
+    }
+
+    /**
+     * DML 观测面：待决桶重放下界（Task 11 挂起桶跨检查点修复——透传
+     * {@link ChangeStream#pendingFloorLsn()}；检查点落盘/槽推进封顶/续传流起点回退的
+     * 数据源，亦是诊断面："挂起 2PC 存活期间 floor 停滞推进"属预期形态）。
+     *
+     * <p>changeStream 惰性建（接收线程首条记录前 null → 0，与"无待决桶"同面）；
+     * 检查点调用与 onRecord 同在 wal-receiver 线程或停机 join 后——串行一致。</p>
+     *
+     * @return 待决桶首记录 lsn 最小值；无待决桶（或 DML 面未起）为 0
+     */
+    public long dmlPendingFloorLsn() {
+        ChangeStream cs = changeStream;
+        return cs == null ? 0L : cs.pendingFloorLsn();
     }
 
     /**

@@ -175,6 +175,37 @@ class XactGrouperTest {
     }
 
     /**
+     * 待决桶重放下界（Task 11 挂起桶跨检查点修复的离线锚）：pendingFloorLsn 恒等于
+     * 最老待决桶<b>首行记录 lsn</b>——①空态 0；②桶 700 开桶即取首 INSERT 的 lsn，更晚
+     * 开的桶 800 不抬高下界；③桶 700 终态（COMMIT_PREPARED 发射）后下界跳到次老桶
+     * 800 的首记录 lsn；④全桶终结回落 0（含 2PC 挂起桶在内——挂起桶也是待决桶，
+     * 下界为其首行而非 PREPARE 记录：重放须重建桶内行，gid 由重放段内的 PREPARE
+     * 记录补挂）。检查点把该值落盘，续传流起点按它回退（StateStore v3 dmlFloorLsn）。
+     */
+    @Test
+    void pendingFloorLsnTracksOldestOpenBucketFirstRecord() {
+        Fixture fx = fixture();
+        assertEquals(0L, fx.grouper.pendingFloorLsn(), "空态下界应为 0");
+
+        WalRecord first700 = fx.insert(700, 0, 1, "p1");
+        fx.insert(700, 0, 2, "p2");
+        fx.feed(WalBytes.prepareRecord(700, COMMIT_MICROS, "gt-42"));   // 挂起：桶仍在待决面
+        assertEquals(first700.lsn(), fx.grouper.pendingFloorLsn(),
+                "挂起桶的下界应是其首行记录 lsn（非 PREPARE 记录 lsn）");
+
+        WalRecord first800 = fx.insert(800, 0, 3, "q1");
+        assertEquals(first700.lsn(), fx.grouper.pendingFloorLsn(),
+                "更晚开的桶不抬高下界（取最小）");
+
+        fx.feed(WalBytes.xactRecordWithGid(HeapOps.XLOG_XACT_COMMIT_PREPARED, 888, COMMIT_MICROS, 700, "gt-42"));
+        assertEquals(first800.lsn(), fx.grouper.pendingFloorLsn(),
+                "最老桶终态后下界应跳到次老桶首记录 lsn");
+
+        fx.commit(800);
+        assertEquals(0L, fx.grouper.pendingFloorLsn(), "全桶终绔回落 0");
+    }
+
+    /**
      * PREPARE 半边 gid 直测（审查修复面）：PREPARE 记录的 gid 经 72B 头 gidlen 解出并
      * <b>剥尾 NUL</b>（真实 gidlen=strlen+1，twophase.c 同面）挂到桶上；确认记录无
      * GID chunk（wal_level&lt;logical 真实形态）时回落桶值——gid 断言来源是 PREPARE 侧

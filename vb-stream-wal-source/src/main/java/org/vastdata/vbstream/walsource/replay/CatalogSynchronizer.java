@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.StringJoiner;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /**
  * 伪备库 catalog 同步器（spec §5 组件四）：JDBC 一致性引导 + 物理流接收 + ctid 重放
@@ -107,6 +108,15 @@ public final class CatalogSynchronizer {
     private volatile long appliedLsn;
 
     /**
+     * DML 待决桶重放下界供应者（Task 11 挂起桶跨检查点修复）：检查点把它与 lsn 一并
+     * 落盘（StateStore {@code dmlFloorLsn}）、槽推进按它封顶（WAL 保留覆盖重放窗口）、
+     * 续传流起点按它回退（重放段重建待决桶）。缺省恒 0（无 DML 面 / 无待决桶）。
+     * 赋值发生在 startInternal（接收线程启动前——线程启动 HB 边覆盖可见性）；读面在
+     * 检查点（接收线程或停机 join 后），与写入串行。
+     */
+    private LongSupplier pendingFloor = () -> 0L;
+
+    /**
      * 纯逻辑构造缝（测试/离线组装用：直接持 stores + 重放引擎，无接收器——apply 面
      * 与 start 组装路径完全同源）。
      *
@@ -175,7 +185,7 @@ public final class CatalogSynchronizer {
         ConnInfo ci = ConnInfo.from(sql);
         LOG.warn("CatalogSynchronizer 未显式传凭据——复制连接按派生凭据建立（URL 参数优先、"
                 + "否则 user=metadata 用户名/password 空）；密码认证环境请用带凭据重载 start(..., user, password, ...)");
-        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, null, 0L, null, interestRelOid);
+        return startInternal(sql, slotName, layout, ci.user(), ci.pass(), null, null, 0L, null, null, interestRelOid);
     }
 
     /**
@@ -212,7 +222,7 @@ public final class CatalogSynchronizer {
         // SelfHealer 真接线（Task 13 装配裁定）：带凭据档 = 生产推荐形态，探测复用引导会话
         // ——probe 在接收线程单写者上下文调用，引导会话自此归同步器独占（调用方不得并发使用）
         return startInternal(sql, slotName, layout, user, password,
-                new SelfHealer(new JdbcProbeImpl(sql)), null, 0L, null, interestRelOid);
+                new SelfHealer(new JdbcProbeImpl(sql)), null, 0L, null, null, interestRelOid);
     }
 
     /**
@@ -259,7 +269,7 @@ public final class CatalogSynchronizer {
             String user, String password, StateConfig state, long forcedStartLsn,
             long... interestRelOid) throws SQLException {
         return startInternal(sql, slotName, layout, user, password,
-                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, null, interestRelOid);
+                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, null, null, interestRelOid);
     }
 
     /**
@@ -291,8 +301,44 @@ public final class CatalogSynchronizer {
     public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
             String user, String password, StateConfig state, long forcedStartLsn,
             Consumer<WalRecord> postApply, long... interestRelOid) throws SQLException {
+        return start(sql, slotName, layout, user, password, state, forcedStartLsn, postApply,
+                () -> 0L, interestRelOid);
+    }
+
+    /**
+     * v2 组装入口（带凭据 + 检查点 + post-apply 分发 + <b>待决桶下界供应者</b>，
+     * Task 11）：post-apply 档之上把 DML 组装器的 {@code pendingFloorLsn} 接进检查点
+     * 生命周期——落盘带 floor（StateStore v3 {@code dmlFloorLsn}）、槽推进按 floor
+     * 封顶、续传时流起点回退到 min(stored, floor) 页对齐（catalog 过滤线仍 = stored
+     * lsn，重放段不二次施加字典——postApply 无过滤面地重建待决桶）。
+     *
+     * <p><b>修复背景</b>：检查点 lsn = catalog 已施加前沿，可越过 DML 待决桶（进行中
+     * 事务 + 2PC 挂起桶）的行记录所在页——续传若只按 stored lsn 页对齐起流，重放段
+     * 够不到桶内行，终态记录到达即无桶静默零发射（COMMIT / COMMIT_PREPARED 丢事务，
+     * 对拍场景 5 实测红）。供应者读面（检查点）与 DML 组装器写面（onRecord）同在
+     * wal-receiver 线程或停机 join 后——串行无并发。</p>
+     *
+     * @param sql            引导用 SQL 会话（probe 与槽推进复用，归同步器独占）
+     * @param slotName       槽名
+     * @param layout         版本布局描述符
+     * @param user           复制连接用户
+     * @param password       复制连接密码
+     * @param state          检查点配置（null 或 dir=null = 禁用）
+     * @param forcedStartLsn 显式流起点（0 = 按决策；&gt;0 = 覆盖，诊断接缝）
+     * @param postApply      apply 之后的第二消费者（DML 组装面）
+     * @param pendingFloor   DML 待决桶重放下界供应者（null = 恒 0；典型
+     *                       {@code ChangeStream::pendingFloorLsn}）
+     * @param interestRelOid tracked 面 oid
+     * @return 已运行的同步器
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    public static CatalogSynchronizer start(Connection sql, String slotName, WalLayout layout,
+            String user, String password, StateConfig state, long forcedStartLsn,
+            Consumer<WalRecord> postApply, LongSupplier pendingFloor, long... interestRelOid)
+            throws SQLException {
         return startInternal(sql, slotName, layout, user, password,
-                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, postApply, interestRelOid);
+                new SelfHealer(new JdbcProbeImpl(sql)), state, forcedStartLsn, postApply,
+                pendingFloor == null ? () -> 0L : pendingFloor, interestRelOid);
     }
 
     /**
@@ -317,7 +363,7 @@ public final class CatalogSynchronizer {
      */
     private static CatalogSynchronizer startInternal(Connection sql, String slotName, WalLayout layout,
             String user, String password, SelfHealer healer, StateConfig state, long forcedStartLsn,
-            Consumer<WalRecord> postApply, long... interestRelOid) throws SQLException {
+            Consumer<WalRecord> postApply, LongSupplier pendingFloor, long... interestRelOid) throws SQLException {
         // 版本交叉校验（审查 Med-3）：连接端 server_version_num 与 layout 双向核对——
         // 错配的常量会让页遍历/记录解析/投影槽位整体错位（如 V18 layout 读 V17 的
         // reltoastrelid@112 会读进 relallvisible），必须在任何槽/流副作用之前 fail-fast
@@ -337,12 +383,14 @@ public final class CatalogSynchronizer {
         long start;
         boolean resumed = false;
         long storedLsn = 0;
+        long storedFloor = 0;
         if (state != null && state.enabled()) {
             stateStore = new StateStore(state.dir(), layout.majorVersion());
             Optional<StoredState> loaded = stateStore.load();
             if (loaded.isPresent() && loaded.get().lsn() >= p0) {
                 loaded.get().restoreInto(stores);
                 storedLsn = loaded.get().lsn();
+                storedFloor = loaded.get().dmlFloorLsn();
                 start = storedLsn;
                 resumed = true;
                 LOG.info("CatalogSynchronizer 自检查点续传: stored lsn={}（attr {} / class {} 行, 跳过引导）",
@@ -380,6 +428,7 @@ public final class CatalogSynchronizer {
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout), healer), receiver,
                 slotName, state, stateStore, stateStore == null ? null : sql);
+        sync.pendingFloor = pendingFloor == null ? () -> 0L : pendingFloor;
         // 前沿种子化（终审 C1 两级语义）——前沿兼作 apply 的重投递过滤线，种子按字典来源分级：
         // ① 续传/forced：字典已<strong>施加</strong>到 stored/forced lsn——部分记录类二次施加
         //    非幂等，须在未对齐的 stored/forced lsn 处严格过滤（Low-5 泛化：续传页对齐
@@ -395,12 +444,25 @@ public final class CatalogSynchronizer {
             sync.lastCheckpointWallMs = System.currentTimeMillis();
             sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
         }
+        // 流起点（Task 11 挂起桶跨检查点修复）：续传时 DML 待决桶下界（检查点落盘的
+        // dmlFloorLsn）低于 stored lsn 则回退到 floor 起流（接收器内页对齐下取整）——
+        // 重放段把待决桶的行记录重新喂给 postApply 面重建桶；catalog 过滤线仍 =
+        // stored lsn（appliedLsn 种子不变），重放段不二次施加字典
+        long streamStart = start;
+        if (resumed && storedFloor > 0 && storedFloor < start) {
+            streamStart = storedFloor;
+            LOG.info("续传流起点按 DML 待决桶下界回退: floor {} < stored {}（重放段重建待决桶，"
+                    + "catalog 过滤线不动）", Lsn.format(storedFloor), Lsn.format(start));
+        }
         receiver.start(postApply == null
                 ? sync::apply
                 : rec -> {
-                    sync.apply(rec);            // 先施加字典——变更面读到的即施加本记录后的 as-of 快照
+                    sync.applyRecord(rec);      // 先施加字典——变更面读到的即施加本记录后的 as-of 快照
                     postApply.accept(rec);
-                }, start);
+                    // 检查点在 postApply 之后（Task 11）：floor 须含本记录新建的待决桶
+                    // ——先检查点后组装会把"本记录开桶"漏进 floor=0 的检查点
+                    sync.maybeCheckpoint();
+                }, streamStart);
         LOG.info("CatalogSynchronizer 启动: slot={} 流起点 {}（interest {} 个, selfHeal={}, state={}, resumed={}）",
                 slotName, Lsn.format(start), interestRelOid.length, healer != null,
                 state != null && state.enabled(), resumed);
@@ -447,13 +509,25 @@ public final class CatalogSynchronizer {
      * @param r 走读完成的记录
      */
     public void apply(WalRecord r) {
+        applyRecord(r);
+        maybeCheckpoint();
+    }
+
+    /**
+     * 施加单条记录（apply 的记录面——不含检查点判定）：过滤线（记录末尾 &le; 已施加
+     * 前沿跳过）→ catalog 施加 → 前沿推进。Task 11 从 {@link #apply} 拆出：post-apply
+     * 分发档的 sink 组合需要"施加 → 组装 → 检查点"次序（检查点须含本记录新建的待决
+     * 桶，floor 不滞后一条记录），纯 catalog 档（{@code sync::apply}）行为不变。
+     *
+     * @param r 走读完成的记录
+     */
+    private void applyRecord(WalRecord r) {
         long end = (r.lsn() + r.totLen() + 7) & ~7L;
         if (end <= appliedLsn) {
             return;    // 重投递窗口内已施加（续传页对齐多收/重连重发）——跳过, 前沿不回退
         }
         replay.applyCatalogRecord(r, stores);
         appliedLsn = end;
-        maybeCheckpoint();
     }
 
     /**
@@ -481,13 +555,18 @@ public final class CatalogSynchronizer {
     }
 
     /**
-     * 落一次检查点（best-effort）+ 持久化成功后推槽（Task 8 裁定方案 a）。
+     * 落一次检查点（best-effort）+ 持久化成功后推槽（Task 8 裁定方案 a；Task 11 增
+     * 待决桶下界面）。
      *
-     * <p>关键步骤：{@link StateStore#checkpoint}（全量序列化 + fsync + 原子换名）成功
-     * 才记 {@link #lastCheckpointLsn} 并 {@link #advanceSlot}——推进严格在持久化之后
+     * <p>关键步骤：{@link StateStore#checkpoint(CatalogStores, long, long)}（全量序列化
+     * + fsync + 原子换名，lsn 之外落 DML 待决桶下界 floor）成功才记
+     * {@link #lastCheckpointLsn} 并 {@link #advanceSlot}——推进目标按 floor 封顶
+     * （floor &gt; 0 且 &lt; lsn 时推 floor：槽保留窗口须覆盖重放段，越程推进会让
+     * 续传起流点之前的 WAL 被回收、待决桶永久不可重建）；推进严格在持久化之后
      * （崩溃时最坏重复重放已落盘之后的窗口，不丢状态）。边界与异常语义：IOException
      * WARN 吞掉（旧检查点不受损）；推进失败仅 WARN。线程约束：接收线程（周期路径）与
-     * stop 调用线程（最终路径）串行——stop 先 join 接收线程。</p>
+     * stop 调用线程（最终路径）串行——stop 先 join 接收线程，floor 读面与 DML 组装器
+     * 写面同线程串行。</p>
      *
      * @param lsn 检查点 lsn（调用时点的已施加前沿）
      */
@@ -496,10 +575,11 @@ public final class CatalogSynchronizer {
         if (store == null) {
             return;
         }
+        long floor = pendingFloor.getAsLong();
         try {
-            store.checkpoint(stores, lsn);
+            store.checkpoint(stores, lsn, floor);
             lastCheckpointLsn = lsn;
-            advanceSlot(lsn);
+            advanceSlot(floor > 0 && floor < lsn ? floor : lsn);
         } catch (IOException e) {
             LOG.warn("检查点落盘失败（保留旧检查点, 接收不中断）: lsn={} 原因: {}",
                     Lsn.format(lsn), e.getMessage(), e);

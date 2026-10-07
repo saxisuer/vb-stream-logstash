@@ -35,8 +35,9 @@ import java.util.zip.CheckedOutputStream;
  * {@code .part→rename} publish 范式同一语义：目录里无 {@code .part} 后缀的
  * {@value #FILE_NAME} 即完整检查点）。
  *
- * <p><strong>文件布局（formatVersion=2，大端，DataOutputStream 原生序；v2 增
- * pg_namespace 面——nsp 表/nsp tail 表/pgNspRelnode 标量，class 行增 relkind）</strong>：
+ * <p><strong>文件布局（formatVersion=3，大端，DataOutputStream 原生序；v2 增
+ * pg_namespace 面——nsp 表/nsp tail 表/pgNspRelnode 标量，class 行增 relkind；
+ * v3 增 dmlFloorLsn u64——待决桶重放下界，Task 11 挂起桶跨检查点修复）</strong>：
  * <pre>
  * header 24B: magic "VBWS" 4B + formatVersion u16 + pgVersion u16（大版本，与构造
  *             入参 layout.majorVersion() 同源——17 写 17、18 写 18，load 校验同源）
@@ -50,15 +51,16 @@ import java.util.zip.CheckedOutputStream;
  *           → class tail 表（同上）→ nsp tail 表（同上）
  *           → tracked 双 ctid u64×2 + pgAttr/pgClass/pgNsp relfilenode u64×3
  *           → staleOids（count u32 + oid u64×n）+ interestRelOids（同上）
+ *           → dmlFloorLsn u64（v3 增——DML 待决桶重放下界，0 = 无待决桶）
  * footer 12B: lsn u64（header 复述双验）+ fileCrc32 u32（[0, len-4) 全文件）
  * </pre></p>
  *
  * <p><strong>拒载语义</strong>：任一校验不符（magic / formatVersion / pgVersion /
  * headerLen / header CRC / 全文件 CRC / lsn 双验 / 尾部余量）或解析期
  * EOF——{@link #load()} 一律 {@code Optional.empty()} + ERROR 日志，回落重引导
- * 由 caller 决定；<strong>v1（formatVersion=1）检查点一律拒载</strong>（v2 扩链
- * 裁定：v1 缺 nsp 表段语义不完整，不迁移——拒载回落全新引导是安全侧）；{@code .part}
- * 残留永不 load（{@link #exists()} 亦只认正名文件）。
+ * 由 caller 决定；<strong>v1/v2（formatVersion&lt;3）检查点一律拒载</strong>（扩链
+ * 裁定沿 v1→v2 先例：旧版缺段语义不完整，不迁移——拒载回落全新引导是安全侧）；
+ * {@code .part} 残留永不 load（{@link #exists()} 亦只认正名文件）。
  * 持久化面 = 完整 CatalogStores 可重建态除 metrics 外全部字段（裁定见
  * {@link StoredState}）。<strong>契约（Med-3）：一个目录同一时刻仅一个活实例写
  * 检查点</strong>——两实例共用目录时后停机者以陈旧状态覆盖新检查点（文件锁后续）。
@@ -78,9 +80,10 @@ public final class StateStore {
     /**
      * 格式版本（header u16——不符拒载，不回退兼容解读）。v2（Task 4 扩链）：增
      * pg_namespace 面（nsp 表/nsp tail/pgNspRelnode）+ class 行 relkind 字段；
-     * v1 文件（版本 1）拒载回落全新引导（裁定不迁移）。
+     * v3（Task 11）：body 尾增 dmlFloorLsn u64（DML 待决桶重放下界）；v1/v2 文件
+     * 拒载回落全新引导（裁定不迁移，沿 v1→v2 先例）。
      */
-    private static final int FORMAT_VERSION = 2;
+    private static final int FORMAT_VERSION = 3;
 
     /** header 定长 24B（4+2+2+8+4+4——版本演进的前向兼容跳读锚）。 */
     private static final int HEADER_LEN = 24;
@@ -115,22 +118,37 @@ public final class StateStore {
     }
 
     /**
-     * 把 stores 全量序列化为一次检查点（持久化面见 {@link StoredState}）。
-     *
-     * <p>关键步骤：内存序列化（header CRC 与全文件 CRC 双计）→ 写
-     * {@code .part}（truncate 覆写）→ {@code FileChannel.force(true)} 落盘 →
-     * 同目录 {@code Files.move(ATOMIC_MOVE, REPLACE_EXISTING)} 原子换名（旧检查点
-     * 整体替换，无中间态可见；ATOMIC_MOVE 不支持时回落非原子 move + WARN）。边界
-     * 与异常语义：IOException 上抛（调用方决定 fail-fast——检查点失败不损既有
-     * 正名文件，最坏残留 {@code .part} 半成品，下次 checkpoint 覆写）；目录不存
-     * 在则先建。线程约束：意图上单写者（停流/周期检查点线程）。</p>
+     * 把 stores 全量序列化为一次检查点（无待决桶档——dmlFloorLsn 落 0；持久化面见
+     * {@link StoredState}）。
      *
      * @param stores 待持久化的重放状态容器
      * @param lsn    检查点 LSN（已施加前沿）
      * @throws IOException 序列化/落盘/换名失败
      */
     public void checkpoint(CatalogStores stores, long lsn) throws IOException {
-        byte[] payload = serialize(stores, lsn);
+        checkpoint(stores, lsn, 0L);
+    }
+
+    /**
+     * 把 stores 全量序列化为一次检查点（持久化面见 {@link StoredState}）。
+     *
+     * <p>关键步骤：内存序列化（header CRC 与全文件 CRC 双计）→ 写
+     * {@code .part}（truncate 覆写）→ {@code FileChannel.force(true)} 落盘 →
+     * 同目录 {@code Files.move(ATOMIC_MOVE, REPLACE_EXISTING)} 原子换名（旧检查点
+     * 整体替换，无中间态可见；ATOMIC_MOVE 不支持时回落非原子 move + WARN）。
+     * dmlFloorLsn 落 body 尾（v3 段）——DML 组装器待决桶的首记录 lsn 下界，续传
+     * 时流起点按它回退（Task 11 挂起桶跨检查点修复）。边界与异常语义：IOException
+     * 上抛（调用方决定 fail-fast——检查点失败不损既有正名文件，最坏残留
+     * {@code .part} 半成品，下次 checkpoint 覆写）；目录不存在则先建。线程约束：
+     * 意图上单写者（停流/周期检查点线程，dmlFloorLsn 的读面与其同线程串行）。</p>
+     *
+     * @param stores       待持久化的重放状态容器
+     * @param lsn          检查点 LSN（已施加前沿）
+     * @param dmlFloorLsn  DML 待决桶重放下界（0 = 无待决桶）
+     * @throws IOException 序列化/落盘/换名失败
+     */
+    public void checkpoint(CatalogStores stores, long lsn, long dmlFloorLsn) throws IOException {
+        byte[] payload = serialize(stores, lsn, dmlFloorLsn);
         Files.createDirectories(target.getParent());
         try (FileChannel ch = FileChannel.open(part,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
@@ -196,12 +214,13 @@ public final class StateStore {
      * {@link CheckedOutputStream} 逐字节计全文件 CRC，末尾追加 CRC 自身（CRC 不
      * 覆盖自己）。
      *
-     * @param stores 待序列化容器
-     * @param lsn    检查点 LSN
+     * @param stores      待序列化容器
+     * @param lsn         检查点 LSN
+     * @param dmlFloorLsn DML 待决桶重放下界（v3 段，0 = 无待决桶）
      * @return 完整文件字节
      * @throws IOException 序列化失败（内存流上实际不发生）
      */
-    private byte[] serialize(CatalogStores stores, long lsn) throws IOException {
+    private byte[] serialize(CatalogStores stores, long lsn, long dmlFloorLsn) throws IOException {
         ByteArrayOutputStream prefixBuf = new ByteArrayOutputStream(HEADER_LEN - 4);
         DataOutputStream prefix = new DataOutputStream(prefixBuf);
         prefix.write(MAGIC);
@@ -220,6 +239,7 @@ public final class StateStore {
         out.write(headerPrefix);
         out.writeInt((int) headerCrc.getValue());
         writeBody(out, stores);
+        out.writeLong(dmlFloorLsn);    // v3 段：DML 待决桶重放下界（0 = 无待决桶）
         out.writeLong(lsn);    // footer lsn 复述（与 header 双验）
         out.flush();
 
@@ -375,6 +395,7 @@ public final class StateStore {
         long pgNspRelnode = in.readLong();
         Set<Long> staleOids = readOids(in, bytes.length);
         Set<Long> interestRelOids = readOids(in, bytes.length);
+        long dmlFloorLsn = in.readLong();    // v3 段：DML 待决桶重放下界（0 = 无待决桶）
 
         long footerLsn = in.readLong();
         if (footerLsn != lsn) {
@@ -385,7 +406,7 @@ public final class StateStore {
         }
         return new StoredState(lsn, attrs, classes, nspRows, rawAttrTails, rawClassTails, rawNspTails,
                 trackedTableCtid, trackedToastCtid, pgAttrRelfilenode, pgClassRelfilenode, pgNspRelnode,
-                interestRelOids, staleOids);
+                interestRelOids, staleOids, dmlFloorLsn);
     }
 
     /**

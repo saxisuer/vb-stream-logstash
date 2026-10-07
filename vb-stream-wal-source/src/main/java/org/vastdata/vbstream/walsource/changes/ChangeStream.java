@@ -101,4 +101,18 @@ public final class ChangeStream {
     public long reconstructedTruncatedRows() {
         return grouper.reconstructedTruncatedRows();
     }
+
+    /**
+     * 待决桶重放下界（Task 11 挂起桶跨检查点修复——透传
+     * {@link XactGrouper#pendingFloorLsn()}）：检查点落盘 / 槽推进封顶 / 续传流起点
+     * 回退三面的数据源。
+     *
+     * <p>线程约束：无待决桶为 0；调用面（检查点）在接收线程或停机 join 后——
+     * 与 onRecord 单写者串行，读一致。</p>
+     *
+     * @return 待决桶首记录 lsn 最小值；无待决桶为 0
+     */
+    public long pendingFloorLsn() {
+        return grouper.pendingFloorLsn();
+    }
 }
