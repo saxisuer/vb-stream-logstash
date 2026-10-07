@@ -68,6 +68,43 @@ class WalStreamWalkerTest {
         assertEquals(1L, metrics.censusSnapshot().get("1/20"));
     }
 
+    /**
+     * 记录头自页尾跨页（Task 10 修复回归锚，对拍 IT 场景 3 实测形态）：填充记录
+     * MAXALIGN 后落 8176（页尾恰余 16B），下一条记录的 24B 头<b>前 16B 在页尾、
+     * 余部经续体页头后继续</b>——xlog.c CopyXLogRecordToWAL 对记录起点只保证
+     * xl_tot_len 4 字节在本页（{@code Assert(freespace >= sizeof(uint32))}），头本体
+     * 可跨页。原实现把"页尾不足 24B"当零垫跳页，整条记录静默丢失（实测：TOAST
+     * chunk 记录 1127B 自 0x...5FF0 起被丢 → 值降级 toast-unavailable）。
+     */
+    @Test
+    void recordHeaderStraddlingPageTailIsStitchedNotSkipped() {
+        long p1 = 0x20000L;
+        long p2 = p1 + 8192;
+        // 填充记录：起点 24，totLen=8152（无块 + DATA_LONG 头 5B + main 8123B）
+        byte[] filler = WalBytes.record(RM_HEAP_ID, 0x00, 66).main(new byte[8123]).build();
+        assertEquals(8152, filler.length, "填充记录 totLen 前提（拼装布局漂移即修测试）");
+        byte[] straddled = smallRec(RM_HEAP_ID, 0x00, 55);
+        byte[] trailing = smallRec(RM_XACT_ID, 0x20, 77);
+        byte[] headFirst16 = Arrays.copyOfRange(straddled, 0, 16);
+        byte[] page1 = WalBytes.page(p1, filler, headFirst16);   // 第二段起点 8176（已对齐）
+        byte[] rest = Arrays.copyOfRange(straddled, 16, straddled.length);
+        byte[] page2 = WalBytes.page(p2, WalBytes.XLP_FIRST_IS_CONTRECORD, rest.length, rest, trailing);
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, out::add);
+        walker.feed(p1 + 2 * 8192, concat(page1, page2));
+
+        assertEquals(3, out.size(), "跨页头记录不得被当页尾零垫丢弃:\n" + out);
+        assertEquals(p1 + 24, out.get(0).lsn());
+        assertEquals(p1 + 8176, out.get(1).lsn(), "跨页头记录的起点是页尾 16B 段首");
+        assertEquals(straddled.length, out.get(1).totLen());
+        assertArrayEquals(straddled, out.get(1).raw(), "头两段缝合后与原记录逐字节全等");
+        assertEquals(p2 + 24 + align8(rest.length), out.get(2).lsn(), "续体余部后的记录照常解出");
+        assertEquals(1, metrics.contrecords.sum());
+        assertEquals(0, metrics.resyncs.sum());
+    }
+
     /** 用例 2：记录跨页（首段占满 p1 数据区、p2 首段为续体余部）→ contrecord 缝合完整。 */
     @Test
     void recordSpanningPagesIsStitchedViaContrecord() {

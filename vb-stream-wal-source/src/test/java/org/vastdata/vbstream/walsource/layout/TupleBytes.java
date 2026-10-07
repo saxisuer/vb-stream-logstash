@@ -240,6 +240,41 @@ public final class TupleBytes {
     }
 
     /**
+     * text 列写 18B external 短指针（Task 10 对拍锚）：{@code [0x01][0x12 VARTAG_ONDISK]
+     * [rawsize u32 LE][extinfo = extsize 低 30 位 | 方法&lt;&lt;30 u32 LE][valueid u32 LE]
+     * [toastrelid u32 LE]}——经 TupleDecoder 的 VarlenaResolver 接线走 ToastAssembler
+     * 重组/unchanged 哨兵分支。
+     *
+     * @param rawsize    原始 varlena 总长（载荷+4 头）
+     * @param extsize    外部存储载荷长（== chunk 拼接总长）
+     * @param method     压缩方法码（0=pglz、1=lz4，占 extinfo 高 2 位）
+     * @param valueid    TOAST 值 id
+     * @param toastrelid toast 关系 oid
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 text
+     */
+    public TupleBytes externalTextPointer(int rawsize, int extsize, int method, long valueid, long toastrelid) {
+        byte[] cell = new byte[18];
+        cell[0] = 0x01;                                  // VARATT_IS_1B_E
+        cell[1] = 0x12;                                  // VARTAG_ONDISK = 18
+        writeInto(cell, 2, rawsize);
+        writeInto(cell, 6, extsize | (method << 30));
+        writeInto(cell, 10, (int) valueid);
+        writeInto(cell, 14, (int) toastrelid);
+        return scalar("text", 4, cell);
+    }
+
+    /**
+     * 就地写 4 字节小端 u32（external 指针四字段）。
+     */
+    private static void writeInto(byte[] b, int o, int v) {
+        b[o] = (byte) v;
+        b[o + 1] = (byte) (v >>> 8);
+        b[o + 2] = (byte) (v >>> 16);
+        b[o + 3] = (byte) (v >>> 24);
+    }
+
+    /**
      * 纯字面量 pglz 流的字节数（每 8 个字面量一组，每组前缀 1 控制字节）。
      */
     private static int pglzLiteralSize(int rawLen) {

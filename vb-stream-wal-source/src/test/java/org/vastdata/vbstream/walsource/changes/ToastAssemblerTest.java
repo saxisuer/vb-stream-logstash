@@ -135,8 +135,30 @@ class ToastAssemblerTest {
     }
 
     /**
-     * 任务书 ④：回查也缺 → {@code toast-unavailable} + WARN 一次（含 valueid/toastrelid
-     * 上下文）——probe 返回的 chunk 仍不齐（只有 seq 1），不 fail 整条流。
+     * Task 10 值面裁定：归集面<b>全空</b>（未变列指针/跨事务/重启窗口前）→ 返回
+     * unchanged-TOAST 哨兵（{@code ==} 身份识别）且<b>不回查</b>——engine 的 pgoutput
+     * 同形发 'u'（proto.c LOGICALREP_COLUMN_UNCHANGED），回查反而产出 engine 没有的值
+     * 破坏双路对拍。
+     */
+    @Test
+    void emptyCollectionReturnsUnchangedMarkerWithoutProbe() {
+        StubProbe probe = new StubProbe();
+        probe.serve(TOAST_REL, VALUE_ID, Map.of());   // 即便可回查也不应触达
+        ToastAssembler assembler = new ToastAssembler(probe);
+
+        byte[] resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
+
+        assertTrue(resolved == ToastAssembler.UNCHANGED_TOAST_MARKER,
+                "归集面空应返回 unchanged 哨兵（身份比较），实得 " + java.util.Arrays.toString(resolved));
+        assertEquals(-1L, probe.lastToastOid, "归集面空不触发回查");
+        assertTrue(appender.list.stream().noneMatch(e -> e.getLevel() == Level.WARN), "无 WARN（非降级路径）");
+    }
+
+    /**
+     * 任务书 ④（Task 10 收窄后）：归集面<b>非空但不完整</b>、回查也缺 →
+     * {@code toast-unavailable} + WARN 一次（含 valueid/toastrelid 上下文）——先喂
+     * seq 0 使归集面非空（空面走 unchanged 哨兵分支不回查），probe 返回的 chunk 仍
+     * 不齐（只有 seq 1），不 fail 整条流。
      */
     @Test
     void probeMissDegradesToUnavailableAndWarnsOnce() {
@@ -145,6 +167,7 @@ class ToastAssemblerTest {
         partial.put(1L, new byte[10]);
         probe.serve(TOAST_REL, VALUE_ID, partial);
         ToastAssembler assembler = new ToastAssembler(probe);
+        assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 0, new byte[10]));
 
         byte[] resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
 
@@ -157,13 +180,15 @@ class ToastAssemblerTest {
 
     /**
      * probe 抛异常（基础设施故障经 ISE 包装）同样降级不 fail——WARN 行携带异常，
-     * 值面 {@code toast-unavailable}（v2 设计：回查失败不 fail 整条流）。
+     * 值面 {@code toast-unavailable}（v2 设计：回查失败不 fail 整条流）。归集面先喂
+     * seq 0 使非空（Task 10 契约：空面不回查走 unchanged 哨兵）。
      */
     @Test
     void probeFailureDegradesToUnavailable() {
         StubProbe probe = new StubProbe();
         probe.failWith(new IllegalStateException("toast probe connection down"));
         ToastAssembler assembler = new ToastAssembler(probe);
+        assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 0, new byte[10]));
 
         byte[] resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
 

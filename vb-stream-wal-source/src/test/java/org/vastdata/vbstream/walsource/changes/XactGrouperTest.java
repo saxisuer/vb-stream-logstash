@@ -278,10 +278,54 @@ class XactGrouperTest {
         assertEquals("abcdefghij", new String(before, StandardCharsets.UTF_8), "终态前 chunk 已归集可拼装");
 
         fx.commit(901);                                         // 无桶事务的终态同样触发淘汰
-        assertEquals("toast-unavailable",
-                new String(fx.toast.resolveExternal(pointer(14, 10, 4242L, TOAST_REL), 0),
-                        StandardCharsets.UTF_8),
-                "终态后归集面已清、无 probe 回查即降级");
+        assertTrue(fx.toast.resolveExternal(pointer(14, 10, 4242L, TOAST_REL), 0)
+                        == ToastAssembler.UNCHANGED_TOAST_MARKER,
+                "终态后归集面已清 → unchanged 哨兵（Task 10 契约：空面不回查，engine 'u' 同形）");
+    }
+
+    /**
+     * 逐行清窗 + unchanged 渲染（Task 10 值面裁定，双路对拍 IT 场景 3 的离线锚）：
+     * 同事务先 INSERT 引用 external 指针（chunk 已归集 → 拼装原值），行施加后清窗
+     * （镜像服务端 clear_toast_afterwards 的 toast hash 重置）；随后 UPDATE 新元组
+     * 携<b>同一指针</b>（未变列）→ 归集面空 → {@code <toast-unchanged>}（engine 的
+     * pgoutput 'u' 同形），绝不把清窗前的残留 chunk"重组"成 engine 不发的值。
+     */
+    @Test
+    void updateWithUnchangedExternalPointerRendersUnchangedToastAfterWindowReset() {
+        Fixture fx = fixture();
+        fx.toastChunks(100, 4242L, "abcdefghij".getBytes(StandardCharsets.UTF_8), 5);
+
+        // INSERT：新元组 name 列 = external 指针 → 窗口内 chunk 拼装为原值
+        byte[] insertTuple = TupleBytes.of("int4", "text")
+                .i32(1).externalTextPointer(14, 10, 0, 4242L, TOAST_REL).payload();
+        byte[] main = new byte[3];
+        main[0] = 1;
+        fx.feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, 100)
+                .block(0, SPC, DB, USER_REL, 0).data(insertTuple).main(main).build());
+
+        // UPDATE：只改 id，name 列同一指针（未变列形态）→ 清窗后归集面空 → 'u'
+        byte[] before = TupleBytes.of("int4", "text").i32(1).text("abcdefghij").payload();
+        byte[] after = TupleBytes.of("int4", "text")
+                .i32(2).externalTextPointer(14, 10, 0, 4242L, TOAST_REL).payload();
+        ByteArrayOutputStream m = new ByteArrayOutputStream();
+        put32(m, 0x11223344L);                              // old_xmax u32@0
+        put16(m, 5);                                        // old_offnum u16@4
+        m.write(0);                                         // old_infobits u8@6
+        m.write(0x04 | 0x08);                               // flags u8@7 = XLH_UPDATE_CONTAINS_OLD
+        put32(m, 0x55667788L);                              // new_xmax u32@8
+        put16(m, 9);                                        // new_offnum u16@12
+        m.writeBytes(before);
+        fx.feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, 100)
+                .block(0, SPC, DB, USER_REL, 0).data(after).main(m.toByteArray()).build());
+        fx.commit(100);
+
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=2",
+                "ROW INSERT public.t_stream before=null after={id=1, name=abcdefghij}",
+                "ROW UPDATE public.t_stream before={id=1, name=abcdefghij}"
+                        + " after={id=2, name=<toast-unchanged>}",
+                "END xid=100 emitted=2 exp=2"), fx.listener.events,
+                "INSERT 窗口内拼装原值、行施加后清窗、UPDATE 未变列同指针渲染 unchanged（engine 'u' 同形）");
     }
 
     /**

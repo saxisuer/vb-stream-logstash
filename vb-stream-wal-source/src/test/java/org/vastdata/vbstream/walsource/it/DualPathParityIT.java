@@ -1,11 +1,15 @@
 package org.vastdata.vbstream.walsource.it;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.WalSource;
 import org.vastdata.vbstream.walsource.changes.OutputRenderer;
 
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -48,10 +52,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  * （wal_level &lt; logical），与 CONTAINS_OLD 旧元组记录（需 ≥ logical）互斥——本环境
  * 逻辑流下用户表 UPDATE 恒全量记录，截断重建/跳过双计数恒 0 作回归哨兵。</p>
  *
- * <p>场景组（任务书场景矩阵第 1 组 + Task 8.5 场景 6）：单行事务 / 单事务多语句（I+U+D）/
- * 双连接交错事务 / 回滚零输出 / 子事务 SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列。表形态
- * {@code REPLICA IDENTITY FULL}——UPDATE 与 DELETE 双路恒携带整行前像（replica identity
- * 面对称，BEFORE 渲染可对拍）。需要本机 Docker。</p>
+ * <p>场景组（任务书场景矩阵第 1 组 + Task 8.5 场景 6 + Task 9 场景 2/4 + Task 10
+ * 场景 3）：单行事务 / 单事务多语句（I+U+D）/ 双连接交错事务 / 回滚零输出 / 子事务
+ * SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列 / 17 类型边界值矩阵 / 事务内 ADD COLUMN
+ * as-of / TOAST 三存储形态 + 重启续传 unchanged 对齐（external 重组 / external pglz
+ * / 行内压缩 / 续传后未变宽列指针双路同渲染 {@code <toast-unchanged>}——pgoutput 'u'
+ * 同形）。表形态 {@code REPLICA IDENTITY FULL}——UPDATE
+ * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要
+ * 本机 Docker。</p>
  */
 class DualPathParityIT {
 
@@ -94,6 +102,27 @@ class DualPathParityIT {
             "CREATE TABLE parity.t_ddlin (id int4 NOT NULL, name text, PRIMARY KEY (id))",
             "ALTER TABLE parity.t_ddlin REPLICA IDENTITY FULL",
     };
+
+    /**
+     * 场景 3 表 DDL（Task 10）：无 PK 两列表——宽值列 {@code w} 的 TOAST 存储形态
+     * 实测锚（2026-10-07 docker PG 18.6 探针，{@code pg_column_size} + toast 表
+     * chunk 计量双源）：md5 链 7040B → external 未压缩（4 chunk、extsize==rawsize-4）；
+     * md5 串联定长 'y' 段的半可压缩值 24600B → external pglz 压缩（extsize 11040
+     * &lt; 24596）；{@code repeat('x',10000)} → <b>行内压缩</b>（存储 125B、toast 表零
+     * chunk——任务书要点②原述 repeat 型走 external 与实测不符：tuptoaster 先压缩、
+     * 完全可压缩值压缩后 tuple 已低于阈值即行内落盘，external pglz 需"压缩后仍
+     * 超 2KB"的半可压缩值，见 ToastAssembler javadoc 的 64000 字符 repeat 实测同证）。
+     * 无 PK 避免索引记录干扰；FULL 前像对齐场景 1 前提（UPDATE/DELETE 旧元组以
+     * 存储形态落 WAL——external 指针/压缩 datum 原样进前像，重组面双像都受验）。
+     */
+    private static final String[] TOAST_TABLE_DDL = {
+            "CREATE TABLE parity.t_parity_toast (id int4, w text)",
+            "ALTER TABLE parity.t_parity_toast REPLICA IDENTITY FULL",
+    };
+
+    /** 场景 3 重启回查用例的检查点目录（@TempDir 每用例独立——一目录一活实例契约）。 */
+    @TempDir
+    Path toastStateDir;
 
     /** 头行解析模式：TXN-BEGIN xid=.. kind=.. gid=.. commitLsn=0x.. commitTs=.. changes=..（两路同格式）。 */
     private static final Pattern HEADER = Pattern.compile(
@@ -297,6 +326,157 @@ class DualPathParityIT {
         });
     }
 
+    // ---- 场景 9：TOAST 三存储形态窗口内重组（Task 10 / 任务书场景 3）----
+
+    /**
+     * TOAST 三存储形态对拍（Task 10 场景 3 前半）：单事务覆盖宽值的三种落盘形态——
+     * ①external 未压缩（md5 链 7040B，chunk 拼装即原载荷）；②external pglz 压缩
+     * （md5 串联 'y' 段的半可压缩值 24600B→extsize 11040，拼接剥 4B tcinfo 后解压）；
+     * ③行内压缩（{@code repeat('x',10000)} 压缩至 ~121B 落元组内——TupleDecoder 的
+     * VarlenaResolver 行内接线）——I×3 + UPDATE（只改 id，宽列不动：新旧元组都以
+     * 存储形态落 WAL，external 指针/压缩 datum 进前像+后像双像）+ D×1，双路 diff 空。
+     *
+     * <p><b>值面裁定（首跑红→源码钉，Task 10 实测发现）</b>：UPDATE 未变 external 列的
+     * <b>后像</b>两路都渲染 {@code <toast-unchanged>}——engine 侧是 pgoutput wire 的
+     * 'u'（proto.c LOGICALREP_COLUMN_UNCHANGED：VARATT_IS_EXTERNAL_ONDISK 的列不发值；
+     * 服务端 reorder buffer 对每条已施加用户变更后重置 toast hash，decode.c
+     * clear_toast_afterwards），wal 侧镜像同构（ToastAssembler 归集面空 → unchanged
+     * 哨兵 + XactGrouper 逐行清窗）。<b>前像恒带完整值</b>：FULL 身份旧元组在 WAL 写入
+     * 时已被服务端 toast_flatten_tuple 拍扁内联（heapam.c ExtractReplicaIdentity）。
+     * 行内压缩（形态③）非 external——proto.c 正常发文本，双像都是完整值。补充断言钉
+     * 三形态的输出足迹（各尾注按行像数出现 + unchanged 恰 2 处——形态①②的 UPDATE
+     * 后像）且全程无 {@code toast-unavailable} 降级字面。</p>
+     *
+     * <p><b>任务书勘误记档</b>：要点②原述 {@code repeat('x', N)} 走 external pglz 与
+     * 实测不符（完全可压缩值压缩后 tuple 已低于 2KB 阈值即行内落盘，恰是形态③样本；
+     * external pglz 需"压缩后仍超阈值"的半可压缩值），见 {@link #TOAST_TABLE_DDL}
+     * javadoc 的实测锚。</p>
+     */
+    @Test
+    void toastThreeStorageFormsWideValuesParityAcrossPaths() throws Exception {
+        List<String> walLines = runParityWal("TOAST 三形态窗口内重组", 1, TOAST_TABLE_DDL, conn -> {
+            conn.setAutoCommit(false);
+            exec(conn, "INSERT INTO parity.t_parity_toast VALUES (1,"
+                    + " (SELECT string_agg(md5(i::text),'') FROM generate_series(1,220) i))");
+            exec(conn, "INSERT INTO parity.t_parity_toast VALUES (2,"
+                    + " (SELECT string_agg(md5(i::text)||repeat('y',50),'') FROM generate_series(1,300) i))");
+            exec(conn, "INSERT INTO parity.t_parity_toast VALUES (3, repeat('x',10000))");
+            exec(conn, "UPDATE parity.t_parity_toast SET id = id + 100");
+            exec(conn, "DELETE FROM parity.t_parity_toast WHERE id = 102");
+            conn.commit();
+        });
+        String joined = String.join("\n", walLines);
+        assertFalse(joined.contains("toast-unavailable"),
+                "TOAST 三形态场景不应出现 toast-unavailable 降级字面:\n" + joined);
+        assertEquals(2, countLiteral(joined, "...(7040B)"),
+                "形态① external 未压缩宽值应在 INSERT 后像 + UPDATE 前像共 2 处渲染 7040B 截断尾注"
+                        + "（UPDATE 后像是 unchanged，值不在 wire 上）:\n" + joined);
+        assertEquals(3, countLiteral(joined, "...(24600B)"),
+                "形态② external pglz 宽值应在 INSERT 后像 + UPDATE 前像 + DELETE 前像共 3 处渲染"
+                        + " 24600B 截断尾注:\n" + joined);
+        assertEquals(3, countLiteral(joined, "...(10000B)"),
+                "形态③ 行内压缩宽值应在 INSERT 后像 + UPDATE 前后双像共 3 处渲染 10000B 截断尾注"
+                        + "（行内压缩非 external，正常发文本）:\n" + joined);
+        assertEquals(2, countLiteral(joined, "<toast-unchanged>"),
+                "形态①②的 UPDATE 后像（未变 external 列）应各渲染一处 unchanged 占位:\n" + joined);
+    }
+
+    // ---- 场景 10：重启后续传 + 未变宽列指针的 unchanged 对齐（Task 10 / 任务书场景 3 收官）----
+
+    /**
+     * 重启续传对拍（Task 10 场景 3 后半，<b>值面裁定后重塑</b>）：wal 路<b>两段会话</b>
+     * ——段一（带检查点 stateDir）捕 INSERT 宽值事务，close 落最终检查点；段二同
+     * stateDir 续传（{@code resumedFromState} 钉前提），UPDATE 只改 id 不动宽列——
+     * 新元组的 external 指针指向<b>窗口之前</b>写入的 chunk（段二 ToastAssembler 全新、
+     * 归集面恒空）。engine 路全程单会话捕两个事务，按 xid 交集对拍 diff 空。
+     *
+     * <p><b>与任务书要点的偏差记档（源码钉）</b>：任务书预期"回查路径命中（值经
+     * JdbcToastProbe 重建）"，实测首跑红揭示 engine 对该形态的 UPDATE <b>后像</b>恒发
+     * pgoutput 'u'（proto.c——external-on-disk 列不发值；reorder buffer 的 toast hash
+     * 只覆盖本事务新写值且逐变更重置）——engine 的 wire 上<b>根本没有值</b>，wal 侧
+     * 若回查重组反而制造 engine 没有的输出、破坏逐字节对拍。故本场景断言重塑为：
+     * ①UPDATE 后像双路同渲染 {@code w=<toast-unchanged>}；②<b>前像</b>（FULL 身份
+     * 旧元组，服务端 toast_flatten_tuple 写入时已拍扁内联）双路同渲染完整值——Java
+     * 侧独立复算 md5 链的 64 截断形态逐字面断言；③{@code JdbcToastProbe} 的对拍角色
+     * 收窄为"补全窗口内新写值的 FPI 缺口"（离线 {@code ToastAssemblerTest} 锚定），
+     * 窗口前指针不回查。另wal 段二的页对齐重叠窗口会重发已检查点的 INSERT 事务
+     * （at-least-once，与 engine 重启重发同语义）——{@code parse} 的重复块全等容忍
+     * 面吸收，重发块参与对拍断言（幂等重发逐字节全等）。</p>
+     */
+    @Test
+    void restartUpdateUnchangedWideColumnRendersUnchangedToastParity() throws Exception {
+        ParityEnv.resetScenario(TOAST_TABLE_DDL);
+        EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig());
+        ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
+        Properties walCfg = ParityEnv.walSourceConfig();
+        walCfg.setProperty(WalSource.KEY_STATE_DIR, toastStateDir.toString());
+        WalSource wal1 = new WalSource(walCfg, new OutputRenderer());
+        WalSource wal2 = new WalSource(walCfg, new OutputRenderer());
+        Throwable primary = null;
+        boolean resumed = false;
+        List<String> engineLines = List.of();
+        List<String> walLines = List.of();
+        try {
+            engine.start();
+            try (wal1) {
+                wal1.start();
+                try (Connection conn = ParityEnv.newSqlConnection()) {
+                    exec(conn, "INSERT INTO parity.t_parity_toast VALUES (1,"
+                            + " (SELECT string_agg(md5(i::text),'') FROM generate_series(1,220) i))");
+                }
+                await(() -> engine.emittedTxns() >= 1,
+                        "TOAST 重启续传: 段一 engine 路未输出 INSERT 事务（emitted="
+                                + engine.emittedTxns() + ", consumerFailed=" + engine.failed() + "）");
+                await(() -> wal1.dmlEmittedBuckets() >= 1,
+                        "TOAST 重启续传: 段一 wal 路未发射 INSERT 桶（buckets="
+                                + wal1.dmlEmittedBuckets() + ", terminal=" + wal1.receiverTerminalFailure() + "）");
+            }   // close = 最终 best-effort 检查点 + 槽推进（段二续传的起点）
+            try (wal2) {
+                wal2.start();
+                resumed = wal2.resumedFromState();
+                try (Connection conn = ParityEnv.newSqlConnection()) {
+                    exec(conn, "UPDATE parity.t_parity_toast SET id = 101 WHERE id = 1");
+                }
+                await(() -> engine.emittedTxns() >= 2,
+                        "TOAST 重启续传: 段二 engine 路未输出 UPDATE 事务（emitted="
+                                + engine.emittedTxns() + ", consumerFailed=" + engine.failed() + "）");
+                await(() -> wal2.dmlEmittedBuckets() >= 1,
+                        "TOAST 重启续传: 段二 wal 路未发射 UPDATE 桶（buckets="
+                                + wal2.dmlEmittedBuckets() + ", terminal=" + wal2.receiverTerminalFailure() + "）");
+            }
+        } catch (Throwable t) {
+            primary = t;   // 不在 finally 内断言——finally 的断言失败会吞掉真正的根因
+        } finally {
+            walLines = walCapture.closeAndDrain();
+            engineLines = engine.stopAndDrain();
+        }
+        assertTrue(resumed, "段二应自检查点续传（段一 close 落盘有效检查点）——否则重启前提不成立");
+        if (primary != null) {
+            wal1.receiverTerminalFailure().ifPresent(t -> LOG_WAL_TERMINAL.error(
+                    "wal 段一接收器终态失败堆栈（TOAST 重启续传）", t));
+            wal2.receiverTerminalFailure().ifPresent(t -> LOG_WAL_TERMINAL.error(
+                    "wal 段二接收器终态失败堆栈（TOAST 重启续传）", t));
+            fail("TOAST 重启续传: 对拍前置失败——" + primary + "\nengine 捕获=" + engineLines
+                    + "\nwal 捕获=" + walLines, primary);
+        }
+        assertParity(engineLines, walLines, "TOAST 重启续传", 0);
+
+        // 值面断言：UPDATE 后像 unchanged（engine 'u' 同形）、前像完整值（Java 独立复算）
+        String wide = md5Chain(220);
+        String truncated = wide.substring(0, 64) + "...(" + wide.length() + "B)";
+        List<String> updateRows = walLines.stream()
+                .filter(l -> l.contains("UPDATE parity.t_parity_toast")).toList();
+        assertEquals(1, updateRows.size(), "应恰一行 UPDATE（宽列未变）:\n" + String.join("\n", walLines));
+        String update = updateRows.get(0);
+        assertTrue(update.contains("AFTER=[id=101, w=<toast-unchanged>]"),
+                "UPDATE 后像的未变 external 列应渲染 unchanged 占位（engine 'u' 同形）:\n" + update);
+        assertEquals(1, countLiteral(update, truncated),
+                "UPDATE 前像应恰一处渲染完整宽值截断形态 " + truncated + "（FULL 身份旧元组写入时已拍扁内联）:\n"
+                        + update);
+        assertFalse(String.join("\n", walLines).contains("toast-unavailable"),
+                "重启续传场景不应出现 toast-unavailable 降级字面:\n" + String.join("\n", walLines));
+    }
+
     // ---- 对拍骨架 ----
 
     /**
@@ -370,6 +550,43 @@ class DualPathParityIT {
      */
     private long runParity(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
             SqlConsumer<Connection> dml) throws Exception {
+        return runParityCore(scenario, expectedTxns, walAborted, tableDdl, dml).skippedTruncatedRows();
+    }
+
+    /**
+     * 单场景对拍骨架（无 aborted 形态）+ wal 捕获行透出档（Task 10 场景 3）：归一化
+     * 对拍之外，场景还需对 wal 路输出行做值面补充断言（TOAST 三形态的截断尾注/降级
+     * 字面出现性），本档把捕获行交回调用方。
+     *
+     * @param scenario     场景名（断言消息上下文）
+     * @param expectedTxns 场景内已提交事务数——两路各自的追平目标
+     * @param tableDdl     本场景建表语句（parity schema 内）
+     * @param dml          DML 执行器
+     * @return wal 路 CDC 捕获行（停流后快照——值面补充断言的原料）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private List<String> runParityWal(String scenario, long expectedTxns, String[] tableDdl,
+            SqlConsumer<Connection> dml) throws Exception {
+        return runParityCore(scenario, expectedTxns, 0L, tableDdl, dml).walLines();
+    }
+
+    /**
+     * 单场景对拍核心（Task 10 抽取）：重置环境 → 两路起流 → 执行 DML → 各自等待追平
+     * → 停流取捕获行 → 归一化对拍，返回截断哨兵与 wal 捕获行的快照。
+     *
+     * <p>关键步骤与边界语义同 {@link #runParity(String, long, long, SqlConsumer)} 的
+     * 骨架描述（本方法是该骨架的唯一实现体——两个委派档分别取哨兵计数/捕获行）。</p>
+     *
+     * @param scenario      场景名（断言消息上下文）
+     * @param expectedTxns  场景内已提交事务数——两路各自的追平目标
+     * @param walAborted    场景内被回滚的子事务行数（wal 记账与实付的期望差）
+     * @param tableDdl      本场景建表语句
+     * @param dml           DML 执行器
+     * @return 对拍结局快照（截断跳过哨兵 + wal 捕获行）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    private ParityOutcome runParityCore(String scenario, long expectedTxns, long walAborted, String[] tableDdl,
+            SqlConsumer<Connection> dml) throws Exception {
         ParityEnv.resetScenario(tableDdl);
         EnginePathRunner engine = new EnginePathRunner(ParityEnv.engineConfig());
         ParityEnv.CdcCapture walCapture = ParityEnv.capture("org.vastdata.vbstream.walsource.cdc");
@@ -403,7 +620,7 @@ class DualPathParityIT {
                     + "\nwal 捕获=" + walLines, primary);
         }
         assertParity(engineLines, walLines, scenario, walAborted);
-        return wal.dmlSkippedTruncatedRows();
+        return new ParityOutcome(wal.dmlSkippedTruncatedRows(), walLines);
     }
 
     /**
@@ -464,6 +681,11 @@ class DualPathParityIT {
      * 捕获行流 → xid 有序事务块：TXN-BEGIN 开块（正则解头字段），{@code "  [n] "} 行文本
      * 逐条入块，TXN-END 闭块（尾行格式两路恒同——xid 相同即相等，不需单独保存）。
      *
+     * <p><b>重复块容忍（Task 10）</b>：同 xid 的重复 TXN-BEGIN 允许——wal 路重启续传的
+     * 页对齐重叠窗口会把已检查点的事务重发给 DML 面（at-least-once，engine 的
+     * "重启重发不去重"文档承诺同语义）；闭块时若 xid 已有块，逐字段+行序全等则丢弃
+     * 重复块、不等即 fail（重发不是幂等即语义破坏信号）。</p>
+     *
      * <p>边界与异常语义：块未闭合/头行字段缺失抛 AssertionError（格式漂移即对拍基建失效，
      * 优于静默漏比对）。</p>
      *
@@ -473,19 +695,34 @@ class DualPathParityIT {
     private static Map<Long, TxBlock> parse(List<String> lines) {
         Map<Long, TxBlock> out = new LinkedHashMap<>();
         TxBlock cur = null;
+        TxBlock dupOf = null;   // 非 null = 当前块是既有 xid 的重发块，闭块时按全等校验后丢弃
         for (String line : lines) {
             if (line.startsWith("TXN-BEGIN ")) {
                 Matcher m = HEADER.matcher(line);
                 assertTrue(m.matches(), "TXN-BEGIN 头行格式漂移: " + line);
                 cur = new TxBlock(Long.parseLong(m.group(1)), m.group(2), m.group(3),
                         m.group(4), m.group(5), Long.parseLong(m.group(6)));
-                assertTrue(out.putIfAbsent(cur.xid, cur) == null, "同 xid 重复 TXN-BEGIN: " + line);
+                dupOf = out.get(cur.xid);
+                if (dupOf == null) {
+                    out.put(cur.xid, cur);
+                }
             } else if (line.startsWith("  [")) {
                 assertNotNull(cur, "行文本先于 TXN-BEGIN: " + line);
                 cur.rows.add(line);
             } else if (line.startsWith("TXN-END")) {
                 assertNotNull(cur, "TXN-END 先于 TXN-BEGIN: " + line);
                 cur.endLine = line;
+                if (dupOf != null) {
+                    final TxBlock dup = cur;   // lambda 消息捕获用的 final 快照
+                    assertEquals(dupOf.kind, dup.kind, () -> "重发块 kind 不等: xid=" + dup.xid);
+                    assertEquals(dupOf.gid, dup.gid, () -> "重发块 gid 不等: xid=" + dup.xid);
+                    assertEquals(dupOf.commitLsnHex, dup.commitLsnHex, () -> "重发块 commitLsn 不等: xid=" + dup.xid);
+                    assertEquals(dupOf.commitTs, dup.commitTs, () -> "重发块 commitTs 不等: xid=" + dup.xid);
+                    assertEquals(dupOf.changes, dup.changes, () -> "重发块 changes 不等: xid=" + dup.xid);
+                    assertEquals(dupOf.rows, dup.rows, () -> "重发块行序列不等: xid=" + dup.xid);
+                    assertEquals(dupOf.endLine, dup.endLine, () -> "重发块尾行不等: xid=" + dup.xid);
+                    dupOf = null;
+                }
                 cur = null;
             } else {
                 fail("未知 CDC 行格式（TXN-BEGIN / \"  [n] \" / TXN-END 三前缀均不匹配）: " + line);
@@ -534,6 +771,69 @@ class DualPathParityIT {
 
         /** 执行场景 DML。 @param t 连接 @throws Exception 底层异常 */
         void accept(T t) throws Exception;
+    }
+
+    /**
+     * 字面计数（{@code String.split} 以正则解释分隔串，{@code .()} 是元字符会假匹配
+     * ——indexOf 循环做纯字面语义）。
+     *
+     * @param s       目标串（null 安全按空串）
+     * @param literal 字面子串
+     * @return 出现次数（不重叠——每次命中后游标跳过整个字面）
+     */
+    private static int countLiteral(String s, String literal) {
+        int count = 0;
+        int idx = 0;
+        while ((idx = s.indexOf(literal, idx)) >= 0) {
+            count++;
+            idx += literal.length();
+        }
+        return count;
+    }
+
+    /**
+     * 复算场景值的确定性 md5 链（与 SQL {@code string_agg(md5(i::text),'')} 逐字面一致
+     * ——int4 的 text 形态即十进制串，md5 输出恒 32 位小写 hex）。
+     *
+     * @param count 链节数（220 → 7040 字符）
+     * @return 拼接后的宽值原文
+     */
+    private static String md5Chain(int count) {
+        StringBuilder out = new StringBuilder(32 * count);
+        for (int i = 1; i <= count; i++) {
+            out.append(md5Hex(Integer.toString(i)));
+        }
+        return out.toString();
+    }
+
+    /**
+     * 单值 md5 小写 hex（PG {@code md5()} 同形——32 位零补齐小写）。
+     *
+     * @param s 输入串
+     * @return 32 位 hex
+     */
+    private static String md5Hex(String s) {
+        MessageDigest md;
+        try {
+            md = MessageDigest.getInstance("MD5");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("JVM 缺 MD5 算法（规范保证提供）", e);
+        }
+        StringBuilder out = new StringBuilder(32);
+        for (byte b : md.digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+            out.append(String.format("%02x", b));
+        }
+        return out.toString();
+    }
+
+    /**
+     * 对拍结局快照（Task 10 抽取）：截断跳过哨兵（既有场景断言用）+ wal 捕获行
+     * （TOAST 场景的值面补充断言原料——engine 行经 diff 空已传递等价，不单独透出）。
+     *
+     * @param skippedTruncatedRows wal 路会话累计的截断 UPDATE 跳过计数
+     * @param walLines             wal 路 CDC 捕获行（停流后快照）
+     */
+    private record ParityOutcome(long skippedTruncatedRows, List<String> walLines) {
     }
 
     /**

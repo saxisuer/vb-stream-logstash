@@ -41,24 +41,68 @@ import java.util.TreeMap;
  * {@code 00960000}（LE 38400）、lz4 样本 {@code 00960040}（0x40009600）；两形态拼接
  * 总长均 == extsize。</p>
  *
- * <p><b>完整性判定与回查兜底</b>：chunk 按 valueid 归集 {@code TreeMap<seq,byte[]>}，
- * 完整当且仅当拼接总长 == extsize（缺任何一块必然短）；缺 → {@link ToastProbe}
- * 回查（窗口前指针：重启续传后 UPDATE 未变 TOAST 列指向窗口之前的 chunk）→ 仍缺
- * 或 probe 抛异常 → 返回 {@code toast-unavailable} + WARN（含 valueid/toastrelid
- * 上下文），<b>不 fail 整条流</b>（v2 设计 §5）。lz4 双防线：字典面
- * {@link #lz4Guard} 启动期 WARN 一次；运行期撞方法位 1 的 external → ISE fail-fast
- * （本实现无 lz4 解压面，静默降级会产出错值）。</p>
+ * <p><b>完整性判定、unchanged 对齐与回查兜底（Task 10 值面裁定，REL_18 源码钉）</b>：
+ * chunk 按 valueid 归集 {@code TreeMap<seq,byte[]>}，完整当且仅当拼接总长 == extsize。
+ * 三分支：</p>
+ * <ul>
+ *   <li><b>归集面空 → 返回 {@link #UNCHANGED_TOAST_MARKER}</b>（值不在窗口，不回查）
+ *   ——对齐 engine 的 pgoutput wire 契约：'u'（LOGICALREP_COLUMN_UNCHANGED，proto.c
+ *   L812-819——"Unchanged toasted datum ... a cheap check to avoid sending large
+ *   values unnecessarily"，VARATT_IS_EXTERNAL_ONDISK 的列不发值）。服务端只有
+ *   reorder buffer 的本事务 toast hash 命中才内联替换（reorderbuffer.c
+ *   ReorderBufferToastReplace 按 valueid 查 {@code txn->toast_hash}），而
+ *   <b>每条已施加的用户表变更后 hash 即重置</b>（decode.c 对 INSERT/UPDATE/DELETE/
+ *   MULTI_INSERT 末行置 {@code clear_toast_afterwards=true} →
+ *   ReorderBufferToastReset）——故"未变列指针"（同事务早先行消费过、或跨事务/重启
+ *   窗口前）在 engine 侧恒为 'u'，wal 侧归集面空（{@code XactGrouper} 同式逐行清窗）
+ *   恰同形，回查反而会产出 engine 没有的值、破坏双路对拍；</li>
+ *   <li><b>归集面非空但不完整 → {@link ToastProbe} 回查合并</b>——probe 的对拍角色
+ *   收窄为"补全窗口内的新写值缺口"（如 FPI 镜像形态的 chunk 记录采集面跳过后留下的
+ *   部分归集——服务端解码面不受 FPI 形态影响、会发值，wal 侧须回查补齐）；</li>
+ *   <li><b>回查后仍缺或 probe 抛异常 → {@code toast-unavailable} + WARN</b>（含
+ *   valueid/toastrelid 上下文），<b>不 fail 整条流</b>（v2 设计 §5）。</li>
+ * </ul>
+ * <p>另注（旧元组免重组依据）：REPLICA IDENTITY FULL 的旧元组在 WAL 写入时已被
+ * 服务端 {@code toast_flatten_tuple} 拍扁内联（heapam.c ExtractReplicaIdentity——
+ * "When logging the entire old tuple, it very well could contain toasted columns.
+ * If so, force them to be inlined"），外部指针不会出现在前像；压缩 external 拍扁后
+ * 是行内压缩 varlena，走 {@link #decompressInlineCompressed} 同一面。lz4 双防线：
+ * 字典面 {@link #lz4Guard} 启动期 WARN 一次；运行期撞方法位 1 的 external → ISE
+ * fail-fast（本实现无 lz4 解压面，静默降级会产出错值）。</p>
  *
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程：onChunkRow 与 resolveExternal 同线程
- * 调用）——内部 HashMap/HashSet 非线程安全，与 v1 replay 组件同假设；已知限制：
- * 归集的 chunk 无淘汰面（aborted/删除值的 chunk 会滞留），生命周期管理落在
- * Task 5 的 XactGrouper 接线。{@link #resolveExternal} 返回 <b>byte[]</b>（Task 8
+ * 调用）——内部 HashMap/HashSet 非线程安全，与 v1 replay 组件同假设。{@link #clear()}
+ * 两处调用面：事务终态淘汰（aborted/已消费 chunk 防滞留）+ <b>逐行清窗</b>
+ * （{@code XactGrouper} 在每条用户表行施加后调用——镜像服务端 clear_toast_afterwards
+ * 的 hash 重置，见上）。{@link #resolveExternal} 返回 <b>byte[]</b>（Task 8
  * 保真裁定）——文本族由 {@code TupleDecoder} 解码 UTF-8、numeric/bytea 等非文本面
  * 字节直达渲染矩阵，不经 String 有损往返。</p>
  */
 public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
 
     private static final Logger LOG = LoggerFactory.getLogger(ToastAssembler.class);
+
+    /**
+     * unchanged-TOAST 的渲染字面（engine {@code ConsoleRenderer} 的
+     * {@code TupleValue.UnchangedToast} 分支同形——pgoutput 'u' 列的输出契约）。
+     */
+    public static final String UNCHANGED_TOAST_TEXT = "<toast-unchanged>";
+
+    /**
+     * <b>unchanged-TOAST 哨兵</b>（Task 10 值面裁定）——resolveExternal 在归集面空
+     * （值不在当前窗口：未变列指针/跨事务/重启窗口前）时的返回，字节内容即
+     * {@link #UNCHANGED_TOAST_TEXT} 的 UTF-8 形态（对齐 engine ConsoleRenderer 对
+     * pgoutput 'u' 列的渲染字面）。
+     *
+     * <p><b>双路径交付设计</b>：text 族列经 {@code TupleDecoder.readTextDatum} 的
+     * {@code new String(字节)} 交付——哨兵字节自然解码为渲染字面（与真值恰为该字面
+     * 的输出形态天然全等，无歧义成本）；bytea/numeric 族列经字节直达——渲染层
+     * （{@code XactGrouper.renderRow}）以<b>身份比较</b>（{@code ==}）识别本实例后
+     * 改渲染字面（否则会被 bytea 的 hex 矩阵消费成错值）。真实值经 pglz/chunk 拼装
+     * 产出，与共享哨兵实例无身份碰撞。</p>
+     */
+    public static final byte[] UNCHANGED_TOAST_MARKER =
+            UNCHANGED_TOAST_TEXT.getBytes(StandardCharsets.UTF_8);
 
     /** 短外部 varlena 首 byte（VARATT_IS_1B_E：恰 0x01）。 */
     private static final int TAG_1B_EXTERNAL = 0x01;
@@ -145,19 +189,23 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * <p>关键步骤：①指针头校验（0x01/0x12 + 越界，形不符 ISE）→ 解 rawsize/extinfo/
      * valueid/toastrelid；②方法位判定——lz4 ISE fail-fast（无解压面，静默只会产出
      * 错值）；③chunk 归集（键 = toastrelid，未命中再按 valueid 全域兜底扫描——主表
-     * 重写后 relfilenode 与 oid 分叉的容错）；④拼接总长 != extsize → probe 回查合并
-     * 后复检；⑤未压缩（extsize == rawsize-4）拼接即载荷；压缩（&lt;）校验 chunk0 前
-     * 4B tcinfo 与指针一致（(rawsize-4)|方法&lt;&lt;30，不符 ISE）后剥 4B 走
-     * {@link Pglz#decompress} 解至 rawsize-4 字节。</p>
+     * 重写后 relfilenode 与 oid 分叉的容错）；④<b>归集面空 → 返回
+     * {@link #UNCHANGED_TOAST_MARKER}</b>（Task 10 值面裁定：值不在窗口——未变列指针
+     * /跨事务/重启窗口前，engine 同形发 'u'，不回查；依据与三分支语义见类 javadoc）；
+     * ⑤非空但拼接总长 != extsize → probe 回查合并后复检，仍缺 → 降级
+     * {@code toast-unavailable}；⑥未压缩（extsize == rawsize-4）拼接即载荷；压缩
+     * （&lt;）校验 chunk0 前 4B tcinfo 与指针一致（(rawsize-4)|方法&lt;&lt;30，不符
+     * ISE）后剥 4B 走 {@link Pglz#decompress} 解至 rawsize-4 字节。</p>
      *
-     * <p>边界与异常语义：src 过短/tag 不符/tcinfo 不符/pglz 数据损坏抛 ISE；chunk
-     * 缺失且回查（probe 为 null、查无、抛异常）仍不齐 → WARN（valueid/toastrelid
-     * 上下文）并返回降级字面 {@code toast-unavailable} 的 UTF-8 字节（不 fail 流）；
-     * extsize==0 返回空数组。线程约束：单写者（与 {@link #onChunkRow} 同线程调用）。</p>
+     * <p>边界与异常语义：src 过短/tag 不符/tcinfo 不符/pglz 数据损坏抛 ISE；归集面
+     * 非空且回查（probe 为 null、查无、抛异常）仍不齐 → WARN（valueid/toastrelid
+     * 上下文）并返回降级字面 {@code toast-unavailable} 的 UTF-8 字节（不 fail 流）。
+     * 线程约束：单写者（与 {@link #onChunkRow} 同线程调用）。</p>
      *
      * @param src 完整源缓冲（记录/页字节，契约只读）
      * @param off 指针起点（已对齐）
-     * @return 拼装解压后的原值字节；缺 chunk 不可得时降级字节的 UTF-8 字节
+     * @return 拼装解压后的原值字节；归集面空时 {@link #UNCHANGED_TOAST_MARKER}；
+     *         窗口内缺口回查不可得时降级字节的 UTF-8 字节
      * @throws IllegalArgumentException src 为 null 或 off 越界
      * @throws IllegalStateException    指针形态/lz4 方法/tcinfo/pglz 数据不符
      */
@@ -187,6 +235,12 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
                             + ", toastrelid=" + toastrelid);
         }
         TreeMap<Integer, byte[]> collected = collectChunks(toastrelid, valueid);
+        if (collected.isEmpty()) {
+            // Task 10 值面裁定：归集面空 = 值不在当前窗口（未变列指针/跨事务/重启窗口前）
+            // ——engine 的 pgoutput 同形发 'u'（proto.c LOGICALREP_COLUMN_UNCHANGED），
+            // 回查反而会产出 engine 没有的值、破坏双路对拍；渲染层按 UNCHANGED_TOAST_TEXT 输出
+            return UNCHANGED_TOAST_MARKER;
+        }
         RuntimeException probeFailure = null;
         if (totalSize(collected) != extsize && probe != null) {
             probeFailure = mergeFetched(toastrelid, valueid, collected);
@@ -274,17 +328,23 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
     }
 
     /**
-     * 全清 chunk 归集面——事务终态（COMMIT/ABORT/PREPARE/两阶段确认）后由
-     * {@code XactGrouper} 调用的淘汰面（2026-10 控制器裁定：全清是最简可靠形态）。
+     * 全清 chunk 归集面——两个调用面共用（2026-10 控制器裁定：全清是最简可靠形态）：
+     * ①<b>逐行清窗</b>（Task 10）：{@code XactGrouper} 在每条用户表行施加后调用——
+     * 镜像服务端 reorder buffer 的 toast hash 重置（decode.c 对 INSERT/UPDATE/DELETE/
+     * MULTI_INSERT 末行置 {@code clear_toast_afterwards=true} → ReorderBufferToastReset），
+     * 使"未变列指针"（本事务早先行消费过/跨事务）在 resolveExternal 归集面空 →
+     * {@link #UNCHANGED_TOAST_MARKER}，与 engine 的 pgoutput 'u' 同形；②<b>事务终态
+     * 淘汰</b>（COMMIT/ABORT/PREPARE/两阶段确认后）：防 aborted/已消费 chunk 无限滞留。
      *
      * <p>全清安全性依据：<b>valueid 全局唯一</b>——valueid 是 TOAST 写路径经 oid 计数器
      * 分配的新 oid（tuptoaster.c toast_save_datum 的 GetNewOid），跨事务不复用（计数器
      * 单调，wraparound 需 4G 个值后才发生且 PG 侧同面对待），故清空不会使后续到达的
-     * chunk 与残留归集语义错位；反之不清理会让 aborted/已解码事务的 chunk 无限滞留
-     * （内存泄漏面）。调用时机语义：终态即清 <b>早于</b> 行引用解码的场景只剩"进行中
-     * 事务的行引用了本次被清掉的早期 chunk"（交错事务的终态夹在 chunk 写入与引用行
-     * 到达之间）——该形态落入 {@link #resolveExternal} 的回查兜底路径（JDBC 末态），
-     * 回查不可得时降级 {@code toast-unavailable}，不 fail 流。线程约束：单写者
+     * chunk 与残留归集语义错位。调用时机语义：清窗 <b>早于</b> 行引用解码的场景
+     * （未变列指针/交错事务的终态夹在 chunk 写入与引用行到达之间）按归集面空走
+     * {@link #UNCHANGED_TOAST_MARKER}（engine 同形）；已知限制：与服务端按事务分 hash
+     * 的重置不同，本清窗是全局的——交错事务 B 的行夹在 A 的 chunk 写入与 A 的引用行
+     * 之间时 A 的窗口被清（服务端 A 的 hash 不受 B 影响），A 行多见一个 'u' 占位，
+     * 属对拍面已知分叉（v3 记档：per-txn 窗口）。线程约束：单写者
      * （与 {@link #onChunkRow} 同线程）。</p>
      */
     public void clear() {

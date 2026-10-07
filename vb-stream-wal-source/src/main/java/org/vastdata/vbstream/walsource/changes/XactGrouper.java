@@ -71,13 +71,17 @@ import java.util.Set;
  * 理论残留与 v1 块匹配同口径。缺省身份映射（relfilenode==oid）下三表可直认。</p>
  *
  * <p><b>TOAST 接线</b>：toast 关系（relkind 't'）上的 INSERT/MULTI_INSERT 解码为
- * 三列 chunk 行喂 {@link ToastAssembler#onChunkRow}；每个事务终态记录（COMMIT/ABORT/
- * PREPARE/两阶段确认）后调 {@link ToastAssembler#clear()}（控制器裁定全清——valueid
- * 全局唯一依据与交错风险面见其 javadoc）。<b>行内 external 接线（Task 7 硬前置②）
- * </b>：本类构造的 {@link TupleDecoder} 注入 {@code toast::resolveExternal}——用户表
- * 元组内首字节 0x01 的 external 短指针经已归集 chunk 拼装/解压/回查兜底重建原值
- * （缺值降级 {@code toast-unavailable} 不 fail 流）；toast=null（采集禁用）时保持
- * v1 拒绝面。行内 compressed varlena（tag 0x02）仍 ISE——非 TOAST 重组面。</p>
+ * 三列 chunk 行喂 {@link ToastAssembler#onChunkRow}；<b>每条用户表行施加后清窗 +
+ * 每个事务终态记录后全清</b>（COMMIT/ABORT/PREPARE/两阶段确认）——{@link #resetToastWindow}
+ * 镜像服务端 {@code clear_toast_afterwards} 的逐变更 hash 重置（Task 10 值面裁定：
+ * 未变列指针 engine 恒发 pgoutput 'u'，wal 侧归集面空 →
+ * {@link ToastAssembler#UNCHANGED_TOAST_MARKER} → 渲染 {@code <toast-unchanged>} 同形；
+ * 依据全文与 REL_18 源码钉见 ToastAssembler 类 javadoc）。<b>行内 external 接线
+ * （Task 7 硬前置②）</b>：本类构造的 {@link TupleDecoder} 注入
+ * {@code toast::resolveExternal}——用户表元组内首字节 0x01 的 external 短指针经
+ * 已归集 chunk 拼装/解压/回查兜底重建原值（缺值降级 {@code toast-unavailable}
+ * 不 fail 流）；toast=null（采集禁用）时保持 v1 拒绝面。行内 compressed varlena
+ * （tag 0x02）仍 ISE——非 TOAST 重组面。</p>
  *
  * <p><b>类型词典</b>：列 kind 由 typeOid 经 {@link DecodeKinds#forTypeOid} 单源派生
  * ——Task 7 硬前置①扩容后与渲染矩阵 oid 集合对齐（含 date/time/timetz/
@@ -462,6 +466,7 @@ public final class XactGrouper {
                             updFlags, oldOff, rec.mainLen() - layout.sizeOfHeapUpdate() - 5, res.kinds());
                     noteReconstructedTruncatedUpdate(res);
                     appendRow(top, origin, res, ChangeOutputListener.DmlKind.UPDATE, before, after);
+                    resetToastWindow();
                     return;
                 }
                 Object[] before = (updFlags & HeapOps.XLH_UPDATE_CONTAINS_OLD) != 0
@@ -479,6 +484,7 @@ public final class XactGrouper {
             }
             default -> { /* 未预期 opcode 静默忽略 */ }
         }
+        resetToastWindow();
     }
 
     /**
@@ -528,13 +534,18 @@ public final class XactGrouper {
                         null, decoder.decodePageTuple(page, lp, res.kinds()));
             }
         }
+        resetToastWindow();   // MULTI_INSERT 末行镜像（clear_toast_afterwards 只在 LAST_IN_MULTI 置位）
     }
 
     /**
      * toast 关系上的行记录采集为 chunk（INSERT 单行 / MULTI_INSERT 逐 entry，三列
      * 词典 oid/int4/bytea）——chunk_data 是 plain varlena（chunk ≤1996B 恒行内），
-     * external/compressed 拒绝面不触发。非 toast 关系、非行承载 opcode 或无块 data
-     * （INIT_PAGE 镜像形态）静默跳过——缺 chunk 落回查兜底。
+     * external/compressed 拒绝面不触发。块无 data 的 FPI 镜像形态<b>自镜像页重建采集</b>
+     * （Task 10 补面：CHECKPOINT 后页首改走整页镜像、块零 data，跳过会留窗口内缺口
+     * ——而进行中事务的 chunk 未提交、JDBC 回查不可见，缺口在行到达期不可补，对拍
+     * IT 实测即红；重建路径与 dispatchHeap2 的 FPI 分支同构：PageImages.rebuild +
+     * 行指针 + decodePageTuple）。非 toast 关系、非行承载 opcode 或既无 data 又无
+     * 镜像的畸形形态静默跳过——缺 chunk 落回查/unchanged 兜底。
      *
      * @param rec     heap/heap2 记录
      * @param blk     首块（relfilenode 归集键）
@@ -549,8 +560,11 @@ public final class XactGrouper {
             return;   // chunk 删除（DELETE/PRUNE）不采集——归集面由终态全清承担
         }
         if (!blk.hasData()) {
-            return;   // INIT_PAGE+镜像无 data 形态：chunk 载荷在镜像内，采集面跳过
-            //（对齐 dispatchHeap2 的 hasData 判定；缺 chunk 落 resolveExternal 回查兜底）
+            if (!blk.hasImage()) {
+                return;   // 既无 data 又无镜像的畸形形态：不可解码，缺 chunk 落兜底
+            }
+            collectToastChunksFromPageImage(rec, blk, relNode, op);
+            return;
         }
         if (op == HeapOps.XLOG_HEAP_INSERT) {
             Object[] row = decoder.decodePayload(rec.raw(), blk.dataOff(), TOAST_CHUNK_KINDS);
@@ -570,6 +584,34 @@ public final class XactGrouper {
             }
             toast.onChunkRow(relNode, decoder.decodeEntry(raw, off, TOAST_CHUNK_KINDS));
             off += 2 + datalen;
+        }
+    }
+
+    /**
+     * FPI 镜像形态的 chunk 采集（Task 10 补面）：重建页 → 按记录声明的行号取行指针 →
+     * 页内完整 tuple 解码为三列 chunk 行——INSERT 单行与 MULTI_INSERT 逐行同面
+     * （与 {@link #dispatchHeap2} 的 FPI 分支同构）。
+     *
+     * <p>边界与异常语义：镜像重建由 {@link PageImages#rebuild} 承担（洞区拼接），
+     * 行指针越界裸抛（走读不变量已保证）。线程约束：单写者（与采集同缝）。</p>
+     *
+     * @param rec     heap/heap2 记录（块带镜像无 data）
+     * @param blk     首块
+     * @param relNode relfilenode（归集键）
+     * @param op      INSERT 或 MULTI_INSERT opcode
+     */
+    private void collectToastChunksFromPageImage(WalRecord rec, BlockRef blk, long relNode, int op) {
+        byte[] page = PageImages.rebuild(rec, blk);
+        if (op == HeapOps.XLOG_HEAP_INSERT) {
+            HeapViews.HeapInsertView v = HeapViews.HeapInsertView.parse(rec, layout);
+            int lp = PageImages.linePointerOffset(page, v.offnum());
+            toast.onChunkRow(relNode, decoder.decodePageTuple(page, lp, TOAST_CHUNK_KINDS));
+            return;
+        }
+        HeapViews.MultiInsertView v = HeapViews.MultiInsertView.parse(rec, layout);
+        for (int i = 0; i < v.ntuples(); i++) {
+            int lp = PageImages.linePointerOffset(page, v.offsetAt(i));
+            toast.onChunkRow(relNode, decoder.decodePageTuple(page, lp, TOAST_CHUNK_KINDS));
         }
     }
 
@@ -764,7 +806,10 @@ public final class XactGrouper {
 
     /**
      * 值数组 → 列名→渲染值 map（列序保持 attnum 序——LinkedHashMap）：dropped 列恒
-     * null（占位语义），其余经静态 {@link DiskValueRenderer#render} 取 PG text 形态。
+     * null（占位语义）、unchanged-TOAST 哨兵（{@code ==} 身份比较）渲染
+     * {@link ToastAssembler#UNCHANGED_TOAST_TEXT}（Task 10 值面裁定：对齐 engine 对
+     * pgoutput 'u' 列的输出字面），其余经静态 {@link DiskValueRenderer#render} 取
+     * PG text 形态。
      *
      * <p>短数组尾列补 null 的<b>唯一合法来源</b>是 ADD COLUMN 前的存量元组（旧元组缺
      * 尾列，PG 语义读作 NULL——补 null 恰是正确值）；截断 UPDATE 新元组不经此面——
@@ -782,9 +827,30 @@ public final class XactGrouper {
         for (int i = 0; i < cols.size(); i++) {
             ColumnMeta col = cols.get(i);
             Object decoded = i < vals.length ? vals[i] : null;
-            m.put(col.name(), col.dropped() ? null : DiskValueRenderer.render(decoded, col.typeOid()));
+            Object rendered = decoded == ToastAssembler.UNCHANGED_TOAST_MARKER
+                    ? ToastAssembler.UNCHANGED_TOAST_TEXT
+                    : col.dropped() ? null : DiskValueRenderer.render(decoded, col.typeOid());
+            m.put(col.name(), rendered);
         }
         return m;
+    }
+
+    /**
+     * 逐行清空 TOAST chunk 归集窗（Task 10 值面裁定）——每条用户表行施加后调用，
+     * 镜像服务端 reorder buffer 的 toast hash 重置（decode.c 对 INSERT/UPDATE/DELETE/
+     * MULTI_INSERT 末行置 {@code clear_toast_afterwards=true} → ReorderBufferToastReset，
+     * REL_18 源码钉）：使"未变列指针"（本事务早前行消费过/跨事务）在后续行的
+     * resolveExternal 归集面空 → {@code <toast-unchanged>}（engine 的 pgoutput 'u'
+     * 同形），绝不让归集面滞留的早期 chunk 把 engine 不发的值"重组"出来。
+     *
+     * <p>调用点：dispatchHeap 单行三态（INSERT/UPDATE 双分支/DELETE）施加后 +
+     * dispatchHeap2 MULTI_INSERT 整记录末（末行语义）。toast 为 null（采集禁用）
+     * no-op。线程约束：单写者（与行施加同缝）。</p>
+     */
+    private void resetToastWindow() {
+        if (toast != null) {
+            toast.clear();
+        }
     }
 
     /**

@@ -29,10 +29,12 @@ import java.util.function.Consumer;
  * </ol>
  *
  * <p>导航骨架（发现 11）：页边界 → 页头校验（长/短页头按 XLP_LONG_HEADER 分档）→
- * 孤立续体跳过（MAXALIGN(页头+rem_len) 补齐）→ 记录头（totLen==0 或页尾余量不足
- * 记录头长 = 零垫，整页跳过）→ 记录缝合（跨页按"当前页剩余"取数——累计消耗与页内
- * 偏移严禁混用同一坐标系）→ emit。页尾零垫不预消费（无法区分"已到页尾"与"字节
- * 未到"），待下页字节到达后跳页。</p>
+ * 孤立续体跳过（MAXALIGN(页头+rem_len) 补齐）→ 记录头（页尾余量 &lt;{@value #MIN_RECORD_START}
+ * 或 totLen==0 = 零垫整页跳过；<b>余量 4..23B 且 totLen 非零 = 记录头自页尾跨页</b>
+ * ——xlog.c 对记录起点只保证 xl_tot_len 4 字节在本页，头余部经续体页头缝合，Task 10
+ * 修复：原"余量不足头长即跳页"形态会把此类记录整条静默丢弃）→ 记录缝合（跨页按
+ * "当前页剩余"取数——累计消耗与页内偏移严禁混用同一坐标系）→ emit。页尾零垫不
+ * 预消费（无法区分"已到页尾"与"字节未到"），待下页字节到达后跳页。</p>
  *
  * <p>线程约束：单写者——feed/consumedLsn 限定接收线程（Task 8 的 readPending 循环）
  * 调用；sink 回调在 feed 调用线程内同步执行。</p>
@@ -64,6 +66,12 @@ public final class WalStreamWalker {
 
     /** 再同步扫描的 pageaddr 容差（页为单位）：±2 页内视为可重锚的受控漂移。 */
     private static final int RESYNC_TOLERANCE_PAGES = 2;
+
+    /**
+     * 记录起点的最小页内余量（xlog.c CopyXLogRecordToWAL 的断言面：记录起点所在页
+     * 至少容纳 xl_tot_len 的 4 字节——头本体可跨页，Task 10 修复依据）。
+     */
+    private static final int MIN_RECORD_START = 4;
 
     /** expectedPageAddr 未初始化标记（0 是合法页地址，不能用零作哨兵）。 */
     private static final long PAGEADDR_UNSET = Long.MIN_VALUE;
@@ -265,9 +273,18 @@ public final class WalStreamWalker {
                 pos += hdrSize;
                 cur += hdrSize;
             }
-            // 页内：记录头位置（页尾余量不足记录头长 = 整页零垫，直接跳页）
+            // 页内：记录头位置——<b>头可跨页缝合</b>（Task 10 修复）：xlog.c
+            // CopyXLogRecordToWAL 对记录起点的唯一保证是"本页剩余至少容纳 xl_tot_len
+            // 的 4 字节"（Assert(freespace >= sizeof(uint32))）——头本体（24B）可自
+            // 页尾最后 4..23 字节起跨页，余部经续体页头后继续（实测形态：页尾恰 16B
+            // 起 1127B 记录，续体页 rem_len=1111）。原实现把"页尾不足 24B"一律当
+            // 整页零垫跳页，会把这类记录<b>整条静默丢弃</b>（对拍 IT 场景 3 实测即红
+            // ——TOAST chunk 记录丢失→值降级）。正确判别：不足 4B 必为页尾（XLogSwitch
+            // /段尾垫）；≥4B 读 totLen，零 = 垫、非零 = 记录头（余下字节由记录缝合
+            // 循环按页缝合——头跨页与体跨页同构）。
             int pageRemain = bs - (int) (cur & (bs - 1));
-            if (pageRemain < recHdr) {
+            if (pageRemain < MIN_RECORD_START) {
+                // 不足 4B：不可能是记录起点（PG 断言），必为页尾零垫
                 if (len - pos < pageRemain) {
                     break;
                 }
@@ -275,8 +292,8 @@ public final class WalStreamWalker {
                 cur += pageRemain;
                 continue;
             }
-            if (len - pos < recHdr) {
-                break;   // 记录头跨 chunk 分裂
+            if (len - pos < MIN_RECORD_START) {
+                break;   // totLen 4 字节未到齐（记录头跨 chunk 分裂）
             }
             int totLen = u32(buf, pos);
             if (totLen == 0) {
