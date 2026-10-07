@@ -68,6 +68,19 @@ import static org.junit.jupiter.api.Assertions.fail;
  * {@code REPLICA IDENTITY FULL}——UPDATE
  * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要
  * 本机 Docker。</p>
+ *
+ * <p><b>场景编号对照（Task 13 注记）</b>——spec §6 场景矩阵号 → 测试方法（交付任务
+ * 与 spec 号错位是并行拆任务所致）：场景 1 基础 DML = 前 6 个 @Test（单行/多语句/
+ * 交错/回滚/SAVEPOINT/截断中段列——末者 Task 8.5 记作"场景 6 追加"，方法归组 1）；
+ * 场景 2 类型矩阵 = {@code typeMatrixBoundaryRowsParityAcrossPaths}；场景 3 TOAST =
+ * {@code toastThreeStorageFormsWideValuesParityAcrossPaths} +
+ * {@code restartUpdateUnchangedWideColumnRendersUnchangedToastParity}；场景 4 DDL-in-txn
+ * = {@code inTxnAddColumnAsOfRenderingParity}；场景 5 2PC =
+ * {@code twoPhaseSuspendDiscardAndCommitPreparedParity} +
+ * {@code twoPhasePreparedPendingSurvivesRestartResumeParity}；场景 6 生命周期 =
+ * {@code midStreamStopResumePlainDmlParityAcrossPaths}；矩阵外补充 =
+ * {@code createSchemaNamespaceDictionaryParityInStream}（Task 4 延期清账）+ 干扰矩阵
+ * 2 个 @RepeatedTest(2)（Task 12）。</p>
  */
 class DualPathParityIT {
 

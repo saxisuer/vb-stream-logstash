@@ -86,7 +86,8 @@ import java.util.Set;
  * {@code toast::resolveExternal}——用户表元组内首字节 0x01 的 external 短指针经
  * 已归集 chunk 拼装/解压/回查兜底重建原值（缺值降级 {@code toast-unavailable}
  * 不 fail 流）；toast=null（采集禁用）时保持 v1 拒绝面。行内 compressed varlena
- * （tag 0x02）仍 ISE——非 TOAST 重组面。</p>
+ * （tag 0x02）同经 resolver 委派解压（{@code ToastAssembler.decompressInlineCompressed}
+ * ——同一 pglz 面，Task 9 场景 3 的行内压缩形态对拍即走此路）。</p>
  *
  * <p><b>类型词典</b>：列 kind 由 typeOid 经 {@link DecodeKinds#forTypeOid} 单源派生
  * ——Task 7 硬前置①扩容后与渲染矩阵 oid 集合对齐（含 date/time/timetz/

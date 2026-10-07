@@ -160,7 +160,8 @@ public final class TupleDecoder {
      * 位图（(natts+7)/8 字节）；游标自 tupleStart+t_hoff 起，逐列——位图 null 位为 0
      * 即 null 跳过，否则按 kind 分支：定宽类型先按类型对齐（对齐相对 tupleStart，
      * spike 发现 7——tuple 可坐在缓冲任意偏移）再取宽序小端值；varlena 类（text/
-     * bytea/skip）先 4 对齐再走双头读长；dropped 零消耗、值恒 null（发现 26）。
+     * bytea/skip）经 varlenaStart 落位（当前字节非零即 1B 头未对齐起点、为零按 4
+     * 对齐——Task 8 实测钉）再走双头读长；dropped 零消耗、值恒 null（发现 26）。
      * 边界与异常语义：natts &gt; kinds.length 抛 ISE（消息含两侧计数）、未注册 kind
      * 抛 ISE、raw 过短裸抛越界；线程约束：纯读 + 无实例可变状态参与，并发安全。</p>
      *
@@ -276,7 +277,7 @@ public final class TupleDecoder {
      * compressed varlena 恒 ISE。线程约束：纯读（resolver 的线程语义由注入方保证）。</p>
      *
      * @param src  源缓冲
-     * @param c    datum 起点（已按 4 对齐）
+     * @param c    datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @param next 单元素游标：返回值 = 整个 datum 之后的首偏移
      * @return 文本（external 形态为重组后的原值字符串）
      */
@@ -300,7 +301,7 @@ public final class TupleDecoder {
      * 线程约束：纯读。</p>
      *
      * @param src  源缓冲
-     * @param c    datum 起点（已按 4 对齐）
+     * @param c    datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @param next 单元素游标：返回值 = 整个 datum 之后的首偏移
      * @return 载荷字节（external 形态为重组后的原值字节）
      */
@@ -388,7 +389,7 @@ public final class TupleDecoder {
      * 解码。边界与异常语义：非 plain varlena 抛 ISE；线程约束：纯读，并发安全。</p>
      *
      * @param src  源缓冲
-     * @param c    varlena 起点（已按 4 对齐）
+     * @param c    varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @param next 单元素游标：返回值 = 整个 varlena 之后的首偏移
      * @return UTF-8 文本
      * @throws IllegalStateException external/compressed varlena（v1 不支持）
@@ -417,7 +418,7 @@ public final class TupleDecoder {
      * 裁定，见 {@link #rejectNonPlainVarlena}）抛 ISE；线程约束：纯读，并发安全。</p>
      *
      * @param src  源缓冲
-     * @param c    varlena 起点（已按 4 对齐）
+     * @param c    varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @param next 单元素游标：返回值 = 整个 varlena 之后的首偏移
      * @return 载荷字节副本
      * @throws IllegalStateException external/compressed varlena（v1 不支持）
@@ -448,7 +449,7 @@ public final class TupleDecoder {
      * 纯读，并发安全。</p>
      *
      * @param src  源缓冲
-     * @param c    varlena 起点（已按 4 对齐）
+     * @param c    varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @param next 单元素游标：返回值 = 整个 varlena 之后的首偏移
      * @throws IllegalStateException external/compressed varlena（v1 不支持）
      */
@@ -557,7 +558,8 @@ public final class TupleDecoder {
          * 自 src 的 off 起剥 18B external 指针并重建原值字节。
          *
          * @param src 完整源缓冲（契约只读）
-         * @param off 指针起点（已 4 对齐）
+         * @param off 指针起点（external 指针是 1B 头短 varlena——无 4 对齐保证，
+         *            实现按字节起读，与 {@code varlenaStart} 的未对齐落位形态衔接）
          * @return 重组后的原值字节（不可得时为降级字面的 UTF-8 字节）
          * @throws IllegalStateException 指针形态/lz4 方法码不符
          */

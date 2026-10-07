@@ -72,14 +72,19 @@ final class EnginePathRunner {
     /**
      * 装配 runner（不建连接——连接推迟到 {@link #start()}，失败配置不留半开资源）。
      *
+     * <p>构造序注记（Task 13 顺手修）：管道临时目录先建、CDC 捕获 appender 后挂——
+     * 原次序下 {@code createTempDirectory} 抛 IOException 时 appender 已挂上却无
+     * {@link #stopAndDrain()} 摘除路径（测试框架不会调已构造失败对象的方法），
+     * appender 泄漏到后续测试类的捕获面；倒序后挂 appender 之前无失败面。</p>
+     *
      * @param config engine 路复制配置（ParityEnv.engineConfig 形态）
      * @throws IOException 管道临时目录创建失败
      */
     EnginePathRunner(ReplicationConfig config) throws IOException {
         this.config = config;
         this.session = new PgReplicationSession(config);
-        this.capture = ParityEnv.capture("org.vastdata.vbstream.cdc");
         this.pipeDir = Files.createTempDirectory("parity-pipe");
+        this.capture = ParityEnv.capture("org.vastdata.vbstream.cdc");
     }
 
     /**

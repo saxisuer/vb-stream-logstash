@@ -53,6 +53,9 @@ public final class OutputRenderer implements ChangeOutputListener {
     /** CDC 数据通道专用 logger 名（与 engine 的 {@code org.vastdata.vbstream.cdc} 分流惯例同构）。 */
     private static final Logger CDC = LoggerFactory.getLogger("org.vastdata.vbstream.walsource.cdc");
 
+    /** 诊断 logger（契约违背类 WARN——不混入 CDC 数据通道）。 */
+    private static final Logger LOG = LoggerFactory.getLogger(OutputRenderer.class);
+
     /** 值渲染截断阈值（超出截 64 字符并附原长字节数——engine ConsoleRenderer 同规则）。 */
     private static final int VALUE_TRUNCATE_LIMIT = 64;
 
@@ -73,12 +76,18 @@ public final class OutputRenderer implements ChangeOutputListener {
      * 头行字段在此缓存，changes 留待 End 终值）。
      *
      * <p>关键步骤：建 Pending（头字段 + 空行列表）、入 per-xid map、置为当前开桶
-     * （后续 onRow 归属于此）。线程约束：单写者。</p>
+     * （后续 onRow 归属于此）。边界与异常语义：同 xid 重复 onBegin（End/Aborted 缺位
+     * ——xid 回绕前的序列错乱信号）WARN 一行后覆盖旧桶（旧桶行随覆盖丢失，观测面
+     * 留痕而非静默吞）。线程约束：单写者。</p>
      *
      * @param begin 事务头事件
      */
     @Override
     public void onBegin(BatchBegin begin) {
+        if (pending.containsKey(begin.xid())) {
+            LOG.warn("同 xid 重复 onBegin 覆盖待决桶（前桶 End/Aborted 缺位）: xid={}",
+                    begin.xid());
+        }
         Pending p = new Pending(begin.twoPhase() ? KIND_TWO_PHASE : KIND_NORMAL,
                 begin.gid(), begin.commitLsn(), begin.commitTs());
         pending.put(begin.xid(), p);

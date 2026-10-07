@@ -75,8 +75,8 @@ class ToastAssemblerTest {
     }
 
     /**
-     * 任务书 ①：未压缩 external——26 字节载荷分 3 chunk（10/10/6），乱序喂入
-     * （seq 2,0,1）钉 TreeMap 按 seq 归集；extsize(26)==rawsize(30)-4 走原文拼接
+     * 任务书 ①：未压缩 external——28 字节载荷分 3 chunk（10/10/8），乱序喂入
+     * （seq 2,0,1）钉 TreeMap 按 seq 归集；extsize(28)==rawsize(32)-4 走原文拼接
      * 路径，UTF-8 解回原文。
      */
     @Test
@@ -214,15 +214,34 @@ class ToastAssemblerTest {
     }
 
     /**
-     * 运行期 lz4 external fail-fast——extinfo 方法位（&gt;&gt;30）== 1（实测锚：
-     * lz4 样本 extinfo=0x40004E8A）抛 ISE，绝不静默降级（本实现无 lz4 解压面）。
+     * 运行期 lz4 external fail-fast——归集面<b>非空</b>（窗口内新写的 lz4 值，解压
+     * 不可避免）时 extinfo 方法位（&gt;&gt;30）== 1（实测锚：lz4 样本
+     * extinfo=0x40004E8A）抛 ISE，绝不静默降级（本实现无 lz4 解压面）。Task 13 顺手
+     * 修后方法位检查后移到空面判定之后——本用例先喂一条 chunk 使归集面非空。
      */
     @Test
     void lz4CompressedExternalThrowsIllegalState() {
         ToastAssembler assembler = new ToastAssembler(null);
+        assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 0, new byte[10]));
 
         assertThrows(IllegalStateException.class,
                 () -> assembler.resolveExternal(pointer(15, 10, 1, VALUE_ID, TOAST_REL), 0));
+    }
+
+    /**
+     * lz4 列的<b>未变列指针</b>（归集面空——值不在当前窗口）返回 unchanged-TOAST
+     * 哨兵而非 ISE（Task 13 顺手修：空面判定先于方法位检查）——engine 的 pgoutput
+     * 对未变 TOAST 列恒发 'u' 与压缩方法无关，先查方法位会把该形态错杀成 ISE 杀流。
+     */
+    @Test
+    void lz4UnchangedPointerWithEmptyWindowReturnsMarkerNotIllegalState() {
+        ToastAssembler assembler = new ToastAssembler(null);
+
+        byte[] resolved = assembler.resolveExternal(pointer(35, 31, 1, VALUE_ID, TOAST_REL), 0);
+
+        assertTrue(resolved == ToastAssembler.UNCHANGED_TOAST_MARKER,
+                "lz4 未变列指针的空归集面应走哨兵（== 身份），实得 "
+                        + java.util.Arrays.toString(resolved));
     }
 
     /**

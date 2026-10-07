@@ -263,8 +263,13 @@ public final class CatalogStores {
         /** 计数键：INPLACE 就地更新（TRUNCATE/ANALYZE 改 relfilenode/toast）的行数。 */
         public static final String INPLACE_UPDATES = "inplaceUpdates";
 
-        /** 计数键：截断更新经自愈校验采纳（中段新值对 JDBC 末态，spec §6②）的次数。 */
+        /** 计数键：截断更新经末态回填自愈采纳（记录 new 位探测 JDBC 末态行整行采纳——
+         *  旧"候选枚举 + 中段值校验"形态已废弃，见 {@code SelfHealer} 裁定注记）的次数。 */
         public static final String SELF_HEALED = "selfHealed";
+
+        /** 计数键：pg_namespace 面 PRUNE redirect 缺行放弃物化的次数（v2 无 nsp 探测
+         *  通道的观测面——非零提示 nsp 链断，schema 字典可能静默缺表）。 */
+        public static final String NSP_REDIRECT_MISSES = "nspRedirectMisses";
 
         private final Map<String, Long> counters = new ConcurrentHashMap<>();
 

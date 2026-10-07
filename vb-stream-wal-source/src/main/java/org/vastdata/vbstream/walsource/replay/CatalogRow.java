@@ -91,7 +91,7 @@ public final class CatalogRow {
      * @param relfilenode relfilenode（列 8，数据区偏移 88）
      * @param reltoastrelid toast 关系 oid（列 13/14 依版本——V17 槽 12 数据区偏移
      *                      108、V18 槽 13 偏移 112，两版差恰 4B 单列宽）
-     * @param relkind     relkind 单字符（列 18/19 依版本——V17 槽 16 偏移 115、V18 槽 17
+     * @param relkind     relkind 单字符（列 17/18 依版本——V17 槽 16 偏移 115、V18 槽 17
      *                    偏移 119；v2 表过滤的分派键，投影恒裸字符如 "r"）
      */
     public record ClassRow(long relOid, String relname, long relnamespace, long reltype, long reloftype,

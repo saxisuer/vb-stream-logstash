@@ -67,7 +67,8 @@ import java.util.TreeMap;
  * "When logging the entire old tuple, it very well could contain toasted columns.
  * If so, force them to be inlined"），外部指针不会出现在前像；压缩 external 拍扁后
  * 是行内压缩 varlena，走 {@link #decompressInlineCompressed} 同一面。lz4 双防线：
- * 字典面 {@link #lz4Guard} 启动期 WARN 一次；运行期撞方法位 1 的 external → ISE
+ * 字典面 {@link #lz4Guard} 启动期 WARN 一次；运行期撞方法位 1 的 external（归集面
+ * 非空——空面按未变列哨兵先行返回，见 {@link #resolveExternal}）→ ISE
  * fail-fast（本实现无 lz4 解压面，静默降级会产出错值）。</p>
  *
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程：onChunkRow 与 resolveExternal 同线程
@@ -187,12 +188,13 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * numeric/bytea 不再经 String UTF-8 有损往返）。
      *
      * <p>关键步骤：①指针头校验（0x01/0x12 + 越界，形不符 ISE）→ 解 rawsize/extinfo/
-     * valueid/toastrelid；②方法位判定——lz4 ISE fail-fast（无解压面，静默只会产出
-     * 错值）；③chunk 归集（键 = toastrelid，未命中再按 valueid 全域兜底扫描——主表
-     * 重写后 relfilenode 与 oid 分叉的容错）；④<b>归集面空 → 返回
+     * valueid/toastrelid；②chunk 归集（键 = toastrelid，未命中再按 valueid 全域兜底
+     * 扫描——主表重写后 relfilenode 与 oid 分叉的容错）；③<b>归集面空 → 返回
      * {@link #UNCHANGED_TOAST_MARKER}</b>（Task 10 值面裁定：值不在窗口——未变列指针
-     * /跨事务/重启窗口前，engine 同形发 'u'，不回查；依据与三分支语义见类 javadoc）；
-     * ⑤非空但拼接总长 != extsize → probe 回查合并后复检，仍缺 → 降级
+     * /跨事务/重启窗口前，engine 同形发 'u'，不回查；<b>空面判定先于方法位检查</b>
+     * ——lz4 列的未变列指针同走哨兵，先查方法位会把该形态错杀成 ISE；依据与三分支
+     * 语义见类 javadoc）；④非空时方法位判定——lz4 ISE fail-fast（无解压面，静默只
+     * 会产出错值）；⑤拼接总长 != extsize → probe 回查合并后复检，仍缺 → 降级
      * {@code toast-unavailable}；⑥未压缩（extsize == rawsize-4）拼接即载荷；压缩
      * （&lt;）校验 chunk0 前 4B tcinfo 与指针一致（(rawsize-4)|方法&lt;&lt;30，不符
      * ISE）后剥 4B 走 {@link Pglz#decompress} 解至 rawsize-4 字节。</p>
@@ -203,7 +205,8 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * 线程约束：单写者（与 {@link #onChunkRow} 同线程调用）。</p>
      *
      * @param src 完整源缓冲（记录/页字节，契约只读）
-     * @param off 指针起点（已对齐）
+     * @param off 指针起点（external 指针是 1B 头短 varlena——<b>无 4 对齐保证</b>，
+     *            按 {@code TupleDecoder.varlenaStart} 的落位判定直接字节起读）
      * @return 拼装解压后的原值字节；归集面空时 {@link #UNCHANGED_TOAST_MARKER}；
      *         窗口内缺口回查不可得时降级字节的 UTF-8 字节
      * @throws IllegalArgumentException src 为 null 或 off 越界
@@ -227,19 +230,21 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
         long toastrelid = u32le(src, off + 14);
         long extsize = extinfo & EXTSIZE_MASK;
         int method = (int) (extinfo >>> EXTSIZE_BITS);
+        TreeMap<Integer, byte[]> collected = collectChunks(toastrelid, valueid);
+        if (collected.isEmpty()) {
+            // Task 10 值面裁定：归集面空 = 值不在当前窗口（未变列指针/跨事务/重启窗口前）
+            // ——engine 的 pgoutput 同形发 'u'（proto.c LOGICALREP_COLUMN_UNCHANGED），
+            // 回查反而会产出 engine 没有的值、破坏双路对拍；渲染层按 UNCHANGED_TOAST_TEXT 输出。
+            // 空面判定先于方法位检查（Task 13 顺手修）：lz4 列的未变列指针同走哨兵——
+            // 值不在窗口即无需解压，engine 同形发 'u'，先查方法位会把该形态错杀成 ISE
+            return UNCHANGED_TOAST_MARKER;
+        }
         if (method != METHOD_PGLZ) {
             throw new IllegalStateException(method == METHOD_LZ4
                     ? "lz4 压缩的 external TOAST 值不受支持（无 lz4 解压面）: valueid=" + valueid
                             + ", toastrelid=" + toastrelid
                     : "未知 TOAST 压缩方法码 " + method + ": valueid=" + valueid
                             + ", toastrelid=" + toastrelid);
-        }
-        TreeMap<Integer, byte[]> collected = collectChunks(toastrelid, valueid);
-        if (collected.isEmpty()) {
-            // Task 10 值面裁定：归集面空 = 值不在当前窗口（未变列指针/跨事务/重启窗口前）
-            // ——engine 的 pgoutput 同形发 'u'（proto.c LOGICALREP_COLUMN_UNCHANGED），
-            // 回查反而会产出 engine 没有的值、破坏双路对拍；渲染层按 UNCHANGED_TOAST_TEXT 输出
-            return UNCHANGED_TOAST_MARKER;
         }
         RuntimeException probeFailure = null;
         if (totalSize(collected) != extsize && probe != null) {
@@ -315,8 +320,9 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * 撞上运行期 fail-fast 之前先留观测痕迹（每关系 WARN 一次，防大事务刷屏）。
      *
      * <p>关键步骤：'l' 且关系名首次出现才打 WARN；'p'（pglz）与其他值 no-op。
-     * 边界与异常语义：relName 为 null 抛 NPE（告警去重键要素）。线程约束：单写者
-     * （与字典装配同线程）。</p>
+     * 边界与异常语义：relName 为 null 不抛——非 'l' 直接 no-op 不触去重集，'l' 时
+     * null 亦可作去重键（HashSet 容 null，WARN 打字面 null，字典面正常装配不会
+     * 出 null 关系名——防御面而非契约）。线程约束：单写者（与字典装配同线程）。</p>
      *
      * @param attcompression pg_attribute.attcompression（'p'=pglz、'l'=lz4）
      * @param relName        关系名（告警去重键与上下文）

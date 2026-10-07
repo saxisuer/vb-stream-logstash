@@ -31,6 +31,12 @@ import java.math.RoundingMode;
  * <p>线程约束：静态纯函数、并发安全（无共享可变状态）。JDK 17 的
  * {@code Double.toString} 不保证最短（JDK-4511638，19 才修）且形态分叉，故不得用于
  * 本面。</p>
+ *
+ * <p><b>前提注记（Task 13 补）</b>：本格式化器对齐的是 PG 缺省会话参数
+ * {@code extra_float_digits=1}（shortest-round-trip 路径，v2 spec §5 首发集前提）；
+ * 会话把 efd 调到 &le;0 时 float8out/float4out 走老式 %g 风格路径（定点/科学门限
+ * 与尾数位随 efd 变化），engine 路（服务端渲染）与本侧形态会分叉——双路对拍环境
+ * 不改该参数即无此面。</p>
  */
 public final class PgFloatFormat {
 

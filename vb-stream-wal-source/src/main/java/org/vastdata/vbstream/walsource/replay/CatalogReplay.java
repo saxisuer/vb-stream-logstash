@@ -40,7 +40,7 @@ import java.util.function.LongFunction;
  * {@link CatalogStores} 的重放入口按<strong>单线程</strong>假设运行（spec §3 单线程
  * 直通）；纯提取面（{@link #heapEvents} 四参档）为实例态纯函数，任意线程并发安全。
  * block 匹配按 relNode 单值（spike 按 spc/db/relNode 三件组；本签名无 spc/db——
- * 同库引导下等价，跨库 relfilenode 碰撞为理论残留，Task 11 接线时可收紧）。</p>
+ * 同库引导下等价，跨库 relfilenode 碰撞为理论残留；v1 接线后维持单值形态未收紧）。</p>
  */
 public final class CatalogReplay {
 
@@ -110,7 +110,8 @@ public final class CatalogReplay {
     /**
      * watched 目录判别（PRUNE 施加面的三向分派）：tracked 双 ctid 跟随仅 pg_class
      * （行位语义）；redirect 缺行的精确采纳物化仅 ATTR/CLASS 两面（有 probe 面），
-     * NSP 面 v1 无探测通道、缺行放弃物化（行留待后续链事件/对拍暴露）。
+     * NSP 面无 ctid 探测通道（v2 限制）、缺行放弃物化并计
+     * {@link CatalogStores.CatalogMetrics#NSP_REDIRECT_MISSES}（行留待后续链事件/对拍暴露）。
      */
     private enum WatchedLeg {
         /** pg_attribute 面（attr 精确采纳可用）。 */
@@ -1109,7 +1110,9 @@ public final class CatalogReplay {
      * {@link #attrExactAdopt}——attr 采纳行 attnum &le; 0（系统列，字典面契约外）
      * 丢弃不落。边界与异常语义：探测无行（to 位也被再迁移/复用）返回 null（本
      * redirect 放弃物化，行留待后续链事件/对拍暴露）；拒绝记账仅 class 面（与
-     * 截断更新采纳同规则）。线程约束：单写者（重放线程，probe 复用 healer 会话）。</p>
+     * 截断更新采纳同规则）；NSP 面 DEBUG + 专用计数后返回 null（观测面见
+     * {@code WatchedLeg.NSP} 注记）。线程约束：单写者（重放线程，probe 复用 healer
+     * 会话）。</p>
      *
      * @param r       走读完成的 PRUNE 记录（LSN 定位日志面）
      * @param to      redirect 目标 ctid 键（探测位 = 行末态位）
@@ -1128,7 +1131,13 @@ public final class CatalogReplay {
             return rc == null ? null : (T) CatalogRow.ClassRow.fromDecoded(rc.row(), layout);
         }
         if (leg == WatchedLeg.NSP) {
-            return null;    // nsp 面无 ctid 探测通道（v2 限制）：缺行放弃物化，留待后续链事件/对拍暴露
+            // nsp 面无 ctid 探测通道（v2 限制）：缺行放弃物化，留待后续链事件/对拍暴露——
+            // Task 13 补观测面（此前零痕迹）：DEBUG 一行 + 专用计数，生产 schema DDL 高频
+            // 场景可据此发现 nsp 链断（触发条件 NSP redirect 缺行，fail-safe 方向见 v2 限制）
+            LOG.debug("NSP redirect 缺行放弃物化（v2 限制，行留待后续链事件/对拍暴露）: to=0x{}",
+                    Long.toHexString(to));
+            stores.metrics().inc(CatalogStores.CatalogMetrics.NSP_REDIRECT_MISSES);
+            return null;
         }
         Reconstruction rc = attrExactAdopt(r, to, stores.metrics());
         if (rc == null) {

@@ -45,7 +45,7 @@ final class Pglz {
      * 解压一段 pglz 压缩数据。
      *
      * <p>职责：转录 {@code pglz_decompress()} 的主循环（L705 起）——外层按
-     * control byte 分组（每组至多 8 条目，输入耗尽或输出写满即提前出组，L713），
+     * control byte 分组（每组至多 8 条目，输入耗尽或输出写满即提前出组，L714），
      * 组内逐条目按 LSB 位分派字面量/match 两分支。</p>
      *
      * <p>关键步骤：match 分支先做 tag 完整性预检（2 字节、扩展时 3 字节），

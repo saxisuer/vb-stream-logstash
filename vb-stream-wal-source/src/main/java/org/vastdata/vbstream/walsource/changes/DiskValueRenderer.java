@@ -428,7 +428,10 @@ public final class DiskValueRenderer {
      *
      * <p>自行排版的原因：{@code ZoneOffset.toString()} 在本 JDK 输出 {@code +08:00}
      * 形态（带分钟段），与 PG 服务器文本输出分叉——双路对拍（Task 8）engine 路以
-     * 服务器 text 为准，本渲染必须逐字符对齐。</p>
+     * 服务器 text 为准，本渲染必须逐字符对齐。秒段注记（Task 13 记档）：偏移的秒
+     * 分量（仅历史 LMT 时区出现，如 1900 年前的 +00:19:32）被截断到分钟粒度——
+     * PG 的 timestamptz_out 输出面同样是 HH[:MM] 分钟粒度（服务器端即先折算到分钟），
+     * 本侧截断与 PG 同形，非分叉面。</p>
      *
      * @param off 目标时刻的时区偏移
      * @return PG 文本形态的偏移段
