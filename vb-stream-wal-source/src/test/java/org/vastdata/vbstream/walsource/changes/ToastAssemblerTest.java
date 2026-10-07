@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import net.jpountz.lz4.LZ4Factory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -22,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * TOAST 重组（{@link ToastAssembler}）的失败先行测试——手造 18B external 指针与
- * chunk 行字节，断言拼装/解压/回查/降级/lz4 拒绝五面。
+ * chunk 行字节，断言拼装/解压/回查/降级四面前置 + pglz/lz4 双方法解压面。
  *
  * <p><b>布局实测锚</b>（2026-10-07 docker PG 18.6 容器 src/docker，全文推导记录在
  * task-3-report.md）：</p>
@@ -40,9 +41,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * </ul>
  *
  * <p>任务书 Step 1 五用例（未压缩 3 chunk 拼装+extsize 校验 / pglz 手造压缩块解压往返 /
- * chunk 缺失 stub probe 回查命中 / 回查也缺失 toast-unavailable / lz4 列 guard）+ 实测布局
- * 锚定的补充用例（多 chunk 压缩分界、指针 tag 拒绝、tcinfo 校验、relfilenode 分叉容错、
- * probe 抛异常降级）。</p>
+ * chunk 缺失 stub probe 回查命中 / 回查也缺失 toast-unavailable / lz4 解压往返[原 guard
+ * 用例随 lz4 支持落地而废]）+ 实测布局锚定的补充用例（多 chunk 压缩分界、指针 tag 拒绝、
+ * tcinfo 校验、relfilenode 分叉容错、probe 抛异常降级、lz4 行内压缩往返、未知方法码 ISE）。</p>
  */
 class ToastAssemblerTest {
 
@@ -198,35 +199,59 @@ class ToastAssemblerTest {
     }
 
     /**
-     * 任务书 ⑤：lz4 列 guard——attcompression='l' 首调 WARN、重复调用不重打
-     * （每关系一次观测节流）；'p'（pglz）不告警。
+     * lz4 压缩 external 解压往返（原 ISE 拒绝用例随 lz4 支持落地改为解压断言）——
+     * 40 字节周期 3 载荷经 lz4-java 压缩器压成裸 block，chunk 拼接 =
+     * {@code [tcinfo = (rawsize-4) | 1<<30][lz4 流]}（实测锚：lz4 样本 chunk0 首 4B
+     * {@code 00960040}），指针方法位（extinfo&gt;&gt;30）=1；extsize=tcinfo+lz4 流长
+     * &lt; rawsize-4 → 压缩路径分派到 {@link Lz4}，解回原文。
      */
     @Test
-    void lz4ColumnGuardWarnsOncePerRelation() {
+    void lz4CompressedExternalRoundTrips() {
         ToastAssembler assembler = new ToastAssembler(null);
+        String text = "abc".repeat(13) + "a";               // 40 字节周期 3 可压缩载荷
+        byte[] payload = text.getBytes(StandardCharsets.US_ASCII);
+        byte[] block = LZ4Factory.fastestInstance().fastCompressor()
+                .compress(payload, 0, payload.length);
+        byte[] stream = concat(u32le(payload.length | (1 << 30)), block);
+        feedChunks(assembler, TOAST_REL, VALUE_ID, stream, 6);   // 跨多 chunk 分界
 
-        assembler.lz4Guard((byte) 'l', "t_wide");
-        assembler.lz4Guard((byte) 'l', "t_wide");
-        assembler.lz4Guard((byte) 'p', "t_other");
+        byte[] resolved = assembler.resolveExternal(
+                pointer(payload.length + 4, stream.length, 1, VALUE_ID, TOAST_REL), 0);
 
-        List<ILoggingEvent> warns = appender.list.stream().filter(e -> e.getLevel() == Level.WARN).toList();
-        assertEquals(1, warns.size());
-        assertTrue(warns.get(0).getFormattedMessage().contains("t_wide"));
+        assertEquals(text, new String(resolved, StandardCharsets.US_ASCII));
     }
 
     /**
-     * 运行期 lz4 external fail-fast——归集面<b>非空</b>（窗口内新写的 lz4 值，解压
-     * 不可避免）时 extinfo 方法位（&gt;&gt;30）== 1（实测锚：lz4 样本
-     * extinfo=0x40004E8A）抛 ISE，绝不静默降级（本实现无 lz4 解压面）。Task 13 顺手
-     * 修后方法位检查后移到空面判定之后——本用例先喂一条 chunk 使归集面非空。
+     * 未知方法位 ISE——方法码 2（既非 pglz=0 也非 lz4=1，varatt.h 未定义的保留值）
+     * 是走读错位/格式演进信号，仍 ISE fail-fast（lz4 落地后唯一的方法面拒绝分支）。
      */
     @Test
-    void lz4CompressedExternalThrowsIllegalState() {
+    void unknownCompressionMethodStillThrowsIllegalState() {
         ToastAssembler assembler = new ToastAssembler(null);
         assembler.onChunkRow(TOAST_REL, chunkRow(VALUE_ID, 0, new byte[10]));
 
         assertThrows(IllegalStateException.class,
-                () -> assembler.resolveExternal(pointer(15, 10, 1, VALUE_ID, TOAST_REL), 0));
+                () -> assembler.resolveExternal(pointer(15, 10, 2, VALUE_ID, TOAST_REL), 0));
+    }
+
+    /**
+     * lz4 行内压缩 varlena 解压往返——载荷 = {@code [tcinfo = 原长 | 1<<30][lz4 流]}
+     * （与 external 压缩值同构，方法位在 tcinfo 高 2 位），经
+     * {@code decompressInlineCompressed} 分派到 {@link Lz4} 解回原文；无降级形态
+     * （行内数据自包含）。
+     */
+    @Test
+    void lz4InlineCompressedRoundTrips() {
+        ToastAssembler assembler = new ToastAssembler(null);
+        String text = "0123456789abcdef".repeat(64);        // 1024 字节周期 16 载荷
+        byte[] payload = text.getBytes(StandardCharsets.US_ASCII);
+        byte[] block = LZ4Factory.fastestInstance().fastCompressor()
+                .compress(payload, 0, payload.length);
+        byte[] varlenaPayload = concat(u32le(payload.length | (1 << 30)), block);
+
+        byte[] resolved = assembler.decompressInlineCompressed(varlenaPayload);
+
+        assertEquals(text, new String(resolved, StandardCharsets.US_ASCII));
     }
 
     /**

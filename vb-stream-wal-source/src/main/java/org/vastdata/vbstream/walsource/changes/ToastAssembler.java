@@ -7,9 +7,7 @@ import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 import java.util.TreeMap;
 
 /**
@@ -66,10 +64,10 @@ import java.util.TreeMap;
  * 服务端 {@code toast_flatten_tuple} 拍扁内联（heapam.c ExtractReplicaIdentity——
  * "When logging the entire old tuple, it very well could contain toasted columns.
  * If so, force them to be inlined"），外部指针不会出现在前像；压缩 external 拍扁后
- * 是行内压缩 varlena，走 {@link #decompressInlineCompressed} 同一面。lz4 双防线：
- * 字典面 {@link #lz4Guard} 启动期 WARN 一次；运行期撞方法位 1 的 external（归集面
- * 非空——空面按未变列哨兵先行返回，见 {@link #resolveExternal}）→ ISE
- * fail-fast（本实现无 lz4 解压面，静默降级会产出错值）。</p>
+ * 是行内压缩 varlena，走 {@link #decompressInlineCompressed} 同一面。压缩方法面：
+ * pglz（方法位 0）经 {@link Pglz}、lz4（方法位 1，TOAST_LZ4_COMPRESSION_ID）经
+ * {@link Lz4}（lz4-java 裸 block 解压）分派解压，两路契约同形（定长期望、损坏
+ * ISE fail-fast）；未知方法位（varatt.h 未定义保留值）ISE——走读错位信号。</p>
  *
  * <p>线程约束：<b>单写者</b>（wal-receiver 线程：onChunkRow 与 resolveExternal 同线程
  * 调用）——内部 HashMap/HashSet 非线程安全，与 v1 replay 组件同假设。{@link #clear()}
@@ -126,9 +124,6 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
     /** 压缩方法码：lz4（TOAST_LZ4_COMPRESSION_ID=1，实测 lz4 样本方法位=01）。 */
     private static final int METHOD_LZ4 = 1;
 
-    /** pg_attribute.attcompression 的 lz4 列标记字节（"char" 'l'）。 */
-    private static final byte ATTCOMPRESSION_LZ4 = 'l';
-
     /** 回查仍缺的降级字面（v2 设计 §5：不 fail 整条流）。 */
     private static final String TOAST_UNAVAILABLE = "toast-unavailable";
 
@@ -140,9 +135,6 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
 
     /** chunk 归集：toast 关系键（WAL relfilenode 或 oid）→ valueid → seq → 字节。 */
     private final Map<Long, Map<Long, TreeMap<Integer, byte[]>>> chunksByToast = new HashMap<>();
-
-    /** 已 WARN 过 lz4 列的关系名（观测节流，每关系一次）。 */
-    private final Set<String> lz4WarnedRels = new HashSet<>();
 
     /**
      * 构造重组器。
@@ -193,11 +185,12 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * {@link #UNCHANGED_TOAST_MARKER}</b>（Task 10 值面裁定：值不在窗口——未变列指针
      * /跨事务/重启窗口前，engine 同形发 'u'，不回查；<b>空面判定先于方法位检查</b>
      * ——lz4 列的未变列指针同走哨兵，先查方法位会把该形态错杀成 ISE；依据与三分支
-     * 语义见类 javadoc）；④非空时方法位判定——lz4 ISE fail-fast（无解压面，静默只
-     * 会产出错值）；⑤拼接总长 != extsize → probe 回查合并后复检，仍缺 → 降级
-     * {@code toast-unavailable}；⑥未压缩（extsize == rawsize-4）拼接即载荷；压缩
-     * （&lt;）校验 chunk0 前 4B tcinfo 与指针一致（(rawsize-4)|方法&lt;&lt;30，不符
-     * ISE）后剥 4B 走 {@link Pglz#decompress} 解至 rawsize-4 字节。</p>
+     * 语义见类 javadoc）；④非空时方法位判定——未知方法码（非 pglz/lz4 的保留值）
+     * ISE fail-fast（走读错位信号）；⑤拼接总长 != extsize → probe 回查合并后复检，
+     * 仍缺 → 降级 {@code toast-unavailable}；⑥未压缩（extsize == rawsize-4）拼接
+     * 即载荷；压缩（&lt;）校验 chunk0 前 4B tcinfo 与指针一致（(rawsize-4)|方法&lt;&lt;30，
+     * 不符 ISE）后剥 4B 经 {@link #inflate} 按方法位分派（pglz/lz4）解至 rawsize-4
+     * 字节。</p>
      *
      * <p>边界与异常语义：src 过短/tag 不符/tcinfo 不符/pglz 数据损坏抛 ISE；归集面
      * 非空且回查（probe 为 null、查无、抛异常）仍不齐 → WARN（valueid/toastrelid
@@ -210,7 +203,7 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * @return 拼装解压后的原值字节；归集面空时 {@link #UNCHANGED_TOAST_MARKER}；
      *         窗口内缺口回查不可得时降级字节的 UTF-8 字节
      * @throws IllegalArgumentException src 为 null 或 off 越界
-     * @throws IllegalStateException    指针形态/lz4 方法/tcinfo/pglz 数据不符
+     * @throws IllegalStateException    指针形态/未知方法码/tcinfo/压缩流数据不符
      */
     public byte[] resolveExternal(byte[] src, int off) {
         if (src == null) {
@@ -239,12 +232,9 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
             // 值不在窗口即无需解压，engine 同形发 'u'，先查方法位会把该形态错杀成 ISE
             return UNCHANGED_TOAST_MARKER;
         }
-        if (method != METHOD_PGLZ) {
-            throw new IllegalStateException(method == METHOD_LZ4
-                    ? "lz4 压缩的 external TOAST 值不受支持（无 lz4 解压面）: valueid=" + valueid
-                            + ", toastrelid=" + toastrelid
-                    : "未知 TOAST 压缩方法码 " + method + ": valueid=" + valueid
-                            + ", toastrelid=" + toastrelid);
+        if (method != METHOD_PGLZ && method != METHOD_LZ4) {
+            throw new IllegalStateException("未知 TOAST 压缩方法码 " + method + ": valueid=" + valueid
+                    + ", toastrelid=" + toastrelid);
         }
         RuntimeException probeFailure = null;
         if (totalSize(collected) != extsize && probe != null) {
@@ -273,29 +263,53 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
                 throw new IllegalStateException("压缩 TOAST 头与指针不一致: tcinfo=" + tcinfo
                         + ", 期望=" + expected + ", valueid=" + valueid);
             }
-            byte[] pglz = new byte[concat.length - 4];
-            System.arraycopy(concat, 4, pglz, 0, pglz.length);
-            return Pglz.decompress(pglz, (int) (rawsize - 4));
+            byte[] stream = new byte[concat.length - 4];
+            System.arraycopy(concat, 4, stream, 0, stream.length);
+            return inflate(method, stream, (int) (rawsize - 4));
         }
         return concat;
     }
 
     /**
+     * 压缩流解压的公共分派面（external 拼接体与行内压缩 varlena 共用——两形态的
+     * 压缩流同源，均是 tuptoaster.c 压缩产出面的裸流）。
+     *
+     * <p>关键步骤：按方法码分派——pglz（0）走 {@link Pglz}（PG 源码纯移植）、
+     * lz4（1）走 {@link Lz4}（liblz4 裸 block，lz4-java 实现）；两者契约同形
+     * （定长期望、损坏 ISE fail-fast）。边界与异常语义：未知方法码（varatt.h
+     * 未定义的保留值）抛 ISE——走读错位/格式演进信号，绝不静默降级。线程约束：
+     * 纯分派无共享状态。</p>
+     *
+     * @param method      压缩方法码（extinfo/tcinfo 高 2 位）
+     * @param stream      纯压缩流（4B tcinfo 头已剥）
+     * @param expectedLen 解压结果的期望字节数（tcinfo/指针声明的原长）
+     * @return 长度恰为 expectedLen 的解压字节
+     * @throws IllegalStateException 未知方法码或压缩流损坏
+     */
+    private static byte[] inflate(int method, byte[] stream, int expectedLen) {
+        return switch (method) {
+            case METHOD_PGLZ -> Pglz.decompress(stream, expectedLen);
+            case METHOD_LZ4 -> Lz4.decompress(stream, expectedLen);
+            default -> throw new IllegalStateException("未知 TOAST 压缩方法码 " + method);
+        };
+    }
+
+    /**
      * 行内压缩 varlena 的解压面（{@link TupleDecoder.VarlenaResolver} 契约，Task 7
      * 行内接线）——payload 即剥去 4B varlena 头的
-     * {@code [u32 tcinfo = exhdrlen 低 30 位 | 方法&lt;&lt;30][pglz 流]}，与 external
-     * 压缩值的 chunk 拼接体<b>同构</b>（同一 pglz_compress 产出面，2026-10-07 实测：
-     * 64000 字符 repeat 型宽值压缩至 779B 行内落盘、头上 30 位承载总长）。
+     * {@code [u32 tcinfo = exhdrlen 低 30 位 | 方法&lt;&lt;30][压缩流]}，与 external
+     * 压缩值的 chunk 拼接体<b>同构</b>（同一压缩产出面，2026-10-07 实测：64000 字符
+     * repeat 型宽值压缩至 779B 行内落盘、头上 30 位承载总长）。
      *
-     * <p>关键步骤：载荷 &lt;4B 抛 ISE（缺 tcinfo 头）；tcinfo 方法位判定——lz4 ISE
-     * fail-fast（无 lz4 解压面，静默只会产出错值）；剥 4B tcinfo 后
-     * {@link Pglz#decompress} 解至低 30 位声明的原长。边界与异常语义：tcinfo/pglz
-     * 数据不符抛 ISE（走读错位信号）；与 {@link #resolveExternal} 不同，本面无降级
-     * 形态（行内数据自包含，缺值不可能发生）。线程约束：单写者（与解码同线程）。</p>
+     * <p>关键步骤：载荷 &lt;4B 抛 ISE（缺 tcinfo 头）；剥 4B tcinfo 后经
+     * {@link #inflate} 按方法位分派（pglz/lz4）解至低 30 位声明的原长。边界与
+     * 异常语义：tcinfo/压缩流不符抛 ISE（走读错位信号）；与
+     * {@link #resolveExternal} 不同，本面无降级形态（行内数据自包含，缺值不可能
+     * 发生）。线程约束：单写者（与解码同线程）。</p>
      *
      * @param payload 行内压缩载荷（4B varlena 头已剥，≥4B 才含 tcinfo）
      * @return 解压后的原载荷字节
-     * @throws IllegalStateException tcinfo 头缺失/lz4 方法码/pglz 数据不符
+     * @throws IllegalStateException tcinfo 头缺失/未知方法码/压缩流损坏
      */
     @Override
     public byte[] decompressInlineCompressed(byte[] payload) {
@@ -305,32 +319,9 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
         int tcinfo = (int) u32le(payload, 0);
         int rawLen = tcinfo & EXTSIZE_MASK;
         int method = tcinfo >>> EXTSIZE_BITS;
-        if (method != METHOD_PGLZ) {
-            throw new IllegalStateException(method == METHOD_LZ4
-                    ? "lz4 压缩的行内 varlena 不受支持（无 lz4 解压面）"
-                    : "未知行内压缩方法码 " + method);
-        }
-        byte[] pglz = new byte[payload.length - 4];
-        System.arraycopy(payload, 4, pglz, 0, pglz.length);
-        return Pglz.decompress(pglz, rawLen);
-    }
-
-    /**
-     * lz4 列的字典面提前告警——{@code pg_attribute.attcompression} 为 'l' 的列在
-     * 撞上运行期 fail-fast 之前先留观测痕迹（每关系 WARN 一次，防大事务刷屏）。
-     *
-     * <p>关键步骤：'l' 且关系名首次出现才打 WARN；'p'（pglz）与其他值 no-op。
-     * 边界与异常语义：relName 为 null 不抛——非 'l' 直接 no-op 不触去重集，'l' 时
-     * null 亦可作去重键（HashSet 容 null，WARN 打字面 null，字典面正常装配不会
-     * 出 null 关系名——防御面而非契约）。线程约束：单写者（与字典装配同线程）。</p>
-     *
-     * @param attcompression pg_attribute.attcompression（'p'=pglz、'l'=lz4）
-     * @param relName        关系名（告警去重键与上下文）
-     */
-    public void lz4Guard(byte attcompression, String relName) {
-        if (attcompression == ATTCOMPRESSION_LZ4 && lz4WarnedRels.add(relName)) {
-            LOG.warn("列压缩方法为 lz4 的关系: {}——运行期撞 lz4 external TOAST 将 fail-fast", relName);
-        }
+        byte[] stream = new byte[payload.length - 4];
+        System.arraycopy(payload, 4, stream, 0, stream.length);
+        return inflate(method, stream, rawLen);
     }
 
     /**
