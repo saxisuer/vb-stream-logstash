@@ -2,11 +2,13 @@
 
 适配 PostgreSQL 逻辑解码 **stream 模式**的 CDC 采集器：基于 pgjdbc `ReplicationConnection` 直连复制流，自研 pgoutput 协议解码器，实时解析普通事务、流式大事务（`streaming=parallel`）、两阶段提交（`two_phase`）与 Truncate，并把原始字节流组装后以**流式事件**输出（`事务头 → 逐变更 → 事务尾`，回放期堆峰 O(单条)；`vb.output.mode=block` 可切回原子事务块语义——读取与组装输出解耦：reader 记账写入 Chronicle Queue 主缓冲管道，独立消费线程回放输出，组装期桶内零字节引用，LSN 确认按输出前沿封顶且前沿锚定事务尾，at-least-once）。
 
-- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 六模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）、`vb-stream-file-format`（VBFG 落地文件契约层——事件 IR + 文件命名，纯 JDK 零依赖，见 vb-stream-file-format/CLAUDE.md）、`vb-stream-binary-format`（VBFG 二进制读写，依赖基座 vb-stream-file-format）、`vb-stream-sql-format`（SQL 文本渲染，依赖基座 vb-stream-file-format）、`vb-stream-connector-postgres-stream`（Debezium 流式连接器）与 `vb-stream-reader`（debezium-embedded 宿主冒烟应用）
+- 坐标：聚合 parent `org.vastdata:vb-stream-logstash:1.0-SNAPSHOT`（packaging=pom，Vastbase 生态）+ 八模块：`vb-stream-engine`（现有引擎：protocol / replication / Main / ConsoleRenderer）、`vb-stream-file-format`（VBFG 落地文件契约层——事件 IR + 文件命名，纯 JDK 零依赖，见 vb-stream-file-format/CLAUDE.md）、`vb-stream-binary-format`（VBFG 二进制读写，依赖基座 vb-stream-file-format）、`vb-stream-sql-format`（SQL 文本渲染，依赖基座 vb-stream-file-format）、`vb-stream-connector-postgres-stream`（Debezium 流式连接器）、`vb-stream-connector-postgres-stream-debezium19`（Debezium **1.9.7** 宿主嵌入版连接器——同包名整模块复制+接缝层按 1.9.7 API 改写，已自含化：vanilla 连接器类裁剪复刻进自有命名空间、pom 零 connector-postgres 依赖；与 3.6.1 模块永不同 classpath）、`vb-stream-reader`（debezium-embedded 宿主冒烟应用）与 `vb-stream-wal-source`（WAL 直解源**纯库**：物理复制流收原始 WAL + 纯 Java 按 REL_STABLE 转录的 V17/V18 布局描述符解析 + ctid 重放自维护 pg_attribute/pg_class as-of 字典，v2 已落用户表 DML 面——TOAST 三形态重组/lz4 压缩值解压/事务组装输出，经双路对拍 IT 钉死与引擎逻辑解码路输出逐字节等价）
 - 工具链：Java 17 + Maven；日志 slf4j + logback
 - 连接器模块 `vb-stream-connector-postgres-stream`（Debezium 流式 PG 连接器插件，MS1–MS6 收官）：配置面/打包安装/at-least-once 语义/已知限制一档全，见 [vb-stream-connector-postgres-stream/README.md](vb-stream-connector-postgres-stream/README.md)
+- 连接器 1.9.7 宿主版模块 `vb-stream-connector-postgres-stream-debezium19`（与 3.6.1 模块同包名整模块复制、双线同步约定；自含化 assembly 产物可独立挂 plugin.path）：配置键差异/打包安装/自含性验收锚见 [vb-stream-connector-postgres-stream-debezium19/README.md](vb-stream-connector-postgres-stream-debezium19/README.md)
 - 宿主模块 `vb-stream-reader`（debezium-embedded 冒烟入口，`DebeziumEngine.create(Connect.class)` 加载自研连接器，零 `-D` 参数即可起；输出形态 `vb.reader.mode=log|file`——file 落地文件双格式 `vb.reader.format=binary|sql`：默认 binary=VBFG 二进制，与 vb-cdc-file-transform 的 cdc-sink 消费端互通；sql=可执行 SQL 文本）：三层合并配置面/运行/file 落地语义见 [vb-stream-reader/README.md](vb-stream-reader/README.md)
-- 状态：里程碑 2.0 完成——协议层 19 种消息全量解析、复制会话、解耦事务组装（reader 记账 + CQ 管道主缓冲 + transaction-consumer 回放 + Relation 版本快照随行——DDL 后旧行按变更时刻表结构渲染 + 输出前沿反馈封顶）、**输出契约流式化**（单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付），544 个测试全绿（引擎 224 + 连接器 272 + file-format 3 + binary-format 12 + sql-format 10 + reader 23，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
+- WAL 直解源模块 `vb-stream-wal-source`（不经逻辑解码输出插件的另一条 CDC 路：pgjdbc 物理复制流收原始 WAL，纯 Java 直解 heap 记录 + ctid 重放自维护 as-of 字典，v2 起输出与引擎逻辑解码路**逐字节等价**——双路对拍 IT 验收；DML 面需 `wal_level=logical`，catalog 同步面仅需物理复制）：场景支持矩阵/配置面/已知限制见 [vb-stream-wal-source/README.md](vb-stream-wal-source/README.md)
+- 状态：里程碑 2.0 完成（引擎——协议层 19 种消息全量解析、复制会话、解耦事务组装、**输出契约流式化**：单回调事件交付，回放期堆峰从 O(事务) 降到 O(单条)，block 逃生门恢复 1.7 原子交付）+ wal-source v1/v2 完成（catalog 同步与 WAL 接收、用户表 DML 面含 TOAST 三形态重组与 lz4 压缩值解压）+ debezium19 自含化完成，1073 个测试全绿（引擎 224 + 连接器 272 + debezium19 276 + file-format 3 + binary-format 12 + sql-format 10 + reader 23 + wal-source 253，单元 + Testcontainers 集成），JMH 基线在档（`docs/benchmarks-baseline.md`，含 2.0 契约换血对照段与 connector 化端到端对照段）
 
 ## PostgreSQL 前置要求
 
@@ -116,20 +118,36 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
      --add-opens jdk.unsupported/sun.misc=ALL-UNNAMED \
      --add-opens java.base/sun.nio.fs=ALL-UNNAMED \
      --add-opens java.base/java.lang.reflect=ALL-UNNAMED \
-     -cp "vb-stream-reader/target/classes;$(cat vb-stream-reader/target/cp.txt)" \
+     -cp "vb-stream-reader/target/classes:$(cat vb-stream-reader/target/cp.txt)" \
      org.vastdata.vbstream.reader.Main
 ```
 
-（`--add-opens` 清单同上——连接器内 Chronicle Queue 的 mmap 需要；命令为 Windows 形态——classpath 分隔符 `;`，macOS/Linux 为 `:`。）
+（`--add-opens` 清单同上——连接器内 Chronicle Queue 的 mmap 需要。）
+
+## 运行 vb-stream-wal-source（WAL 直解源）
+
+不经逻辑解码输出插件的另一条 CDC 路：`org.vastdata.vbstream.walsource.Main` 起全管线——pgjdbc **物理复制流**接收原始 WAL → 纯 Java 按 REL_STABLE 转录的 V17/V18 布局描述符直解 heap 记录 → ctid 重放自维护 pg_attribute/pg_class **as-of 字典**（DDL 后旧行按变更时刻表结构渲染，与引擎 Relation 版本快照同语义）→ v2 DML 面把用户表变更按事务组装（TOAST external 重组/unchanged-TOAST 哨兵/lz4 压缩值解压）输出为与引擎 `ConsoleRenderer` **逐字节等价**的事务块（TXN-BEGIN/逐行/TXN-END，双路对拍 IT 验收）。零 Chronicle 依赖，**无需 `--add-opens`**；每 10s 一行 smoke 统计 INFO，事务块走 CDC 专用 logger `org.vastdata.vbstream.walsource.cdc`。
+
+配置全走 `-Dvb.wal.*` 十一键（host/port/db/user/pass/slot + state.dir/state.interval.ms/state.events + DML 两键 `vb.wal.tables` 表白名单[空=全放行] / `vb.wal.dml`[默认 true，false 回纯 v1 catalog 形态]），默认 localhost:5432/postgres、槽 wal_source、state 检查点禁用，全表见模块 README。
+
+```bash
+cd src/docker && docker compose up -d && cd ../..     # 前置 PG（已起可跳过；DML 面需 wal_level=logical，src/docker 已配）
+mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java -cp "vb-stream-wal-source/target/classes:$(cat vb-stream-wal-source/target/cp.txt)" \
+     -Dvb.wal.port=55432 -Dvb.wal.state.dir=/tmp/wal-source-state \
+     org.vastdata.vbstream.walsource.Main
+```
+
+state 检查点（`vb.wal.state.dir` 指定后启用）：CRC 双验 + `.part`→fsync→原子 rename 持久化消费前沿，重启续传 + 槽推进；损坏拒载回落全新引导。Ctrl-C hook 优雅 close（含最终 best-effort 检查点）。
 
 ## 测试
 
 ```bash
-mvn test                # 全部：六模块单元测试 + Testcontainers 集成测试（544 用例：引擎 224 + 连接器 272 + file-format 3 + binary-format 12 + sql-format 10 + reader 23）
+mvn test                # 全部：八模块单元测试 + Testcontainers 集成测试（1073 用例：引擎 224 + 连接器 272 + debezium19 276 + file-format 3 + binary-format 12 + sql-format 10 + reader 23 + wal-source 253）
 mvn test -pl vb-stream-engine -Dtest=StreamedTransactionTest    # 单类（多模块后 -Dtest 须带 -pl）
 ```
 
-集成测试（`org.vastdata.vbstream.it`，14 组）经 Testcontainers 自动起容器（postgres:18 单例 + PG 17 兼容实证专用的 postgres:17 单例），需本机 Docker。`Pg17CompatTest` 跑 PG 17 源库五场景（Relation typmod 对齐 / binary 五类型族 / 流式 binary 大事务 / two_phase / StreamAbort parallel 附加字段），是源码级 PG 17 兼容性审计的真库佐证。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。
+引擎模块集成测试（`org.vastdata.vbstream.it`，14 组）经 Testcontainers 自动起容器（postgres:18 单例 + PG 17 兼容实证专用的 postgres:17 单例），需本机 Docker。`Pg17CompatTest` 跑 PG 17 源库五场景（Relation typmod 对齐 / binary 五类型族 / 流式 binary 大事务 / two_phase / StreamAbort parallel 附加字段），是源码级 PG 17 兼容性审计的真库佐证。其中 `BenchCorpusRecordTest` 兼任 JMH 语料生成器——语料已提交进库且指纹一致时不启容器，常规 `mvn test` 秒级通过。其余模块 IT 同为 Testcontainers：wal-source 含 PG 17/18 双矩阵对抗性对拍与双路对拍（`DualPathParityIT`），两连接器模块各含 embedded engine + 真 PG/真 Kafka Connect 端到端。
 
 JMH 基准在引擎模块的独立源码根 `vb-stream-engine/src/jmh`（`-Pjmh` 档才参与编译，默认构建零 JMH 依赖）；运行方式与基线数字见 `docs/benchmarks-baseline.md`。
 
@@ -140,4 +158,7 @@ JMH 基准在引擎模块的独立源码根 `vb-stream-engine/src/jmh`（`-Pjmh`
 - 里程碑 1.6（完成）：组装缓冲溢写 Chronicle Queue——MEMORY/SPILLED 混合桶、低水位删档、瞬态工作区语义 + JMH 基线
 - 里程碑 1.7（完成）：读取与组装输出解耦——reader 记账 + CQ 主缓冲管道（MEMORY/SPILLED 双形态与溢写阈值退役，桶纯 index 段记账）+ transaction-consumer 回放输出 + Relation 版本快照随行 + 输出前沿反馈封顶
 - 里程碑 2.0（完成）：输出契约流式化——`onEvent` 单回调事件交付（事务头 → 逐变更 → 事务尾），回放期堆峰从 O(事务) 降到 O(单条)；事务尾返回 = 完整消费确认，前沿随之推进；`vb.output.mode=block` 边界适配器恢复 1.7 原子交付语义（输出格式逐字节不变）
+- 连接器双宿主（完成）：Debezium 3.6.1 连接器（MS1–MS6 收官）+ Debezium **1.9.7** 宿主嵌入版（同包名整模块复制，2026-09-30 自含化——vanilla 连接器类裁剪复刻进自有命名空间，assembly 产物可独立挂 plugin.path）
+- wal-source v1（完成，2026-10-05）：WAL 直解源纯库——物理复制流接收（pageaddr 锚定协议/断流重连）+ V17/V18 布局描述符解析 + ctid 重放自维护 as-of 字典（竞速三修正：引导一致性/末态回填自愈/pageaddr 锚定）+ 检查点持久化（续传+槽推进）+ PG 17/18 双版本对抗性对拍 IT
+- wal-source v2（完成，2026-10-06）：用户表 DML 面——事务组装/TOAST 三形态重组/`vb.wal.tables`+`vb.wal.dml` 配置面/输出复刻 engine ConsoleRenderer 格式，经**双路对拍 IT**（引擎逻辑解码路 vs WAL 直解路，六场景+干扰矩阵，按 xid 交集逐行 diff 空）钉死两路 CDC 输出逐字节等价；2026-10-07 增 lz4 压缩值面（external/行内 lz4 经 lz4-java 解压，双路对拍专项验收）
 - 后续（计划）：输出队列、与 Logstash 集成
