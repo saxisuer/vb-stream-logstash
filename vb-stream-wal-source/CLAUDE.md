@@ -13,7 +13,8 @@ CREATE SCHEMA）证明两路 CDC 输出逐字节等价。设计全文见
 `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md`（先导实验
 `docs/wal-direct-decode-spike.md` + `spike/wal-parse` throwaway）。
 
-**依赖方向刻意收窄**：运行依赖仅 pgjdbc + slf4j-api，零 engine/Chronicle/logback
+**依赖方向刻意收窄**：运行依赖 pgjdbc + slf4j-api + lz4-java（TOAST lz4 压缩值解压，
+2026-10-07 lz4 支持落地引入），零 engine/Chronicle/logback
 依赖——将来是 engine（或连接器）依赖本模块，不是反过来（v2 裁定：两模块是**平级的
 解析工具**，输出格式对齐靠双路对拍测试钉死、不靠代码共享；engine 仅以 test-scope
 依赖出现在对拍 harness）。包结构 `org.vastdata.vbstream.walsource` 下
@@ -29,7 +30,7 @@ CREATE SCHEMA）证明两路 CDC 输出逐字节等价。设计全文见
 | `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件 |
 | `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验；formatVersion 3 增 `dmlFloorLsn`——DML 待决桶重放下界，Task 11），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
 | `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面 |
-| `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger |
+| `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`Lz4`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/lz4/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger |
 
 单线程直通执行模型（接收 → 解析 → 重放/解码 → 周期落盘全在 wal-receiver 线程，sink
 同步执行——检查点取当前已消费 LSN 即天然一致点，无需快照冻结）；组件接口化留解耦位。
@@ -76,8 +77,9 @@ CREATE SCHEMA）证明两路 CDC 输出逐字节等价。设计全文见
 | `ChangeStream` | DML 门面：单入口 `onRecord(WalRecord)`，WalSource sink 分发的第二消费者（catalog 同步器之后）；内建组装三件套装配（ToastAssembler probe 取 SQL 会话建 JdbcToastProbe，null 连接 = 纯回放禁回查档） |
 | `XactGrouper` | 事务组装状态机：heap I/U/D 行入桶累积（到达期解码 + 渲染），XACT 终态驱动发射/弃桶/挂起；子事务归并双通道（TOPLEVEL_XID 收割优先 + ASSIGNMENT 兜底）；TableMeta 按 relfilenode 缓存、字典三表 heap 记录到达即全清失效 |
 | `TableFilter` | relkind 'r'/'p' + `vb.wal.tables` 白名单（`schema.table` 逗号分隔，空 = 全放行）；从 v1 三表字典 as-of 解析表身份与列序 |
-| `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz 解压 + 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
+| `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz/lz4 双方法解压（`inflate` 分派面）+ 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
 | `Pglz` | PG pglz 解压纯移植（`pg_lzcompress.c` 主循环逐行转录，control byte 分组 + match 回拷，L705-790 源码锚） |
+| `Lz4` | lz4 裸 block 解压（lz4-java safeDecompressor 定长目标形态；PG `toast_decompress_datum`→`LZ4_decompress_safe` 同格式，JNI 优先纯 Java回落；2026-10-07 随 lz4 值面支持引入） |
 | `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `0x` + WARN 一次、dropped 列 ∅） |
 | `PgFloatFormat` | PG 风格浮点格式化器（Ryū 最短往返 + %g 定点门限——`1e+20`/`0.0001`/`-0`，补 `Double.toString` 的 `1.0E20` 分叉；前提会话 `extra_float_digits=1` 缺省档） |
 | `OutputRenderer` | pending 缓冲 + TXN-BEGIN/逐行/TXN-END 输出（**engine `ConsoleRenderer` 格式复刻契约**——头行 changes 终值在 End 组装、值截 64 附 `...(NB)`、dropped ∅/NULL 字面同形）；onAborted 丢桶零输出 |
@@ -131,7 +133,7 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 | **INSERT / UPDATE / DELETE**（wal_level=logical + REPLICA IDENTITY FULL） | ✅ 双路对拍逐字节等价 | — |
 | **事务组装**：普通/交错/SAVEPOINT 子事务回滚剔除/整体回滚零输出 | ✅ 场景 1 | — |
 | **两阶段提交**：PREPARE 挂起/COMMIT PREPARED 发射/ROLLBACK PREPARED 弃/挂起重启续传 | ✅ 场景 5（kind=TWO_PHASE + gid 双路一致） | — |
-| **TOAST**：external 重组/pglz 解压/行内压缩/UPDATE 未变列 `<toast-unchanged>`/重启后窗口前指针 probe 回查 | ✅ 场景 3（三存储形态 + 重启回查） | — |
+| **TOAST**：external 重组/pglz 与 lz4 解压/行内压缩/UPDATE 未变列 `<toast-unchanged>`/重启后窗口前指针 probe 回查 | ✅ 场景 3（三存储形态 + 重启回查）+ lz4 专项场景（`SET COMPRESSION lz4` 双形态，2026-10-07） | — |
 | **类型矩阵**：bool/int2/4/8/float4/8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp(tz)/uuid | ✅ 场景 2（17 类型 + 边界值 + 浮点 PG 风格格式化） | — |
 | **DDL-in-txn**：事务内 ADD COLUMN 前后段 as-of 渲染 | ✅ 场景 4 | — |
 | **RENAME/TRUNCATE**：catalog 行跟踪（v1 面） | ✅ v1 对拍 | — |
@@ -142,7 +144,7 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 | **UPDATE 未变列前像**（REPLICA IDENTITY FULL） | ✅ 前像恒完整（服务端 toast_flatten_tuple） | — |
 | **replica 形态 UPDATE**（wal_level=replica） | ❌ v3 或非目标 | liveness guard 行级跳过 + WARN/表 + skipped 计数——**系统性缺行**（README 限定 DML 需 logical） |
 | **截断 UPDATE 非 FULL 身份**（wal_level=logical + DEFAULT/KI 身份） | ⚠️ 理论不可达 | 互斥门保证 logical 流下恒 CONTAINS_OLD（heapam.c 实源）——liveness guard 防御面，双计数恒 0 哨兵 |
-| **lz4 压缩值**（external/行内） | ❌ v2 非目标 | 空归集面走哨兵（未变列同 engine 'u'）；非空 ISE fail-fast；字典面 attcompression=='l' 启动 WARN |
+| **lz4 压缩值**（external/行内） | ✅ 2026-10-07 落地（lz4-java） | —（未知方法码仍 ISE；解压损坏 ISE 同 pglz 契约） |
 | **矩阵外类型**（enum/域/jsonb/组合等） | ❌ 部分支持 | `0x` 十六进制降级 + WARN 一次/oid——输出可读性降但流不断；双路对拍在该集外会 diff |
 | **dropped 列**（DROP COLUMN 后新 INSERT） | ⚠️ 两路分叉 | wal 渲 `∅` 占位 vs engine pgoutput 'R' 不发 dropped 列——对拍矩阵刻意避开含 dropped 列场景 |
 | **压缩 FPW**（wal_compression 非 off） | ❌ v1 前提外 | ISE fail-fast——运维前提 `wal_compression=off` |
@@ -167,8 +169,9 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 - **dropped 列对拍分叉**：wal 侧渲 `∅` 占位（磁盘布局 dropped 列仍在元组内占位），
   engine 侧 pgoutput 'R' 关系消息不发 dropped 列——两路列集分叉，对拍矩阵刻意避开
   含 dropped 列的场景（含 DROP COLUMN 后新 INSERT 的形态）。
-- **lz4**：字典面 attcompression=='l' 启动期 WARN + 运行期撞 lz4（归集面非空）ISE
-  fail-fast；无解压面。空归集面的 lz4 未变列指针同走哨兵（Task 13 顺手修）。
+- **lz4 值面已支持**（2026-10-07）：`SET COMPRESSION lz4` 列（PG 14+）的 external/
+  行内压缩值经 lz4-java 裸 block 解压（`Lz4` 面），双路对拍专项场景验收；原
+  attcompression=='l' 启动 WARN + ISE 拒绝面已删（lz4Guard 从未接线且语义已废）。
 - **大事务输出缓冲 O(事务)**：pending 桶攒行文本至提交，与 engine block 模式同级；
   落盘化（格式层/file）是 v3 升级路径。
 - **清窗全局 vs per-txn 窄缝**（v3 合并条目）：全局清窗使交错事务 B 的行夹在 A 的
@@ -242,8 +245,8 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
   后两个吞记录通道均已闭合；17 风暴矩阵的次序规避保留、专项复验未重跑，复验绿后可
   勾销本条。
 - **压缩 FPW 不支持**：pglz/lz4/zstd 压缩页镜像一律 ISE——运维前提 `wal_compression=off`
-  （CHECKPOINT 后首写必带页镜像）；external/行内压缩 varlena 已在 v2 由
-  `ToastAssembler` 重组解压支持（lz4 压缩值除外，见 v2 限制）。
+  （CHECKPOINT 后首写必带页镜像）；external/行内压缩 varlena 的**值面**已由
+  `ToastAssembler` 重组解压支持（pglz + lz4 双方法，2026-10-07 补 lz4）。
 - **VACUUM FULL 全表重发的 CDC 语义**：v1 非目标——重放面按新 relfilenode 跟踪字典，
   但用户表 DML 语义未承诺。
 - **two_phase 记录**：v1 不消费；v2（Task 5）起 XactGrouper 已实现 PREPARE 挂起/
@@ -283,7 +286,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**245 用例 = 离线 206 + Testcontainers IT 39（需本机 Docker）**。
+**253 用例 = 离线 213 + Testcontainers IT 40（需本机 Docker）**。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
@@ -293,17 +296,21 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   4；`state` StateStoreTest 9（往返/CRC 拒载/版本拒载/pgVersion 参数化错配拒载——
   17 写 17、18 写 18，终审 I1；formatVersion 3 dmlFloorLsn 往返）/ StateConfigTest
   5；`changes`（v2 DML 面：DiskValueRendererTest 18 / XactGrouperTest 20 /
-  ToastAssemblerTest 12 / OutputRendererTest 7 / TableFilterTest 7 / PgFloatFormatTest
-  7 / PglzTest 5 / ChangeStreamTest 7）；`api` WalSourceConfigTest 5；ModuleBuildTest 1。
+  ToastAssemblerTest 13（含 lz4 双形态解压往返与未知方法码 ISE）/ OutputRendererTest 7 /
+  TableFilterTest 7 / PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：
+  手造黄金字节 + 库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；
+  `api` WalSourceConfigTest 5；ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
   `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
-  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 18（v2 双路对拍——engine
+  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 19（v2 双路对拍——engine
   逻辑解码路 in-process vs wal 直解路 DML 面同容器对拍，xid 交集逐行 diff 空：场景
   1 系基础 DML 六形态 + 类型矩阵边界值 + DDL-in-txn as-of + TOAST 三存储形态/重启
   unchanged + 2PC 四形态 + **普通 DML 中途停续（Task 12——at-least-once 重发双路一致，
   段一同页事务整桶幂等重发由重复块容忍面吸收）+ 流内 CREATE SCHEMA nsp 字典面
   （Task 4 延期清账）+ 干扰矩阵（Task 12——catalog 风暴线程[autovacuum toggle +
-  ANALYZE 循环]下场景 1/TOAST 复跑 @RepeatedTest(2)）**）、`WalReceiveTest` 6（接收
+  ANALYZE 循环]下场景 1/TOAST 复跑 @RepeatedTest(2)）** + lz4 压缩列双形态值面
+  （2026-10-07：`SET COMPRESSION lz4` external/行内 lz4，`pg_column_compression`
+  钉前提）、`WalReceiveTest` 6（接收
   锚定 + 杀后端原地重连 + 首连失败）、`WalAdversarialIT` 3（autovacuum 拉满/ANALYZE
   风暴/随机 CHECKPOINT 干扰下 DDL 全场景对拍，@RepeatedTest(2) + RENAME 最小复现）、
   `WalLifecycleIT` 5（检查点续传/损坏回落全新引导/丢页末态追平 resyncs==0/门面全装配/

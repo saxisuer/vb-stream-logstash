@@ -60,8 +60,8 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 `start()`，单线程直通（接收→解析→重放/解码→周期落盘）。**v2 增 `changes` 包 DML 面**：
 `ChangeStream` 门面 → `XactGrouper` 事务组装（提交时批量发射）+ `TableFilter` 白名单 +
 `ToastAssembler` TOAST 三形态重组 + `DiskValueRenderer`/`PgFloatFormat` 值渲染 +
-`OutputRenderer` 复刻 engine `ConsoleRenderer` 事务块格式。运行依赖仅 pgjdbc +
-slf4j-api，组件细节与坑位见模块 `CLAUDE.md`。
+`OutputRenderer` 复刻 engine `ConsoleRenderer` 事务块格式。运行依赖 pgjdbc +
+slf4j-api + lz4-java（TOAST lz4 压缩值解压），组件细节与坑位见模块 `CLAUDE.md`。
 
 ## 验收
 
@@ -72,20 +72,20 @@ slf4j-api，组件细节与坑位见模块 `CLAUDE.md`。
   engine Main 装配）与 wal 直解路各自独立槽位捕获输出，按 xid 交集**逐行 diff 为空**；
   六场景（基础 DML 六形态 / 17 类型边界值 / TOAST 三形态 + 重启 unchanged / DDL-in-txn
   as-of / 2PC 四形态 / 中途停续）+ CREATE SCHEMA + 干扰矩阵。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（245 用例 = 离线 206 + Testcontainers
-  IT 39，后者需本机 Docker）。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（253 用例 = 离线 213 + Testcontainers
+  IT 40，后者需本机 Docker）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
 
 **✅ 支持（双路对拍验收过）**：INSERT/UPDATE/DELETE（`wal_level=logical` + REPLICA IDENTITY
 FULL）、事务组装（交错/SAVEPOINT/回滚零输出/2PC 四形态）、TOAST 全形态（external 重组/
-pglz 解压/行内压缩/未变列 `<toast-unchanged>`/重启回查）、17 类型矩阵、事务内 DDL as-of、
-RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重发、PG 17+18 双版本。
+pglz 与 lz4 解压/行内压缩/未变列 `<toast-unchanged>`/重启回查）、17 类型矩阵、事务内 DDL
+as-of、RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重发、PG 17+18
+双版本。
 
 **❌ 不支持（触发时的行为）**：
 - **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，
   **DML 面需 `wal_level=logical`**
-- **lz4 压缩值** → ISE fail-fast（未变列空面走哨兵同 engine 'u'）
 - **压缩 FPW** → ISE fail-fast——运维前提 `wal_compression=off`
 - **矩阵外类型**（enum/jsonb/域等）→ `0x` 十六进制降级 + WARN，流不断
 - **VACUUM FULL/CLUSTER** → 字典跟踪但 DML 语义未承诺
@@ -99,7 +99,7 @@ RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重�
 - **接收器 5 次重连失败/解析 ISE 后进程 exit 1**——接收线程自行退出后冒烟 `Main`
   周期行检测终态 → ERROR + `System.exit(1)`（fail-fast，对齐引擎约定）
 - **压缩 FPW 不支持**——运维前提 `wal_compression=off`（CHECKPOINT 后首写必带页镜像）；
-  external/行内压缩 varlena 已支持（pglz 面），lz4 压缩值 fail-fast
+  external/行内压缩 varlena 的值面已支持 pglz 与 lz4 双方法
 - **首发 17 类型集外的列**（enum/域/jsonb/组合类型等）`hex:` 降级 + WARN——双路对拍
   仅在首发集内逐字节一致；大事务输出缓冲 O(事务)（与 engine block 模式同级，落盘化
   是 v3 路径）；engine 流式驱逐形态 kind=STREAMED 与 wal 侧恒 NORMAL 是已知分叉
