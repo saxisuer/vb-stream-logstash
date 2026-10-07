@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
@@ -60,7 +61,9 @@ import static org.junit.jupiter.api.Assertions.fail;
  * 回滚零输出 / 子事务 SAVEPOINT 回滚剔除 / 截断 UPDATE 中段列 / 17 类型边界值矩阵 /
  * 事务内 ADD COLUMN as-of / TOAST 三存储形态 + 重启续传 unchanged 对齐（external
  * 重组 / external pglz / 行内压缩 / 续传后未变宽列指针双路同渲染
- * {@code <toast-unchanged>}——pgoutput 'u' 同形）/ 2PC 四形态（挂起期零输出 /
+ * {@code <toast-unchanged>}——pgoutput 'u' 同形）/ lz4 压缩列双形态值面（2026-10-07
+ * lz4 支持落地——external lz4 归集解压 + 行内压缩 lz4，{@code pg_column_compression}
+ * 钉前提）/ 2PC 四形态（挂起期零输出 /
  * ROLLBACK PREPARED 弃桶 / COMMIT PREPARED 发射 {@code kind=TWO_PHASE}+gid /
  * 挂起期 wal-source 停机重启续传重放重建桶）/ 普通双段 DML 中途停续（Task 12 场景 6
  * ——at-least-once 重发双路一致）/ 流内 CREATE SCHEMA nsp 字典面（Task 4 延期项清账）
@@ -436,6 +439,60 @@ class DualPathParityIT {
                         + "（行内压缩非 external，正常发文本）:\n" + joined);
         assertEquals(2, countLiteral(joined, "<toast-unchanged>"),
                 "形态①②的 UPDATE 后像（未变 external 列）应各渲染一处 unchanged 占位:\n" + joined);
+    }
+
+    // ---- 场景 3 补充：lz4 压缩列的 TOAST 值面（lz4 支持落地，2026-10-07）----
+
+    /**
+     * lz4 压缩列（{@code SET COMPRESSION lz4}，PG 14+）的双形态值面对拍：半可压缩
+     * 宽值 24600B（md5 串联定长 'y' 段——与 pglz 场景形态②同源载荷，压缩后仍超
+     * 2KB 阈值 → <b>external lz4</b>，多 chunk 归集 + {@code Lz4} 解压）与全可压缩
+     * 值 {@code repeat('z',10000)}（压缩后低于阈值 → <b>行内压缩 lz4</b>，前像拍扁
+     * 内联同走该面）。DML 面与 TOAST 三形态场景同构（INSERT×2 + 全行 UPDATE +
+     * DELETE 行内值行），双路按 xid 交集逐行 diff 空。
+     *
+     * <p><b>场景前提钉死</b>：DML 事务内查 {@code pg_column_compression(w)} 断言
+     * 两行均以 lz4 落盘（external/行内两形态的压缩方法前提——若服务端静默回落
+     * pglz 则本场景测不到 {@link org.vastdata.vbstream.walsource.changes.Lz4} 面，
+     * fail 比假绿好）。足迹断言：external lz4 值（24600B 截断尾注）在 INSERT 后像
+     * + UPDATE 前像共 2 处（UPDATE 后像 unchanged，值不在 wire 上）+ 行内 lz4 值
+     * （10000B）在 INSERT/UPDATE 前后双像/DELETE 前像共 4 处 + unchanged 恰 1 处
+     * （external 列的 UPDATE 后像）。</p>
+     */
+    @Test
+    void lz4CompressedToastValuesParityAcrossPaths() throws Exception {
+        String[] ddl = {
+                "CREATE TABLE parity.t_parity_lz4 (id int4, w text)",
+                "ALTER TABLE parity.t_parity_lz4 REPLICA IDENTITY FULL",
+                "ALTER TABLE parity.t_parity_lz4 ALTER COLUMN w SET COMPRESSION lz4",
+        };
+        List<String> walLines = runParityWal("TOAST lz4 值面", 1, ddl, conn -> {
+            conn.setAutoCommit(false);
+            exec(conn, "INSERT INTO parity.t_parity_lz4 VALUES (1,"
+                    + " (SELECT string_agg(md5(i::text)||repeat('y',50),'') FROM generate_series(1,300) i))");
+            exec(conn, "INSERT INTO parity.t_parity_lz4 VALUES (2, repeat('z',10000))");
+            try (ResultSet rs = conn.createStatement().executeQuery(
+                    "SELECT pg_column_compression(w) FROM parity.t_parity_lz4 ORDER BY id")) {
+                assertTrue(rs.next() && "lz4".equals(rs.getString(1)),
+                        "行 1（external 形态）应以 lz4 落盘，实得 " + (rs.isAfterLast() ? "无行" : rs.getString(1)));
+                assertTrue(rs.next() && "lz4".equals(rs.getString(1)),
+                        "行 2（行内压缩形态）应以 lz4 落盘，实得 " + rs.getString(1));
+            }
+            exec(conn, "UPDATE parity.t_parity_lz4 SET id = id + 100");
+            exec(conn, "DELETE FROM parity.t_parity_lz4 WHERE id = 102");
+            conn.commit();
+        });
+        String joined = String.join("\n", walLines);
+        assertFalse(joined.contains("toast-unavailable"),
+                "lz4 场景不应出现 toast-unavailable 降级字面:\n" + joined);
+        assertEquals(2, countLiteral(joined, "...(24600B)"),
+                "external lz4 宽值应在 INSERT 后像 + UPDATE 前像共 2 处渲染 24600B 截断尾注"
+                        + "（UPDATE 后像是 unchanged）:\n" + joined);
+        assertEquals(4, countLiteral(joined, "...(10000B)"),
+                "行内压缩 lz4 值应在 INSERT 后像 + UPDATE 前后双像 + DELETE 前像共 4 处渲染"
+                        + " 10000B 截断尾注:\n" + joined);
+        assertEquals(1, countLiteral(joined, "<toast-unchanged>"),
+                "external lz4 列的 UPDATE 后像应渲染一处 unchanged 占位:\n" + joined);
     }
 
     // ---- 场景 10：重启后续传 + 未变宽列指针的 unchanged 对齐（Task 10 / 任务书场景 3 收官）----
