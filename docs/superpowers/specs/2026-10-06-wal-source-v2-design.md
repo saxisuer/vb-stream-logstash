@@ -25,7 +25,7 @@ v1 交付了"伪备库"的两块地基：catalog 同步（pg_attribute/pg_class 
 **非目标**
 - engine 模块的任何改动（两模块永零依赖，双路对拍中 engine 以黑盒跑）
 - lz4 external 值解压（检测 + ISE fail-fast，文档前提；升级路径平滑）
-- 矩阵外类型（超出 §5 首发集）的 text 渲染——降级 `hex:` + WARN，双路对拍在
+- 矩阵外类型（超出 §5 首发集）的 text 渲染——降级 `0x` + WARN，双路对拍在
   该集外会 diff，文档化为已知差异面
 - 压缩 FPW（维持 v1 的 `wal_compression=off` 运维前提）
 - VACUUM FULL/CLUSTER 全表重发的 CDC 语义（检测 + WARN 记档，v3 议）
@@ -89,13 +89,15 @@ engine 从 block 到 MessagePipe 的演进平行。
 **跨重启安全**：挂起桶终态悬置无碍——检查点 LSN 必然落后 PREPARE 位点，
 重放重建桶并补发终态事件。
 
+> 实现注记：发射点=提交时批量（Begin 携终值；BatchAborted 弃桶保证回滚零输出）——实现期裁定，spec 原文的即时发射措辞据此理解
+
 ## 5. 值面（DiskValueRenderer + ToastAssembler）
 
 **渲染矩阵**（磁盘格式 → PG text，对齐 pgoutput text 输出）：
 - 首发类型集：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bytea/
   date/time/timestamp/timestamptz/uuid——逐类型钉死渲染规则（numeric 精度、
   timestamptz 时区、负值与边界）
-- 矩阵外类型：`hex:<十六进制>` + WARN 一次；dropped 列：`∅`
+- 矩阵外类型：`0x<十六进制>` + WARN 一次；dropped 列：`∅`
 - 方法论复用 engine `BinaryValueDecoder` 的类型矩阵经验（同为"二进制 → text
   对齐"问题族，但布局是磁盘格式而非 typsend 格式）
 
@@ -152,6 +154,8 @@ DualPathParityIT（干扰容器变体，每场景两路同构跑 → 输出逐�
 - **矩阵外类型差异面**：双路对拍仅在首发类型集内逐字节一致——文档化
 - **VACUUM FULL 重写**：整表重发为 bulk INSERT 形态——v2 检测（新 relfilenode
   首批高频 multi-insert）+ WARN 记档，语义决策留 v3
+
+  > 勘误：v2 未实现检测/WARN（非目标化），v3 议
 - v1 遗留开放项顺延（56KB 跳变根因/17 丢 INSERT 复验——Task 13 收官注记：该丢失形态
   与引导一致性 C1 修复前的窗口同形（风暴推高跨窗口在途事务概率），C1 + Task 11
   pendingFloorLsn 后两个吞记录通道均已闭合，17 风暴专项复验待重跑后可勾销/

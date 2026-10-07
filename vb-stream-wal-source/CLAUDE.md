@@ -78,7 +78,7 @@ CREATE SCHEMA）证明两路 CDC 输出逐字节等价。设计全文见
 | `TableFilter` | relkind 'r'/'p' + `vb.wal.tables` 白名单（`schema.table` 逗号分隔，空 = 全放行）；从 v1 三表字典 as-of 解析表身份与列序 |
 | `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz 解压 + 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
 | `Pglz` | PG pglz 解压纯移植（`pg_lzcompress.c` 主循环逐行转录，control byte 分组 + match 回拷，L705-790 源码锚） |
-| `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `hex:` + WARN 一次、dropped 列 ∅） |
+| `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `0x` + WARN 一次、dropped 列 ∅） |
 | `PgFloatFormat` | PG 风格浮点格式化器（Ryū 最短往返 + %g 定点门限——`1e+20`/`0.0001`/`-0`，补 `Double.toString` 的 `1.0E20` 分叉；前提会话 `extra_float_digits=1` 缺省档） |
 | `OutputRenderer` | pending 缓冲 + TXN-BEGIN/逐行/TXN-END 输出（**engine `ConsoleRenderer` 格式复刻契约**——头行 changes 终值在 End 组装、值截 64 附 `...(NB)`、dropped ∅/NULL 字面同形）；onAborted 丢桶零输出 |
 | `ChangeOutputListener` | 中立事件接口：`BatchBegin`/`RowChange`/`BatchEnd`(expectedChanges)/`BatchAborted` |
@@ -133,8 +133,11 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 - **STREAMED kind 分叉**：engine 逻辑解码流式驱逐形态输出 `kind=STREAMED` + 行尾
   `[streamed xid=N]`，wal 侧恒 NORMAL（WAL 无驱逐概念）——parity 环境禁驱逐规避；真
   流式形态对齐需 wal 侧模拟驱逐语义，v3 议。
-- **矩阵外类型**：首发 17 类型集外的列（enum/域/jsonb/组合类型等）`hex:` 降级 + WARN
+- **矩阵外类型**：首发 17 类型集外的列（enum/域/jsonb/组合类型等）`0x` 降级 + WARN
   ——双路对拍在该集外会 diff，文档化差异面。
+- **dropped 列对拍分叉**：wal 侧渲 `∅` 占位（磁盘布局 dropped 列仍在元组内占位），
+  engine 侧 pgoutput 'R' 关系消息不发 dropped 列——两路列集分叉，对拍矩阵刻意避开
+  含 dropped 列的场景（含 DROP COLUMN 后新 INSERT 的形态）。
 - **lz4**：字典面 attcompression=='l' 启动期 WARN + 运行期撞 lz4（归集面非空）ISE
   fail-fast；无解压面。空归集面的 lz4 未变列指针同走哨兵（Task 13 顺手修）。
 - **大事务输出缓冲 O(事务)**：pending 桶攒行文本至提交，与 engine block 模式同级；

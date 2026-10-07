@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -149,7 +150,7 @@ class ToastAssemblerTest {
         byte[] resolved = assembler.resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
 
         assertTrue(resolved == ToastAssembler.UNCHANGED_TOAST_MARKER,
-                "归集面空应返回 unchanged 哨兵（身份比较），实得 " + java.util.Arrays.toString(resolved));
+                "归集面空应返回 unchanged 哨兵（身份比较），实得 " + Arrays.toString(resolved));
         assertEquals(-1L, probe.lastToastOid, "归集面空不触发回查");
         assertTrue(appender.list.stream().noneMatch(e -> e.getLevel() == Level.WARN), "无 WARN（非降级路径）");
     }
@@ -241,7 +242,7 @@ class ToastAssemblerTest {
 
         assertTrue(resolved == ToastAssembler.UNCHANGED_TOAST_MARKER,
                 "lz4 未变列指针的空归集面应走哨兵（== 身份），实得 "
-                        + java.util.Arrays.toString(resolved));
+                        + Arrays.toString(resolved));
     }
 
     /**
