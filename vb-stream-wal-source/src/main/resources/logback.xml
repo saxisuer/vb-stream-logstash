@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
-    <!-- 冒烟 Main 运行配置：root INFO 控制台——周期统计行与生命周期日志走 slf4j（规约禁 System.out） -->
+    <!-- 冒烟 Main 日志面：CDC 数据输出（TXN-BEGIN/逐行/TXN-END）走专用 logger
+         org.vastdata.vbstream.walsource.cdc（INFO，与系统日志分离、可独立调级）；
+         解析/接收逐记录细节 DEBUG 默认关闭（排障时单独调对应 logger 级别）。
+         与 engine 模块的 logback.xml 同式（本地冒烟约定，非部署配置）。 -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
             <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{24} - %msg%n</pattern>

@@ -14,8 +14,10 @@ CREATE SCHEMA）证明两路 CDC 输出逐字节等价。设计全文见
 `docs/wal-direct-decode-spike.md` + `spike/wal-parse` throwaway）。
 
 **依赖方向刻意收窄**：运行依赖 pgjdbc + slf4j-api + lz4-java（TOAST lz4 压缩值解压，
-2026-10-07 lz4 支持落地引入），零 engine/Chronicle/logback
-依赖——将来是 engine（或连接器）依赖本模块，不是反过来（v2 裁定：两模块是**平级的
+2026-10-07 lz4 支持落地引入）+ logback-classic（**runtime** 绑定 + `src/main/resources/`
+logback.xml，2026-10-09 自 test-scope 提升——此前 main 面直接跑冒烟 Main 因 slf4j 无绑定
+NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配置时以其 classpath 为准），
+零 engine/Chronicle 依赖——将来是 engine（或连接器）依赖本模块，不是反过来（v2 裁定：两模块是**平级的
 解析工具**，输出格式对齐靠双路对拍测试钉死、不靠代码共享；engine 仅以 test-scope
 依赖出现在对拍 harness）。包结构 `org.vastdata.vbstream.walsource` 下
 `layout`/`receive`/`replay`/`state`/`api`/`changes` 六包 + 顶层冒烟 `Main`。

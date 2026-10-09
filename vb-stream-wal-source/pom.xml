@@ -35,11 +35,15 @@
             <artifactId>lz4-java</artifactId>
             <version>${lz4-java.version}</version>
         </dependency>
+        <!-- logback-classic：slf4j 运行时绑定（2026-10-09 自 test-scope 提升——此前 main 面
+             直接跑冒烟 Main 因无绑定 NOP 静默零日志）。runtime 不进编译面；库形态宿主
+             （reader/连接器）自带绑定时以其 classpath 为准——本模块随 jar 附带的
+             logback.xml 仅在无更高优先级配置时生效（logback.configurationFile 可覆盖）。 -->
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
             <version>${logback.version}</version>
-            <scope>test</scope>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>

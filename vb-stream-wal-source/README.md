@@ -61,7 +61,9 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 `ChangeStream` 门面 → `XactGrouper` 事务组装（提交时批量发射）+ `TableFilter` 白名单 +
 `ToastAssembler` TOAST 三形态重组 + `DiskValueRenderer`/`PgFloatFormat` 值渲染 +
 `OutputRenderer` 复刻 engine `ConsoleRenderer` 事务块格式。运行依赖 pgjdbc +
-slf4j-api + lz4-java（TOAST lz4 压缩值解压），组件细节与坑位见模块 `CLAUDE.md`。
+slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime 绑定——
+直接 `java -cp` 跑冒烟 Main 即有日志；宿主自带绑定时以其配置为准），组件细节与
+坑位见模块 `CLAUDE.md`。
 
 ## 验收
 
