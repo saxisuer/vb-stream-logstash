@@ -84,22 +84,45 @@ UPDATE WAL **从不记录旧元组**（CONTAINS_OLD 系列是 wal_level=logical 
 - LSN 函数：沿用 xlog 命名（无 wal 命名、无 flush 变体）+ `gs_current_xlog_insert_end_location`。
 - `pg_read_binary_file` 直读 `pg_xlog/` 可用（本调研的字节面全靠它）。
 
-### 2.3 P0 阻塞：物理流启动导致实例整体退出（4 次复现）
+### 2.3 P0：物理流启动导致实例整体退出——根因已定位（2026-10-11 二轮排障）
 
 **现象**：`START_REPLICATION PHYSICAL <lsn>` 被接受（日志明确 `received wal replication command`），
 随后**整个 gaussdb 实例退出**（容器 Exit 0、日志无 FATAL/PANIC），唯一前兆是
-`WARNING: the ha connection is not in the channel list`。
+`WARNING: the ha connection is not in the channel list`。复现矩阵：vanilla pgjdbc 42.7.13 /
+opengauss-jdbc 5.0.0-og × amd64-qemu / arm64 原生——双驱动双架构 4+ 次复现（排除 qemu 因素）。
 
-**复现矩阵**：vanilla pgjdbc 42.7.13 × amd64-qemu ✅复现；opengauss-jdbc 5.0.0-og × amd64-qemu
-✅复现；vanilla pgjdbc × arm64 原生 ✅复现（排除 qemu 因素）。
+**根因链（strace + 源码 + 服务器日志多路钉死）**：
 
-**假说**（按可能性排序，待验证）：
-1. openGauss HA 通道校验：物理复制面向的是登记过的主备通道（replauth/channel 体系），未登记
-   客户端起流触发服务端异常路径——需研究 replauth GUC/通道登记配置是否放行。
-2. openGauss 私有握手缺位：其 walreceiver 协议有 IDENTIFY_SYSTEM 带 session version/term 协商
-   （记录头里的 xl_term 即为此体系），vanilla pgjdbc 直发 START_REPLICATION 跳过了协商。
-3. 两者叠加。**解锁前 receive 面不成立**；若最终不可解锁，备选路线是 WAL 文件级采集
-   （pg_read_binary_file / 文件 tail + 归档），性能形态不同但解析层完全复用。
+1. **walsender 线程死亡**。openGauss 是线程架构，walsender 是线程。strace 实测：物理流
+   START_REPLICATION 后 walsender 线程 `exit(0)`（线程级退出 syscall）——主端口形态下**零日志
+   零数据**（连首个 keepalive 都未发出）；HA 端口形态下可见两种死法：`No message received
+   from standby for maximum time`（WalSndHandshake 30s 超时路径，walsender.cpp ~L520 的
+   `proc_exit(0)`）与静默冻结（线程耗尽、监听全撤、无日志）。
+2. **HA 状态机自杀**。openGauss 把物理复制流视为 HA 体系一部分：日志实证 `all build walsenders
+   exited` → `Gaussdb exit(0)`——配了 replconninfo 的实例在"物理 walsender 全部退出"时整个实例
+   退出；未配 replconninfo 的单机容器同样在物理 walsender 死亡后实例退出（更快更静默）。
+   **单机场景下这个设计意味着：任何第三方物理流客户端断开/失礼，数据库实例自杀**。
+3. **第三方客户端"失礼"的具体点**：openGauss walreceiver 标准握手是私有序列——
+   `IDENTIFY_SYSTEM`（systemid/tli/xlogpos/mode）→ **`IDENTIFY_VERSION`（sversion/pversion/term
+   协商）**→ `IDENTIFY_CHANNEL <ha_port>` →（build 场景 `IDENTIFY_CONSISTENCE`）→
+   `START_REPLICATION [SLOT ...]`，且流期间要求规律的 standby 反馈。pgjdbc 系驱动（含
+   opengauss-jdbc 继承 pgjdbc 的 replication API）直发 START_REPLICATION、跳过全部私有握手，
+   运行在服务端未定义状态上。记录头里恒见的 `xl_term=0x80000001` 正是 term 体系的痕迹。
+4. **通道与端口体系**（实测）：配 `replconninfo1` 后实例额外监听 **HA 专用端口（localport，
+   如 5433）**与心跳端口；HA 端口拒绝 SQL 客户端（`FATAL: the local listen ip and port is not
+   for the gsql client`）、主端口 5432 接受复制连接但物理流处于半支持状态（通道校验
+   `IsChannelAdapt`：连接双方 IP 须与 replconninfo 的 localhost/remotehost 字符串全等）。
+   另两个坑：replconninfo 的 localhost 填错 IP 时 HA socket 创建失败会**阻塞整个实例启动**；
+   配置 replconninfo 后若 remotehost 不可达，build walsender 全退 → 启动期实例自杀（研究期用
+   宿主机假监听 `nc -lk 5435` 喂住 build 连接可绕过）。
+
+**对适配的结论**：receive 面需要**自研 openGauss 备库兼容客户端**（不能复用 pgjdbc/opengauss-jdbc
+的 replication API）：v3 协议 startup（md5）→ 私有握手序列（IDENTIFY_SYSTEM/IDENTIFY_VERSION
+[term 比对]/IDENTIFY_CHANNEL）→ CopyBoth START_REPLICATION → 规律 standby 反馈。wal-source 的
+`WalStreamReceiver` 本就是薄层（pgjdbc 只是传输壳），替换为该客户端是可控工作量（预估数百行
+原型 + 稳定性打磨）。**风险注记**：即便握手做全，"客户端断开 → 实例退出"的 HA 状态机行为
+是否仅限配了 replconninfo 的实例、对生产是否可接受，需在真实部署形态评估；单机（不配
+replconninfo）+ 主端口物理流的静默死亡路径，需在握手补全后复验是否消失。
 
 ### 2.4 引导一致性面的两个小坑
 
