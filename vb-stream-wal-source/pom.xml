@@ -35,6 +35,17 @@
             <artifactId>lz4-java</artifactId>
             <version>${lz4-java.version}</version>
         </dependency>
+        <!-- opengauss-jdbc（openGauss M1，Task 6）：openGauss 5.0.0 档 SQL 会话驱动
+             （sha256 认证兼容；包名 org.opengauss.jdbc 系——与 vanilla pgjdbc 同 classpath
+             可共存，调研 §"双驱动收流实测"）。runtime：编译面零引用——WalSource 仅经
+             DriverManager 按 URL 前缀（jdbc:opengauss:，键 vb.wal.og.jdbc.prefix）分流，
+             缺省 jdbc:postgresql: 时本依赖不被触达（PG 17/18 档零感知）。 -->
+        <dependency>
+            <groupId>org.opengauss</groupId>
+            <artifactId>opengauss-jdbc</artifactId>
+            <version>${opengauss-jdbc.version}</version>
+            <scope>runtime</scope>
+        </dependency>
         <!-- logback-classic：slf4j 运行时绑定（2026-10-09 自 test-scope 提升——此前 main 面
              直接跑冒烟 Main 因无绑定 NOP 静默零日志）。runtime 不进编译面；库形态宿主
              （reader/连接器）自带绑定时以其 classpath 为准——本模块随 jar 附带的

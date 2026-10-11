@@ -100,7 +100,8 @@ public final class Main {
     }
 
     /**
-     * 收集 {@code vb.wal.*} 六键 + state 三键 + v2 两键（tables/dml）系统属性为门面配置。
+     * 收集 {@code vb.wal.*} 六键 + state 三键 + v2 两键（tables/dml）+ openGauss 档五键
+     * （M1 Task 6，spec §7）系统属性为门面配置。
      *
      * <p>关键步骤：逐键 {@code System.getProperty}，仅非 null 值入 Properties——缺键留给
      * {@link WalSource} 构造器取默认值（单一默认值来源，Main 不复刻）。</p>
@@ -120,6 +121,11 @@ public final class Main {
         copySysProp(WalSource.KEY_STATE_EVENTS, cfg);
         copySysProp(WalSource.KEY_TABLES, cfg);
         copySysProp(WalSource.KEY_DML, cfg);
+        copySysProp(WalSource.KEY_OG_SOURCE, cfg);
+        copySysProp(WalSource.KEY_OG_RX_MODE, cfg);
+        copySysProp(WalSource.KEY_OG_RX_DIR, cfg);
+        copySysProp(WalSource.KEY_OG_RX_BIN, cfg);
+        copySysProp(WalSource.KEY_OG_JDBC_PREFIX, cfg);
         return cfg;
     }
 

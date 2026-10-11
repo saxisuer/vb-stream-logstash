@@ -36,6 +36,7 @@
         <maven-assembly-plugin.version>3.8.0</maven-assembly-plugin.version>
         <testcontainers.version>2.0.5</testcontainers.version>
         <lz4-java.version>1.8.0</lz4-java.version>
+        <opengauss-jdbc.version>5.0.0-og</opengauss-jdbc.version>
         <jmh.version>1.37</jmh.version>
         <maven-build-helper-plugin.version>3.6.0</maven-build-helper-plugin.version>
 

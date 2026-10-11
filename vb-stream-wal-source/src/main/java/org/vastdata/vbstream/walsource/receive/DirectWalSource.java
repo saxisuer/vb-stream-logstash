@@ -66,6 +66,16 @@ public final class DirectWalSource implements WalByteSource {
     private final String pass;
     private final String slotName;
     private final long statusIntervalMs;
+
+    /**
+     * 首连起点注入（M1 Task 6 装配缝）：{@code WalSource} openGauss 档把引导一致点
+     * （ensureSlot P₀ / bootstrap B / 检查点 stored lsn）传进本源——首连不采纳
+     * IDENTIFY_SYSTEM 的 xlogpos（它是服务端当前末观测位点，晚于引导一致点时采纳即跳过
+     * (B, xlogpos] 窗口记录——引导一致性 C1 的 OG 面）。0 = 现状 IDENTIFY_SYSTEM 档；
+     * 断流重连恒自 consumedLsn 续传（注入值只作用于首连）。
+     */
+    private final long startLsn;
+
     private final long segmentSize;
     private final int readTimeoutMs;
     private final long backoffBaseMs;
@@ -107,11 +117,13 @@ public final class DirectWalSource implements WalByteSource {
      * @param pass             密码
      * @param slotName         物理复制槽名
      * @param statusIntervalMs 反馈心跳的 statusInterval（毫秒，心跳周期 = 其一半）
+     * @param startLsn         首连起点（0 = IDENTIFY_SYSTEM xlogpos 档；&gt;0 = 注入值段对齐
+     *                         下取整起流——WalSource OG 档引导一致点的传递面，M1 Task 6）
      */
     public DirectWalSource(String host, int port, String user, String pass,
-                           String slotName, long statusIntervalMs) {
+                           String slotName, long statusIntervalMs, long startLsn) {
         this(host, port, user, pass, slotName, statusIntervalMs, FileWalSource.DEFAULT_SEGMENT_SIZE,
-                (int) Math.max(statusIntervalMs * 4, 30_000), 1_000, 5);
+                (int) Math.max(statusIntervalMs * 4, 30_000), 1_000, 5, startLsn);
     }
 
     /**
@@ -127,10 +139,11 @@ public final class DirectWalSource implements WalByteSource {
      * @param readTimeoutMs    通道读超时（毫秒，≤0 无限阻塞）
      * @param backoffBaseMs    重连退避基数（逐次翻倍封顶 16s）
      * @param maxAttempts      连续失败上限（达限置终态）
+     * @param startLsn         首连起点（0 = IDENTIFY_SYSTEM xlogpos 档；&gt;0 = 注入值优先）
      */
     public DirectWalSource(String host, int port, String user, String pass, String slotName,
                     long statusIntervalMs, long segmentSize, int readTimeoutMs,
-                    long backoffBaseMs, int maxAttempts) {
+                    long backoffBaseMs, int maxAttempts, long startLsn) {
         this.host = host;
         this.port = port;
         this.user = user;
@@ -141,6 +154,7 @@ public final class DirectWalSource implements WalByteSource {
         this.readTimeoutMs = readTimeoutMs;
         this.backoffBaseMs = backoffBaseMs;
         this.maxAttempts = maxAttempts;
+        this.startLsn = startLsn;
     }
 
     /**
@@ -289,7 +303,8 @@ public final class DirectWalSource implements WalByteSource {
 
     /**
      * 单连接生命周期：建连认证 → IDENTIFY_SYSTEM → 起点对齐（续传优先 consumedLsn，首连
-     * 取 xlogpos；段对齐下取整）→ START_REPLICATION → CopyBoth 进入 → 起心跳 → 流循环
+     * 依次取注入 startLsn（Task 6 装配缝——引导一致点优先于服务端观测位点）、都缺才取
+     * xlogpos；段对齐下取整）→ START_REPLICATION → CopyBoth 进入 → 起心跳 → 流循环
      * 至断连/CopyDone。
      *
      * @throws IOException 连接/认证/命令/流读失败（工作循环的失败面）
@@ -300,7 +315,8 @@ public final class DirectWalSource implements WalByteSource {
         channel = ch;
         ch.connect();
         String[] row = ch.identifySystem();
-        long resumeBase = consumedLsn.get() > 0 ? consumedLsn.get() : Lsn.parse(row[2]);
+        long resumeBase = consumedLsn.get() > 0 ? consumedLsn.get()
+                : startLsn > 0 ? startLsn : Lsn.parse(row[2]);
         long start = resumeBase - resumeBase % segmentSize;
         ch.startPhysicalReplication(slotName, start);
         LOG.info("直连流已起: systemid={} tli={} 续传基点 {} 流起点 {}",

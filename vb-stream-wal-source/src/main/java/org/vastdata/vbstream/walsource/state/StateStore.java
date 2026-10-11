@@ -40,7 +40,9 @@ import java.util.zip.CheckedOutputStream;
  * v3 增 dmlFloorLsn u64——待决桶重放下界，Task 11 挂起桶跨检查点修复）</strong>：
  * <pre>
  * header 24B: magic "VBWS" 4B + formatVersion u16 + pgVersion u16（大版本，与构造
- *             入参 layout.majorVersion() 同源——17 写 17、18 写 18，load 校验同源）
+ *             入参 layout.majorVersion() 同源——17 写 17、18 写 18；openGauss 档写
+ *             5 = WalLayoutVOpenGauss.majorVersion() 自有口径[非 PG 9，M1 Task 6]，
+ *             u16 校验面天然容纳、格式零改动，load 校验同源错配拒载）
  *             + lsn u64 + headerLen u32(=24) + headerCrc32 u32（前 20 字节）
  * body:       attr 表（rowCount u32 + 行[ctid u64 + attrelid u64 + atttypid u64
  *               + attnum u32 + attisdropped u8 + attname u16 前缀 UTF]×n）

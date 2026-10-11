@@ -101,7 +101,7 @@ class DirectWalSourceStreamTest {
             List<Chunk> chunks = new ArrayList<>();
             List<Long> frontierSinks = new ArrayList<>();
             DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
-                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3);
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3, 0L);
             source.start(l -> frontierSinks.add(l), (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
             try {
                 await(() -> chunks.size() == 2, "两块 WAL 须交付");
@@ -171,7 +171,7 @@ class DirectWalSourceStreamTest {
             });
             List<Chunk> chunks = new ArrayList<>();
             DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
-                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3);
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3, 0L);
             source.start(l -> { }, (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
             try {
                 await(() -> chunks.size() == 2, "重连后重发块须交付");
@@ -201,7 +201,7 @@ class DirectWalSourceStreamTest {
             deadPort = probe.getLocalPort();   // 占用后即关——该端口无监听
         }
         DirectWalSource source = new DirectWalSource("localhost", deadPort, "gaussdb",
-                "Gauss_12345", "wal_source", 600, SEG_SIZE, 500, 50, 2);
+                "Gauss_12345", "wal_source", 600, SEG_SIZE, 500, 50, 2, 0L);
         source.start(l -> { }, (lsn, bytes) -> { });
         try {
             await(source::isTerminated, "两次连接失败后须终态退出");
@@ -244,7 +244,7 @@ class DirectWalSourceStreamTest {
             });
             List<Chunk> chunks = new ArrayList<>();
             DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
-                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3);
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3, 0L);
             source.start(l -> { }, (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
             try {
                 await(() -> chunks.size() == 2, "重连后次块须交付");
@@ -289,7 +289,7 @@ class DirectWalSourceStreamTest {
             });
             List<Chunk> chunks = new ArrayList<>();
             DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
-                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3);
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3, 0L);
             source.start(l -> { }, (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
             try {
                 await(() -> chunks.size() == 2, "CopyDone 重连后次块须交付");
@@ -303,6 +303,38 @@ class DirectWalSourceStreamTest {
             assertEquals(segBase + 16, chunks.get(1).anchor, "CopyDone 重连续传锚接续");
             assertEquals(segBase + 16, source.consumedLsn());
             assertTrue(source.terminalFailure().isEmpty(), "单次 CopyDone 属可重试面——无终态");
+        }
+    }
+
+    /**
+     * Task 6 装配缝：显式 startLsn&gt;0 时首连起点采纳注入值（段对齐下取整）而非
+     * IDENTIFY_SYSTEM 的 xlogpos——WalSource openGauss 档把引导一致点（ensureSlot P₀ /
+     * bootstrap B）传进字节源的通道；xlogpos（服务端当前末观测位点）晚于引导一致点时
+     * 若被采纳会跳过 (B, xlogpos] 窗口记录（引导一致性 C1 的 OG 面）。
+     */
+    @Test
+    void explicitStartLsnOverridesIdentifyXlogposOnFirstConnection() throws Exception {
+        long segBase = 0x10000L;
+        try (OgPseudoServer server = OgPseudoServer.start()) {
+            server.script(session -> {
+                handshake(session);
+                identify(session, "0/3000000");   // 服务端观测位点远于注入起点——不得采纳
+                assertEquals("START_REPLICATION SLOT \"wal_source\" 0/8000", session.readQuery(),
+                        "首连起点 = 注入 startLsn(0x8000, 恰 32KB 段对齐) 而非 xlogpos");
+                session.writeCopyBothResponse();
+                session.writeWalData(segBase, segBase + 0x100000L, "ok".getBytes(StandardCharsets.UTF_8));
+                session.drainUntilClientClose();
+            });
+            List<Chunk> chunks = new ArrayList<>();
+            DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3, 0x8000L);
+            source.start(l -> { }, (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
+            try {
+                await(() -> chunks.size() == 1, "起点正确的流上须交付首块");
+            } finally {
+                source.stop();
+            }
+            server.awaitScript(SCRIPT_TIMEOUT_MS);   // 起点断言在脚本线程内执行——不符即 AssertionError 上浮
         }
     }
 

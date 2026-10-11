@@ -6,8 +6,13 @@ import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.changes.ChangeStream;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
+import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
 import org.vastdata.vbstream.walsource.layout.WalLayouts;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
+import org.vastdata.vbstream.walsource.receive.DirectWalSource;
+import org.vastdata.vbstream.walsource.receive.FileWalSource;
+import org.vastdata.vbstream.walsource.receive.ReceivexlogProcess;
+import org.vastdata.vbstream.walsource.receive.WalByteSource;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 import org.vastdata.vbstream.walsource.replay.CatalogSynchronizer;
 import org.vastdata.vbstream.walsource.state.StateConfig;
@@ -32,19 +37,28 @@ import java.util.function.LongSupplier;
  *
  * <p>装配次序（委派 {@link CatalogSynchronizer#start(Connection, String, WalLayout,
  * String, String, StateConfig, long...)}）：① 普通 JDBC URL 建 SQL 会话；② 同会话查
- * {@code current_setting('server_version_num')} 经 {@link WalLayouts#forServerVersion}
- * 分发布局——错配版本启动期 ISE fail-fast（绝不近似回退）；③ 带凭据档 + 检查点配置
- * 起同步器（自愈接线；state.dir 有有效检查点 → 续传跳过引导，否则全新引导——决策
- * 见同步器 javadoc）。v1 门面无 tracked 面（interest 0 个，纯字典同步形态）。</p>
+ * {@code current_setting('server_version_num')} 经 {@link WalLayouts#forServer}（9 万段
+ * 补充 version() 文本）分发布局——错配版本启动期 ISE fail-fast（绝不近似回退）；
+ * ③ 带凭据档 + 检查点配置起同步器（自愈接线；state.dir 有有效检查点 → 续传跳过引导，
+ * 否则全新引导——决策见同步器 javadoc）。v1 门面无 tracked 面（interest 0 个，纯字典
+ * 同步形态）。<strong>openGauss 5.0.0 档（M1 Task 6）</strong>：判别命中
+ * {@code WalLayoutVOpenGauss} 时转 {@code startOpenGauss}——槽走 ensureSlotOg（dummy_
+ * standby 建槽 + xlog 位点函数）、收流按 {@code vb.wal.og.source} 走 WalByteSource
+ * 双通道（file=sidecar tail / direct=裸 v3 直连）、DML 面不装配（M2 范围，请求即 ISE）；
+ * 观测面（consumedLsn/metrics/terminalFailure/检查点/槽推进）经同步器同源透传。</p>
  *
  * <p>配置面：构造入参 {@link Properties} 读 {@code vb.wal.host/port/db/user/pass/slot}
  * 六键 + {@code vb.wal.state.dir/interval.ms/events} 三键 + v2 两键
- * （{@code vb.wal.tables} 白名单 / {@code vb.wal.dml} DML 输出开关，Task 7），默认
- * {@code localhost:5432/postgres}、{@code postgres/postgres}、槽 {@code wal_source}、
- * state 禁用（三键语义/默认值见 {@link StateConfig}，单一来源不双写）、白名单空 =
- * 全放行、dml 缺省 true。port/interval/events 非数字启动构造期抛
- * {@link NumberFormatException}；{@code vb.wal.dml} 非 true/false 构造期 IAE
- * （fail-fast 优于静默连错端口/吞掉 DML 面）。</p>
+ * （{@code vb.wal.tables} 白名单 / {@code vb.wal.dml} DML 输出开关，Task 7）+ openGauss
+ * 档五键（M1 Task 6，spec §7：{@code vb.wal.og.source} file|direct / {@code
+ * vb.wal.og.rx.mode} managed|external / {@code vb.wal.og.rx.dir} / {@code
+ * vb.wal.og.rx.bin} / {@code vb.wal.og.jdbc.prefix}——前缀分流 opengauss-jdbc 与
+ * pgjdbc，缺省 jdbc:postgresql: 保 PG 档零感知），默认 {@code localhost:5432/postgres}、
+ * {@code postgres/postgres}、槽 {@code wal_source}、state 禁用（三键语义/默认值见
+ * {@link StateConfig}，单一来源不双写）、白名单空 = 全放行、dml 缺省 true。port/interval/
+ * events 非数字启动构造期抛 {@link NumberFormatException}；{@code vb.wal.dml} 非
+ * true/false、OG 五键取值域外 / 显式空白 rx.dir/rx.bin 构造期 IAE（fail-fast 优于
+ * 静默连错端口/吞掉 DML 面）。</p>
  *
  * <p>生命周期：start/close 单程（重复 start 抛 ISE；close 幂等，实现 AutoCloseable；
  * close 含最终 best-effort 检查点 + 槽推进——委派 {@link CatalogSynchronizer#stop()}）；
@@ -57,6 +71,12 @@ import java.util.function.LongSupplier;
 public final class WalSource implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(WalSource.class);
+
+    /**
+     * OG 档 direct 通道的反馈心跳 statusInterval（毫秒）——与接收器路 5s flush 反馈同
+     * 量级（DirectWalSource 心跳周期 = 其一半）。
+     */
+    private static final long OG_DIRECT_STATUS_INTERVAL_MS = 10_000;
 
     /** PG 主机键（默认 localhost）。 */
     public static final String KEY_HOST = "vb.wal.host";
@@ -91,6 +111,42 @@ public final class WalSource implements AutoCloseable {
     /** DML 输出开关键（默认 true；false 回纯 v1 catalog 形态——ChangeStream 不装配）。 */
     public static final String KEY_DML = "vb.wal.dml";
 
+    /**
+     * openGauss 档收流通道键（M1，spec §7）：{@code file}=sidecar pg_receivexlog 落目录
+     * + FileWalSource tail（缺省）；{@code direct}=DirectWalSource 裸 v3 协议直连。非法值
+     * 构造期 IAE。PG 17/18 档不读本键。
+     */
+    public static final String KEY_OG_SOURCE = "vb.wal.og.source";
+
+    /**
+     * openGauss 档 sidecar 管理键（仅 file 通道有意义）：{@code managed}=自拉起
+     * pg_receivexlog 子进程（缺省）；{@code external}=只读既有落盘目录（进程运维自担）。
+     * 非法值构造期 IAE。
+     */
+    public static final String KEY_OG_RX_MODE = "vb.wal.og.rx.mode";
+
+    /**
+     * openGauss 档段落盘目录键（file 通道的 tail 目录 / managed 的 {@code -D} 参数值；
+     * 缺省 {@code wal-og-queue}，相对工作目录）。显式空白构造期 IAE（spec §4）。
+     */
+    public static final String KEY_OG_RX_DIR = "vb.wal.og.rx.dir";
+
+    /**
+     * openGauss 档 pg_receivexlog 可执行文件键（managed 模式；缺省 {@code pg_receivexlog}
+     * 走 PATH）。显式空白构造期 IAE（spec §4）。
+     */
+    public static final String KEY_OG_RX_BIN = "vb.wal.og.rx.bin";
+
+    /**
+     * openGauss 档 SQL 会话驱动前缀键（M1 Task 6 增设，spec §0 的 URL 前缀分流面）：
+     * {@code jdbc:opengauss:}=opengauss-jdbc（sha256 认证，OG 部署推荐）；缺省
+     * {@code jdbc:postgresql:}=vanilla pgjdbc（+md5，须服务端 pg_hba 预埋 md5 行——运维
+     * 自担）。<strong>缺省保持 jdbc:postgresql: 的理由</strong>：是否 OG 档在建连后才知道，
+     * 缺省换前缀会让 PG 17/18 档在零配置变化下改走 opengauss-jdbc（违反"PG 档零回归"
+     * 硬约束）——OG 部署显式设本键选驱动。非法值构造期 IAE。
+     */
+    public static final String KEY_OG_JDBC_PREFIX = "vb.wal.og.jdbc.prefix";
+
     private final String host;
     private final int port;
     private final String database;
@@ -101,6 +157,21 @@ public final class WalSource implements AutoCloseable {
 
     /** DML 白名单（{@code schema.table} 集；空 = 全放行——透传 ChangeStream/TableFilter）。 */
     private final Set<String> tables;
+
+    /** OG 档收流通道（file/direct——构造期已校验，存档内合法值）。 */
+    private final String ogSource;
+
+    /** OG 档 sidecar 管理形态（managed/external——仅 file 通道消费）。 */
+    private final String ogRxMode;
+
+    /** OG 档段落盘目录（file 通道 tail 目录 / managed 的 -D 参数值）。 */
+    private final Path ogRxDir;
+
+    /** OG 档 pg_receivexlog 可执行文件（managed 模式）。 */
+    private final String ogRxBin;
+
+    /** SQL 会话 URL 驱动前缀（jdbc:postgresql: / jdbc:opengauss:——DriverManager 分流面）。 */
+    private final String ogJdbcPrefix;
 
     /** DML 输出开关与输出 listener（listener 为 null 时 DML 面恒关——纯 catalog 形态）。 */
     private final ChangeOutputListener dmlOut;
@@ -170,6 +241,65 @@ public final class WalSource implements AutoCloseable {
             default -> throw new IllegalArgumentException(
                     KEY_DML + " 须为 true/false: " + dmlCfg + "（静默当 false 会吞掉 DML 输出面）");
         }
+        // openGauss 档五键（M1，spec §7）：缺省值对 PG 17/18 档零感知（前缀缺省即现状拼接）
+        this.ogSource = parseChoice(cfg, KEY_OG_SOURCE, "file", "file", "direct");
+        this.ogRxMode = parseChoice(cfg, KEY_OG_RX_MODE, "managed", "managed", "external");
+        this.ogJdbcPrefix = parseChoice(cfg, KEY_OG_JDBC_PREFIX, "jdbc:postgresql:",
+                "jdbc:postgresql:", "jdbc:opengauss:");
+        this.ogRxDir = parseNonBlankPath(cfg, KEY_OG_RX_DIR, "wal-og-queue");
+        this.ogRxBin = parseNonBlank(cfg, KEY_OG_RX_BIN, "pg_receivexlog");
+    }
+
+    /**
+     * 枚举式配置选择：取键值（缺省 default 值）后必须命中允许值之一，否则构造期 IAE。
+     *
+     * @param cfg          配置源
+     * @param key          键
+     * @param defaultValue 键缺席时的取值（本身须是合法值）
+     * @param allowed      允许值全集
+     * @return 已校验的取值
+     * @throws IllegalArgumentException 值不在允许集（fail-fast 优于静默跑错通道）
+     */
+    private static String parseChoice(Properties cfg, String key, String defaultValue, String... allowed) {
+        String value = cfg.getProperty(key, defaultValue).trim();
+        for (String candidate : allowed) {
+            if (candidate.equals(value)) {
+                return value;
+            }
+        }
+        throw new IllegalArgumentException(key + " 须为 " + String.join("|", allowed) + ": " + value);
+    }
+
+    /**
+     * 非空文本配置：键缺席取默认；显式设置但空白抛 IAE（spec §4——显式空白属配置面
+     * 错误，不得静默回落默认值跑错目录/二进制）。
+     *
+     * @param cfg          配置源
+     * @param key          键
+     * @param defaultValue 键缺席时的取值
+     * @return 非空取值
+     * @throws IllegalArgumentException 显式空白
+     */
+    private static String parseNonBlank(Properties cfg, String key, String defaultValue) {
+        String value = cfg.getProperty(key, defaultValue);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(key + " 显式设置时不得为空白（键缺席才有默认值 "
+                    + defaultValue + "）");
+        }
+        return value.trim();
+    }
+
+    /**
+     * 非空路径配置（{@link #parseNonBlank} 的路径面）。
+     *
+     * @param cfg          配置源
+     * @param key          键
+     * @param defaultValue 键缺席时的路径文本
+     * @return 路径
+     * @throws IllegalArgumentException 显式空白
+     */
+    private static Path parseNonBlankPath(Properties cfg, String key, String defaultValue) {
+        return Path.of(parseNonBlank(cfg, key, defaultValue));
     }
 
     /** 显式关闸（vb.wal.dml=false）；缺省 null = 由 listener 有无决定。 */
@@ -215,15 +345,64 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
+     * OG 档收流通道观测面（配置直读——file/direct，spec §7）。
+     *
+     * @return 通道名（缺省 file）
+     */
+    public String ogSource() {
+        return ogSource;
+    }
+
+    /**
+     * OG 档 sidecar 管理形态观测面（配置直读——managed/external）。
+     *
+     * @return 管理形态（缺省 managed）
+     */
+    public String ogRxMode() {
+        return ogRxMode;
+    }
+
+    /**
+     * OG 档段落盘目录观测面（配置直读）。
+     *
+     * @return 目录（缺省 wal-og-queue）
+     */
+    public Path ogRxDir() {
+        return ogRxDir;
+    }
+
+    /**
+     * OG 档 pg_receivexlog 可执行文件观测面（配置直读）。
+     *
+     * @return 二进制（缺省 pg_receivexlog）
+     */
+    public String ogRxBin() {
+        return ogRxBin;
+    }
+
+    /**
+     * SQL 会话驱动前缀观测面（配置直读——jdbc:postgresql: / jdbc:opengauss:）。
+     *
+     * @return 前缀（缺省 jdbc:postgresql:——PG 档零感知前提）
+     */
+    public String ogJdbcPrefix() {
+        return ogJdbcPrefix;
+    }
+
+    /**
      * 启动全管线：建 SQL 会话 → 版本分发布局 → 起同步器（续传/引导决策 + 接收线程 +
      * 检查点/槽推进生命周期）；DML 面启用时 sink 串接 {@link ChangeStream}（post-apply
      * 分发：先 catalog 施加后变更组装，as-of 次序保证）。
      *
-     * <p>关键步骤：① 普通 JDBC URL（不带 replication 参数）建会话（此后归同步器独占
-     * ——probe/槽推进复用；DML 面的 TOAST 回查 probe 同线程串行共享，单写者契约不破）；
-     * ② {@code current_setting('server_version_num')}（文本数字，如 180002）经
-     * {@link WalLayouts#forServerVersion} 分发，未注册版本 ISE fail-fast；③
-     * {@link CatalogSynchronizer#start} 带凭据 + state 配置（interest 0 个）+ 可选
+     * <p>关键步骤：① 普通 JDBC URL（不带 replication 参数，前缀按
+     * {@code vb.wal.og.jdbc.prefix} 分流——缺省 jdbc:postgresql: 与既有拼接相同）建会话
+     * （此后归同步器独占——probe/槽推进复用；DML 面的 TOAST 回查 probe 同线程串行共享，
+     * 单写者契约不破）；② {@code current_setting('server_version_num')}（文本数字，如
+     * 180002）+ 9 万段补充的 {@code version()} 文本经 {@link WalLayouts#forServer} 分发
+     * （17/18 区间返回与旧 {@code forServerVersion} 同实例——PG 档行为零变化），未注册
+     * 版本 ISE fail-fast；<strong>判别命中 openGauss 档时转入 {@link #startOpenGauss}
+     * （M1 Task 6：槽 OG 变体 + WalByteSource 双通道装配，与 PG 档互斥）</strong>；
+     * ③ {@link CatalogSynchronizer#start} 带凭据 + state 配置（interest 0 个）+ 可选
      * post-apply 接缝——ChangeStream 惰性建（快照视图需同步器实例，而 sink 在
      * startInternal 内接线先于 start 返回；接收线程单写者初始化、volatile 发布）。
      * 边界与异常语义：已 start 再调抛 ISE、已 close 再调抛 ISE；SQLException（连不上/
@@ -238,10 +417,18 @@ public final class WalSource implements AutoCloseable {
         if (started) {
             throw new IllegalStateException("WalSource already started");
         }
-        String url = "jdbc:postgresql://" + host + ":" + port + "/" + database;
-        sqlConnection = DriverManager.getConnection(url, user, pass);
+        sqlConnection = DriverManager.getConnection(sqlJdbcUrl(), user, pass);
         int versionNum = queryServerVersionNum(sqlConnection);
-        WalLayout layout = WalLayouts.forServerVersion(versionNum);
+        // version() 文本只在 9 万段（openGauss 撞号区间）查询——判别 openGauss 的唯一面是
+        // 版本文本（90204 与 vanilla 9.2 撞号，WalLayouts.forServer）；17/18 区间不触碰
+        // 该查询（PG 档除分发调用形态外行为零变化）
+        String versionText = versionNum >= 90_000 && versionNum < 100_000
+                ? queryServerVersionText(sqlConnection) : null;
+        WalLayout layout = WalLayouts.forServer(versionNum, versionText);
+        if (layout == WalLayoutVOpenGauss.INSTANCE) {
+            startOpenGauss(layout);
+            return;
+        }
         Consumer<WalRecord> postApply = dmlEnabled() ? rec -> changeStreamOrInit(layout).onRecord(rec) : null;
         // 待决桶下界供应者（Task 11 挂起桶跨检查点修复）：检查点落盘/槽推进封顶/续传流起点
         // 回退三面经同步器消费；changeStream 惰性建（首条记录前为 null → 0，与"无待决桶"同面）
@@ -252,6 +439,79 @@ public final class WalSource implements AutoCloseable {
         LOG.info("WalSource 启动: server_version_num={} slot={} state={} dml={} tables={} 续传起点 {}",
                 versionNum, slotName, state.enabled() ? state.dir() : "禁用", dmlEnabled(),
                 tables.isEmpty() ? "全放行" : tables, Lsn.format(sync.consumedLsn()));
+    }
+
+    /**
+     * openGauss 5.0.0 档装配分支（M1 Task 6，spec §3 启动次序）：判别命中 OG 布局后由
+     * {@link #start()} 转入——SQL 会话已建（URL 前缀按 {@code vb.wal.og.jdbc.prefix} 分流），
+     * 此后委派 {@link CatalogSynchronizer#startOg}（槽 OG 变体 → state 决策 → bootstrap →
+     * 字节源装配）。
+     *
+     * <p>关键步骤：DML 面门控——M1 范围裁定（spec §0）OG 档仅 catalog 同步面，DML/
+     * changes 面属 M2，listener 在场且 dml 开着即启动期 ISE fail-fast（宁拒不错，优于
+     * 静默装配一个未验收的输出面）；字节源按 {@code vb.wal.og.source} 由
+     * {@link #buildOgByteSource} 构造（工厂形态——流起点由同步器的续传/引导决策给出，
+     * 构造需在此之后）。边界与异常语义：SQLException/ISE 原样上抛（已建资源由本类持有、
+     * 调用方 close 释放）；bootstrap 的 OG 内部适配（列单/LSN 函数）归 Task 7——真 OG
+     * 服务端全新引导路径在 bootstrap 处失败属 M1 预期形态，本任务的验收面是配置/槽/装配
+     * 缝正确。线程约束：装配线程（start 调用线程）单次执行。</p>
+     *
+     * @param layout 判别出的 openGauss 布局描述符
+     * @throws SQLException 槽管理/引导查询失败
+     * @throws IllegalStateException DML 面在 OG 档请求装配（M2 范围）
+     */
+    private void startOpenGauss(WalLayout layout) throws SQLException {
+        if (dmlEnabled()) {
+            throw new IllegalStateException("openGauss 档 M1 仅 catalog 同步面——DML 输出面属 M2"
+                    + "（spec 2026-10-11 §0）；请 -Dvb.wal.dml=false（或无 listener 的单参构造）后重试");
+        }
+        sync = CatalogSynchronizer.startOg(sqlConnection, slotName, layout, state, 0L,
+                startLsn -> buildOgByteSource(layout, startLsn));
+        started = true;
+        LOG.info("WalSource 启动（openGauss 档）: slot={} source={} mode={} dir={} bin={} jdbcPrefix={} state={} 续传起点 {}",
+                slotName, ogSource, ogRxMode, ogRxDir, ogRxBin, ogJdbcPrefix,
+                state.enabled() ? state.dir() : "禁用", Lsn.format(sync.consumedLsn()));
+    }
+
+    /**
+     * 按 {@code vb.wal.og.source} 构造 OG 档字节源（同步器决策出流起点后经工厂回调）。
+     *
+     * <p>关键步骤：direct 通道 = {@link DirectWalSource}（首连起点注入 startLsn，反馈
+     * 心跳 10s——与接收器路 5s 反馈同量级）；file 通道 = {@link FileWalSource}（段尺寸
+     * 16MB 生产档、续传起点 startLsn 段内页对齐由源内取整），managed 模式附带
+     * {@link ReceivexlogProcess}（拉起 {@code vb.wal.og.rx.bin} 落盘 {@code rx.dir}，
+     * 密码只经 PGPASSWORD 环境变量），external 模式纯 tail。边界与异常语义：构造期不建
+     * 连接/不拉进程（source.start 由同步器调用）；sidecar 终态失败经源的
+     * terminalFailure 联动暴露（FileWalSource Task 6 接线）。</p>
+     *
+     * @param layout   openGauss 布局描述符（页大小 = 续传段内偏移的页对齐基准）
+     * @param startLsn 同步器决策出的流起点（续传 = stored lsn / 引导 = max(P₀, B)）
+     * @return 已构造未启动的字节源
+     */
+    private WalByteSource buildOgByteSource(WalLayout layout, long startLsn) {
+        if ("direct".equals(ogSource)) {
+            return new DirectWalSource(host, port, user, pass, slotName,
+                    OG_DIRECT_STATUS_INTERVAL_MS, startLsn);
+        }
+        if ("managed".equals(ogRxMode)) {
+            ReceivexlogProcess process = new ReceivexlogProcess(ogRxBin, ogRxDir,
+                    host, port, user, pass, slotName);
+            return new FileWalSource(ogRxDir, FileWalSource.DEFAULT_SEGMENT_SIZE, startLsn,
+                    layout.walBlockSize(), process);
+        }
+        return new FileWalSource(ogRxDir, FileWalSource.DEFAULT_SEGMENT_SIZE, startLsn,
+                layout.walBlockSize());
+    }
+
+    /**
+     * SQL 会话 URL（包可见供离线测试钉 PG 档零回归锚）：前缀按
+     * {@code vb.wal.og.jdbc.prefix}（缺省 {@code jdbc:postgresql:}——与既有拼接逐字节
+     * 相同），DriverManager 按前缀分流驱动（代码零分支）。
+     *
+     * @return 形如 {@code <prefix>//host:port/db}
+     */
+    String sqlJdbcUrl() {
+        return ogJdbcPrefix + "//" + host + ":" + port + "/" + database;
     }
 
     /**
@@ -482,6 +742,25 @@ public final class WalSource implements AutoCloseable {
              ResultSet rs = st.executeQuery("SELECT current_setting('server_version_num')")) {
             rs.next();
             return Integer.parseInt(rs.getString(1));
+        }
+    }
+
+    /**
+     * 查服务端版本文本（openGauss 判别的唯一面——90204 与 vanilla 9.2 撞号，仅版本文本
+     * 含 "openGauss" 可区分，见 {@link WalLayouts#forServer}）。
+     *
+     * <p>只在 9 万段版本号时调用（PG 17/18 档零额外查询）；空值/null 不在此判——分发器
+     * 对判别信息缺失走拒绝面。</p>
+     *
+     * @param connection 已建立的 SQL 会话
+     * @return {@code version()} 文本（如 "(openGauss 5.0.0 build ...) compiled at ..."）
+     * @throws SQLException 查询失败
+     */
+    private static String queryServerVersionText(Connection connection) throws SQLException {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery("SELECT version()")) {
+            rs.next();
+            return rs.getString(1);
         }
     }
 }

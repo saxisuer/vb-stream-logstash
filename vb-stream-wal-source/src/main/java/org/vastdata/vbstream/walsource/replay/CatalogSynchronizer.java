@@ -8,8 +8,10 @@ import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.receive.PhysicalSlotManager;
+import org.vastdata.vbstream.walsource.receive.WalByteSource;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 import org.vastdata.vbstream.walsource.receive.WalStreamReceiver;
+import org.vastdata.vbstream.walsource.receive.WalStreamWalker;
 import org.vastdata.vbstream.walsource.state.StateConfig;
 import org.vastdata.vbstream.walsource.state.StateStore;
 import org.vastdata.vbstream.walsource.state.StoredState;
@@ -28,6 +30,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.StringJoiner;
 import java.util.function.Consumer;
+import java.util.function.LongFunction;
 import java.util.function.LongSupplier;
 
 /**
@@ -76,6 +79,22 @@ public final class CatalogSynchronizer {
 
     /** 接收器（start 组装路径注入；纯逻辑测试缝为 null）。 */
     private final WalStreamReceiver receiver;
+
+    /**
+     * openGauss 档字节源（startOg 组装路径注入，M1 Task 6；PG 路与纯逻辑缝为 null）——
+     * {@code stop()} 连带停机、{@code terminalFailure()}/{@code consumedLsn()} 在无接收器时
+     * 的回落来源。赋值发生在 startOg（源 start 之前），读取在任意线程（源自身线程安全）。
+     */
+    private WalByteSource byteSource;
+
+    /** OG 档 walker 计数（receiver==null 时 {@link #streamMetrics()} 的来源；startOg 装配）。 */
+    private WalStreamMetrics externalMetrics;
+
+    /**
+     * OG 档消费前沿镜像（walker.consumedLsn 的 volatile 跨线程副本——接收器路同款镜像
+     * 语义）：startOg 种子化为页对齐起点，字节源的 chunkSink（源线程单写者）每块后刷新。
+     */
+    private volatile long externalConsumedLsn;
 
     /** 槽名（槽推进 SQL 的目标；纯逻辑缝为 null）。 */
     private final String slotName;
@@ -342,6 +361,102 @@ public final class CatalogSynchronizer {
     }
 
     /**
+     * openGauss 5.0.0 档组装入口（M1 Task 6）：{@code startInternal} 的字节源变体——
+     * 槽确保走 {@link PhysicalSlotManager#ensureSlotOg}（dummy_standby 建槽 + xlog 位点
+     * 函数），收流不经 pgjdbc 接收器而由注入工厂构造的 {@link WalByteSource}（file/
+     * direct 双通道，spec §3）承担，记录交付面 = {@code WalStreamWalker} → 本实例
+     * {@link #apply}（applyRecord + maybeCheckpoint——与 PG 档 receiver 路同一次序）。
+     *
+     * <p>关键步骤：版本交叉校验与续传/引导双路决策同 {@code startInternal} 共核
+     * （{@link #decideResumeOrBootstrap}——state 检查点按 {@code layout.majorVersion()}
+     * (=5) 错配拒载回落）；流起点交工厂构造字节源（file 档 tail 起点/direct 档首连
+     * 注入，FileWalSource 段内页对齐、DirectWalSource 段对齐——重叠段由 appliedLsn
+     * 过滤线消化）；chunkSink 组合 = walker.feed → walker 逐记录 → apply（walker 的
+     * 记录计数/再同步计数经自有 {@link WalStreamMetrics} 暴露于 {@link #streamMetrics()}）。
+     * 边界与异常语义：<strong>本入口在 M1 Task 6 只接装配缝——bootstrap/replay 的 OG
+     * 内部适配（种子列单/LSN 函数 xlog 化）归 Task 7</strong>，真 OG 服务端上全新引导路径
+     * 会在 bootstrap 的 flush LSN 函数处 SQLException（预期形态，state 检查点续传路径不
+     * 触碰该函数）；字节源构造/启动失败原样上抛（半建资源由调用方 close 释放——工厂
+     * 产物失败时尚未持有，无泄漏面）。线程约束：装配线程单次调用；此后 apply 在字节源
+     * 线程（wal-file-tail / wal-direct-rx）单写者执行——与 PG 档接收线程同契约。</p>
+     *
+     * @param sql             引导用 SQL 会话（probe 与槽推进复用，归同步器独占）
+     * @param slotName        物理槽名
+     * @param layout          版本布局描述符（openGauss 档经 {@code WalLayouts.forServer} 分发）
+     * @param state           检查点配置（null 或 dir=null = 禁用）
+     * @param forcedStartLsn  显式流起点（0 = 按决策；&gt;0 = 覆盖，诊断接缝）
+     * @param sourceFactory   字节源工厂——入参 = 决策出的流起点（工厂按 source 配置键
+     *                        构造 FileWalSource[managed/external] 或 DirectWalSource）
+     * @param interestRelOid  tracked 面 oid（v1 注册 0 个）
+     * @return 已运行的同步器（apply 消费面 + snapshot 查询面 + 字节源观测面）
+     * @throws SQLException 槽管理或引导查询失败
+     * @throws IllegalStateException 布局与连接端 server_version_num 错配（跨版本注入）
+     */
+    public static CatalogSynchronizer startOg(Connection sql, String slotName, WalLayout layout,
+            StateConfig state, long forcedStartLsn, LongFunction<WalByteSource> sourceFactory,
+            long... interestRelOid) throws SQLException {
+        // 版本交叉校验（与 startInternal 同面）：错配的常量会让页遍历/记录解析整体错位
+        int serverVersionNum = queryServerVersionNum(sql);
+        if (!layout.supports(serverVersionNum)) {
+            throw new IllegalStateException("layout mismatch: descriptor PG" + layout.majorVersion()
+                    + " does not support server_version_num " + serverVersionNum
+                    + "（跨版本注入——请经 WalLayouts.forServer 分发）");
+        }
+        CatalogStores stores = new CatalogStores();
+        for (long oid : interestRelOid) {
+            stores.interestRelOids().add(oid);
+        }
+        long p0 = new PhysicalSlotManager(sql).ensureSlotOg(slotName);
+        StartDecision decision = decideResumeOrBootstrap(sql, layout, stores, state, p0);
+        StateStore stateStore = decision.stateStore();
+        long start = decision.start();
+        boolean resumed = decision.resumed();
+        boolean forced = false;
+        if (forcedStartLsn > 0) {
+            if (forcedStartLsn < start) {
+                throw new IllegalStateException("forcedStartLsn " + Lsn.format(forcedStartLsn)
+                        + " 低于字典一致起点 " + Lsn.format(start) + "——对已恢复字典二次施加风险，拒绝启动");
+            }
+            start = forcedStartLsn;
+            forced = true;
+        }
+        CatalogSynchronizer sync = new CatalogSynchronizer(stores,
+                new CatalogReplay(layout, new TupleDecoder(layout), new SelfHealer(new JdbcProbeImpl(sql))),
+                null, slotName, state, stateStore, stateStore == null ? null : sql);
+        // 前沿种子化（与 startInternal 同式）：续传/forced = 决策起点严格过滤；全新引导 =
+        // 页对齐流起点（流交付重叠段重放消化，终审 C1 两级语义的 OG 面）
+        sync.appliedLsn = resumed || forced ? start
+                : start & ~((long) layout.walBlockSize() - 1);
+        sync.resumedFromState = resumed;
+        if (state != null && state.enabled()) {
+            sync.lastCheckpointWallMs = System.currentTimeMillis();
+            sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
+        }
+        // 收流组装（spec §3）：walker 计数自有实例（receiver==null 档的 streamMetrics 来源）
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, sync::apply);
+        WalByteSource source = sourceFactory.apply(start);
+        sync.byteSource = source;
+        sync.externalMetrics = metrics;
+        sync.externalConsumedLsn = sync.appliedLsn;   // 种子化：首块前即报告页对齐起点（与接收器路同形）
+        try {
+            source.start(lsn -> { }, (endLsn, bytes) -> {
+                walker.feed(endLsn, bytes);
+                sync.externalConsumedLsn = walker.consumedLsn();
+            });
+        } catch (RuntimeException e) {
+            // 启动失败净退出：sync 尚未返回调用方、无人再触 stop——就地停源防孤儿源线程
+            // （tail/直连工作线程均非守护）
+            source.stop();
+            throw e;
+        }
+        LOG.info("CatalogSynchronizer 启动（openGauss 档）: slot={} 字节源 {} 流起点 {}（interest {} 个, state={}, resumed={}）",
+                slotName, source.getClass().getSimpleName(), Lsn.format(start), interestRelOid.length,
+                state != null && state.enabled(), resumed);
+        return sync;
+    }
+
+    /**
      * 组装共核（全部公开 start 重载的唯一实现）：healer 与 state 注入是各档差异——带凭据
      * 档注入 {@link SelfHealer}（probe 复用引导会话），无凭据回落档 healer=null（截断
      * 未知 oldCtid 保留 skip + 计数行为）；state 启用时按续传/引导双路决策（见全参档
@@ -378,37 +493,11 @@ public final class CatalogSynchronizer {
             stores.interestRelOids().add(oid);
         }
         long p0 = new PhysicalSlotManager(sql).ensureSlot(slotName);
-
-        StateStore stateStore = null;
-        long start;
-        boolean resumed = false;
-        long storedLsn = 0;
-        long storedFloor = 0;
-        if (state != null && state.enabled()) {
-            stateStore = new StateStore(state.dir(), layout.majorVersion());
-            Optional<StoredState> loaded = stateStore.load();
-            if (loaded.isPresent() && loaded.get().lsn() >= p0) {
-                loaded.get().restoreInto(stores);
-                storedLsn = loaded.get().lsn();
-                storedFloor = loaded.get().dmlFloorLsn();
-                start = storedLsn;
-                resumed = true;
-                LOG.info("CatalogSynchronizer 自检查点续传: stored lsn={}（attr {} / class {} 行, 跳过引导）",
-                        Lsn.format(start), stores.attrRows().size(), stores.classRows().size());
-            } else if (loaded.isPresent()) {
-                LOG.warn("检查点 lsn {} 落在槽保留窗口 P₀ {} 之前——字典无法覆盖窗口, 回落全新引导（安全侧）",
-                        Lsn.format(loaded.get().lsn()), Lsn.format(p0));
-                start = Long.MIN_VALUE;    // 哨兵：下方引导路径覆盖
-            } else {
-                start = Long.MIN_VALUE;    // 无文件/拒载：全新引导
-            }
-        } else {
-            start = Long.MIN_VALUE;
-        }
-        if (!resumed && start == Long.MIN_VALUE) {
-            long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
-            start = Math.max(p0, bootstrapLsn);
-        }
+        StartDecision decision = decideResumeOrBootstrap(sql, layout, stores, state, p0);
+        StateStore stateStore = decision.stateStore();
+        long start = decision.start();
+        boolean resumed = decision.resumed();
+        long storedFloor = decision.storedFloor();
         boolean forced = false;
         if (forcedStartLsn > 0) {
             if (forcedStartLsn < start) {
@@ -467,6 +556,69 @@ public final class CatalogSynchronizer {
                 slotName, Lsn.format(start), interestRelOid.length, healer != null,
                 state != null && state.enabled(), resumed);
         return sync;
+    }
+
+    /**
+     * 续传/引导双路决策的产物（{@link #decideResumeOrBootstrap} 的返回面）。
+     *
+     * @param start       决策出的流起点（续传 = stored lsn；引导 = max(P₀, bootstrap B)）
+     * @param resumed     是否自检查点续传（true = restoreInto 已灌回、跳过引导）
+     * @param storedFloor 检查点携带的 DML 待决桶下界（续传路径非 0；引导路径恒 0）
+     * @param stateStore  检查点存储器（state 禁用时 null）
+     */
+    private record StartDecision(long start, boolean resumed, long storedFloor, StateStore stateStore) {
+    }
+
+    /**
+     * 续传/引导双路决策（startInternal 与 startOg 共核，M1 Task 6 抽取——行为与原内联
+     * 块逐字一致）。
+     *
+     * <p>关键步骤：state 启用时 {@link StateStore#load()}——成功且 stored lsn &ge; P₀ 即
+     * {@link StoredState#restoreInto} 续传（跳过引导）；成功但 lsn &lt; P₀（槽保留窗口
+     * 已越前）WARN 回落全新引导（安全侧）；无文件/拒载全新引导。引导路径
+     * {@link CatalogBootstrap#bootstrap}（RR 单事务首句 flush LSN 语义，OG 档内部函数名
+     * 归 Task 7）后取 max(P₀, B)。边界与异常语义：SQLException 原样上抛（此时点无流
+     * 副作用，失败即净退出）。线程约束：装配线程单次调用。</p>
+     *
+     * @param sql    引导用 SQL 会话
+     * @param layout 版本布局描述符（StateStore 的 pgVersion 与其 majorVersion 同源）
+     * @param stores 重放状态容器（续传路径在此灌回）
+     * @param state  检查点配置（null/禁用 = 恒引导路径）
+     * @param p0     槽确保给出的保留窗口下界（ensureSlot/ensureSlotOg 返回值）
+     * @return 决策产物
+     * @throws SQLException 槽推进外的引导查询失败
+     */
+    private static StartDecision decideResumeOrBootstrap(Connection sql, WalLayout layout,
+            CatalogStores stores, StateConfig state, long p0) throws SQLException {
+        StateStore stateStore = null;
+        long start;
+        boolean resumed = false;
+        long storedFloor = 0;
+        if (state != null && state.enabled()) {
+            stateStore = new StateStore(state.dir(), layout.majorVersion());
+            Optional<StoredState> loaded = stateStore.load();
+            if (loaded.isPresent() && loaded.get().lsn() >= p0) {
+                loaded.get().restoreInto(stores);
+                start = loaded.get().lsn();
+                storedFloor = loaded.get().dmlFloorLsn();
+                resumed = true;
+                LOG.info("CatalogSynchronizer 自检查点续传: stored lsn={}（attr {} / class {} 行, 跳过引导）",
+                        Lsn.format(start), stores.attrRows().size(), stores.classRows().size());
+            } else if (loaded.isPresent()) {
+                LOG.warn("检查点 lsn {} 落在槽保留窗口 P₀ {} 之前——字典无法覆盖窗口, 回落全新引导（安全侧）",
+                        Lsn.format(loaded.get().lsn()), Lsn.format(p0));
+                start = Long.MIN_VALUE;    // 哨兵：下方引导路径覆盖
+            } else {
+                start = Long.MIN_VALUE;    // 无文件/拒载：全新引导
+            }
+        } else {
+            start = Long.MIN_VALUE;
+        }
+        if (!resumed && start == Long.MIN_VALUE) {
+            long bootstrapLsn = new CatalogBootstrap(sql, layout).bootstrap(stores);
+            start = Math.max(p0, bootstrapLsn);
+        }
+        return new StartDecision(start, resumed, storedFloor, stateStore);
     }
 
     /**
@@ -626,13 +778,18 @@ public final class CatalogSynchronizer {
 
     /**
      * 接收消费前沿（透传 {@link WalStreamReceiver#consumedLsn()}——含已走读但 sink
-     * 尚在执行的批内记录；纯逻辑缝无接收器时回落已施加前沿）。
+     * 尚在执行的批内记录；OG 档透传字节源路的 walker 前沿镜像；纯逻辑缝无接收器时
+     * 回落已施加前沿）。
      *
      * @return 下一个未消费字节的 LSN；未 start 为 0
      */
     public long consumedLsn() {
         WalStreamReceiver r = receiver;
-        return r == null ? appliedLsn : r.consumedLsn();
+        if (r != null) {
+            return r.consumedLsn();
+        }
+        WalByteSource source = byteSource;
+        return source != null ? externalConsumedLsn : appliedLsn;
     }
 
     /**
@@ -658,22 +815,29 @@ public final class CatalogSynchronizer {
     /**
      * 接收器指标观测面（resyncs/reconnects/census 等锚定协议计数）。
      *
-     * @return 接收器内建计数器；纯逻辑缝实例（无接收器）null
+     * @return 接收器内建计数器；OG 档为 walker 计数（字节源路）；纯逻辑缝实例（无接收
+     *         器且未走 startOg）null
      */
     public WalStreamMetrics streamMetrics() {
         WalStreamReceiver r = receiver;
-        return r == null ? null : r.metrics();
+        return r != null ? r.metrics() : externalMetrics;
     }
 
     /**
      * 接收器终态失败透传面（终审 I2）：接收线程因确定性失败（重连耗尽/解析 ISE）自行
-     * 退出时返回根因，Main/宿主据此 fail-fast；正常停机与运行中/纯逻辑缝为 empty。
+     * 退出时返回根因，Main/宿主据此 fail-fast；OG 档透传字节源的终态失败
+     * （{@link WalByteSource#terminalFailure()}——direct 重连耗尽/file tail sink 异常或
+     * sidecar 终态联动）；正常停机与运行中/纯逻辑缝为 empty。
      *
-     * @return 终态根因；无接收器或运行中为 empty
+     * @return 终态根因；无接收器/字节源或运行中为 empty
      */
     public Optional<Throwable> terminalFailure() {
         WalStreamReceiver r = receiver;
-        return r == null ? Optional.empty() : r.terminalFailure();
+        if (r != null) {
+            return r.terminalFailure();
+        }
+        WalByteSource source = byteSource;
+        return source != null ? source.terminalFailure() : Optional.empty();
     }
 
     /**
@@ -706,9 +870,10 @@ public final class CatalogSynchronizer {
     }
 
     /**
-     * 幂等停机：停接收线程（join 3s 上限，委派 {@link WalStreamReceiver#stop()}）→
-     * state 启用时做最终 best-effort 检查点 + 槽推进（接收线程已 join，冻结态即单
-     * 线程天然一致点）；引导 SQL 会话归调用方持有生命周期，本类不越权关闭。
+     * 幂等停机：停接收线程（join 3s 上限，委派 {@link WalStreamReceiver#stop()}）或 OG
+     * 档字节源（{@link WalByteSource#stop()}——managed 模式连带终止 sidecar 子进程）→
+     * state 启用时做最终 best-effort 检查点 + 槽推进（流线程已 join，冻结态即单线程
+     * 天然一致点）；引导 SQL 会话归调用方持有生命周期，本类不越权关闭。
      *
      * <p>重复调用安全：appliedLsn 已冻结，重复落盘内容幂等。</p>
      */
@@ -716,6 +881,10 @@ public final class CatalogSynchronizer {
         WalStreamReceiver r = receiver;
         if (r != null) {
             r.stop();
+        }
+        WalByteSource source = byteSource;
+        if (source != null) {
+            source.stop();
         }
         StateConfig cfg = stateConfig;
         if (cfg != null && cfg.enabled()) {

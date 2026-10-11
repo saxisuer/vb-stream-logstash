@@ -252,6 +252,24 @@ class StateStoreTest {
     }
 
     /**
+     * 用例 ⑩（openGauss M1 Task 6）：OG 档 pgVersion = {@code WalLayoutVOpenGauss.majorVersion()}
+     * = 5（OG 自有版本口径）——现有 u16 校验面天然容纳，格式零改动（沿 v3 先例不升
+     * formatVersion）：5 写 5 load 自洽；17/18 写出的检查点用 5 存储器 load 拒载 empty、
+     * 5 写出的用 17/18 存储器 load 同拒（错配回落全新引导——服务端版本切换后旧检查点
+     * 不得被跨档误载）。
+     */
+    @Test
+    void ogPgVersionRoundtripsAndCrossVersionLoadRejects() throws IOException {
+        new StateStore(dir, 5).checkpoint(filledStores(), LSN);
+        assertTrue(new StateStore(dir, 5).load().isPresent(), "OG 档（pgVersion=5）同版本 load 应自洽");
+        assertTrue(new StateStore(dir, 18).load().isEmpty(), "5 写出的检查点用 18 存储器 load 应拒载 empty");
+        assertTrue(new StateStore(dir, 17).load().isEmpty(), "5 写出的检查点用 17 存储器 load 应拒载 empty");
+
+        new StateStore(dir, 18).checkpoint(filledStores(), LSN);
+        assertTrue(new StateStore(dir, 5).load().isEmpty(), "18 写出的检查点用 OG(5) 存储器 load 应拒载 empty");
+    }
+
+    /**
      * 构造全字段灌满的 stores（确定性数据）：attr 三行（含 dropped 占位行）、class
      * 两行（用户表 'r' + toast 关系行 't'——relkind 两形态）、nsp 两行（public +
      * pg_catalog）、三 tail 各一条、tracked 双 ctid、三 relfilenode、interest/stale

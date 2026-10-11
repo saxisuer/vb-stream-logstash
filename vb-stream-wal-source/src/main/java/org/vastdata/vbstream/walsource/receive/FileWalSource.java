@@ -152,9 +152,10 @@ public final class FileWalSource implements WalByteSource {
     }
 
     /**
-     * 终态失败观测面（对齐接收器终态死亡契约）：tail 线程因 sink 确定性异常自行退出后
-     * 返回根因；运行中/正常停机/未 start 为 empty。宿主应周期轮询本面，见终态即
-     * fail-fast——tail 线程非守护，不感知即进程空转且源停更。
+     * 终态失败观测面（对齐接收器终态死亡契约）：tail 线程因 sink 确定性异常或 managed
+     * 模式 sidecar 终态失败（连续重拉耗尽，Task 6 接线）自行退出后返回根因；运行中/
+     * 正常停机/未 start 为 empty。宿主应周期轮询本面，见终态即 fail-fast——tail 线程
+     * 非守护，不感知即进程空转且源停更。
      *
      * @return 终态根因；非终态为 empty
      */
@@ -246,11 +247,15 @@ public final class FileWalSource implements WalByteSource {
     }
 
     /**
-     * tail 主循环（线程体）：目录 pump → 无进展睡 {@value #POLL_INTERVAL_MS}ms。
+     * tail 主循环（线程体）：目录 pump → sidecar 终态检查 → 无进展睡
+     * {@value #POLL_INTERVAL_MS}ms。
      *
      * <p>关键步骤：每轮 pumpOnce（段发现/增量读/切段，见其 javadoc）；IO 异常 WARN 后
      * 重试（rename 竞态暂态）；sink 的 RuntimeException 属确定性失败——置 terminalFailure
-     * 后 ERROR 退出（不吞异常面，与接收器同构）。finally 关句柄防泄漏。</p>
+     * 后 ERROR 退出（不吞异常面，与接收器同构）。managed 模式每轮检查 sidecar 的终态
+     * 失败面（Task 4 遗留接线债，Task 6 吸纳）：监督线程放弃重拉后目录不会再有新段，
+     * tail 若继续空转即"源停更而宿主无终态可查"——见终态即包装传播为源级终态失败并
+     * 停机（根因链保留 sidecar 异常）。finally 关句柄防泄漏。</p>
      */
     private void runTailLoop() {
         try {
@@ -266,6 +271,9 @@ public final class FileWalSource implements WalByteSource {
                             Lsn.format(consumedLsn), e);
                     return;
                 }
+                if (sidecarTerminalSeen()) {
+                    return;
+                }
                 if (!progressed && !stopRequested) {
                     sleepQuiet(POLL_INTERVAL_MS);
                 }
@@ -273,6 +281,33 @@ public final class FileWalSource implements WalByteSource {
         } finally {
             closeInputQuietly();
         }
+    }
+
+    /**
+     * managed 模式的 sidecar 终态检查：监督线程置终态失败（连续重拉耗尽）即把失败
+     * 包装传播为本源的 terminalFailure 并请求停机。
+     *
+     * <p>关键步骤：external 模式（process null）恒 false；sidecar 终态在场时置
+     * terminalFailure（IllegalStateException 包装，cause 保留原根因）+ ERROR 日志
+     * （fail-fast 轮询契约——宿主经 {@link #terminalFailure()} 感知）。线程约束：tail
+     * 线程单写者。</p>
+     *
+     * @return sidecar 终态已传播（tail 应退出）为 true
+     */
+    private boolean sidecarTerminalSeen() {
+        ReceivexlogProcess proc = process;
+        if (proc == null) {
+            return false;
+        }
+        Optional<Throwable> failure = proc.terminalFailure();
+        if (failure.isEmpty()) {
+            return false;
+        }
+        terminalFailure = new IllegalStateException(
+                "pg_receivexlog sidecar 终态失败——目录不会再有新段，WAL 文件源联动停机", failure.get());
+        LOG.error("pg_receivexlog sidecar 终态失败——WAL 文件源联动停机，前沿 {}",
+                Lsn.format(consumedLsn), failure.get());
+        return true;
     }
 
     /**

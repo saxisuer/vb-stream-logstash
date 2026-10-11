@@ -17,6 +17,7 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -174,7 +175,9 @@ class FileWalSourceTest {
                 "og-host", 5432, "gauss", "s3cret-pass", "og_slot");
         proc.start();
         try {
-            awaitTrue(() -> Files.exists(argsFile), "假二进制须被拉起并捕获参数");
+            // 等末参（og_slot）在场而非仅文件存在——shell 逐参 append 与测试读存在竞态窗
+            // （全量套件高负载下曾假红：文件已建但参数未写完）
+            awaitTrue(() -> fileHasLine(argsFile, "og_slot"), "假二进制须被拉起并捕获全部参数");
             assertTrue(proc.processAlive(), "长驻假二进制须存活");
 
             List<String> args = Files.readAllLines(argsFile);
@@ -263,6 +266,48 @@ class FileWalSourceTest {
             assertFalse(alive, "拉起过的子进程 " + pid + " 不得存活（孤儿子进程）");
         }
         assertFalse(proc.processAlive(), "stop 后句柄面不得有活子进程（stop 窗内新拉起须被销毁/放弃）");
+    }
+
+    /**
+     * 用例 ③e（Task 6 接线债——Task 4 遗留）：managed 模式 sidecar 终态失败（连续重拉耗尽）
+     * → tail 联动停机并把失败传播为源级 {@code terminalFailure()}（根因链保留 sidecar 的
+     * 终态异常）——不传播则源停更而宿主无终态可查（进程空转）。
+     *
+     * <p>构造：立即退出的假二进制 + 快速退避（10ms 基数 / 上限 1 次）→ 2 次拉起后监督
+     * 线程置终态；目录保持空（tail 无可读段）→ 断言唯一推进面就是终态传播。</p>
+     */
+    @Test
+    void sidecarTerminalFailurePropagatesToSourceAndStopsTail() throws Exception {
+        Path bin = writeScript("#!/bin/sh\nexit 7\n");
+        ReceivexlogProcess proc = new ReceivexlogProcess(bin.toString(), dir,
+                null, 0, null, null, null, 10, 1);
+        FileWalSource source = new FileWalSource(dir, SEG_SIZE, 0, 8192, proc);
+        source.start(lsn -> { }, (lsn, bytes) -> { });
+        try {
+            awaitTrue(() -> source.terminalFailure().isPresent(), "sidecar 终态须传播为源级终态失败");
+        } finally {
+            source.stop();
+        }
+        Throwable t = source.terminalFailure().orElseThrow();
+        assertTrue(t.getMessage().contains("pg_receivexlog"), "终态消息须指明 sidecar 失败根源");
+        assertNotNull(t.getCause(), "根因链须保留 sidecar 的终态异常（排障面）");
+        awaitTrue(() -> !proc.supervisorAlive(), "源停机须连带监督线程终止");
+    }
+
+    /**
+     * 判定文本文件是否已含指定行（文件级 await 的内容条件——吸收 shell 逐行 append 的
+     * 写入竞态窗；读失败按未就绪处理）。
+     *
+     * @param file 目标文件
+     * @param line 期望行
+     * @return 文件存在且含该行为 true
+     */
+    private static boolean fileHasLine(Path file, String line) {
+        try {
+            return Files.exists(file) && Files.readAllLines(file).contains(line);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     /**
