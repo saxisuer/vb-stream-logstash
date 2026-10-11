@@ -34,10 +34,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       SIGKILL（{@code destroyForcibly()}）。</li>
  * </ol>
  *
- * <p>线程约束：监督线程独占子进程拉起/回收；{@code processAlive()} 经 volatile 句柄
- * 供任意线程读；{@code start()/stop()} synchronized 单程闸门（幂等停机）。终态失败经
+ * <p>线程约束：监督线程（<b>守护</b>——drainOutput 的阻塞读不响应 interrupt，守护位
+ * 兜底 JVM 退出）独占子进程拉起/回收；{@code processAlive()} 经 volatile 句柄供任意
+ * 线程读；{@code start()/stop()} 单程闸门（幂等停机）。终态失败经
  * {@link #terminalFailure()} 暴露——宿主周期轮询，见终态即 fail-fast（与接收器/
  * FileWalSource 的终态死亡契约同构）。</p>
+ *
+ * <p><strong>stop×拉起竞态互斥（fix round 1）</strong>：拉起（start + 句柄发布）与
+ * stop 的"置停机位 + 读句柄销毁"作用同一把锁——stop 先获锁则拉起面见到停机位直接
+ * 放弃（不产生孤儿子进程）；拉起面先获锁则 stop 随后销毁的恰是新句柄。join/interrupt
+ * 在锁外执行（监督线程的下一轮拉起需要同把锁，锁内 join 会假性超时）。</p>
  */
 public final class ReceivexlogProcess {
 
@@ -149,6 +155,16 @@ public final class ReceivexlogProcess {
     }
 
     /**
+     * 监督线程是否仍在运行（观测面，任意线程）——stop/终态失败后的终止性验收锚。
+     *
+     * @return 监督线程存活为 true；未 start/已终止为 false
+     */
+    public boolean supervisorAlive() {
+        Thread w = worker;
+        return w != null && w.isAlive();
+    }
+
+    /**
      * 终态失败观测面：连续重拉耗尽后返回根因（进程退出链的最后一个根因包装/拉起
      * IOException）；运行中/正常停机/未 start 为 empty。
      *
@@ -159,7 +175,8 @@ public final class ReceivexlogProcess {
     }
 
     /**
-     * 同步启动监督线程（wal-rx-supervisor，非守护）——子进程在监督线程内首次拉起。
+     * 同步启动监督线程（wal-rx-supervisor，守护——阻塞读不响应 interrupt 的 JVM 退出
+     * 兜底）——子进程在监督线程内首次拉起。
      *
      * <p>边界与异常语义：重复 start / 停机后再 start 抛 ISE（生命周期单程，新会话新实例）；
      * 首次拉起失败不抛给调用方——走监督循环的退避/终态面（宿主轮询 terminalFailure）。</p>
@@ -173,7 +190,7 @@ public final class ReceivexlogProcess {
         }
         started = true;
         worker = new Thread(this::runSupervisorLoop, "wal-rx-supervisor");
-        worker.setDaemon(false);
+        worker.setDaemon(true);
         worker.start();
         LOG.info("pg_receivexlog 监督线程启动: bin={} dir={}", bin, dir);
     }
@@ -181,50 +198,79 @@ public final class ReceivexlogProcess {
     /**
      * 幂等停机：SIGTERM（destroy）→ 3s 等待 → SIGKILL（destroyForcibly）→ join 监督线程。
      *
-     * <p>关键步骤：置停机位（监督循环退出 + 子进程退出不计失败）→ 终止当前子进程
-     * （监督线程阻塞的合并流读随进程退出 EOF 解除）→ join 3s（监督线程可能正在退避睡，
-     * 超时 interrupt 提前打断）。</p>
+     * <p>关键步骤：锁内仅做"置停机位 + 快照句柄"（与 {@link #launchOnce} 互斥——stop
+     * 先获锁则拉起面见停机位放弃，不产生孤儿；拉起面先获锁则此处快照到的恰是新句柄）；
+     * 销毁与 join 在<b>锁外</b>执行（监督线程下一轮拉起需要同把锁，锁内 join 会假性
+     * 超时）。销毁当前子进程后监督线程阻塞的合并流读随 EOF 解除，循环顶停机位令其退出；
+     * join 超时则 interrupt（打断退避睡）+ WARN——监督线程为守护位兜底。</p>
      */
-    public synchronized void stop() {
-        if (stopped) {
-            return;
+    public void stop() {
+        Process toKill;
+        synchronized (this) {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            stopRequested = true;
+            toKill = process;
         }
-        stopped = true;
-        stopRequested = true;
-        Process p = process;
-        if (p != null) {
-            p.destroy();
+        if (toKill != null) {
+            toKill.destroy();
             try {
-                if (!p.waitFor(STOP_WAIT_MS, TimeUnit.MILLISECONDS)) {
-                    p.destroyForcibly();
+                if (!toKill.waitFor(STOP_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    toKill.destroyForcibly();
                     LOG.warn("pg_receivexlog {}ms 内未随 SIGTERM 退出——已 SIGKILL", STOP_WAIT_MS);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
-        if (worker != null) {
+        Thread w = worker;
+        if (w != null) {
             try {
-                worker.join(STOP_WAIT_MS);
+                w.join(STOP_WAIT_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            if (worker.isAlive()) {
-                worker.interrupt();
-                LOG.warn("wal-rx-supervisor 线程 {}ms 内未退出——已 interrupt（停机位已置）", STOP_WAIT_MS);
+            if (w.isAlive()) {
+                w.interrupt();
+                LOG.warn("wal-rx-supervisor 线程 {}ms 内未退出——已 interrupt（停机位已置，守护位兜底）",
+                        STOP_WAIT_MS);
             }
         }
         LOG.info("pg_receivexlog 子进程停机: dir={} 累计拉起 {} 次", dir, launches.get());
     }
 
     /**
+     * 单次拉起（锁内，与 {@link #stop()} 互斥）：复核停机位后 start 子进程并发布句柄。
+     *
+     * <p>竞态语义：stop 先获锁置位 → 此处见停机位返回 null（调用方退出循环，不产生
+     * 孤儿子进程）；本方法先获锁完成句柄发布 → stop 的锁内快照必达同一句柄。锁只覆盖
+     * start + 发布（毫秒级），drainOutput 的长阻塞在锁外。</p>
+     *
+     * @return 新拉起的子进程；stop 已先行则为 null（不再拉起）
+     * @throws IOException ProcessBuilder.start 失败（交监督循环失败面）
+     */
+    private synchronized Process launchOnce() throws IOException {
+        if (stopRequested) {
+            return null;
+        }
+        Process p = buildProcessBuilder().start();
+        process = p;
+        int n = launches.incrementAndGet();
+        LOG.info("pg_receivexlog 已拉起（第 {} 次）: {} -D {}", n, bin, dir);
+        return p;
+    }
+
+    /**
      * 监督主循环（线程体）：拉起 → 排空输出并等退出 → 退避重拉 / 终态停机。
      *
-     * <p>关键步骤：每轮 buildProcessBuilder().start() 后排空合并输出流（阻塞至 EOF =
-     * 子进程退出）再 waitFor 收割退出码；stopRequested 置位下的退出属停机路径直接
-     * 返回；异常退出计失败——稳定运行超阈值先清零计数，超 {@code maxAttempts} 置
-     * terminalFailure 后 ERROR 退出；IOException（拉起失败/输出读失败——后者先
-     * destroy 防双活）同计失败面。退避睡可被 interrupt 提前结束（循环顶停机位再查）。</p>
+     * <p>关键步骤：每轮 launchOnce（锁内复核停机位，stop 先行则收 null 直接退出）后排空
+     * 合并输出流（阻塞至 EOF = 子进程退出）再 waitFor 收割退出码；stopRequested 置位下
+     * 的退出属停机路径直接返回；异常退出计失败——稳定运行超阈值先清零计数，超
+     * {@code maxAttempts} 置 terminalFailure 后 ERROR 退出；IOException（拉起失败/输出
+     * 读失败——后者先 destroy 防双活）同计失败面。退避睡可被 interrupt 提前结束
+     * （循环顶停机位再查）。</p>
      */
     private void runSupervisorLoop() {
         long backoff = backoffBaseMs;
@@ -232,10 +278,10 @@ public final class ReceivexlogProcess {
         while (!stopRequested) {
             long startedAt = System.currentTimeMillis();
             try {
-                Process p = buildProcessBuilder().start();
-                process = p;
-                int n = launches.incrementAndGet();
-                LOG.info("pg_receivexlog 已拉起（第 {} 次）: {} -D {}", n, bin, dir);
+                Process p = launchOnce();
+                if (p == null) {
+                    return;   // stop 与拉起竞态：stop 先获锁——本线程退出，不产孤儿
+                }
                 drainOutput(p);
                 int exit = p.waitFor();
                 if (stopRequested) {

@@ -229,6 +229,43 @@ class FileWalSourceTest {
     }
 
     /**
+     * 用例 ③d（fix round 1）：退出重拉 churn 中 stop——无孤儿子进程且监督线程时限内终止。
+     *
+     * <p>竞态窗构造：短命子进程（50ms 退出）+ 快速退避（10ms）形成持续重拉 churn；
+     * 落 stop 前先放置长命开关（flag 后续子进程 {@code sleep 3600}）——stop 窗口内
+     * 恰好拉起的子进程即为孤儿形态（长命 + 无人销毁），ProcessHandle 逐 pid 验尸。
+     * 锁互斥修复下无论落点如何：先获锁则拉起面放弃、后获锁则 stop 销毁新句柄。</p>
+     */
+    @Test
+    void stopDuringRelaunchChurnLeavesNoOrphanChildAndSupervisorExits() throws Exception {
+        Path pids = dir.resolve("pids.txt");
+        Path longRunFlag = dir.resolve("longrun.flag");
+        Path bin = writeScript("#!/bin/sh\n"
+                + "echo $$ >> '" + pids + "'\n"
+                + "if [ -f '" + longRunFlag + "' ]; then sleep 3600; else sleep 0.05; exit 0; fi\n");
+
+        ReceivexlogProcess proc = new ReceivexlogProcess(bin.toString(), dir,
+                null, 0, null, null, null, 10, 1_000);
+        proc.start();
+        try {
+            awaitTrue(() -> proc.launches() >= 2, "须形成退出重拉 churn（竞态窗前提）");
+            Files.writeString(longRunFlag, "on");   // 放大：stop 窗内的新拉起变长命（孤儿可见）
+        } finally {
+            proc.stop();
+        }
+        awaitTrue(() -> !proc.supervisorAlive(), "stop 后监督线程须终止");
+        // pid 文件按需验尸（子进程可能在脚本首行 echo 前被销毁——记录滞后于内存计数，
+        // 不作数量下限锚）；孤儿判定的确定性锚是句柄面 processAlive
+        for (String pid : Files.readAllLines(pids)) {
+            boolean alive = ProcessHandle.of(Long.parseLong(pid.trim()))
+                    .map(ProcessHandle::isAlive)
+                    .orElse(false);
+            assertFalse(alive, "拉起过的子进程 " + pid + " 不得存活（孤儿子进程）");
+        }
+        assertFalse(proc.processAlive(), "stop 后句柄面不得有活子进程（stop 窗内新拉起须被销毁/放弃）");
+    }
+
+    /**
      * 写一个可执行的假二进制 shell 脚本（模拟 pg_receivexlog 的可观测面）。
      *
      * @param content 脚本内容（首行 shebang 由调用方给出）
