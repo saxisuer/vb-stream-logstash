@@ -1,5 +1,6 @@
 package org.vastdata.vbstream.walsource.receive;
 
+import java.util.Optional;
 import java.util.function.BiConsumer;
 import java.util.function.LongConsumer;
 
@@ -15,4 +16,15 @@ public interface WalByteSource extends AutoCloseable {
     void stop();
     /** 消费前沿（已交付字节末尾的 LSN；未 start 为 0）。 */
     long consumedLsn();
+
+    /**
+     * 终态失败观测面（openGauss M1 Task 5 追加）：源线程因确定性错误（重连耗尽/sink
+     * 确定性异常）自行退出后返回根因；运行中/正常停机/未 start 为 empty。宿主应周期
+     * 轮询本面，见终态即 fail-fast——源停更而进程空转。默认 empty（实现按需覆写）。
+     *
+     * @return 终态根因；非终态为 empty
+     */
+    default Optional<Throwable> terminalFailure() {
+        return Optional.empty();
+    }
 }

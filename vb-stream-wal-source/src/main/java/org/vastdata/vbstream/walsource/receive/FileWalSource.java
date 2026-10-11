@@ -158,6 +158,7 @@ public final class FileWalSource implements WalByteSource {
      *
      * @return 终态根因；非终态为 empty
      */
+    @Override
     public Optional<Throwable> terminalFailure() {
         return Optional.ofNullable(terminalFailure);
     }
