@@ -36,9 +36,9 @@ package org.vastdata.vbstream.walsource.layout;
  * </table>
  *
  * <p><strong>Task 2 语料锚定补充（2026-10-12，og-plan 32KB 窗口 / 283 条记录）</strong>：
- * sizeOfHeapUpdate=13（SizeOfOldHeapUpdate 5 + LogCSN 8——HOT_UPDATE 0x23598f0
+ * sizeOfHeapUpdate=13（SizeOfOldHeapUpdate 5 + LogCSN 8——HOT_UPDATE 0x2359908
  * 旧行 xl_heap_header 恰在 main+13）、sizeOfHeapDelete=11（同构，DELETE
- * 0x2359ac0）、sizeOfHeapInplace=2（heap_inplace_update 不记 CSN）；块引用消费序
+ * 0x2359AD8）、sizeOfHeapInplace=2（heap_inplace_update 不记 CSN）；块引用消费序
  * xlogreader.cpp DecodeXLogRecord：定位器 12+2、blkno 后 last_lsn u64、镜像头
  * 4B 仅洞字段（2 条 FPI 记录实测）——常量注记逐项含出处。</p>
  *
@@ -92,7 +92,7 @@ public final class WalLayoutVOpenGauss implements WalLayout {
      * v5.0.0 htup.h xl_heap_update（常态走 SizeOfOldHeapUpdate：old_offnum u16@0 +
      * new_offnum u16@2 + flags u8@4）+ heapam.cpp log_heap_update 在 xlrec 后经
      * LogCSN 追加 CommitSeqNo u64（wal_level=logical 时 XLogLogicalInfoActive 恒
-     * 真——本模块 DML 面前提）。语料实测：HOT_UPDATE lsn=0x23598f0 的旧行
+     * 真——本模块 DML 面前提）。语料实测：HOT_UPDATE lsn=0x2359908 的旧行
      * xl_heap_header 恰在 main+13（t_hoff=24 锚）。变体偏离：UPDATE+INIT_PAGE 在
      * xlrec 前另有 pd_xid_base u64（前缀 21）；xmax 为 MultiXactId 时走全量
      * SizeOfHeapUpdate（u64 xmax 布局，前缀漂移）——消费面（Task 3+）须以
@@ -101,15 +101,15 @@ public final class WalLayoutVOpenGauss implements WalLayout {
 
     /** heap DELETE main 前缀 11 = SizeOfOldHeapDelete 3 + LogCSN 8 // openGauss
      * v5.0.0 htup.h xl_heap_delete（常态走 SizeOfOldHeapDelete：offnum u16@0 +
-     * flags u8@2）+ LogCSN u64 同 UPDATE。语料实测：DELETE lsn=0x2359ac0 旧行
+     * flags u8@2）+ LogCSN u64 同 UPDATE。语料实测：DELETE lsn=0x2359AD8 旧行
      * xl_heap_header 恰在 main+11（'x'x64 旧行 75B 完整收口）。同 UPDATE 的
      * MultiXactId 变体偏离注记。 */
     private static final int SIZE_OF_HEAP_DELETE = 11;
 
     /** heap INPLACE main 前缀 2 // openGauss v5.0.0 htup.h xl_heap_inplace 仅
      * {offnum u16}——heapam.cpp heap_inplace_update 不调 LogCSN（无 CSN 块），
-     * 新元组数据在块 0 载荷非 main。语料实测：两条 INPLACE（lsn=0x23587c0/
-     * 0x2358900）mainLen 恒 2。与 V18 的 20（含 dbId/tsId/msgs[] 前缀）语义
+     * 新元组数据在块 0 载荷非 main。语料实测：两条 INPLACE（lsn=0x23587D8/
+     * 0x2358918）mainLen 恒 2。与 V18 的 20（含 dbId/tsId/msgs[] 前缀）语义
      * 不同源：OG 无共享失效消息内联面。 */
     private static final int SIZE_OF_HEAP_INPLACE = 2;
 
@@ -274,7 +274,7 @@ public final class WalLayoutVOpenGauss implements WalLayout {
 
     /**
      * {@inheritDoc}——13 = SizeOfOldHeapUpdate(5) + LogCSN(8)，常态逻辑日志形态
-     * （htup.h + heapam.cpp log_heap_update 消费序 + 语料 0x23598f0 旧行位实测）；
+     * （htup.h + heapam.cpp log_heap_update 消费序 + 语料 0x2359908 旧行位实测）；
      * INIT_PAGE/MultiXactId 变体的前缀漂移见常量注记，消费面按 info/flags 分派。
      */
     @Override
@@ -283,7 +283,7 @@ public final class WalLayoutVOpenGauss implements WalLayout {
     }
 
     /**
-     * {@inheritDoc}——11 = SizeOfOldHeapDelete(3) + LogCSN(8)（语料 0x2359ac0
+     * {@inheritDoc}——11 = SizeOfOldHeapDelete(3) + LogCSN(8)（语料 0x2359AD8
      * 旧行位实测：'x'x64 旧行 75B 自 main+11 完整收口）。
      */
     @Override

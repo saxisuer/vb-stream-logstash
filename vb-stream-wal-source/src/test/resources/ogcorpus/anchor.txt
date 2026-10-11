@@ -12,23 +12,30 @@ openGauss 5.0.0 WAL 语料锚（2026-10-12 采集，og-plan 容器 opengauss/ope
            UPDATE t_corpus SET v=repeat(chr(99),100) WHERE id=1;   -- xid=12982 (0x32B6)
            DELETE FROM t_corpus WHERE id=2;                        -- xid=12983 (0x32B7)
 
-锚记录（LSN 为记录起始，窗口内走读实测）:
-  0x2359538  rmid=10 info=0x80 (INSERT+INIT_PAGE)  xid=12980  tot=194  块载荷含 'b'x100（新元组）
+LSN 口径 : 记录 LSN = 页头 xlp_pageaddr + 页内全偏移（含 24B 页头字节）。
+           修正注记（fix round 1，2026-10-12）：首版误按"pageaddr + 页头后偏移"计，
+           全部锚恒低 24B——被 xl_prev 链（prev == 前一记录起始 LSN，280/282 对
+           自洽、2 对为跨页记录的源面特例）与服务端 pg_current_xlog_insert_location
+           两点（0x23532F8 / 0x2359C10 恰为窗口内两记录的真实起点）双重证伪。
+
+锚记录（LSN 为记录起始，窗口内走读实测，已按修正口径）:
+  0x2359550  rmid=10 info=0x80 (INSERT+INIT_PAGE)  xid=12980  tot=194  块载荷含 'b'x100（新元组）
              main=19B = pd_xid_base u64 + SizeOfOldHeapInsert 3B + LogCSN 8B
   0x2359600  rmid=11 info=0xa1 (HEAP2)             xid=12980  tot=104  首 INSERT 后的可见性配套
-  0x2359760  rmid=10 info=0x00 (INSERT)            xid=12981  tot=150  块载荷含 'x'x64（新元组）
-  0x23598f0  rmid=10 info=0x40 (HOT_UPDATE)        xid=12982  tot=299  块载荷含 'c'x100（新元组），
-             main=124B = SizeOfOldHeapUpdate 5B + LogCSN 8B + xl_heap_header 5B + 旧行 106B
+  0x2359778  rmid=10 info=0x00 (INSERT)            xid=12981  tot=150  块载荷含 'x'x64（新元组）
+  0x2359908  rmid=10 info=0x40 (HOT_UPDATE)        xid=12982  tot=299  块载荷含 'c'x100（新元组），
+             main=124B = SizeOfOldHeapUpdate 5B + LogCSN 8B + xl_heap_header 5B + 旧行 111B
              （旧行含 'b'x100，prefix=13=本任务 sizeOfHeapUpdate 锚）
-  0x2359ac0  rmid=10 info=0x10 (DELETE)            xid=12983  tot=150  main=86B =
-             SizeOfOldHeapDelete 3B + LogCSN 8B + xl_heap_header 5B + 旧行 70B（'x'x64，
+  0x2359AD8  rmid=10 info=0x10 (DELETE)            xid=12983  tot=150  main=86B =
+             SizeOfOldHeapDelete 3B + LogCSN 8B + xl_heap_header 5B + 旧行 75B（'x'x64，
              prefix=11=本任务 sizeOfHeapDelete 锚）
-  0x23587c0 / 0x2358900  rmid=10 info=0x70 (INPLACE)  main 恒 2B（SizeOfHeapInplace 锚，
+  0x23587D8 / 0x2358918  rmid=10 info=0x70 (INPLACE)  main 恒 2B（SizeOfHeapInplace 锚，
              heap_inplace_update 不记 LogCSN）
 
 窗口走读: 283 条记录全部经 DecodeXLogRecord 权威布局链式解析（块引用 = id u8 +
 fork_flags u8 + data_length u16 + [镜像头 hole_offset/hole_length u16x2] + 定位器
 RelFileNodeOld 12B + extra_flag u16 + blkno u32 + last_lsn u64 + 终止头），不变量
-mainOff+mainLen==totLen 全部成立；含 2 条 FPI（镜像 4B 头形态）与 2 条跨页记录（续体缝合）。
+mainOff+mainLen==totLen 全部成立；含 2 条 FPI（镜像 4B 头形态）与 2 条跨页记录（续体缝合，
+其 xl_prev 指向续体页边界——源面特例，prev 链断言按跨页豁免）。
 表定位器: spc=1663 db=14806 rel=16395 fork=0 blkno=0。
 SHA-256: d56a567edfba42e88249f32326d0f3f134d44a2abf5623dc31d1f1621dd8b3df

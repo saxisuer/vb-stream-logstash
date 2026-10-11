@@ -40,20 +40,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class OgWalRecordParserTest {
 
-    /** 锚 LSN：INSERT+INIT_PAGE（首行 'b'x100，xid=12980）——anchor.txt 实测。 */
-    private static final long LSN_INSERT_INIT_PAGE = 0x2359538L;
+    /** 锚 LSN：INSERT+INIT_PAGE（首行 'b'x100，xid=12980）——anchor.txt 实测。
+     *  记录 LSN = pageaddr + 页内全偏移（含 24B 页头）——fix round 1 修正（首版
+     *  误减页头宽 24B，经 prev 链 + 服务端 insert location 双重证伪）。 */
+    private static final long LSN_INSERT_INIT_PAGE = 0x2359550L;
 
     /** 锚 LSN：普通 INSERT（'x'x64，xid=12981）。 */
-    private static final long LSN_INSERT_PLAIN = 0x2359760L;
+    private static final long LSN_INSERT_PLAIN = 0x2359778L;
 
     /** 锚 LSN：HOT_UPDATE（新行 'c'x100 在块载荷、旧行 'b'x100 在 main，xid=12982）。 */
-    private static final long LSN_HOT_UPDATE = 0x23598f0L;
+    private static final long LSN_HOT_UPDATE = 0x2359908L;
 
     /** 锚 LSN：DELETE（旧行 'x'x64 在 main，xid=12983）。 */
-    private static final long LSN_DELETE = 0x2359AC0L;
+    private static final long LSN_DELETE = 0x2359AD8L;
 
     /** 锚 LSN：两条 XLOG_HEAP_INPLACE（catalog 原地改写，main 恒 2B）。 */
-    private static final long[] LSN_INPLACE = {0x23587C0L, 0x2358900L};
+    private static final long[] LSN_INPLACE = {0x23587D8L, 0x2358918L};
 
     /** 语料表 t_corpus 的块定位器三件组（anchor.txt：spc/db/relfilenode）。 */
     private static final long SPACENODE = 1663L;
@@ -78,12 +80,14 @@ class OgWalRecordParserTest {
     private final WalLayout og = WalLayoutVOpenGauss.INSTANCE;
 
     /**
-     * 真实语料全窗走读 + 四条锚记录逐项验收。
+     * 真实语料全窗走读 + 四条锚记录逐项验收 + prev 链自洽性钉死。
      *
      * <p>关键步骤：加载语料 → 迷你段走读（页头跳过/续体缝合/MAXALIGN 链推进，
      * 形态与生产 walker 同源但零状态）→ 逐条 {@code WalRecordParser.parse}（任何
-     * 记录布局错配即 ISE 直接红）→ 锚记录按 LSN 精确断言（rmid/xid/opcode/定位器
-     * /块载荷值域/旧行前缀与内容）。</p>
+     * 记录布局错配即 ISE 直接红）→ prev 链断言（记录 xl_prev@16 == 前一记录
+     * 起始 LSN——LSN 口径"pageaddr+页内全偏移含页头"的外部权威锚，跨页记录
+     * 除外：OG 对跨页记录写续体页边界为 prev，属源面行为非走读错位）→
+     * 锚记录按 LSN 精确断言（rmid/xid/opcode/定位器/块载荷值域/旧行前缀与内容）。</p>
      */
     @Test
     void parsesRealOgCorpusAnchoredRecords() throws IOException {
@@ -96,6 +100,24 @@ class OgWalRecordParserTest {
         for (SegRecord sr : walk) {
             byLsn.put(sr.lsn, WalRecordParser.parse(sr.rec, sr.lsn, og));   // 任何布局错配在此 ISE
         }
+
+        // prev 链：xl_prev == 前一记录起始 LSN（跨页记录与 prev=0 除外）——LSN 口径
+        // 的外部权威锚（fix round 1：首版口径漏算页头 24B 被 prev 链整体证伪）
+        int pageSize = og.walBlockSize();
+        int chainChecked = 0;
+        for (int i = 1; i < walk.size(); i++) {
+            SegRecord cur = walk.get(i);
+            long prev = leU64(cur.rec, 16);
+            boolean spansPage = cur.lsn + ((cur.rec.length + 7) & ~7)
+                    > (cur.lsn & ~(pageSize - 1L)) + pageSize;
+            if (prev == 0 || spansPage) {
+                continue;
+            }
+            assertEquals(walk.get(i - 1).lsn, prev,
+                    "prev 链断裂于 lsn=" + Long.toHexString(cur.lsn));
+            chainChecked++;
+        }
+        assertTrue(chainChecked >= MIN_RECORDS, "prev 链覆盖记录数异常偏低：" + chainChecked);
 
         // ① INSERT+INIT_PAGE：'b'x100 新元组在块 0 载荷，定位器三件组 + fork/blkno 核对
         WalRecord insert1 = anchored(byLsn, LSN_INSERT_INIT_PAGE);
@@ -309,7 +331,11 @@ class OgWalRecordParserTest {
                 }
                 int totLen = leU32(seg, pos);
                 assertTrue(totLen >= layout.recordHeaderSize(), "totLen 短于记录头——链断裂");
-                out.add(new SegRecord(pageAddr + (pos - page - hdr),
+                // 记录 LSN = pageaddr + 页内全偏移（含页头字节）——WAL 的 LSN 语义是
+                // 字节地址而非"页头后数据区偏移"（fix round 1：首版误减 hdr 使全部
+                // 锚恒低一个页头宽 24B，被 prev 链 280/282 证 + 服务端 insert
+                // location 两点精确命中证伪）
+                out.add(new SegRecord(pageAddr + (pos - page),
                         stitchRecord(seg, page, pos, totLen, layout)));
                 first = false;
                 pos += (totLen + 7) & ~7;
