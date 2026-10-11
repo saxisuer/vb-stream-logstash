@@ -365,27 +365,36 @@ public final class CatalogReplay {
     }
 
     /**
-     * 施加一条 heap2 PRUNE 记录（三种 prune opcode 等价，发现 18）到三目录的
-     * ctid 键控状态：redirected 段重定位行/tail 并跟随 tracked，nowdead/nowunused
-     * 段移除行/tail——不重放 PRUNE 会在 autovacuum 压实页后丢失 tracked 行位
-     * （spike S6 实证）。
+     * 施加一条 heap2 页清理记录（vanilla：三种 prune opcode 等价，发现 18；
+     * openGauss：XLOG_HEAP2_CLEAN 单 opcode——两族 opcode 撞号，门按
+     * layout.legacyHeap2Clean() 分派）到三目录的 ctid 键控状态：redirected 段
+     * 重定位行/tail 并跟随 tracked，nowdead/nowunused 段移除行/tail——不重放
+     * PRUNE 会在 autovacuum 压实页后丢失 tracked 行位（spike S6 实证）。
      *
-     * <p>关键步骤：rmid/opcode 筛 → PruneView 解析（freeze 段已在视图层跳过——
-     * nplans u16 + 2B pad + plans×12B 居首）→ 对 pg_attribute / pg_class /
-     * pg_namespace 各自按 relNode 匹配块后逐段施加。tracked 命中 dead/unused 打
-     * WARN（行位丢失是异常态：该行已被物理删除）。边界与异常语义：非 prune 记录
-     * no-op；记录块不属任一 watched 目录 no-op；段字节越界由上游走读不变量排除
-     * （裸抛）。线程约束：单写者（stores 生命周期内仅重放线程）。</p>
+     * <p>关键步骤：rmid/opcode 筛（OG 档只放行 0x10 CLEAN——0x30 CLEANUP_INFO
+     * 与 vanilla PRUNE_VACUUM_CLEANUP 撞号，须在解析前拦下 no-op）→ PruneView
+     * 解析（vanilla：freeze 段已在视图层跳过；OG：段计数取自 main、unused 余长
+     * 推导）→ 对 pg_attribute / pg_class / pg_namespace 各自按 relNode 匹配块后
+     * 逐段施加。tracked 命中 dead/unused 打 WARN（行位丢失是异常态：该行已被
+     * 物理删除）。边界与异常语义：非页清理记录 no-op；记录块不属任一 watched
+     * 目录 no-op；段字节越界由上游走读不变量排除（裸抛）。线程约束：单写者
+     * （stores 生命周期内仅重放线程）。</p>
      *
      * @param r      走读完成的记录
      * @param stores 重放状态容器
      */
     public void applyPrune(WalRecord r, CatalogStores stores) {
         int op = r.info() & HeapOps.XLOG_XACT_OPMASK;
-        if (r.rmid() != HeapOps.RM_HEAP2_ID
-                || (op != HeapOps.XLOG_HEAP2_PRUNE_ON_ACCESS
+        if (r.rmid() != HeapOps.RM_HEAP2_ID) {
+            return;
+        }
+        if (layout.legacyHeap2Clean()) {
+            if (op != HeapOps.OG_XLOG_HEAP2_CLEAN) {
+                return;    // OG heap2 其它 opcode（FREEZE/PAGE_UPGRADE/CLEANUP_INFO...）非页清理面
+            }
+        } else if (op != HeapOps.XLOG_HEAP2_PRUNE_ON_ACCESS
                 && op != HeapOps.XLOG_HEAP2_PRUNE_VACUUM_SCAN
-                && op != HeapOps.XLOG_HEAP2_PRUNE_VACUUM_CLEANUP)) {
+                && op != HeapOps.XLOG_HEAP2_PRUNE_VACUUM_CLEANUP) {
             return;
         }
         HeapViews.PruneView view = HeapViews.PruneView.parse(r, layout);

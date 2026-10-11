@@ -121,6 +121,17 @@ public final class HeapOps {
     /** heapam_xlog.h XLHP_*：prune 含 nowunused 段（可复用的行指针）。 */
     public static final int XLHP_HAS_NOW_UNUSED_ITEMS = 0x80;
 
+    /** openGauss v5.0.0 htup.h L732：XLOG_HEAP2_CLEAN（opcode 位段 0x10）——9.2 系
+     *  老页清理记录族（vanilla PG 14+ 已改 XLOG_HEAP2_PRUNE_* 三 opcode；OG 的
+     *  0x10 与 vanilla PRUNE_ON_ACCESS、OG CLEANUP_INFO 的 0x30 与 vanilla
+     *  PRUNE_VACUUM_CLEANUP 数值撞号，判定须经 layout 门控不可仅凭 opcode）。 */
+    public static final int OG_XLOG_HEAP2_CLEAN = 0x10;
+
+    /** openGauss v5.0.0 htup.h L746：XLOG_HEAP2_NO_REPAIR_PAGE（info 附加位 0x80，
+     *  heap_page_prune 访问期修剪形态——repair_fragmentation=false；不进 opcode
+     *  位段，解析宽容）。 */
+    public static final int OG_XLOG_HEAP2_NO_REPAIR_PAGE = 0x80;
+
     /**
      * 工具类防实例化。
      */

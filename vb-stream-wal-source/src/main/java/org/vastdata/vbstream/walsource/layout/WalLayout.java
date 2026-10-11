@@ -283,6 +283,28 @@ public interface WalLayout {
     }
 
     /**
+     * heap2 页清理记录是否为 openGauss 的 9.2 系老格式（XLOG_HEAP2_CLEAN 单 opcode）。
+     *
+     * <p>缺省 false＝V17/V18 现行形态（XLOG_HEAP2_PRUNE_{ON_ACCESS,VACUUM_SCAN,
+     * VACUUM_CLEANUP} 三 opcode，main = reason u8 + flags u8（XLHP_* 位）+ 可选冲突
+     * 水位，段计数内联在块0 data 各段首）。openGauss 覆盖 true：页清理是
+     * XLOG_HEAP2_CLEAN（htup.h L732，opcode 0x10）单 opcode + info 高位
+     * NO_REPAIR_PAGE（L746），main = xl_heap_clean（L905-912，SizeOfHeapClean=12：
+     * latestRemovedXid <strong>u64</strong>——OG TransactionId 是 uint64（c.h L450），
+     * 非 vanilla 的 4B——+ nredirected u16@8 + ndead u16@10），块0 data = redirected
+     * 对（2n u16）+ dead（n u16）+ unused（余长推导，redo_heapam.cpp
+     * HeapXlogCleanOperatorPage 同式——<strong>无 per 段计数</strong>）；且 FPI 存储
+     * 时段数组不随记（xloginsert.cpp：needs_data = !needs_backup），块无 data 即空
+     * 清理。两族 opcode 撞号（OG CLEAN 0x10 == vanilla PRUNE_ON_ACCESS），解析分派
+     * 必须经本开关而非 opcode 集判定。</p>
+     *
+     * @return true 表示页清理记录走 OG 老格式解析（仅 OG）
+     */
+    default boolean legacyHeap2Clean() {
+        return false;
+    }
+
+    /**
      * 判定本描述符是否覆盖给定服务端版本号。
      *
      * <p>按大版本全区间判定（如 V18 覆盖 180000-189999，含小版本与发行版位）。</p>

@@ -396,6 +396,17 @@ public final class WalLayoutVOpenGauss implements WalLayout {
         return true;
     }
 
+    /** {@inheritDoc}——true：页清理走 9.2 系 XLOG_HEAP2_CLEAN 老格式（htup.h L705-746
+     *  opcode 表 + L905-912 xl_heap_clean——SizeOfHeapClean=12，latestRemovedXid 为
+     *  u64[OG TransactionId，c.h L450]；块0 data 无 per 段计数，unused 由余长推导）。
+     *  字节实测锚：og-plan 容器 VACUUM t_corpus 期 CLEAN 记录 LSN=0x2367EF8（180B，
+     *  main 12B = xid u64 12984 + nredirected 20 + ndead 11；块0 data 104B = 20 对
+     *  redirect + 11 dead + 1 unused——(104-80-22)/2 余长推导自洽，2026-10-12 采集）。 */
+    @Override
+    public boolean legacyHeap2Clean() {
+        return true;
+    }
+
     /** {@inheritDoc}——openGauss 全系恒报 90204（版本撞号由 forServer(int,String)
      *  判别器消解，仅 openGauss 5.0.x 文本路由到本档），故仅精确匹配 90204。 */
     @Override

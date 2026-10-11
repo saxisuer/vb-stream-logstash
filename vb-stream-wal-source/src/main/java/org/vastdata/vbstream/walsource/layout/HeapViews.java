@@ -28,7 +28,10 @@ import java.util.List;
  *       offsets u16[]@4（INIT_PAGE 时省略，spike 发现 3）</li>
  *   <li>xl_heap_prune：main 区 reason u8@0 + flags u8@1（+冲突水位 4B 可选），
  *       块0 data 区按 XLHP_* 位序分段（freeze/redirected/nowdead/nowunused，
- *       spike 发现 18）</li>
+ *       spike 发现 18）；openGauss 档同视图走 XLOG_HEAP2_CLEAN 老格式分支
+ *       （main = xl_heap_clean 12B：u64 latestRemovedXid + nredirected/ndead，
+ *       段计数在 main、unused 余长推导——两族 opcode 撞号，经
+ *       {@link WalLayout#legacyHeap2Clean()} 分派，详见 PruneView）</li>
  * </ul>
  */
 public final class HeapViews {
@@ -249,43 +252,81 @@ public final class HeapViews {
     }
 
     /**
-     * XLOG_HEAP2_PRUNE_{ON_ACCESS,VACUUM_SCAN,VACUUM_CLEANUP} 记录视图：页修剪的
-     * 标志位与三段行指针分段（spike 发现 18 布局）。
+     * XLOG_HEAP2_PRUNE_{ON_ACCESS,VACUUM_SCAN,VACUUM_CLEANUP}（vanilla）/
+     * XLOG_HEAP2_CLEAN（openGauss）记录视图：页修剪的标志位与三段行指针分段
+     * （spike 发现 18 布局）。
      *
-     * <p>main 区：reason u8@0 + flags u8@1（&amp;0xFF 读——Java byte 符号扩展教训，
-     * 高位段 0x40/0x80 不掩码会变负数）+ 可选冲突水位 XID 4B（flags&amp;0x08 时
-     * unaligned 跟随，视图不消费，冲突消解属备库回放）。块0 data 区按 XLHP_* 位序
-     * 分段：freeze plans（flags&amp;0x10：nplans u16 + 2B pad + plans×12B——含
+     * <p><strong>vanilla 形态</strong>（layout.legacyHeap2Clean()==false）：main 区
+     * reason u8@0 + flags u8@1（&amp;0xFF 读——Java byte 符号扩展教训，高位段
+     * 0x40/0x80 不掩码会变负数）+ 可选冲突水位 XID 4B（flags&amp;0x08 时 unaligned
+     * 跟随，视图不消费，冲突消解属备库回放）。块0 data 区按 XLHP_* 位序分段：
+     * freeze plans（flags&amp;0x10：nplans u16 + 2B pad + plans×12B——含
      * TransactionId 需 4 字节对齐故居首）→ redirected（n 对 from/to）→ nowdead →
-     * nowunused；工厂消化 freeze 段跳过，{@code dataOff} 即首段起点（无任何段时
-     * 亦为 freeze 后的理论起点）。</p>
+     * nowunused，<strong>各段计数内联在段首 u16</strong>；工厂消化 freeze 段跳过，
+     * {@code dataOff} 即首段起点（无任何段时亦为 freeze 后的理论起点），三段计数
+     * 组件全为 -1（未定形，访问器按 flags 位逐段内联走读）。</p>
      *
-     * @param flags   XLHP_* 标志（u8，main@1）
-     * @param dataOff 块0 data 区中 redirected/nowdead/nowunused 首段在 raw 中的
-     *                绝对偏移（freeze 段已跳过）；<strong>-1 = 空 prune</strong>
-     *                （块0 无 data 的 LSN 推进形态，三访问器恒空表）
-     * @param rec     源记录引用（三访问器逐段回读 raw，契约只读）
+     * <p><strong>openGauss 老格式</strong>（legacyHeap2Clean()==true，9.2 系——与
+     * vanilla opcode 撞号故必须经 layout 分派）：opcode 恒 XLOG_HEAP2_CLEAN
+     * （0x10，info 高位 NO_REPAIR_PAGE 0x80 宽容不进 opcode 位段），main 区
+     * xl_heap_clean（htup.h L905-912，SizeOfHeapClean=12）：latestRemovedXid
+     * <strong>u64</strong>@0（OG TransactionId 是 uint64，c.h L450——非 vanilla 4B）
+     * + nredirected u16@8 + ndead u16@10；块0 data = redirected 对（2×nredirected
+     * u16）→ dead（ndead u16）→ unused（<strong>余长推导</strong>：nunused =
+     * (dataLen - 4·nredirected - 2·ndead)/2，redo_heapam.cpp
+     * HeapXlogCleanOperatorPage 同式——无 per 段计数、无 freeze 段）；FPI 存储时
+     * 段数组不随记（xloginsert.cpp：needs_data = !needs_backup），块无 data 即空
+     * 清理。flags() 对 OG 返回按三段存在性<strong>合成</strong>的 XLHP 位（OG 记录
+     * 无 flags 字节，合成位仅供消费面统一段存在性判据，非磁盘字节）。字节实测锚：
+     * og-plan 容器 VACUUM t_corpus 期 CLEAN 记录 LSN=0x2367EF8（nredirected=20 /
+     * ndead=11 / nunused=1 余长自洽，2026-10-12 采集）。</p>
+     *
+     * @param flags       vanilla：XLHP_* 标志（u8，main@1）；OG：段存在性合成位
+     * @param dataOff     块0 data 区中 redirected/nowdead/nowunused 首段在 raw 中的
+     *                    绝对偏移（vanilla 为 freeze 段已跳过后的起点）；
+     *                    <strong>-1 = 空 prune/clean</strong>（块0 无 data 形态，
+     *                    三访问器恒空表）
+     * @param nredirected OG：redirected 段计数（来自 main@8）；vanilla：-1（段首内联）
+     * @param ndead       OG：dead 段计数（来自 main@10）；vanilla：-1（段首内联）
+     * @param nunused     OG：unused 段计数（余长推导）；vanilla：-1（段首内联）
+     * @param rec         源记录引用（三访问器逐段回读 raw，契约只读）
      */
-    public record PruneView(int flags, int dataOff, WalRecord rec) {
+    public record PruneView(int flags, int dataOff, int nredirected, int ndead, int nunused, WalRecord rec) {
 
         /**
-         * 解析一条 heap2 PRUNE 记录（三种 prune opcode 等价，spike 走读同判）。
+         * 解析一条 heap2 页清理记录（vanilla 三 prune opcode 等价 / OG 单 CLEAN
+         * opcode，按 layout.legacyHeap2Clean() 分派——两族 opcode 撞号不可仅凭位段判定）。
          *
-         * <p>关键步骤：校验 rmid==RM_HEAP2_ID 且 opcode ∈ {0x10, 0x20, 0x30}；main 区
-         * 须至少 2 字节（reason + flags）；flags 读 main@1（&amp;0xFF 掩码）；freeze 段
-         * （flags&amp;0x10）在块0 data 起点上跳过 4 + nplans×12 字节得 dataOff（冲突水位
-         * 在 main 区，不影响块区走读）。边界与异常语义：<strong>块0 无 data 为合法空
-         * prune 形态</strong>（heap_prune.c PG 16+：无 redirected/dead/unused/freeze 段
-         * 仍写记录推页 LSN，Task 13 对抗性 IT 实证）——返回 dataOff=-1 的空段视图，
-         * 三访问器恒空表；错配/main 过短/无块仍 ISE。线程约束：静态纯函数 +
+         * <p>关键步骤（vanilla）：校验 rmid==RM_HEAP2_ID 且 opcode ∈ {0x10, 0x20,
+         * 0x30}；main 区须至少 2 字节（reason + flags）；flags 读 main@1（&amp;0xFF
+         * 掩码）；freeze 段（flags&amp;0x10）在块0 data 起点上跳过 4 + nplans×12 字节得
+         * dataOff（冲突水位在 main 区，不影响块区走读）。关键步骤（OG）：opcode 须
+         * 恰为 0x10（其它 heap2 opcode——FREEZE/PAGE_UPGRADE/CLEANUP_INFO 等——非页
+         * 清理面，ISE）；main 须至少 12 字节（xl_heap_clean）；nredirected/ndead 读
+         * main@8/@10；块0 有 data 时按余长推导 nunused（负值或奇数余长即 ISE——
+         * 记录形态损坏）。边界与异常语义：<strong>块0 无 data 为合法空清理形态</strong>
+         * （vanilla：heap_prune.c PG 16+ 无段仍写记录推页 LSN，Task 13 对抗性 IT
+         * 实证；OG：空数组/FPI 存储时 needs_data=false）——返回 dataOff=-1 的空段
+         * 视图，三访问器恒空表；错配/main 过短/无块仍 ISE。线程约束：静态纯函数 +
          * 只读记录引用，并发安全。</p>
          *
-         * @param r      走读完成的记录（main 区即 xl_heap_prune 头）
-         * @param layout 版本布局描述符（本视图分段布局为 PG 16+ 稳定形态，暂不取值；签名统一）
-         * @return 视图（flags + dataOff[-1=空段] + 源记录引用）
-         * @throws IllegalStateException rmid/opcode 错配、main 过短或块链为空
+         * @param r      走读完成的记录（main 区即 xl_heap_prune/xl_heap_clean 头）
+         * @param layout 版本布局描述符（legacyHeap2Clean() 决定两族格式分派）
+         * @return 视图（flags + dataOff[-1=空段] + 三段计数[vanilla 恒 -1] + 源记录引用）
+         * @throws IllegalStateException rmid/opcode 错配、main 过短、无块或 OG 余长异常
          */
         public static PruneView parse(WalRecord r, WalLayout layout) {
+            return layout.legacyHeap2Clean() ? parseLegacyClean(r) : parseVanillaPrune(r);
+        }
+
+        /**
+         * vanilla 解析路径（XLOG_HEAP2_PRUNE 三 opcode，段计数内联）。
+         *
+         * @param r 走读完成的记录
+         * @return 视图（三段计数全 -1，访问器按 XLHP 位逐段内联走读）
+         * @throws IllegalStateException opcode 错配、main 过短或块链为空
+         */
+        private static PruneView parseVanillaPrune(WalRecord r) {
             int op = r.info() & HeapOps.XLOG_XACT_OPMASK;
             if (r.rmid() != HeapOps.RM_HEAP2_ID
                     || (op != HeapOps.XLOG_HEAP2_PRUNE_ON_ACCESS
@@ -304,28 +345,84 @@ public final class HeapViews {
             int flags = raw[r.mainOff() + 1] & 0xFF;
             if (!r.blocks().get(0).hasData()) {
                 // 空 prune（PG 16+ LSN 推进形态）：无任何段，访问器恒空表
-                return new PruneView(flags, -1, r);
+                return new PruneView(flags, -1, -1, -1, -1, r);
             }
             int cur = r.blocks().get(0).dataOff();
             if ((flags & HeapOps.XLHP_HAS_FREEZE_PLANS) != 0) {
                 // nplans u16 + 2B padding + nplans × xlhp_freeze_plan(12B)
                 cur += 4 + u16(raw, cur) * 12;
             }
-            return new PruneView(flags, cur, r);
+            return new PruneView(flags, cur, -1, -1, -1, r);
+        }
+
+        /**
+         * openGauss 老格式解析路径（XLOG_HEAP2_CLEAN，段计数在 main、unused 余长推导）。
+         *
+         * <p>关键步骤：opcode 须恰为 0x10（info 高位 NO_REPAIR_PAGE 0x80 宽容——
+         * heap_page_prune 访问期修剪形态，不进 opcode 位段）；main 须至少 12 字节；
+         * nredirected/ndead 读 main@8/@10；块0 有 data 时 dataOff 即段区起点且
+         * nunused = (dataLen - 4·nredirected - 2·ndead)/2——余长为负（段几何与
+         * dataLen 矛盾）或奇数（错位窗口）均 ISE。边界与异常语义：块0 无 data 为
+         * 合法空清理（空数组或 FPI 存储形态）——dataOff=-1 三计数归零。线程约束：
+         * 静态纯函数，并发安全。</p>
+         *
+         * @param r 走读完成的记录（main 区即 xl_heap_clean）
+         * @return 视图（flags=段存在性合成位 + 三段计数）
+         * @throws IllegalStateException opcode 错配、main 过短、无块或余长异常
+         */
+        private static PruneView parseLegacyClean(WalRecord r) {
+            requireOp(r, HeapOps.RM_HEAP2_ID, HeapOps.OG_XLOG_HEAP2_CLEAN);
+            requireMainLen(r, 12, "xl_heap_clean");
+            if (r.blocks().isEmpty()) {
+                throw new IllegalStateException("clean record without block");
+            }
+            byte[] raw = r.raw();
+            int off = r.mainOff();
+            int nredirected = u16(raw, off + 8);
+            int ndead = u16(raw, off + 10);
+            if (!r.blocks().get(0).hasData()) {
+                // 空 clean（空数组 / FPI 存储形态——needs_data = !needs_backup）
+                return new PruneView(0, -1, 0, 0, 0, r);
+            }
+            BlockRef b0 = r.blocks().get(0);
+            int remainder = b0.dataLen() - 4 * nredirected - 2 * ndead;
+            if (remainder < 0 || (remainder & 1) != 0) {
+                throw new IllegalStateException(String.format(
+                        "xl_heap_clean segment geometry mismatch: dataLen=%d nredirected=%d ndead=%d remainder=%d (lsn=0x%x)",
+                        b0.dataLen(), nredirected, ndead, remainder, r.lsn()));
+            }
+            int nunused = remainder / 2;
+            int flags = 0;
+            if (nredirected > 0) {
+                flags |= HeapOps.XLHP_HAS_REDIRECTIONS;
+            }
+            if (ndead > 0) {
+                flags |= HeapOps.XLHP_HAS_DEAD_ITEMS;
+            }
+            if (nunused > 0) {
+                flags |= HeapOps.XLHP_HAS_NOW_UNUSED_ITEMS;
+            }
+            return new PruneView(flags, b0.dataOff(), nredirected, ndead, nunused, r);
         }
 
         /**
          * redirected 段：被重定向的行指针对（HOT 链根迁移）。
          *
-         * <p>关键步骤：flags 未置 REDIRECTIONS 位则空表；否则自 dataOff 读 n u16，
-         * 展平收集 2n 个 u16——相邻两项为一对 (from, to)。边界与异常语义：段字节
-         * 越界 raw 边界则数组越界裸抛（上游走读不变量已保证 totLen 自洽）；线程
-         * 约束：纯读，并发安全。</p>
+         * <p>关键步骤：vanilla（nredirected&lt;0）flags 未置 REDIRECTIONS 位则空表、
+         * 否则自 dataOff 读内联 n u16 展平收集；OG 直接按 main 计数收集 2×nredirected
+         * 个 u16。边界与异常语义：段字节越界 raw 边界则数组越界裸抛（上游走读不变量
+         * 已保证 totLen 自洽）；线程约束：纯读，并发安全。</p>
          *
          * @return 展平的 (from, to) 对列表（长度 2n；无段为空表）
          */
         public List<Integer> redirectedPairs() {
-            if (dataOff < 0 || (flags & HeapOps.XLHP_HAS_REDIRECTIONS) == 0) {
+            if (dataOff < 0) {
+                return List.of();
+            }
+            if (nredirected >= 0) {
+                return readCount(dataOff, 2 * nredirected);
+            }
+            if ((flags & HeapOps.XLHP_HAS_REDIRECTIONS) == 0) {
                 return List.of();
             }
             return readItems(dataOff, 2);
@@ -334,13 +431,20 @@ public final class HeapViews {
         /**
          * nowdead 段：刚被标记死亡（LP_DEAD）的行指针。
          *
-         * <p>关键步骤：flags 未置 DEAD_ITEMS 位则空表；否则走读越过 redirected 段
-         * （若存在）后读 n u16 与 n 个 u16。边界与异常语义：同 {@link #redirectedPairs()}。</p>
+         * <p>关键步骤：vanilla 走读越过 redirected 段（若存在）后读内联 n u16；
+         * OG 直接读 main 计数个 u16（起点 = dataOff + 4·nredirected）。边界与异常
+         * 语义：同 {@link #redirectedPairs()}。</p>
          *
          * @return 偏移号列表（长度 n；无段为空表）
          */
         public List<Integer> nowdead() {
-            if (dataOff < 0 || (flags & HeapOps.XLHP_HAS_DEAD_ITEMS) == 0) {
+            if (dataOff < 0) {
+                return List.of();
+            }
+            if (ndead >= 0) {
+                return readCount(dataOff + 4 * nredirected, ndead);
+            }
+            if ((flags & HeapOps.XLHP_HAS_DEAD_ITEMS) == 0) {
                 return List.of();
             }
             return readItems(nowdeadStart(), 1);
@@ -349,14 +453,20 @@ public final class HeapViews {
         /**
          * nowunused 段：已回收可复用（LP_UNUSED）的行指针。
          *
-         * <p>关键步骤：flags 未置 NOW_UNUSED_ITEMS 位则空表；否则走读越过 redirected
-         * 与 nowdead 段（若存在）后读 n u16 与 n 个 u16。边界与异常语义：同
-         * {@link #redirectedPairs()}。</p>
+         * <p>关键步骤：vanilla 走读越过 redirected 与 nowdead 段（若存在）后读内联
+         * n u16；OG 直接读余长推导计数个 u16（起点 = dataOff + 4·nredirected +
+         * 2·ndead）。边界与异常语义：同 {@link #redirectedPairs()}。</p>
          *
          * @return 偏移号列表（长度 n；无段为空表）
          */
         public List<Integer> nowunused() {
-            if (dataOff < 0 || (flags & HeapOps.XLHP_HAS_NOW_UNUSED_ITEMS) == 0) {
+            if (dataOff < 0) {
+                return List.of();
+            }
+            if (nunused >= 0) {
+                return readCount(dataOff + 4 * nredirected + 2 * ndead, nunused);
+            }
+            if ((flags & HeapOps.XLHP_HAS_NOW_UNUSED_ITEMS) == 0) {
                 return List.of();
             }
             return readItems(nowunusedStart(), 1);
@@ -386,6 +496,23 @@ public final class HeapViews {
                 pos += 2 + 2 * u16(rec.raw(), pos);
             }
             return pos;
+        }
+
+        /**
+         * 自 pos 起读 count 个 u16 展平收集（openGauss 老格式路径——计数来自
+         * main 结构/余长推导而非段首内联）。
+         *
+         * @param pos   段起点（直接指向首个 u16，无计数前缀）
+         * @param count u16 个数（OG 三段各自的已知计数）
+         * @return 展平值列表
+         */
+        private List<Integer> readCount(int pos, int count) {
+            byte[] raw = rec.raw();
+            List<Integer> out = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                out.add(u16(raw, pos + 2 * i));
+            }
+            return out;
         }
 
         /**
