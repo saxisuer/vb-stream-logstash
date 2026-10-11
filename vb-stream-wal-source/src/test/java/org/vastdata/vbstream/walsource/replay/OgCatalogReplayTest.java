@@ -246,6 +246,40 @@ class OgCatalogReplayTest {
     }
 
     /**
+     * 用例 ⑨（审查 fix round 1——护栏读区边界防御）：截断重建形态的短行不得假阳性
+     * 触发护栏——parttype/reloptions/relbucket 槽越出 OG 值编码读区 144B
+     * （relkind@143+1），suffix 零填充段把它们解成 NUL 字符/空值；修复前 parttype=NUL
+     * ≠ 'n' 会误判分区表拒掉合法行。构造 prefix=84 值编码重建 + suffix 覆盖读区外
+     * 全段：旧行读区回填 [96,144)、[144,∞) 恒零——断言不抛且行按值编码重建落位
+     * （relname 取旓名、filenode 取中段新值、relkind 取回填段）。
+     */
+    @Test
+    void truncatedReconstructionBeyondReadRegionDoesNotTripGuard() {
+        CatalogStores stores = freshStores();
+        long oldKey = CatalogReplay.ctidKey(3, 1);
+        long newKey = CatalogReplay.ctidKey(5, 2);
+        stores.classRows().put(oldKey, new CatalogRow.ClassRow(16390L, "og_t_old", 11L, 12L, 0L, 10L, 0L, 5000L, 0L, "r"));
+
+        TupleBytes fresh = ogClassTuple(16390L, "og_t_old", 5001L, 0L, 0L, 0L, 'n', null, null);
+        int bitmapLen = fresh.tHoff() - 23;
+        int dataLen = fresh.payload().length - 5 - bitmapLen;
+        int prefix = 84;               // = relfilenode 数据区偏移，值编码重建上界
+        int suffix = dataLen - 96;     // 零填充起点 96：读区 [96,144) 旧行回填，parttype@~156 恒零
+        WalRecord rec = rec(ogRecord(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_UPDATE, 1,
+                CLASS_RELNODE, 5, ogTruncatedData(fresh, prefix, suffix))
+                .mainData(updateMain(1, 2, HeapOps.XLH_UPDATE_TRUNCATION))
+                .sameRelBlock(3)
+                .build());
+
+        assertDoesNotThrow(() -> replay.applyCatalogRecord(rec, stores),
+                "零填充段解出的 NUL parttype 须按不可判跳过——不得假阳性 ISE");
+        assertNull(stores.classRows().get(oldKey), "截断 UPD 后旧 ctid 行须消失");
+        assertEquals(new CatalogRow.ClassRow(16390L, "og_t_old", 11L, 12L, 0L, 10L, 0L, 5001L, 0L, "r"),
+                stores.classRows().get(newKey),
+                "prefix 段取旧行（relname）、中段取记录（filenode=5001）、读区回填段取旧行（relkind）");
+    }
+
+    /**
      * 用例 ⑧（护栏边界）：reloptions 含 "segment=on"（段页式的 reloptions 侧判据，
      * 与 relbucket=2 双保险）与 reldeltarelid≠0（列存 delta 表）分别命中判别串；
      * 纯 astore 行（reloptions 无违例串、relbucket null）不触发护栏。
@@ -391,6 +425,30 @@ class OgCatalogReplayTest {
         put16(out, offnum);
         out.write(0x10);
         out.write(new byte[8], 0, 8);   // LogCSN（值不消费）
+        return out.toByteArray();
+    }
+
+    /**
+     * 截断 UPDATE 的块 0 data（OG 档，flags 置双截断位组形态）：
+     * [prefix u16][suffix u16][xl_heap_header 5B][bitmap+pad][数据区自 prefix 起、
+     * 止于 len-suffix]——heapam 截断日志的 chunk 布局（与 CatalogReplayTest 的
+     * vanilla 档同构，双源转录）。
+     *
+     * @param tuple  新行完整 tuple DSL（值供裁切）
+     * @param prefix 前缀字节数（自旧行取）
+     * @param suffix 后缀字节数（零填充段，重建期回填）
+     * @return 块 data 字节
+     */
+    private static byte[] ogTruncatedData(TupleBytes tuple, int prefix, int suffix) {
+        byte[] payload = tuple.payload();
+        int bitmapLen = tuple.tHoff() - 23;
+        byte[] dataRegion = Arrays.copyOfRange(payload, 5 + bitmapLen, payload.length);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        put16(out, prefix);
+        put16(out, suffix);
+        out.write(payload, 0, 5);       // xl_heap_header
+        out.write(payload, 5, bitmapLen);
+        out.write(dataRegion, prefix, dataRegion.length - prefix - suffix);
         return out.toByteArray();
     }
 

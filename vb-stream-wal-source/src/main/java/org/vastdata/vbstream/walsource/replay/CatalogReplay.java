@@ -204,7 +204,16 @@ public final class CatalogReplay {
      * 零回归）；值行槽位 = 物理词典槽位 + classValsSlotDelta()；null 列（relbucket
      * 普通表为 NULL、reloptions 常见 NULL）按无判别跳过；char 列解码为左引号单
      * 字符（{@code 'n'}）经剥引号收敛。命中即抛 ISE（消息含 relname/oid——
-     * fail-fast 面与 vanilla 路径零交集）。线程约束：纯函数。</p>
+     * fail-fast 面与 vanilla 路径零交集）。</p>
+     *
+     * <p><strong>读区边界防御（fix round 1）</strong>：parttype（数据区 ~156）/
+     * reloptions/relbucket 槽均越出 OG 值编码读区（relkind@143 + 1 = 144B，
+     * {@code pgClassRelkindDataOffset()+1}）——若 OG 存在 prefix/suffix 截断更新
+     * （可达性待 Task 8 语料裁定），重建行的零填充段会把这些槽解成 NUL 字符/空值
+     * （parttype=NUL ≠ 'n' 即假阳性拒掉合法行）。防御口径：解码值为 NUL 字符的
+     * char 槽按<strong>不可判</strong>处理（跳过该判据）；relbucket 零填充解 0、
+     * reloptions 零填充解空串，两者本就不触发判别——即"越界/缺值槽不做假阳性
+     * 拒绝"。T8 裁定 OG 截断形态后可收紧为读区边界显式判。线程约束：纯函数。</p>
      *
      * @param vals pg_class 解码值行（与 {@link #classDecodeKinds()} 同长）
      * @throws IllegalStateException 命中任一不支持存储形态
@@ -227,7 +236,7 @@ public final class CatalogReplay {
 
     /**
      * 存储形态判别的共享谓词（值行与 JDBC 种子两侧同源，Task 7）：输入五判别列的
-     * 收敛值（null = 列缺席/NULL），返回违例描述或 null。
+     * 收敛值（null = 列缺席/NULL/NUL 字符不可判），返回违例描述或 null。
      *
      * <p>判别依据（og-plan 容器实测，2026-10-12）：列存表 relcudescrelid=16447 /
      * reldeltarelid=16441；分区父表 parttype='p'；段页式表（SEGMENT=ON）
@@ -236,7 +245,8 @@ public final class CatalogReplay {
      *
      * @param reldelta     reldeltarelid（null=缺席/NULL）
      * @param relcudesc    relcudescrelid（null=缺席/NULL）
-     * @param parttype     parttype 裸单字符（null=缺席/NULL）
+     * @param parttype     parttype 裸单字符（null=缺席/NULL/NUL 不可判——读区边界
+     *                     防御，见 {@link #guardOgStorageEngine} javadoc）
      * @param reloptions   reloptions 原文（null=缺席/NULL）
      * @param relbucket    relbucket（null=缺席/NULL）
      * @return 违例描述；合规 null
@@ -249,7 +259,8 @@ public final class CatalogReplay {
         if (reldelta != null && reldelta != 0) {
             return "column store delta table (reldeltarelid=" + reldelta + ")";
         }
-        if (parttype != null && !parttype.isEmpty() && parttype.charAt(0) != 'n') {
+        if (parttype != null && !parttype.isEmpty() && parttype.charAt(0) != 'n'
+                && parttype.charAt(0) != '\0') {
             return "partitioned table (parttype=" + parttype.charAt(0) + ")";
         }
         if (relbucket != null && relbucket != 0) {
@@ -1155,15 +1166,22 @@ public final class CatalogReplay {
     }
 
     /**
-     * 截断头走读：flags（main@7）的双截断位决定 [prefix u16?][suffix u16?] 前缀，
-     * 返回三元组（prefix、suffix、xl_heap_header 起点的绝对偏移）。
+     * 截断头走读：flags 的双截断位决定 [prefix u16?][suffix u16?] 前缀，返回三元组
+     * （prefix、suffix、xl_heap_header 起点的绝对偏移）。
+     *
+     * <p>flags 取值经 {@link HeapViews.HeapUpdateView#parse} 单源换算（fix round 1）：
+     * vanilla 读 main@7，<b>openGauss 老结构读 main@4</b>（INIT_PAGE 变体再 +8）——
+     * 此前内联 {@code main+7} 是 vanilla 专属偏移，OG 档截断更新会误读 CSN 字节为
+     * flags（恒 0 → 截断位漏检 → chunk 双 u16 前缀被当元组头解码错位）。
+     * 边界与异常语义：视口工厂对 rmid/opcode/main 长度的校验在此复验（同一记录）。
+     * 线程约束：纯函数。</p>
      *
      * @param r  走读完成的 UPDATE 记录
      * @param b0 新页块引用（data 区即截断 chunk）
      * @return {prefix, suffix, headerOff}
      */
     private int[] truncParams(WalRecord r, BlockRef b0) {
-        int flags = r.raw()[r.mainOff() + 7] & 0xFF;
+        int flags = HeapViews.HeapUpdateView.parse(r, layout).flags();
         int cur = b0.dataOff();
         int prefix = 0;
         int suffix = 0;
