@@ -392,6 +392,18 @@ final class OgPseudoServer implements AutoCloseable {
             writeMessage('d', replicationPayload);
         }
 
+        /** 写畸形 keepalive 帧（'k' + 截断载荷——协议错位注入面，客户端须按可重试处理）。 */
+        void writeMalformedKeepalive(int truncatedLength) throws IOException {
+            byte[] frame = new byte[1 + truncatedLength];
+            frame[0] = 'k';
+            writeCopyData(frame);
+        }
+
+        /** 写 CopyDone 帧（'c' 空载荷——服务端结束 copy 流的协议面）。 */
+        void writeCopyDone() throws IOException {
+            writeMessage('c', new byte[0]);
+        }
+
         /**
          * 写 'w' WAL 数据帧：'w' + WalDataMessageHeader（64B 小端 memcpy——dataStart/
          * walEnd/sendTime/四个 sender 位 + catchup + 对齐垫）+ WAL 载荷。

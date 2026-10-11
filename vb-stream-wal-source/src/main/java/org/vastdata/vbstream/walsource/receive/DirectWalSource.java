@@ -252,7 +252,10 @@ public final class DirectWalSource implements WalByteSource {
             long connectedAt = System.currentTimeMillis();
             try {
                 runSingleConnection();
-                return;   // 无异常的正常返回 = CopyDone 收流（服务端收流），M1 视同断线重连语义：回到循环顶重连
+                // 正常返回的唯一来源 = streamLoop 循环顶见停机位（stop() 路径）——直接收工。
+                // CopyDone 不落此路径：streamLoop 对其抛 IOException 走可重试重连（审查
+                // 修复 1——静默 return 会让源停更而宿主无终态可查）。
+                return;
             } catch (IOException e) {
                 if (stopRequested) {
                     return;   // stop() 主动关通道的读异常——正常停机路径
@@ -308,10 +311,13 @@ public final class DirectWalSource implements WalByteSource {
 
     /**
      * 流循环（工作线程体）：逐 CopyData 帧分派——'w' 剥 64B 头交付载荷（锚 =
-     * dataStart+载荷长）、'k' 观测 + 即答 'r'、'm' 跳过、未知帧 WARN 不断流。
+     * dataStart+载荷长）、'k' 帧长校验后观测 + 即答 'r'、'm' 跳过、未知帧 WARN 不断流。
      *
-     * <p>边界：空载荷 'w'（帧长恰 65）跳过——无字节可交付、锚不推进；readCopyData 返回
-     * null（CopyDone）即返回（由工作循环重连）。</p>
+     * <p>边界：空载荷 'w'（帧长恰 65）跳过——无字节可交付、锚不推进；'k' 帧长 ≠33 抛
+     * IOException（协议字节错位属可重试面——重连段对齐重发即纠错，勿落入 RuntimeException
+     * 终态面）；readCopyData 返回 null（服务端 CopyDone）抛 IOException 走可重试重连
+     * （审查修复 1：静默返回会令源停更而宿主无终态可查）。循环顶停机位退出是唯一的
+     * 正常返回（stop() 路径）。</p>
      *
      * @param ch 当前连接通道
      * @throws IOException 流读/反馈写失败
@@ -320,8 +326,11 @@ public final class DirectWalSource implements WalByteSource {
         while (!stopRequested) {
             byte[] msg = ch.readCopyData();
             if (msg == null) {
-                LOG.info("服务端 CopyDone——收流结束（工作循环将重连）");
-                return;
+                // 服务端 CopyDone：物理复制流的 copy 会话被服务端正常结束（时间线切换/对端
+                // 重启等）——按<b>可重试中断</b>处理（与 C 参考客户端收 CopyDone 后由外层
+                // 重连同构）。不得静默 return：工作线程无声终止会让源停更而宿主无终态可查
+                // （本类 javadoc 警告的空转形态）。
+                throw new IOException("服务端 CopyDone——copy 会话被服务端结束，按可重试中断重连");
             }
             if (msg.length == 0) {
                 continue;
@@ -340,10 +349,19 @@ public final class DirectWalSource implements WalByteSource {
                     consumedLsn.set(anchor);
                 }
                 case 'k' -> {
+                    // 帧长下界先行校验（C 客户端 receivelog.cpp:785 的 r != 33 → error 同构）：
+                    // 未校验即取 frame[25] 的 replyRequested 位会被畸形帧触发 AIOOBE，落入
+                    // RuntimeException 终态面——协议字节错位属环境/传输类失败，契约上走
+                    // IOException 可重试面（重连后段对齐重发，服务端即纠错源）。
+                    if (msg.length != 33) {
+                        throw new IOException("畸形 keepalive 帧长 " + msg.length + "（期望 33）——协议错位，断流重连");
+                    }
                     if (V3ProtocolChannel.keepaliveReplyRequested(msg)) {
                         ch.sendStandbyReply(consumedLsn.get(), false);
                     }
-                    LOG.debug("keepalive: walEnd={}", Lsn.format(V3ProtocolChannel.walEndOfKeepalive(msg)));
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("keepalive: walEnd={}", Lsn.format(V3ProtocolChannel.walEndOfKeepalive(msg)));
+                    }
                 }
                 case 'm' -> LOG.debug("服务端配置帧 'm'——跳过（receivelog.cpp 'm' 分支）");
                 default -> LOG.warn("未知复制帧类型 '{}'——跳过（{} 字节）", (char) msg[0], msg.length);

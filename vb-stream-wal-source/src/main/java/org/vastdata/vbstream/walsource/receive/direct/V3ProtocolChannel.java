@@ -487,7 +487,10 @@ public final class V3ProtocolChannel implements AutoCloseable {
     /**
      * 'k' 帧的 walEnd（发送端 WAL 末——帧偏移 1 的 u64 小端，观测面）。
      *
-     * @param frame readCopyData 返回的 'k' 帧
+     * <p>前置：帧长恰 33（sizeof(WalSndrMessage)+1）——调用方先行校验，本方法不再越界
+     * 防护（畸形帧由调用方按协议错位上抛，见 DirectWalSource.streamLoop）。</p>
+     *
+     * @param frame readCopyData 返回的 'k' 帧（长度 33）
      * @return walEnd
      */
     public static long walEndOfKeepalive(byte[] frame) {
@@ -497,7 +500,10 @@ public final class V3ProtocolChannel implements AutoCloseable {
     /**
      * 'k' 帧的 replyRequested 位（帧偏移 25 的 u8——置位须即时回 'r'）。
      *
-     * @param frame readCopyData 返回的 'k' 帧
+     * <p>前置：帧长恰 33——调用方先行校验（畸形短帧取本位会 AIOOBE，须按协议错位的
+     * 可重试面处理，见 DirectWalSource.streamLoop）。</p>
+     *
+     * @param frame readCopyData 返回的 'k' 帧（长度 33）
      * @return 即答请求为 true
      */
     public static boolean keepaliveReplyRequested(byte[] frame) {

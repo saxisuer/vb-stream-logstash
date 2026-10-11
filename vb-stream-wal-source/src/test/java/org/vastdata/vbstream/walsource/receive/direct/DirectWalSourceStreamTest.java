@@ -213,6 +213,99 @@ class DirectWalSourceStreamTest {
         assertEquals(0, source.consumedLsn());
     }
 
+    /**
+     * 审查修复 2 回归：畸形 keepalive 帧（'k' + 截断载荷）属协议字节错位——须按可重试
+     * IOException 断流重连（重连后字节续传零丢），不得被 RuntimeException 面误分类成
+     * 终态失败。
+     */
+    @Test
+    void malformedKeepaliveFrameTriggersReconnectNotTerminalFailure() throws Exception {
+        long segBase = 0x10000L;
+        byte[] first = "0123456789".getBytes(StandardCharsets.UTF_8);       // [65536, 65546)
+        byte[] second = "ABCDEF".getBytes(StandardCharsets.UTF_8);          // [65546, 65552)
+        try (OgPseudoServer server = OgPseudoServer.start()) {
+            server.script(session -> {
+                handshake(session);
+                identify(session, "0/10000");
+                session.readQuery();
+                session.writeCopyBothResponse();
+                session.writeWalData(segBase, segBase + 0x100000L, first);
+                session.writeMalformedKeepalive(5);   // 'k' + 5 字节——replyRequested 位越界
+                session.drainUntilClientClose();
+            });
+            server.script(session -> {
+                handshake(session);
+                identify(session, "0/3000000");
+                assertEquals("START_REPLICATION SLOT \"wal_source\" 0/10000", session.readQuery(),
+                        "畸形帧断流后重连起点 = 前沿段对齐下取整");
+                session.writeCopyBothResponse();
+                session.writeWalData(segBase + 10, segBase + 0x100000L, second);
+                session.drainUntilClientClose();
+            });
+            List<Chunk> chunks = new ArrayList<>();
+            DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3);
+            source.start(l -> { }, (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
+            try {
+                await(() -> chunks.size() == 2, "重连后次块须交付");
+            } finally {
+                source.stop();
+            }
+            server.awaitScript(SCRIPT_TIMEOUT_MS);
+            assertEquals(segBase + 10, chunks.get(0).anchor);
+            assertEquals(segBase + 16, chunks.get(1).anchor, "重连续传锚接续");
+            assertEquals(segBase + 16, source.consumedLsn());
+            assertTrue(source.terminalFailure().isEmpty(), "畸形帧不得置终态——可重试面");
+        }
+    }
+
+    /**
+     * 审查修复 1 回归：服务端 CopyDone（'c' 帧正常结束 copy 流）后工作线程不得静默终止
+     * ——须按可重试中断走重连（重连起点段对齐、字节续传零丢），源持续可用。
+     */
+    @Test
+    void copyDoneFromServerReconnectsInsteadOfSilentTermination() throws Exception {
+        long segBase = 0x10000L;
+        byte[] first = "0123456789".getBytes(StandardCharsets.UTF_8);
+        byte[] second = "ABCDEF".getBytes(StandardCharsets.UTF_8);
+        try (OgPseudoServer server = OgPseudoServer.start()) {
+            server.script(session -> {
+                handshake(session);
+                identify(session, "0/10000");
+                session.readQuery();
+                session.writeCopyBothResponse();
+                session.writeWalData(segBase, segBase + 0x100000L, first);
+                session.writeCopyDone();   // 服务端正常结束 copy 流
+                session.drainUntilClientClose();
+            });
+            server.script(session -> {
+                handshake(session);
+                identify(session, "0/3000000");
+                assertEquals("START_REPLICATION SLOT \"wal_source\" 0/10000", session.readQuery(),
+                        "CopyDone 后重连起点 = 前沿段对齐下取整");
+                session.writeCopyBothResponse();
+                session.writeWalData(segBase + 10, segBase + 0x100000L, second);
+                session.drainUntilClientClose();
+            });
+            List<Chunk> chunks = new ArrayList<>();
+            DirectWalSource source = new DirectWalSource("localhost", server.port(), "gaussdb",
+                    "Gauss_12345", "wal_source", 600, SEG_SIZE, 10_000, 50, 3);
+            source.start(l -> { }, (lsn, bytes) -> chunks.add(new Chunk(lsn, bytes)));
+            try {
+                await(() -> chunks.size() == 2, "CopyDone 重连后次块须交付");
+                assertFalse(source.isTerminated(),
+                        "CopyDone 后工作线程不得静默终止——次块已交付即证其在重连后的连接上继续收流");
+            } finally {
+                source.stop();
+            }
+            server.awaitScript(SCRIPT_TIMEOUT_MS);
+            assertEquals(segBase + 10, chunks.get(0).anchor);
+            assertEquals(segBase + 16, chunks.get(1).anchor, "CopyDone 重连续传锚接续");
+            assertEquals(segBase + 16, source.consumedLsn());
+            assertTrue(source.terminalFailure().isEmpty(), "单次 CopyDone 属可重试面——无终态");
+        }
+    }
+
     /** 轮询等待（100ms 节拍 + 上限断言）。 */
     private static void await(BooleanSupplier cond, String message) throws InterruptedException {
         long deadline = System.currentTimeMillis() + AWAIT_MS;
