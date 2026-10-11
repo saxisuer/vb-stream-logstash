@@ -28,8 +28,11 @@ class WalLayoutVOpenGaussTest {
      * 段首字节实测 74 d0）、短页头 24（pageaddr@8/rem_len@16/xlp_total_len@20）、
      * 长页头 40（sysid@24 u64）、记录头 32（实测 prev@16 8 对齐垫 4B、crc@28——
      * 15 条记录 MAXALIGN 链式走读 prev 链逐条自洽）、xid@8/info@24/rmid@25、
-     * 块引用 RelFileNode 编码 16B（relfilenode.h：spc/db/rel u32×3 + bucketNode
-     * int2 + opt uint2）、扩展位 fail-fast、supports 90204、majorVersion 5。
+     * 块引用定位器伴随区 14B（xlogreader.cpp DecodeXLogRecord：RelFileNodeOld 12B +
+     * extra_flag u16——Task 2 语料勘误：Task 1 的 16B 系 bucket 变体宽度，其块 id
+     * 扩展位由 fail-fast 拒绝不走本宽度）、blkno 后 last_lsn u64、镜像头仅洞字段、
+     * heap 前缀 13/11/2（sizeOfHeapUpdate/Delete/Inplace——语料锚）、扩展位
+     * fail-fast、supports 90204、majorVersion 5。
      *
      * <p>任一漂移都会让页遍历/记录走读整体错位——错一位即全流拒读。</p>
      */
@@ -42,7 +45,10 @@ class WalLayoutVOpenGaussTest {
         assertEquals(8, og.recordXidOffset());
         assertEquals(24, og.recordInfoOffset());
         assertEquals(25, og.recordRmidOffset());
-        assertEquals(16, og.relNodeEncodedSize(), "relfilenode.h: spc/db/rel + bucketNode int2 + opt uint2");
+        assertEquals(14, og.relNodeEncodedSize(),
+                "DecodeXLogRecord 消费序 RelFileNodeOld 12B + extra_flag u16（语料 283 条实测）");
+        assertEquals(8, og.blockRefLastLsnBytes(), "xloginsert.cpp 逐块 last_lsn u64");
+        assertTrue(og.imageHeaderIsHoleOnly(), "XLogRecordBlockImageHeader 仅洞字段（无 bimg_info）");
         assertTrue(og.rejectBlockIdExtensionBits());
         assertTrue(og.supports(90204));
         assertFalse(og.supports(90205), "openGauss 全系恒报 90204，其他值不应到达本档");
@@ -50,9 +56,10 @@ class WalLayoutVOpenGaussTest {
     }
 
     /**
-     * legacy 描述符经接口 default 取到的记录头偏移必须与 WalRecordParser 现实现内联值
-     * 逐项相等（xid@4/info@16/rmid@17/定位器 12B/扩展位不拒绝）——这是"V17/V18 路径
-     * 字节行为零变化"的常量面前置锚，Task 2 把 parser 内联值换成 layout 取值时以此防漂移。
+     * legacy 描述符经接口 default 取到的记录头偏移必须与 WalRecordParser 历内联值
+     * 逐项相等（xid@4/info@16/rmid@17/定位器 12B/尾随 0/现代镜像头/扩展位不拒绝）
+     * ——这是"V17/V18 路径字节行为零变化"的常量面锚，Task 2 起 parser 内联值
+     * 换成 layout 取值，以此防漂移。
      */
     @Test
     void legacyLayoutsKeepParserInlineOffsetsAsDefaults() {
@@ -61,6 +68,8 @@ class WalLayoutVOpenGaussTest {
             assertEquals(16, legacy.recordInfoOffset(), legacy.getClass().getSimpleName());
             assertEquals(17, legacy.recordRmidOffset(), legacy.getClass().getSimpleName());
             assertEquals(12, legacy.relNodeEncodedSize(), legacy.getClass().getSimpleName());
+            assertEquals(0, legacy.blockRefLastLsnBytes(), legacy.getClass().getSimpleName());
+            assertFalse(legacy.imageHeaderIsHoleOnly(), legacy.getClass().getSimpleName());
             assertFalse(legacy.rejectBlockIdExtensionBits(), legacy.getClass().getSimpleName());
         }
     }

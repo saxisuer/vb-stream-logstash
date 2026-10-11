@@ -223,16 +223,49 @@ public interface WalLayout {
     }
 
     /**
-     * 块引用中 RelFileNode 定位器的编码宽度（SAME_REL 未置位时）。
+     * 块引用中关系定位器（含紧随其后的版本私有伴随字段）的编码宽度
+     * （SAME_REL 未置位时）。
      *
-     * <p>缺省 12＝V17/V18 现行值（spc/db/relNode 三 u32）；openGauss 的
-     * RelFileNode 追加 bucketNode int2 + opt uint2（relfilenode.h），编码 16B
-     * ——bucket/opt 读入但不参与 watched 匹配判据。</p>
+     * <p>缺省 12＝V17/V18 现行值（spc/db/relNode 三 u32，xlogrecord.h
+     * XLogRecordBlockHeader 的 RelFileNode 定位器）。openGauss 常规表定位器为
+     * RelFileNodeOld（同 12B）+ 紧随的 extra_flag u16（xlogreader.cpp
+     * DecodeXLogRecord 消费序），合计 14——extra_flag 读跳不参与 watched 匹配
+     * 判据；bucket/段页表的 16B RelFileNode（含 bucketNode/opt）只在块 id 置
+     * BKID_HAS_BUCKET_OR_SEGPAGE(0x80) 时出现，该扩展位由
+     * {@link #rejectBlockIdExtensionBits()} fail-fast 拒绝，不走本宽度。</p>
      *
-     * @return 定位器字节数（V17/18=12，OG=16）
+     * @return 定位器伴随区字节数（V17/18=12，OG=14）
      */
     default int relNodeEncodedSize() {
         return 12;
+    }
+
+    /**
+     * 块引用 blkno 之后跟随的 last_lsn u64 宽度。
+     *
+     * <p>openGauss 的每个块引用在 blkno 之后恒记 last_lsn u64（页 LSN 链回溯用，
+     * xloginsert.cpp XLogRecordAssemble 逐块追加、xlogreader.cpp 同序消费）——
+     * 当前任务不消费该字段，走读按本宽度跳过。缺省 0＝V17/V18 块引用止于 blkno。</p>
+     *
+     * @return 跳过字节数（V17/18=0，OG=8）
+     */
+    default int blockRefLastLsnBytes() {
+        return 0;
+    }
+
+    /**
+     * 块引用镜像头是否为"仅洞字段"形态（无 bimg_info / 无压缩面）。
+     *
+     * <p>openGauss 的 XLogRecordBlockImageHeader 仅 {hole_offset u16,
+     * hole_length u16}（4B，xlogrecord.h——9.5 之前的形制），无 bimg_info 字节、
+     * 无压缩镜像支持；镜像长度恒由 {@code walBlockSize() - hole_length} 推导。
+     * 缺省 false＝V17/V18 现代形态（镜像头含 bimg_info u8，压缩镜像带显式
+     * holeLen u16）。</p>
+     *
+     * @return true 表示镜像头仅两 u16 洞字段（仅 OG）
+     */
+    default boolean imageHeaderIsHoleOnly() {
+        return false;
     }
 
     /**

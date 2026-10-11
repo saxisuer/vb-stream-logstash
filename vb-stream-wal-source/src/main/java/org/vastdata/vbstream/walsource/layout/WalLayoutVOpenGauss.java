@@ -5,6 +5,8 @@ package org.vastdata.vbstream.walsource.layout;
  * openGauss-server v5.0.0 源码头文件与 live opengauss:5.0.0 容器实测（2026-10-12
  * og-plan 容器，pg_read_binary_file 字节面锚定），出处逐项标注于各常量。常量全为
  * 静态 final，任意线程共享读取安全；kinds 访问器返回防御副本。
+ * heap 记录前缀（sizeOfHeapUpdate/Delete/Inplace）已由 Task 2 真实语料锚定
+ * （常量注记含消费序与锚 LSN），不再 ISE。
  *
  * <p><strong>与任务书原值的勘误（字节实测推翻计划期推导，详见任务报告）</strong>：</p>
  * <table border="1">
@@ -25,7 +27,20 @@ package org.vastdata.vbstream.walsource.layout;
  *   <tr><td>pgClassRelkindDataOffset</td><td>135（差 20）</td><td>143（差 28）</td>
  *       <td>五个 oid 列（20B）+ float8 加宽（8B）；实测 relkind='r'@143、
  *       relnatts=2@144 自洽</td></tr>
+ *   <tr><td>relNodeEncodedSize</td><td>16</td><td>14</td>
+ *       <td>Task 2 语料字节验证（本任务显式验收项）：Decoder 消费序为
+ *       RelFileNodeOld 12B + extra_flag u16；16B RelFileNode（bucketNode/opt）
+ *       只随块 id 的 BKID_HAS_BUCKET_OR_SEGPAGE(0x80) 扩展位出现（该位
+ *       fail-fast 拒绝）。计划期的 16 系按 bucket 变体推定——语料 283 条全量
+ *       走读在 14 下不变量全成立、16 下即断裂</td></tr>
  * </table>
+ *
+ * <p><strong>Task 2 语料锚定补充（2026-10-12，og-plan 32KB 窗口 / 283 条记录）</strong>：
+ * sizeOfHeapUpdate=13（SizeOfOldHeapUpdate 5 + LogCSN 8——HOT_UPDATE 0x23598f0
+ * 旧行 xl_heap_header 恰在 main+13）、sizeOfHeapDelete=11（同构，DELETE
+ * 0x2359ac0）、sizeOfHeapInplace=2（heap_inplace_update 不记 CSN）；块引用消费序
+ * xlogreader.cpp DecodeXLogRecord：定位器 12+2、blkno 后 last_lsn u64、镜像头
+ * 4B 仅洞字段（2 条 FPI 记录实测）——常量注记逐项含出处。</p>
  *
  * <p>WAL 面常量（magic/页头/记录头）与任务书一致，且经段页字节链式走读复核：
  * 15 条记录 MAXALIGN 步进下 prev 链逐条自洽（pageaddr+off 对齐）。</p>
@@ -58,10 +73,45 @@ public final class WalLayoutVOpenGauss implements WalLayout {
     private static final int RECORD_INFO_OFFSET = 24;
     /** 记录头 rmid 偏移 25 // xlog_basic.h：XLogRecord（紧随 info，实测）。 */
     private static final int RECORD_RMD_OFFSET = 25;
-    /** 块引用 RelFileNode 编码宽 16 // openGauss v5.0.0 src/include/storage/relfilenode.h：
-     * RelFileNode（spc/db/rel u32×3=12B）+ RelFileNodeForkName 扩展的 bucketNode int2 +
-     * opt uint2——bucket/opt 读入不参与匹配判据（字节面验证归语料任务）。 */
-    private static final int RELNODE_ENCODED_SIZE = 16;
+    /** 关系定位器伴随区宽 14 // openGauss v5.0.0 xlogreader.cpp DecodeXLogRecord：
+     * 常规表定位器 = RelFileNodeOld（relfilenode.h，spc/db/rel u32×3=12B）+
+     * 紧随的 extra_flag u16；bucket/段页表的 16B RelFileNode（bucketNode int2 +
+     * opt uint2）只在块 id 置 BKID_HAS_BUCKET_OR_SEGPAGE(0x80) 时出现——该扩展位
+     * 由 {@link #rejectBlockIdExtensionBits()} fail-fast 拒绝，不走本宽度。
+     * 语料实测（2026-10-12 og-plan 容器，32KB 窗口 283 条记录全量走读：定位器
+     * spc=1663/db=14806/rel=16395 逐字节干净、不变量全成立）——Task 1 期间按
+     * 源码推定的 16B 系 bucket 变体的宽度，常规表实为 12+2。 */
+    private static final int RELNODE_ENCODED_SIZE = 14;
+
+    /** 块引用 blkno 后 last_lsn u64 宽 8 // openGauss v5.0.0 xloginsert.cpp
+     * XLogRecordAssemble 逐块追加（SAME_REL 块同有）、xlogreader.cpp 同序消费；
+     * 语料实测每块引用 blkno 后 8B 恒在（页 LSN 链回溯用，当前任务不消费）。 */
+    private static final int BLOCK_REF_LAST_LSN_BYTES = 8;
+
+    /** heap UPDATE main 前缀 13 = SizeOfOldHeapUpdate 5 + LogCSN 8 // openGauss
+     * v5.0.0 htup.h xl_heap_update（常态走 SizeOfOldHeapUpdate：old_offnum u16@0 +
+     * new_offnum u16@2 + flags u8@4）+ heapam.cpp log_heap_update 在 xlrec 后经
+     * LogCSN 追加 CommitSeqNo u64（wal_level=logical 时 XLogLogicalInfoActive 恒
+     * 真——本模块 DML 面前提）。语料实测：HOT_UPDATE lsn=0x23598f0 的旧行
+     * xl_heap_header 恰在 main+13（t_hoff=24 锚）。变体偏离：UPDATE+INIT_PAGE 在
+     * xlrec 前另有 pd_xid_base u64（前缀 21）；xmax 为 MultiXactId 时走全量
+     * SizeOfHeapUpdate（u64 xmax 布局，前缀漂移）——消费面（Task 3+）须以
+     * flags/INIT_PAGE 位分派，本常量锚常态逻辑日志形态。 */
+    private static final int SIZE_OF_HEAP_UPDATE = 13;
+
+    /** heap DELETE main 前缀 11 = SizeOfOldHeapDelete 3 + LogCSN 8 // openGauss
+     * v5.0.0 htup.h xl_heap_delete（常态走 SizeOfOldHeapDelete：offnum u16@0 +
+     * flags u8@2）+ LogCSN u64 同 UPDATE。语料实测：DELETE lsn=0x2359ac0 旧行
+     * xl_heap_header 恰在 main+11（'x'x64 旧行 75B 完整收口）。同 UPDATE 的
+     * MultiXactId 变体偏离注记。 */
+    private static final int SIZE_OF_HEAP_DELETE = 11;
+
+    /** heap INPLACE main 前缀 2 // openGauss v5.0.0 htup.h xl_heap_inplace 仅
+     * {offnum u16}——heapam.cpp heap_inplace_update 不调 LogCSN（无 CSN 块），
+     * 新元组数据在块 0 载荷非 main。语料实测：两条 INPLACE（lsn=0x23587c0/
+     * 0x2358900）mainLen 恒 2。与 V18 的 20（含 dbId/tsId/msgs[] 前缀）语义
+     * 不同源：OG 无共享失效消息内联面。 */
+    private static final int SIZE_OF_HEAP_INPLACE = 2;
 
     /** pg_class 数据区 relfilenode 偏移 84——推算依据：OG catalog 元组 oid 在 9.2 式
      * 元组头（[t_hoff-4,t_hoff)）非数据区（infomask2 natts=40 实锚），数据区列序即
@@ -223,32 +273,31 @@ public final class WalLayoutVOpenGauss implements WalLayout {
     }
 
     /**
-     * {@inheritDoc}——<b>未锚定，fail-fast</b>：OG 的 xl_heap_update 结构
-     * （openGauss 回移植 9.3-9.6 heapam 体系，与 vanilla 9.2 / V18 均不同）待语料
-     * 任务以真实 UPDATE 记录字节钉死后回填——在锚定前消费即 ISE，绝不静默借用
-     * 相近版本常量（模块契约：宁可拒解也不猜格式）。
+     * {@inheritDoc}——13 = SizeOfOldHeapUpdate(5) + LogCSN(8)，常态逻辑日志形态
+     * （htup.h + heapam.cpp log_heap_update 消费序 + 语料 0x23598f0 旧行位实测）；
+     * INIT_PAGE/MultiXactId 变体的前缀漂移见常量注记，消费面按 info/flags 分派。
      */
     @Override
     public int sizeOfHeapUpdate() {
-        throw new IllegalStateException("openGauss sizeOfHeapUpdate 未锚定——待语料任务实测回填");
+        return SIZE_OF_HEAP_UPDATE;
     }
 
     /**
-     * {@inheritDoc}——<b>未锚定，fail-fast</b>（同 {@link #sizeOfHeapUpdate()}，
-     * 待真实 DELETE 记录字节钉死）。
+     * {@inheritDoc}——11 = SizeOfOldHeapDelete(3) + LogCSN(8)（语料 0x2359ac0
+     * 旧行位实测：'x'x64 旧行 75B 自 main+11 完整收口）。
      */
     @Override
     public int sizeOfHeapDelete() {
-        throw new IllegalStateException("openGauss sizeOfHeapDelete 未锚定——待语料任务实测回填");
+        return SIZE_OF_HEAP_DELETE;
     }
 
     /**
-     * {@inheritDoc}——<b>未锚定，fail-fast</b>（openGauss 是否回移植 PG 18 的
-     * 共享失效消息内联格式未核，待 INPLACE 记录字节钉死）。
+     * {@inheritDoc}——2（xl_heap_inplace {offnum u16}，无 CSN 块；语料两条
+     * INPLACE 记录 mainLen 恒 2 实测锚）。
      */
     @Override
     public int sizeOfHeapInplace() {
-        throw new IllegalStateException("openGauss sizeOfHeapInplace 未锚定——待语料任务实测回填");
+        return SIZE_OF_HEAP_INPLACE;
     }
 
     /** {@inheritDoc}——返回防御副本，调用方改写不污染静态词典。 */
@@ -318,10 +367,26 @@ public final class WalLayoutVOpenGauss implements WalLayout {
         return RECORD_RMD_OFFSET;
     }
 
-    /** {@inheritDoc}——16（三 oid + bucketNode int2 + opt uint2，relfilenode.h）。 */
+    /**
+     * {@inheritDoc}——14（RelFileNodeOld 12B + extra_flag u16；16B bucket 变体由
+     * 扩展位 fail-fast 拒绝不走本宽度——Decoder 消费序 + 语料实测，见常量注记）。
+     */
     @Override
     public int relNodeEncodedSize() {
         return RELNODE_ENCODED_SIZE;
+    }
+
+    /** {@inheritDoc}——8（xloginsert.cpp 逐块追加 last_lsn u64，语料实测）。 */
+    @Override
+    public int blockRefLastLsnBytes() {
+        return BLOCK_REF_LAST_LSN_BYTES;
+    }
+
+    /** {@inheritDoc}——true（XLogRecordBlockImageHeader 仅 hole_offset/hole_length
+     *  两 u16，无 bimg_info 与压缩面，xlogrecord.h）。 */
+    @Override
+    public boolean imageHeaderIsHoleOnly() {
+        return true;
     }
 
     /** {@inheritDoc}——true：bucket/segpage(0x80)/TDE(0x40) 扩展位未支持前 fail-fast，
