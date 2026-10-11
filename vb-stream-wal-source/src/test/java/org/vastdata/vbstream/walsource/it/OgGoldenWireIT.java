@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,7 +46,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * startup 参数键集/值（application_name 值豁免）+ 协议 major==3（minor 参考端 51/本端 0，
  * Task 5 裁定）；IDENTIFY_SYSTEM 逐字节；START_REPLICATION 格式（{@code %X/%X} 非补零、
  * 无槽形态，起点时变豁免）；65B 'r' 反馈的恒定字段（peer_role=3/peer_state=7/总长/
- * replyRequested 位与 sendTime 微秒域单调，LSN 与 sendTime 值时变豁免）。'p' 认证应答帧
+ * replyRequested 位与 sendTime 微秒域 sanity，LSN 与 sendTime 值时变豁免——sendTime
+ * 于 sendLock 前取值，写线程并发下线序可倒置，单调性不作比对面）。'p' 认证应答帧
  * 按宿主→容器命中码 11 的形态归一（startup 后允许至多一帧）。</p>
  *
  * <p>环境前提：本机 Docker（{@code OgTestEnv} 单例容器，类加载起库 60-90s）。</p>
@@ -146,7 +148,7 @@ class OgGoldenWireIT {
      * 值（application_name 豁免）与 major==3；可选单帧 'p' 归一；IDENTIFY_SYSTEM 与 fixture
      * 字节逐字节全等；START_REPLICATION 断命令形态（无 SLOT、%X/%X 非补零）；其余帧须全为
      * 65B 'r' 反馈——恒定字段（role/state/replyRequested 域/replyFlags 零）与 fixture 样本
-     * 等值，sendTime 单调递增（微秒域 sanity）。</p>
+     * 等值，sendTime 微秒域 sanity（写线程并发下线序可倒置，单调性不作比对面）。</p>
      *
      * @param fixture  黄金 fixture（名称 → 帧 hex 字节与注释）
      * @param captured 代理捕获的客户端→服务端全量字节
@@ -335,14 +337,25 @@ class OgGoldenWireIT {
     /**
      * 解析剩余缓冲的全部类型帧（char + int32 大端长 + 载荷）。
      *
+     * <p>边界与异常语义：<b>截断尾帧容错</b>——快照末尾的帧头（&lt;5B）或载荷（&lt;len-4）
+     * 不足、帧长非法（&lt;4）时按"留待下轮"丢弃退出（与生产 walker 的 awaitMore 语义
+     * 同构），不抛 BufferUnderflow——泵与快照的竞态窗（close join 已基本闭合，防御位）
+     * 下截在帧中的尾部字节不构成假红。</p>
+     *
      * @param buf 缓冲（定位在首帧类型字节）
      * @return 帧列表（含原始字节引用）
      */
     private static List<TypedFrame> parseTypedFrames(ByteBuffer buf) {
         List<TypedFrame> out = new ArrayList<>();
         while (buf.hasRemaining()) {
+            if (buf.remaining() < 5) {
+                break;   // 截断尾帧：帧头未到齐
+            }
             int type = buf.get();
             int len = buf.getInt();
+            if (len < 4 || buf.remaining() < len - 4) {
+                break;   // 截断尾帧：载荷未到齐/帧长非法
+            }
             byte[] payload = new byte[len - 4];
             buf.get(payload);
             byte[] raw = new byte[1 + 4 + payload.length];
@@ -439,6 +452,12 @@ class OgGoldenWireIT {
         private final ByteArrayOutputStream serverToClient = new ByteArrayOutputStream();
         private final AtomicReference<Throwable> pumpFailure = new AtomicReference<>();
 
+        /** 已起泵线程登记表——close 时 join，建立"泵写尽 → 主线程快照"的 happens-before。 */
+        private final List<Thread> pumps = new CopyOnWriteArrayList<>();
+
+        /** close 对泵线程的 join 上限（毫秒）——socket 关闭使阻塞读立即返回，常理毫秒级。 */
+        private static final long PUMP_JOIN_TIMEOUT_MS = 3_000;
+
         private CaptureProxy(ServerSocket listen) {
             this.listen = listen;
         }
@@ -485,7 +504,8 @@ class OgGoldenWireIT {
 
         /**
          * 起一个泵线程（守护）：in → out 逐段复制 + tee 进捕获缓冲；IO 失败（对端关
-         * 连接属正常收尾）静默终止并记录首个异常。
+         * 连接属正常收尾）静默终止并记录首个异常。线程登记进 {@link #pumps} 供
+         * {@link #close()} join（快照静默握手）。
          *
          * @param in   源流
          * @param out  目标流
@@ -508,6 +528,7 @@ class OgGoldenWireIT {
                 }
             }, "og-wire-proxy");
             t.setDaemon(true);
+            pumps.add(t);
             t.start();
         }
 
@@ -548,8 +569,14 @@ class OgGoldenWireIT {
             ServerSideFrames out = new ServerSideFrames();
             ByteBuffer buf = ByteBuffer.wrap(all);
             while (buf.hasRemaining()) {
+                if (buf.remaining() < 5) {
+                    break;   // 截断尾帧（帧头未到齐——防御位，join 后不应出现）
+                }
                 int type = buf.get();
                 int len = buf.getInt();
+                if (len < 4 || buf.remaining() < len - 4) {
+                    break;   // 载荷未到齐/帧长非法的截断尾帧——丢弃不比（awaitMore 同构）
+                }
                 byte[] payload = new byte[len - 4];
                 buf.get(payload);
                 if (type == 'd' && payload.length > 0) {
@@ -566,12 +593,23 @@ class OgGoldenWireIT {
         }
 
         /**
-         * 幂等收尾：关三 socket（泵线程随阻塞读返回自行终止，守护位兜底）。
+         * 幂等收尾：关三 socket → join 泵线程（上限 {@value #PUMP_JOIN_TIMEOUT_MS}ms）
+         * ——快照静默握手：join 建立 happens-before，此后 {@link #clientToServerBytes()}
+         * /{@link #serverFrames()} 读到的 tee 必是泵的完整产出（不会截在帧中）；
+         * 超时则守护位兜底退出，截断尾帧由解析面的防御分支兜住。
          */
         void close() {
             closeQuietly(client);
             closeQuietly(server);
             closeQuietly(listen);
+            for (Thread t : pumps) {
+                try {
+                    t.join(PUMP_JOIN_TIMEOUT_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
         }
 
         /**
