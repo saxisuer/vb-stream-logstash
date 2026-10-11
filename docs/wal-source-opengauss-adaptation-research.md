@@ -116,6 +116,28 @@ opengauss-jdbc 5.0.0-og × amd64-qemu / arm64 原生——双驱动双架构 4+ 
    配置 replconninfo 后若 remotehost 不可达，build walsender 全退 → 启动期实例自杀（研究期用
    宿主机假监听 `nc -lk 5435` 喂住 build 连接可绕过）。
 
+**机理终局（walsender.cpp:471 实锚，修正前两轮"端口/握手"假说）**：真正的变量是**连接形态**
+而非端口——`replication=database` 的连接在 openGauss 内核里是 `AM_WAL_DB_SENDER`，WalSndInit
+**无条件路由进 `XLogSendLogical`（逻辑发送循环）**，哪怕客户端发的命令是 `START_REPLICATION
+PHYSICAL`（该命令在握手层已被接受、CopyBoth 已发出，但从未建逻辑解码上下文）→ 发送循环解
+引用空上下文 → walsender 线程即刻静默死亡（零日志零数据）→ HA 状态机把实例带走。这解释了：
+①vanilla pgjdbc 与 opengauss-jdbc 同死（pgjdbc 系 replication API 只会发 `replication=database`
+形态）；②官方驱动的 65B 扩展反馈对齐（字节码 `ByteBuffer.allocate(65)` 实锚）救不了它——死在
+更早的路由上；③`pg_receivexlog` 活——它用 `replication=true`（streamutil.cpp:175-176 实锚，
+纯物理 walsender、无 database）→ 正确走 `XLogSendPhysical`，且**从主端口 5432 直连即可**。
+openGauss JDBC 从未适配物 理面是因为华为自己不用：其物理复制全是 C 实现（服务端 walreceiver /
+pg_receivexlog / gs_basebackup），Java 只做 SQL + 逻辑订阅。另修正：IDENTIFY_VERSION /
+IDENTIFY_CHANNEL 是服务端内部 walreceiver 的动作，客户端工具只发 IDENTIFY_SYSTEM——Java
+直连的握手面比二轮估计更小。
+
+**Java 直连完整配方（全部有实锚，可直接开工）**：raw socket + v3 startup（`replication=true`、
+不带 database；md5）→ `'Q' IDENTIFY_SYSTEM` → `'Q' START_REPLICATION [SLOT] %X/%X`（CopyBoth）
+→ 周期 65B 扩展 'r' 反馈（`StandbyReplyMessage`：receive/write/flush/apply/applyRead 各 8B +
+peer_role/peer_state 各 4B + sendTime 8B + replyRequested 1B + replyFlags 4B，含 C 对齐垫需
+实测钉死）+ 心跳（`standby_message_timeout/2` 发 replyRequested=true）→ 段对齐起点。黄金
+对拍基准：strace 抓 pg_receivexlog 真实 wire bytes。pgjdbc 的 replication API 不支持
+`replication=true` 形态，故 Java 直连须走自研薄客户端（~300-400 行），与 sidecar 双形态并存。
+
 **对适配的结论**：receive 面需要**自研 openGauss 备库兼容客户端**（不能复用 pgjdbc/opengauss-jdbc
 的 replication API）：v3 协议 startup（md5）→ 私有握手序列（IDENTIFY_SYSTEM/IDENTIFY_VERSION
 [term 比对]/IDENTIFY_CHANNEL）→ CopyBoth START_REPLICATION → 规律 standby 反馈。wal-source 的
