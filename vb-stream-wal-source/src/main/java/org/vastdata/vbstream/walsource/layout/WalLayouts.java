@@ -34,4 +34,43 @@ public final class WalLayouts {
         }
         throw new IllegalStateException("unsupported server version " + pgVersionNum);
     }
+
+    /**
+     * 带版本文本的分发（openGauss 判别）。
+     *
+     * <p>关键步骤：先按既有大版本区间路由 V18/V17（与 {@link #forServerVersion(int)}
+     * 同判据，带文本不改变这两档行为）；9 万段（90000-99999）进入 openGauss 判别——
+     * openGauss 全系版本报 90204（与 vanilla 9.2 撞号），唯一区分面是 version() 文本
+     * （实测 5.0.0 形如 "(openGauss 5.0.0 build ...) compiled at ..."）。边界与异常
+     * 语义：90204 且文本含 "openGauss 5.0." 返回 OG 档；含 "openGauss" 但非 5.0.x
+     * 抛 ISE（消息附版本文本）；无 openGauss 标记＝vanilla 9.2 抛 ISE 指明非目标
+     * （无复制槽/无 flush LSN 函数/pgjdbc 拒 replication 参数，四重硬阻塞，
+     * 见 docs/wal-source-opengauss-adaptation-research.md）；versionText 为 null 的
+     * 9 万段同落拒绝面（判别信息缺失不得静默猜测）。其余版本号 ISE 附版本号与文本。
+     * 线程约束：静态纯函数，并发安全。</p>
+     *
+     * @param pgVersionNum 服务端版本号（如 90204/180000）
+     * @param versionText  服务端 {@code version()} 返回文本（判别 openGauss 的唯一面）
+     * @return 覆盖该版本的布局描述符（线程安全单例）
+     * @throws IllegalStateException 版本未注册、vanilla 9.2 非目标或 openGauss 版本不在支持面
+     */
+    public static WalLayout forServer(int pgVersionNum, String versionText) {
+        if (pgVersionNum >= 180000 && pgVersionNum < 190000) {
+            return WalLayoutV18.INSTANCE;
+        }
+        if (pgVersionNum >= 170000 && pgVersionNum < 180000) {
+            return WalLayoutV17.INSTANCE;
+        }
+        if (pgVersionNum / 10000 == 9) {
+            if (versionText != null && versionText.contains("openGauss")) {
+                if (versionText.contains("openGauss 5.0.")) {
+                    return WalLayoutVOpenGauss.INSTANCE;
+                }
+                throw new IllegalStateException("openGauss 版本不在支持面（当前仅 5.0.x）: " + versionText);
+            }
+            throw new IllegalStateException("vanilla PG 9.2 非目标版本（无复制槽/无逻辑日志，"
+                    + "见 docs/wal-source-opengauss-adaptation-research.md）: " + versionText);
+        }
+        throw new IllegalStateException("unsupported server version " + pgVersionNum + ": " + versionText);
+    }
 }

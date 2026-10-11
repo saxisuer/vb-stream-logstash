@@ -185,6 +185,71 @@ public interface WalLayout {
     int pgClassRelkindDataOffset();
 
     /**
+     * WAL 记录头 xl_xid 字段偏移。
+     *
+     * <p>缺省 4＝V17/V18 现行值（xlogrecord.h：tot_len u32@0 + xid u32@4——
+     * {@code WalRecordParser} 历内联值）；openGauss 记录头在 xid 前多 term u32
+     * 字段（xlog_basic.h XLogRecord），覆盖为 8。记录头内联偏移改由本接口供给
+     * 时（openGauss 适配），V17/V18 路径取值须与原内联值逐字节相等。</p>
+     *
+     * @return 头内偏移（V17/18=4，OG=8）
+     */
+    default int recordXidOffset() {
+        return 4;
+    }
+
+    /**
+     * WAL 记录头 xl_info 字段偏移。
+     *
+     * <p>缺省 16＝V17/V18 现行值（prev u64@8 之后，{@code WalRecordParser}
+     * 历内联值）；openGauss 因 term/pad 前置字段与 prev 8 对齐垫整体后移为 24。</p>
+     *
+     * @return 头内偏移（V17/18=16，OG=24）
+     */
+    default int recordInfoOffset() {
+        return 16;
+    }
+
+    /**
+     * WAL 记录头 xl_rmid 字段偏移（紧随 xl_info）。
+     *
+     * <p>缺省 17＝V17/V18 现行值（{@code WalRecordParser} 历内联值）；
+     * openGauss 为 25。</p>
+     *
+     * @return 头内偏移（V17/18=17，OG=25）
+     */
+    default int recordRmidOffset() {
+        return 17;
+    }
+
+    /**
+     * 块引用中 RelFileNode 定位器的编码宽度（SAME_REL 未置位时）。
+     *
+     * <p>缺省 12＝V17/V18 现行值（spc/db/relNode 三 u32）；openGauss 的
+     * RelFileNode 追加 bucketNode int2 + opt uint2（relfilenode.h），编码 16B
+     * ——bucket/opt 读入但不参与 watched 匹配判据。</p>
+     *
+     * @return 定位器字节数（V17/18=12，OG=16）
+     */
+    default int relNodeEncodedSize() {
+        return 12;
+    }
+
+    /**
+     * 块引用 id 字节高位扩展位（openGauss：0x80=BKID_HAS_BUCKET_OR_SEGPAGE、
+     * 0x40=BKID_HAS_TDE_PAGE）是否启动期 fail-fast 拒绝。
+     *
+     * <p>缺省 false＝V17/V18 无扩展位语义（id 上界 32 内天然不命中高位）；
+     * openGauss 覆盖 true——遇到扩展位记录 ISE（消息含 LSN 与违例位），
+     * 防止按普通块头走读产生静默错位（逐位支持随后续任务按需放开）。</p>
+     *
+     * @return true 表示扩展位 fail-fast（仅 OG）
+     */
+    default boolean rejectBlockIdExtensionBits() {
+        return false;
+    }
+
+    /**
      * 判定本描述符是否覆盖给定服务端版本号。
      *
      * <p>按大版本全区间判定（如 V18 覆盖 180000-189999，含小版本与发行版位）。</p>
