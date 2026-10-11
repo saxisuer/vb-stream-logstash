@@ -25,9 +25,11 @@ import java.util.function.LongConsumer;
  *       可带 {@code .partial} 后缀）扫描目录，段号（高 32 位左移或低 32 位）为序消费；
  *       同段完成文件与 partial 并存时取完成文件。external 模式目录里"既有完成段又有
  *       新 partial"的任意组合按段号序全量消化，已读过的（段号低于游标的）跳过。</li>
- *   <li><strong>.partial 增长读</strong>：记录上次读偏移，File.length 轮询
- *       （{@value #POLL_INTERVAL_MS}ms）；读到当前长度即交付，尾部不足一条记录/一页的
- *       字节照发——walker 的 awaitMore 语义天然消化半记录，本源不自行攒块。</li>
+ *   <li><strong>.partial 增长读</strong>：记录上次读偏移，交付上界 = <b>已接收前沿</b>——
+ *       OG pg_receivexlog 对 .partial 预分配整段全零文件、数据原地写入，文件长度≠接收
+ *       进度，前沿经"末非零字节 + 1"前向扫描（{@link #receivedFrontier}，缓存增量扫）
+ *       ；完成段按文件全长读。轮询 {@value #POLL_INTERVAL_MS}ms；尾部不足一条记录/一页
+ *       的字节照发——walker 的 awaitMore 语义天然消化半记录，本源不自行攒块。</li>
  *   <li><strong>rename 切段</strong>：pg_receivexlog 写满段后把 {@code X.partial} rename
  *       为 {@code X}——当前段读尽（偏移到达段尺寸，或文件为完成名）且目录出现更高段号
  *       文件时切到下一段从 0 起读；rename 窗口（partial 已消失、完成名未上列表）由
@@ -65,6 +67,9 @@ public final class FileWalSource implements WalByteSource {
 
     /** 单块交付上限（字节）——满 16MB 段一次性出现时分块交付，界住 chunk 数组与 sink 瞬态。 */
     private static final int CHUNK_LIMIT = 1024 * 1024;
+
+    /** .partial 已接收前沿的扫描块尺寸（字节）——空闲期每轮一块的快路径粒度。 */
+    private static final int FRONTIER_SCAN_BLOCK = 64 * 1024;
 
     /** stop() 对 tail 线程的 join 超时（毫秒）。 */
     private static final long STOP_JOIN_TIMEOUT_MS = 3_000;
@@ -119,6 +124,17 @@ public final class FileWalSource implements WalByteSource {
 
     /** 当前段文件的读句柄（随段切换/rename 重开）。 */
     private RandomAccessFile input;
+
+    /**
+     * .partial 文件"已接收前沿"的扫描缓存（Task 8 修复）：OG pg_receivexlog 对
+     * .partial 段预分配整 16MB 零文件、数据按接收序原地写入——文件长度恒为段尺寸，
+     * 不能作数据前沿。本值 = 上轮前向扫描得到的"末非零字节 + 1"（单调推进；adoptSegment
+     * 重置 0），下轮扫描自此起（空闲期一轮一块的快路径）。完成段（rename 后）不走本面。
+     */
+    private long scannedDataEnd;
+
+    /** scannedDataEnd 所属段号（adoptSegment 判定缓存复用还是重置；-1 未采纳过）。 */
+    private long lastScannedSegNo = -1;
 
     /**
      * external 模式装配（无子进程——落盘目录由外部 pg_receivexlog 进程维护）。
@@ -329,7 +345,9 @@ public final class FileWalSource implements WalByteSource {
         if (!resolveCurrentFile()) {
             return false;
         }
-        long available = input.length() - currentOffset;
+        // .partial 的交付上界是"已接收前沿"而非文件长度（Task 8 修复，见 receivedFrontier）
+        long dataLen = currentIsPartial ? receivedFrontier(input.length()) : input.length();
+        long available = dataLen - currentOffset;
         if (available > 0) {
             int n = (int) Math.min(available, CHUNK_LIMIT);
             byte[] buf = new byte[n];
@@ -343,6 +361,55 @@ public final class FileWalSource implements WalByteSource {
             return true;
         }
         return switchToNextSegmentIfFinal();
+    }
+
+    /**
+     * .partial 文件的已接收数据前沿（末非零字节 + 1）——Task 8 修复（双通道对拍 IT
+     * 实证）：OG pg_receivexlog 把 .partial 段<b>预分配成整段尺寸的全零文件</b>（strace
+     * 实锚：建文件即连发 8192B 全零 write；段几何恒满 16MB），WAL 数据按接收序原地写入
+     * ——文件长度与接收进度无关，按长度 tail 会把未写区的预分配零当数据交付，walker
+     * 跳零页冲到段尾后，后续原地写入的真记录永不重读（尾部记录静默丢失，对拍窗口缺
+     * 760 条的实锚形态）。前沿 = 末非零字节 + 1：写序单调 + 预分配零先在，末非零即
+     * 已写区上界；完成段（rename 后）的零尾是真数据，不走本面。
+     *
+     * <p>关键步骤：自上轮前沿缓存（{@code scannedDataEnd}，adoptSegment 归零）按
+     * {@value #FRONTIER_SCAN_BLOCK}B 块前向扫描——块内自尾向头找非零字节，命中则前沿
+     * 推进到该字节 + 1 并继续下一块；首见全零块即停（空闲期每轮一块的快路径，成本
+     * O(新数据 + 一块)）。边界与异常语义：已知限制——若文件存在"中段永久零区 + 其后
+     * 更高偏移真数据"（服务端跳页的补位零形态，实测未出现——OG 客户端按预分配写序
+     * 落盘），前向扫描会在零区前停住；该形态表现为 tail 停滞（可观测）而非错位，出现
+     * 时按服务端 dataStart 侧信道再扩。线程约束：tail 线程单写者。</p>
+     *
+     * @param fileLen 文件当前长度
+     * @return 已接收前沿（文件为空/全零为 0）
+     * @throws IOException 块读失败
+     */
+    private long receivedFrontier(long fileLen) throws IOException {
+        if (fileLen <= 0 || scannedDataEnd > fileLen) {
+            scannedDataEnd = 0;   // 防御：文件不得回缩（异常形态归零重扫）
+        }
+        long frontier = scannedDataEnd;
+        long p = scannedDataEnd;
+        byte[] block = new byte[FRONTIER_SCAN_BLOCK];
+        while (p < fileLen) {
+            int n = (int) Math.min(FRONTIER_SCAN_BLOCK, fileLen - p);
+            input.seek(p);
+            input.readFully(block, 0, n);
+            int lastNonZero = -1;
+            for (int i = n - 1; i >= 0; i--) {
+                if (block[i] != 0) {
+                    lastNonZero = i;
+                    break;
+                }
+            }
+            if (lastNonZero < 0) {
+                break;   // 全零块：已写区上界定格
+            }
+            frontier = p + lastNonZero + 1;
+            p += n;
+        }
+        scannedDataEnd = frontier;
+        return frontier;
     }
 
     /**
@@ -436,6 +503,11 @@ public final class FileWalSource implements WalByteSource {
         currentPath = segment.path();
         currentIsPartial = segment.partial();
         currentOffset = offsetInSeg;
+        // 前沿扫描缓存随段重置（新段从 0 起扫；rename 换名同段则保留偏移、缓存重扫无害）
+        if (currentSegNo != lastScannedSegNo) {
+            scannedDataEnd = 0;
+            lastScannedSegNo = currentSegNo;
+        }
         input = new RandomAccessFile(currentPath.toFile(), "r");
         LOG.debug("采纳段文件: {} 偏移 {}", currentPath.getFileName(), offsetInSeg);
     }

@@ -432,6 +432,24 @@ public interface WalLayout {
     }
 
     /**
+     * walker 是否容忍<strong>整零页</strong>（页界遇整页全零且页头魔数不符 → 跳过整页
+     * 计 zeroPageSkips，而非再同步/ISE）——Task 8 零页容忍门控面。
+     *
+     * <p>为什么 OG 档需要：pg_receivexlog 落盘的段文件是按段几何补位的字节流——服务端
+     * 流内跳过的未初始化页与完成段的尾零区由客户端<strong>零填充</strong>写到文件补位
+     * （og-plan 容器 strace 实锚：{\@code write(fd, 8192B 全零)} 连发；完成段恒 16MB
+     * 零垫尾），FileWalSource tail 该目录时 walker 必然撞上无页头的整零页。缺省
+     * false＝V17/V18 现行行为逐字节不变——vanilla 收流走 pgjdbc 流面，walsender 流内
+     * 恒不投递整零页（跳过的未初始化页以地址跳跃暴露，由既有 dropped==0 良性重锚
+     * 消化），两档 walker 路径零回归。</p>
+     *
+     * @return true 表示整零页跳过整页容忍（仅 OG；缺省 false）
+     */
+    default boolean tolerateAllZeroPages() {
+        return false;
+    }
+
+    /**
      * 判定本描述符是否覆盖给定服务端版本号。
      *
      * <p>按大版本全区间判定（如 V18 覆盖 180000-189999，含小版本与发行版位）。</p>

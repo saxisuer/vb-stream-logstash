@@ -47,6 +47,13 @@ public final class WalStreamMetrics {
     /** 孤立续体页（记录头在窗口之前）跳过数。 */
     public final LongAdder orphanSkips = new LongAdder();
 
+    /** <strong>整零页</strong>跳过数（Task 8 零页容忍档——OG file 通道专用：pg_receivexlog
+     *  落盘段对服务端跳过的未初始化页与段尾零区以零填充补位，tail 侧 walker 在页界遇
+     *  整页全零且页头魔数不符时跳过整页并计本数，而非走再同步/ISE。与 resyncs 分列：
+     *  零页跳过是确定性的补位形态（无错位、无丢字节），不应污染锚定失配的观测面。
+     *  仅 {@code WalLayout.tolerateAllZeroPages()} 档激活（V17/V18 恒 0）。 */
+    public final LongAdder zeroPageSkips = new LongAdder();
+
     /** carry 衔接失配丢弃次数（chunkStart 与游标不连续 → 丢弃未消费 carry；与 resyncs
      *  分列——resyncs 记页头锚定层的重锚，carryDrops 记 feed 衔接层的丢弃）。 */
     public final LongAdder carryDrops = new LongAdder();
@@ -70,6 +77,7 @@ public final class WalStreamMetrics {
         return "records=" + records.sum() + " resyncs=" + resyncs.sum()
                 + " lossyResyncs=" + lossyResyncs.sum()
                 + " contrecords=" + contrecords.sum() + " orphanSkips=" + orphanSkips.sum()
+                + " zeroPageSkips=" + zeroPageSkips.sum()
                 + " carryDrops=" + carryDrops.sum() + " reconnects=" + reconnects.sum();
     }
 

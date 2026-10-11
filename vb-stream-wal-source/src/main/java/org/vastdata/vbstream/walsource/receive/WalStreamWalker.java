@@ -239,6 +239,28 @@ public final class WalStreamWalker {
                                 ? (pageaddr & (bs - 1)) == 0
                                 : pageaddr == expectedPageAddr && pageaddr == cur);
                 if (!anchored) {
+                    // 整零页容忍档（Task 8 门控，仅 OG 布局激活——V17/V18 走原再同步路径
+                    // 逐字节不变）：pg_receivexlog 落盘段对服务端流内跳过的未初始化页/段尾
+                    // 零区以整页零填充补位，页界撞"魔数不符 + 整页全零"时跳过整页计
+                    // zeroPageSkips（区别于下方 resyncs——零页是确定性补位形态，无错位无
+                    // 丢字节）；expectedPageAddr 随之推进使后续真实页头直锚（零页与真实页
+                    // 同占 8192B 地址空间）。整页未到齐（缓冲尾不足一页且全零）则等待补齐
+                    // ——跳半页会把页内切分错位。与页内零垫路径（totLen==0 垫满整页跳页）
+                    // 的区别：那是"有合法页头、页体余部全零"，本分支是"整页无页头"。
+                    if (layout.tolerateAllZeroPages()
+                            && isZeroRange(buf, pos, Math.min(len, pos + bs))) {
+                        if (len - pos < bs) {
+                            break;   // 半零页等待后续 chunk 补齐
+                        }
+                        metrics.zeroPageSkips.increment();
+                        LOG.debug("整零页跳过: {}..{}", Lsn.format(cur), Lsn.format(cur + bs));
+                        pos += bs;
+                        cur += bs;
+                        if (expectedPageAddr != PAGEADDR_UNSET) {
+                            expectedPageAddr += bs;
+                        }
+                        continue;
+                    }
                     // 页头校验失败（坏 magic / 首头未页对齐 / pageaddr 锚定失配）→ 受控再同步
                     Adoption adopted = resyncAt(buf, pos, len, cur,
                             firstHeader ? cur : expectedPageAddr, pageaddr);
@@ -452,6 +474,24 @@ public final class WalStreamWalker {
                     + tolerance + " bytes (tolerance " + RESYNC_TOLERANCE_PAGES + " pages)");
         }
         return null;
+    }
+
+    /**
+     * 判定缓冲区间是否全零（整零页容忍档的判据面——魔数不符的页界先扫本判据再落
+     * 再同步，见 parse 的零页跳过分支）。
+     *
+     * @param buf  合并缓冲
+     * @param from 起始偏移（含）
+     * @param to   终止偏移（不含；可越过缓冲尾——按 min 截断由调用方保证）
+     * @return 区间内全零为 true
+     */
+    private static boolean isZeroRange(byte[] buf, int from, int to) {
+        for (int i = from; i < to; i++) {
+            if (buf[i] != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

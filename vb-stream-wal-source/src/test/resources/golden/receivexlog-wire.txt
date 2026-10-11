@@ -1,0 +1,38 @@
+# 黄金 wire 对拍 fixture——pg_receivexlog（openGauss 5.0.0）客户端→服务端字节序列
+#
+# 采集：2026-10-12，opengauss/opengauss:5.0.0 容器（throwaway og-task8-plan，宿主端口 15710，
+#       GS_PASSWORD=OgTest#2026），容器内 strace -f -e trace=sendto -s 400 -x 包 32s
+#       pg_receivexlog 会话（-D /tmp/rxseg -h 127.0.0.1 -p 5432 -U gaussdb，无槽）；
+#       会话期并发 INSERT 500 行驱动 'w' 流量与 keepalive/反馈往返。
+#       认证档：回环 127.0.0.1 命中镜像缺省 pg_hba 的 trust 行（服务端日志
+#       "walsender current auth_method is : 3"）——故本 fixture 无 'p' 认证应答帧；
+#       非回环（IT 从宿主连容器）命中缺省 'host replication gaussdb 0.0.0.0/0 md5' 行，
+#       sha256 存储（password_encryption_type=2）→ AUTH_REQ_MD5_SHA256（码 11）挑战，
+#       客户端在 startup 后多发一帧 'p' 应答（OgGoldenWireIT 对 captured 序列按
+#       "startup 后允许至多一帧 'p'" 口径归一）。
+#
+# 行格式：名称 | hex 字节（大写、空格分隔） | 注释
+# OgGoldenWireIT 逐行解析本文件并与 DirectWalSource 经代理实发的字节做结构等价比对；
+# 时变字段按各行注释口径豁免（LSN / sendTime / application_name 值 / 协议 minor /
+# 参考客户端的未初始化栈字节）。
+#
+# 参考客户端与本项目客户端的已知恒定分叉（等价面内，非缺陷）：
+#   ① 协议 minor：参考客户端 3.51（00 33），本项目 3.0——3.0 档使 sha256 挑战走
+#      3.0 形态（含 64 字符 server_signature），Task 5 真容器实证通过；比对只钉 major==3。
+#   ② application_name 值：pg_receivexlog vs vb-wal-source——键集相同、值按客户端名豁免。
+#   ③ 'r' 反馈的前沿五元组：参考客户端只填第 3 个 u64（flush 位）且 receive/write 恒 0、
+#      applyRead/垫/replyFlags 是未初始化栈字节（值漂移、服务端不校验）；本项目四前沿
+#      同报消费前沿、垫/flags 恒零——比对钉：总长 65、peer_role=3、peer_state=7、
+#      replyRequested 字节位（帧偏移 57+5）、sendTime 为自 2000-01-01 微秒且单调。
+#   ④ SSLRequest 探测帧：libpq 客户端专有（探测服务端是否接 SSL）；本项目直发明文
+#      startup，服务端接受——序列比对跳过本帧。
+
+ssl-probe | 00 00 00 08 04 D2 16 2F | libpq SSLRequest 探测（1234/5679 魔数）——可选帧，本项目不发，比对跳过
+
+startup | 00 00 00 5C 00 03 00 33 75 73 65 72 00 67 61 75 73 73 64 62 00 64 61 74 61 62 61 73 65 00 72 65 70 6C 69 63 61 74 69 6F 6E 00 72 65 70 6C 69 63 61 74 69 6F 6E 00 74 72 75 65 00 61 70 70 6C 69 63 61 74 69 6F 6E 5F 6E 61 6D 65 00 70 67 5F 72 65 63 65 69 76 65 78 6C 6F 67 00 00 | 协议 3.51（00 03 00 33——major 钉 3，minor 豁免）；参数对：user=gaussdb / database=replication（物理复制伪库，streamutil.cpp:175-176 形态）/ replication=true / application_name=pg_receivexlog（值豁免、键集不豁免）
+
+identify-system | 51 00 00 00 14 49 44 45 4E 54 49 46 59 5F 53 59 53 54 45 4D 00 | 'Q' 简单查询 IDENTIFY_SYSTEM——与本项目 V3ProtocolChannel 逐字节等同断言
+
+start-replication | 51 00 00 00 20 53 54 41 52 54 5F 52 45 50 4C 49 43 41 54 49 4F 4E 20 30 2F 32 30 30 30 30 30 30 00 | 'Q' START_REPLICATION 无槽形态（本项目 IT 会话同为无槽）；LSN 文本 %X/%X 非补零（receivelog.cpp:632）——起点=IDENTIFY xlogpos 段对齐下取整（0/234E3C0 → 0/2000000），时变豁免但格式钉：单斜杠、纯十六进制、低段无前导零
+
+standby-reply | 64 00 00 00 45 72 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 C0 E3 34 02 00 00 00 00 00 00 00 00 00 00 00 00 F3 22 D3 88 7F 00 00 E7 03 00 00 00 07 00 00 00 7E 03 CB 7B 96 00 03 00 00 7B 41 FD 7F 00 00 70 | CopyData 包 65B StandbyReplyMessage（'r' + receive/write/flush/apply/applyRead 五 u64 + peer_role i32=3 STANDBY_MODE + peer_state i32=7 BUILDING_STATE + sendTime i64 微秒 + replyRequested u8@57 + 垫 3 + replyFlags u32@61）；样本字段读出：flush=0/234E3C0（随消费推进）、sendTime=845071252128638µs（2026-10-12，随时间）、replyRequested=0（心跳档；keepalive 即答档为 1）——applyRead/垫/replyFlags 为参考客户端未初始化栈字节（F3 22 D3 88 7F.. 等指针样值）不参与比对

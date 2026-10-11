@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.vastdata.vbstream.walsource.layout.WalBytes;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalLayoutV18;
+import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 
 import java.util.ArrayList;
@@ -13,6 +14,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * WalStreamWalker 流走读状态机的失败先行测试——页/记录导航 + pageaddr 锚定协议。
@@ -410,6 +412,101 @@ class WalStreamWalkerTest {
         // 丢弃后以错锚点重启 → 页头锚定重锚（resyncs 1 次）→ p1 记录正常产出
         assertEquals(1, metrics.resyncs.sum());
         assertEquals(a + 8192 + 24, out.get(1).lsn());
+    }
+
+    /**
+     * OG 档整零页容忍（Task 8 硬前置——pg_receivexlog 落盘形态实锚）：页 A（OG 魔数
+     * 页头 + 全零页体）→ 页 B（<b>整页全零、无页头</b>——pg_receivexlog 对服务端跳过的
+     * 未初始化页/段尾零区在落盘时零填充补位）→ 页 C（OG 魔数页头 + 全零页体）。
+     * OG 布局档下页 B 须跳过整页（zeroPageSkips 计 1）而非 ISE；跨 chunk 分裂的半零页
+     * 等待补齐；跳页后 expectedPageAddr 同步推进使页 C 无再同步直锚。
+     */
+    @Test
+    void ogLayoutSkipsAllZeroPagesWithDedicatedCounterInsteadOfFailing() {
+        long a = 0x400000L;
+        long b = a + 8192;
+        long c = b + 8192;
+        byte[] pageA = ogHeaderPage(a);
+        byte[] pageB = new byte[8192];
+        byte[] pageC = ogHeaderPage(c);
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(WalLayoutVOpenGauss.INSTANCE, metrics, out::add);
+        // feed 1：A 整页 + B 前半——B 整页未到齐（全零但不足一页）须等待而非跳半页
+        walker.feed(b + 4096, concat(pageA, Arrays.copyOfRange(pageB, 0, 4096)));
+        assertTrue(out.isEmpty());
+        assertEquals(a + 8192, walker.consumedLsn(), "半零页留在 carry——游标停在页 A 末");
+        // feed 2：B 后半 + C 整页——B 跳整页、C 直锚（expectedPageAddr 随零页推进）
+        walker.feed(c + 8192, concat(Arrays.copyOfRange(pageB, 4096, 8192), pageC));
+
+        assertTrue(out.isEmpty(), "零页流不产出记录");
+        assertEquals(1, metrics.zeroPageSkips.sum(), "整零页跳过单列计数");
+        assertEquals(0, metrics.resyncs.sum(), "零页跳过不消耗 resyncs，且页 C 无需重锚");
+        assertEquals(0, metrics.lossyResyncs.sum());
+        assertEquals(c + 8192, walker.consumedLsn());
+    }
+
+    /**
+     * V17/V18 零回归锚（零页容忍门控面）：整零页形态在 vanilla 布局档行为不变——缓冲
+     * 内无合法页头（真实失败形态：完成段尾零区多页连绵、1MB chunk 内无真实页可重锚）
+     * 时魔数失配进入再同步扫描，容差窗口（2 页）扫尽即 ISE。原行为逐字节保持，容忍档
+     * 仅 OG 布局激活（有后续合法页头的单零页形态 vanilla 经 dropped==0 良性重锚消化，
+     * 不在本锚覆盖——那是既有 resync 路径，两档共用）。
+     */
+    @Test
+    void vanillaLayoutStillFailsOnAllZeroPageBeyondResyncTolerance() {
+        long a = 0x500000L;
+        byte[] pageA = new byte[8192];
+        putLe16(pageA, 0, layout.pageMagic());
+        putLe64(pageA, 8, a);
+        byte[] zeroTail = new byte[3 * 8192];
+
+        WalStreamWalker walker = new WalStreamWalker(layout, new WalStreamMetrics(), r -> { });
+        byte[] stream = concat(pageA, zeroTail);
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> walker.feed(a + stream.length, stream));
+        assertTrue(e.getMessage().contains("pageaddr anchoring lost"), "ISE 面须是锚定丢失: " + e.getMessage());
+    }
+
+    /**
+     * 拼 OG 魔数页头的全零体整页（0xD074 + info 0 + pageaddr，页体零——走页内零垫
+     * 路径消费；与整零页[无头]形态互为对照）。
+     *
+     * @param pageAddr 页起始 LSN（写入 xlp_pageaddr；须 8192 对齐）
+     * @return 8192 字节整页
+     */
+    private static byte[] ogHeaderPage(long pageAddr) {
+        byte[] page = new byte[8192];
+        putLe16(page, 0, WalLayoutVOpenGauss.INSTANCE.pageMagic());
+        putLe64(page, 8, pageAddr);
+        return page;
+    }
+
+    /**
+     * 就地写 little-endian u16（测试自持的 OG 页头拼装面——WalBytes 的 page 工厂
+     * 硬钉 V18 魔数，OG 档须绕行）。
+     *
+     * @param target 目标数组
+     * @param offset 起始偏移
+     * @param v      16 位值
+     */
+    private static void putLe16(byte[] target, int offset, int v) {
+        target[offset] = (byte) (v & 0xFF);
+        target[offset + 1] = (byte) ((v >>> 8) & 0xFF);
+    }
+
+    /**
+     * 就地写 little-endian u64（OG 页头 xlp_pageaddr@8）。
+     *
+     * @param target 目标数组
+     * @param offset 起始偏移
+     * @param v      64 位值
+     */
+    private static void putLe64(byte[] target, int offset, long v) {
+        for (int i = 0; i < 8; i++) {
+            target[offset + i] = (byte) ((v >>> (8 * i)) & 0xFF);
+        }
     }
 
     /**

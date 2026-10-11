@@ -466,6 +466,15 @@ public final class WalLayoutVOpenGauss implements WalLayout {
         return 37;
     }
 
+    /** {@inheritDoc}——true（Task 8 零页容忍档）：pg_receivexlog 落盘段对服务端流内
+     *  跳过的未初始化页/段尾零区以零填充补位（og-plan 容器 strace 实锚 write(8192B
+     *  全零) 连发），file 通道 walker 页界撞整零页时跳过整页计 zeroPageSkips——
+     *  V17/V18 档缺省 false 行为不变。 */
+    @Override
+    public boolean tolerateAllZeroPages() {
+        return true;
+    }
+
     /** {@inheritDoc}——openGauss 全系恒报 90204（版本撞号由 forServer(int,String)
      *  判别器消解，仅 openGauss 5.0.x 文本路由到本档），故仅精确匹配 90204。 */
     @Override

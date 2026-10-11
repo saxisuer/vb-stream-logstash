@@ -7,6 +7,7 @@ import org.vastdata.vbstream.walsource.layout.WalLayoutV18;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -90,21 +91,61 @@ class FileWalSourceTest {
         source.start(lsn -> { }, walker::feed);
 
         try {
-            awaitTrue(() -> source.consumedLsn() == baseA + 8192, "首写半段须被读尽");
+            // .partial 交付上界 = 已接收前沿（末非零 + 1，Task 8）——页尾零垫不计入
+            awaitTrue(() -> source.consumedLsn() == baseA + lastNonZeroPlusOne(p0), "首写半段须被读尽");
             Files.write(partial, p1, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-            awaitTrue(() -> source.consumedLsn() == baseA + SEG_SIZE, "增长段须被读尽");
+            awaitTrue(() -> source.consumedLsn() == baseA + 8192 + lastNonZeroPlusOne(p1), "增长段须被读尽");
 
             // pg_receivexlog 完成段 rename + 下一段 .partial 出现
             Files.move(partial, dir.resolve(segName(3)));
             Files.write(dir.resolve(segName(4) + ".partial"), pb0);
-            awaitTrue(() -> source.consumedLsn() == baseB + 8192, "rename 后须切到下一段并读尽");
+            awaitTrue(() -> source.consumedLsn() == baseB + lastNonZeroPlusOne(pb0), "rename 后须切到下一段并读尽");
         } finally {
             source.stop();
         }
 
         assertEquals(List.of(baseA + 24, baseA + 24 + align8(rec(1).length), baseA + 8192 + 24, baseB + 24),
                 records.stream().map(WalRecord::lsn).toList(), "跨段记录序列连续（零丢零重）");
-        assertEquals(baseB + 8192, source.consumedLsn());
+        assertEquals(baseB + lastNonZeroPlusOne(pb0), source.consumedLsn());
+    }
+
+    /**
+     * 用例 ②f（Task 8 修复锚——OG pg_receivexlog 预分配形态）：.partial 是<b>预分配整段
+     * 尺寸的全零文件</b>、数据按接收序原地写入（og-plan strace 实锚）——按文件长度 tail
+     * 会把未写区预分配零当数据交付，walker 跳零页冲到段尾后原地写入的真记录永不重读。
+     * 断言：交付上界 = 已接收前沿（不冲段尾）；frontier 处原地续写后续交付、记录零丢失。
+     */
+    @Test
+    void preallocatedPartialTailDeliversOnlyReceivedFrontierThenFollowsInplaceWrites() throws Exception {
+        long base = 3L * SEG_SIZE;
+        byte[] p0 = WalBytes.page(base, rec(1));
+        byte[] p1 = WalBytes.page(base + 8192, rec(2));
+        Path partial = dir.resolve(segName(3) + ".partial");
+        byte[] preallocated = new byte[(int) SEG_SIZE];
+        System.arraycopy(p0, 0, preallocated, 0, p0.length);
+        Files.write(partial, preallocated);   // 预分配整段（零尾）
+
+        List<WalRecord> records = new ArrayList<>();
+        WalStreamWalker walker = new WalStreamWalker(WalLayoutV18.INSTANCE, new WalStreamMetrics(), records::add);
+        FileWalSource source = new FileWalSource(dir, SEG_SIZE, 0, 8192);
+        source.start(lsn -> { }, walker::feed);
+
+        try {
+            awaitTrue(() -> source.consumedLsn() == base + lastNonZeroPlusOne(p0),
+                    "预分配零尾不得被交付（前沿 = 首页末非零）");
+            // 原地续写第二页（pg_receivexlog 写序形态——数据落在已"存在"的零区）
+            try (var raf = new RandomAccessFile(partial.toFile(), "rw")) {
+                raf.seek(8192);
+                raf.write(p1);
+            }
+            awaitTrue(() -> source.consumedLsn() == base + 8192 + lastNonZeroPlusOne(p1),
+                    "原地续写须按前沿续交付");
+        } finally {
+            source.stop();
+        }
+
+        assertEquals(List.of(base + 24, base + 8192 + 24),
+                records.stream().map(WalRecord::lsn).toList(), "两记录零丢失（预分配零尾不吞记录）");
     }
 
     /** 用例 ②b：目录里既有完成段又有新 partial（external 模式任意组合）→ 按段号序全量消费。 */
@@ -113,10 +154,11 @@ class FileWalSourceTest {
         long baseA = 3L * SEG_SIZE;
         long baseB = 4L * SEG_SIZE;
         long baseC = 5L * SEG_SIZE;
+        byte[] pageC = WalBytes.page(baseC, rec(5));
         Files.write(dir.resolve(segName(3)),
                 concat(WalBytes.page(baseA, rec(1), rec(2)), WalBytes.page(baseA + 8192, rec(3))));
         Files.write(dir.resolve(segName(4)), WalBytes.page(baseB, rec(4)));
-        Files.write(dir.resolve(segName(5) + ".partial"), WalBytes.page(baseC, rec(5)));
+        Files.write(dir.resolve(segName(5) + ".partial"), pageC);
 
         List<WalRecord> records = new ArrayList<>();
         WalStreamWalker walker = new WalStreamWalker(WalLayoutV18.INSTANCE, new WalStreamMetrics(), records::add);
@@ -124,7 +166,8 @@ class FileWalSourceTest {
         source.start(lsn -> { }, walker::feed);
 
         try {
-            awaitTrue(() -> source.consumedLsn() == baseC + 8192, "三段须按序全量读尽");
+            // 尾段是 .partial：交付上界 = 已接收前沿（末非零 + 1，Task 8）
+            awaitTrue(() -> source.consumedLsn() == baseC + lastNonZeroPlusOne(pageC), "三段须按序全量读尽");
         } finally {
             source.stop();
         }
@@ -327,15 +370,38 @@ class FileWalSourceTest {
     /**
      * 造一条小体积完整记录（单 block data + 8B main），与 WalStreamWalkerTest.smallRec 同构。
      *
+     * <p>末字节置非零（0x5A）：DSL 的 crc 占位与 MAXALIGN 垫是零字节，而 .partial 通道的
+     * 交付上界是"末非零字节 + 1"（{@code receivedFrontier}，Task 8）——尾零记录在该语义
+     * 下永不完整交付；真实 WAL 记录以 CRC32 收尾（全零概率可忽略），测试语料以末字节
+     * 非零对齐该前提。</p>
+     *
      * @param xid 记录头 xid（兼作用例内的序号标识）
      * @return 记录字节数组（长度即 totLen）
      */
     private static byte[] rec(int xid) {
-        return WalBytes.record(RM_HEAP_ID, 0x00, xid)
+        byte[] r = WalBytes.record(RM_HEAP_ID, 0x00, xid)
                 .block(0, 1663L, 16385L, 24600L, 1)
                 .data(new byte[] {1, 2, 3, 4})
                 .main(new byte[8])
                 .build();
+        r[r.length - 1] = 0x5A;
+        return r;
+    }
+
+    /**
+     * 字节序的末非零字节 + 1（.partial 已接收前沿语义的测试侧镜像——与
+     * {@code FileWalSource.receivedFrontier} 的判定同式，双源互证）。
+     *
+     * @param bytes 已写区字节
+     * @return 末非零字节后一位的偏移（全零为 0）
+     */
+    private static int lastNonZeroPlusOne(byte[] bytes) {
+        for (int i = bytes.length - 1; i >= 0; i--) {
+            if (bytes[i] != 0) {
+                return i + 1;
+            }
+        }
+        return 0;
     }
 
     /**
