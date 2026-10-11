@@ -124,6 +124,24 @@ opengauss-jdbc 5.0.0-og × amd64-qemu / arm64 原生——双驱动双架构 4+ 
 是否仅限配了 replconninfo 的实例、对生产是否可接受，需在真实部署形态评估；单机（不配
 replconninfo）+ 主端口物理流的静默死亡路径，需在握手补全后复验是否消失。
 
+**M0 更优解（2026-10-11 三轮实测）：`pg_receivexlog` sidecar 架构**。openGauss 发行版自带
+`pg_receivexlog`（即 pg_receivewal 的 9.2 旧名，`bin/` 下与 `pg_recvlogical` 并列）——它是
+带全套私有握手的**合法客户端**，且支持 `--slot`。实测（主端口 5432 直连 + md5）：收流稳定
+（WAL 段以 `.partial` 增长落盘、keepalive 正常、写入并行无阻）、**客户端被杀后 walsender 干净
+关闭（`walsender thread shut down`）且实例存活**。方案形态：
+
+```
+pg_receivexlog -D <wal_dir> [--slot ...]（sidecar 常驻，openGauss 自带零依赖）
+  → wal-source 的 receive 面改"文件源"：tail wal_dir 的段文件（.partial 增长→完成后
+    rename），字节喂给现有 WalStreamWalker（其 awaitMore 语义天然适配"文件尾部未写完"）
+```
+
+代价与待评估项：①多一跳文件 IO（延迟 ms 级）；②`.partial` 文件的尾部边界处理（读多少算
+多少，下轮再读——walker 已有该形态）；③反馈/槽推进语义归 pg_receivexlog 自身，与 wal-source
+检查点解耦（at-least-once 靠 wal-source 自己的检查点 + 文件重读）；④部署面多一个 sidecar
+进程。相比自研协议客户端，此路线**零协议工作量、风险显著更低**——建议 M0 采此形态，
+自研客户端降级为备选（低延迟直连需求时再做）。
+
 ### 2.4 引导一致性面的两个小坑
 
 - B 函数无 flush 档（9.2/openGauss 同）——起流点用 write 位点时，服务端发流前会等到该位点
