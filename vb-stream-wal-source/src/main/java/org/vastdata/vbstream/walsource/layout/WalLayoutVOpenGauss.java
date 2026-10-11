@@ -173,14 +173,14 @@ public final class WalLayoutVOpenGauss implements WalLayout {
             "bool",  // atthasdef
             "bool",  // attisdropped         <-- 槽 14（attnum 15）
             "bool",  // attislocal
-            "int1",  // attcmprmode（OG 独有，列压缩模式；TupleDecoder 分支随 catalog 任务补）
+            "int1",  // attcmprmode（OG 独有，列压缩模式；TupleDecoder int1 分支 Task 7 落地）
             "int4",  // attinhcount（OG int4——V17/V18 为 int2）
             "oid",   // attcollation
             "skip",  // attacl aclitem[]
             "skip",  // attoptions text[]
             "skip",  // attfdwoptions text[]
             "skip",  // attinitdefval bytea（OG 独有，varlena）
-            "int1",  // attkvtype（OG 独有；TupleDecoder 分支随 catalog 任务补）
+            "int1",  // attkvtype（OG 独有；TupleDecoder int1 分支 Task 7 落地）
     };
 
     /**
@@ -224,13 +224,15 @@ public final class WalLayoutVOpenGauss implements WalLayout {
             "bool",   // relhasrules
             "bool",   // relhastriggers
             "bool",   // relhassubclass
-            "int1",   // relcmprs（OG 独有，表级压缩模式；TupleDecoder 分支随 catalog 任务补）
+            "int1",   // relcmprs（OG 独有，表级压缩模式；TupleDecoder int1 分支 Task 7 落地）
             "bool",   // relhasclusterkey（OG 独有）
             "bool",   // relrowmovement（OG 独有）
             "char",   // parttype（OG 分区判别列——分区表 relkind 仍 'r'，'p' 语义由本列承担）
             "int4",   // relfrozenxid（xid32，4B）
             "skip",   // relacl aclitem[]
-            "skip",   // reloptions text[]
+            "text",   // reloptions text[]（Task 7 改 skip→text——UStore/段页式 fail-fast 护栏
+                      //   的判别面：storage_type=ustore / segment=on 仅经本列可判，relam 恒 0
+                      //   无分叉；数组原文按 varlena 文本解出供 sniff，null 表恒 null 位图占位）
             "char",   // relreplident（OG 回移植 9.4+ REPLICA IDENTITY 佐证）
             "int8",   // relfrozenxid64（OG 独有，64 位 xid）
             "oid",    // relbucket（OG 独有）
@@ -405,6 +407,63 @@ public final class WalLayoutVOpenGauss implements WalLayout {
     @Override
     public boolean legacyHeap2Clean() {
         return true;
+    }
+
+    /** {@inheritDoc}——true（Task 7 catalog OG 适配：heap 视图老结构分派 + 引导 SQL 方言）。 */
+    @Override
+    public boolean openGaussDialect() {
+        return true;
+    }
+
+    /** {@inheritDoc}——true（pg_class 元组 oid 在 9.2 式元组头 [t_hoff-4,t_hoff)，
+     *  实锚 t_offprobe 行 oid=16389@28/t_hoff=32——TupleDecoder 经虚拟前导
+     *  kind "oidhdr" 注入值行槽 0）。 */
+    @Override
+    public boolean classOidInTupleHeader() {
+        return true;
+    }
+
+    /** {@inheritDoc}——1（值行槽位 = 物理词典槽位 + 1：class 腿解码注入虚拟头 oid 槽，
+     *  使 ClassRow 槽位镜像与 V17/V18 的 oid@0/relname@1 口径对齐）。 */
+    @Override
+    public int classValsSlotDelta() {
+        return 1;
+    }
+
+    /** {@inheritDoc}——5（OG 词典含 attstattarget@3 的 PG≤16 位次使 attnum 后移一位）。 */
+    @Override
+    public int attrAttnumIndex() {
+        return 5;
+    }
+
+    /** {@inheritDoc}——13（attnum 14，live 实查——列存 delta 表判别列）。 */
+    @Override
+    public int classReldeltarelidIndex() {
+        return 13;
+    }
+
+    /** {@inheritDoc}——15（attnum 16，live 实查——列存 cudesc 判别列，主判据）。 */
+    @Override
+    public int classRelcudescrelidIndex() {
+        return 15;
+    }
+
+    /** {@inheritDoc}——31（attnum 32，live 实查——'n' 普通 / 'p' 分区父表）。 */
+    @Override
+    public int classParttypeIndex() {
+        return 31;
+    }
+
+    /** {@inheritDoc}——34（attnum 35，live 实查——UStore/段页式经 reloptions sniff）。 */
+    @Override
+    public int classReloptionsIndex() {
+        return 34;
+    }
+
+    /** {@inheritDoc}——37（attnum 38，live 实查——普通表 NULL、段页式实测 2）。 */
+    @Override
+    public int classRelbucketIndex() {
+        return 37;
     }
 
     /** {@inheritDoc}——openGauss 全系恒报 90204（版本撞号由 forServer(int,String)

@@ -55,19 +55,24 @@ public final class HeapViews {
          *
          * <p>关键步骤：校验 rmid==RM_HEAP_ID 且 opcode==XLOG_HEAP_INSERT（错配 ISE）；
          * main 区须至少 SizeOfHeapInsert=3 字节；offnum 读 main@0（u16 小端）、
-         * flags 读 main@2（u8）。边界与异常语义：main 过短抛 ISE；线程约束：
-         * 静态纯函数，并发安全。</p>
+         * flags 读 main@2（u8）。<b>openGauss 档（layout.openGaussDialect()）的
+         * INIT_PAGE 变体（info 的 0x80 位）在 xlrec 前多 pd_xid_base u64</b>——
+         * 两字段整体 +8（og-plan 语料锚：INSERT+INIT_PAGE lsn=0x2359550 main=19B
+         * = pd_xid_base 8 + SizeOfOldHeapInsert 3 + LogCSN 8），需 main ≥ 11。
+         * 边界与异常语义：main 过短抛 ISE；线程约束：静态纯函数，并发安全。</p>
          *
          * @param r      走读完成的记录（main 区即 xl_heap_insert 结构）
-         * @param layout 版本布局描述符（本视图结构为版本稳定小结构，暂不取值；签名统一）
+         * @param layout 版本布局描述符（openGaussDialect 决定 INIT_PAGE 前缀分派）
          * @return 视图（offnum + flags）
          * @throws IllegalStateException rmid/opcode 错配或 main 过短
          */
         public static HeapInsertView parse(WalRecord r, WalLayout layout) {
             requireOp(r, HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT);
-            requireMainLen(r, 3, "xl_heap_insert");
+            boolean ogInitPage = layout.openGaussDialect()
+                    && (r.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0;
+            requireMainLen(r, ogInitPage ? 11 : 3, "xl_heap_insert");
             byte[] raw = r.raw();
-            int off = r.mainOff();
+            int off = r.mainOff() + (ogInitPage ? 8 : 0);
             return new HeapInsertView(u16(raw, off), raw[off + 2] & 0xFF);
         }
     }
@@ -90,14 +95,19 @@ public final class HeapViews {
          * 解析一条 heap UPDATE / HOT UPDATE 记录。
          *
          * <p>关键步骤：校验 rmid==RM_HEAP_ID 且 opcode ∈ {UPDATE, HOT_UPDATE}；main 区
-         * 须至少 layout.sizeOfHeapUpdate()（14）字节；old_offnum 读 main@4、flags 读
-         * main@7（共享 xl_heap_delete 同形前缀）、new_offnum 读
-         * main@sizeOfHeapUpdate-2（末成员，偏移经 layout 推导）；oldBlockNo 按块链
-         * 过滤 fork==0 且 blockNo != 块0.blockNo 的首块，无则回退块0.blockNo。边界与
-         * 异常语义：错配/main 过短/无块引用均 ISE；线程约束：静态纯函数，并发安全。</p>
+         * 须至少 layout.sizeOfHeapUpdate()（V17/18=14 / OG=13）字节；
+         * <b>vanilla</b>：old_offnum 读 main@4、flags 读 main@7（共享 xl_heap_delete
+         * 同形前缀）、new_offnum 读 main@sizeOfHeapUpdate-2（末成员，偏移经 layout
+         * 推导）；<b>openGauss（SizeOfOldHeapUpdate=5 老结构 + LogCSN 8）</b>：
+         * old_offnum@0、new_offnum@2、flags@4（Task 2 语料锚 0x2359908 旧行恰在
+         * main+13），INIT_PAGE 变体（info 0x80 位）xlrec 前多 pd_xid_base u64 整体
+         * +8（sizeOfHeapUpdate=21 档）。oldBlockNo 按块链过滤 fork==0 且
+         * blockNo != 块0.blockNo 的首块，无则回退块0.blockNo。边界与异常语义：错配/
+         * main 过短/无块引用均 ISE（OG 的 MultiXactId 全量结构变体未锚定，撞上由
+         * main 长度校验拒下——见 layout 常量注记）；线程约束：静态纯函数，并发安全。</p>
          *
          * @param r      走读完成的记录（main 区即 xl_heap_update 结构）
-         * @param layout 版本布局描述符（注入 SizeOfHeapUpdate 锚定 new_offnum 偏移）
+         * @param layout 版本布局描述符（注入 SizeOfHeapUpdate 与 OG 老结构分派）
          * @return 视图（old/new offnum + flags + oldBlockNo）
          * @throws IllegalStateException rmid/opcode 错配、main 过短或无块引用
          */
@@ -116,9 +126,21 @@ public final class HeapViews {
             }
             byte[] raw = r.raw();
             int off = r.mainOff();
-            int oldOffnum = u16(raw, off + 4);
-            int flags = raw[off + 7] & 0xFF;
-            int newOffnum = u16(raw, off + layout.sizeOfHeapUpdate() - 2);
+            int oldOffnum;
+            int newOffnum;
+            int flags;
+            if (layout.openGaussDialect()) {
+                // OG 常态逻辑日志形态：SizeOfOldHeapUpdate 5B（old@0/new@2/flags@4）
+                // + LogCSN 8B；INIT_PAGE 变体 xlrec 前 pd_xid_base u64 整体 +8
+                int shift = (r.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0 ? 8 : 0;
+                oldOffnum = u16(raw, off + shift);
+                newOffnum = u16(raw, off + shift + 2);
+                flags = raw[off + shift + 4] & 0xFF;
+            } else {
+                oldOffnum = u16(raw, off + 4);
+                flags = raw[off + 7] & 0xFF;
+                newOffnum = u16(raw, off + layout.sizeOfHeapUpdate() - 2);
+            }
             BlockRef newPage = r.blocks().get(0);   // 块 id 0 = 新页 heap 块（HEAP_UPDATE_BLKREF_HEAP_NEW）
             int oldBlockNo = newPage.blockNo();
             for (BlockRef b : r.blocks()) {
@@ -144,13 +166,16 @@ public final class HeapViews {
          * 解析一条 heap DELETE 记录。
          *
          * <p>关键步骤：校验 rmid==RM_HEAP_ID 且 opcode==XLOG_HEAP_DELETE；main 区须
-         * 至少 layout.sizeOfHeapDelete()（8）字节；offnum 读
-         * main@sizeOfHeapDelete-4（xmax u32 前缀之后）、flags 读
-         * main@sizeOfHeapDelete-1（结构末字节）。边界与异常语义：错配/main 过短
+         * 至少 layout.sizeOfHeapDelete()（V17/18=8 / OG=11）字节；
+         * <b>vanilla</b>：offnum 读 main@sizeOfHeapDelete-4（xmax u32 前缀之后）、
+         * flags 读 main@sizeOfHeapDelete-1（结构末字节）；<b>openGauss
+         * （SizeOfOldHeapDelete=3 老结构 + LogCSN 8）</b>：offnum@0、flags@2（语料锚
+         * 0x2359AD8 旧行恰在 main+11），INIT_PAGE 变体（info 0x80 位）xlrec 前
+         * pd_xid_base u64 整体 +8。边界与异常语义：错配/main 过短
          * ISE；线程约束：静态纯函数，并发安全。</p>
          *
          * @param r      走读完成的记录（main 区即 xl_heap_delete 结构）
-         * @param layout 版本布局描述符（注入 SizeOfHeapDelete 锚定两字段偏移）
+         * @param layout 版本布局描述符（注入 SizeOfHeapDelete 与 OG 老结构分派）
          * @return 视图（offnum + flags）
          * @throws IllegalStateException rmid/opcode 错配或 main 过短
          */
@@ -159,6 +184,10 @@ public final class HeapViews {
             requireMainLen(r, layout.sizeOfHeapDelete(), "xl_heap_delete");
             byte[] raw = r.raw();
             int off = r.mainOff();
+            if (layout.openGaussDialect()) {
+                int shift = (r.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0 ? 8 : 0;
+                return new HeapDeleteView(u16(raw, off + shift), raw[off + shift + 2] & 0xFF);
+            }
             int size = layout.sizeOfHeapDelete();
             return new HeapDeleteView(u16(raw, off + size - 4), raw[off + size - 1] & 0xFF);
         }
@@ -225,6 +254,15 @@ public final class HeapViews {
          */
         public static MultiInsertView parse(WalRecord r, WalLayout layout) {
             requireOp(r, HeapOps.RM_HEAP2_ID, HeapOps.XLOG_HEAP2_MULTI_INSERT);
+            if (layout.openGaussDialect()) {
+                // OG 的 xl_heap_multi_insert main 布局（9.2 系 {int ntuples; offsets[]}
+                // + LogCSN 形态）未经语料锚定：og-plan 32KB 窗口（283 条，含 CREATE
+                // TABLE 的 pg_attribute 逐行单条 INSERT）零 multi_insert 记录——盲解
+                // 错读 ntuples/offsets 即静默错位，M1 fail-fast（Task 8 语料补锚后放开）
+                throw new IllegalStateException(String.format(
+                        "openGauss MULTI_INSERT main layout not anchored yet (M1 limitation), lsn=%d info=0x%02x",
+                        r.lsn(), r.info()));
+            }
             requireMainLen(r, 4, "xl_heap_multi_insert");
             int ntuples = u16(r.raw(), r.mainOff() + 2);
             boolean initPage = (r.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0;

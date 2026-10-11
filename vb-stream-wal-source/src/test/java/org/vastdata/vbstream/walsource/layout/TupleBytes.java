@@ -30,6 +30,9 @@ public final class TupleBytes {
     /** HeapTupleHeader 的 t_bits 偏移（offsetof(t_bits)=23）。 */
     private static final int TUPLE_BITS_OFFSET = 23;
 
+    /** 虚拟头 oid 词典字面（与 TupleDecoder.OIDHDR_KIND 同值——测试源码根自持，避免测试跨包引常量的循环）。 */
+    private static final String OIDHDR = "oidhdr";
+
     /** 1B varlena 头可编码的总长上限（含头 1B，即数据 ≤126B）。 */
     private static final int VARLENA_1B_MAX_TOTAL = 127;
 
@@ -41,6 +44,9 @@ public final class TupleBytes {
     private final Cell[] cells;
     private final boolean[] isNull;
     private int cursor;
+
+    /** 虚拟头 oid 槽的值（TupleDecoder.OIDHDR_KIND 首位词典用；未写为 0——OG 元组头 oid 实锚非零，缺值视为 DSL 误用）。 */
+    private long headerOid;
 
     /**
      * 起点：声明逐列 kinds 词典（与被测解码词典同面）。
@@ -69,6 +75,21 @@ public final class TupleBytes {
     }
 
     /**
+     * 虚拟头 oid 槽（词典首位 {@code "oidhdr"}，Task 7 OG 适配）的值——写入 9.2 式
+     * 元组头 [t_hoff-4,t_hoff) 垫区（payload()/tuple() 产出时落位）。
+     *
+     * <p>边界与异常语义：词典首位非 oidhdr 时忽略（防御，不抛）；未调用时头 oid 写 0
+     * （解码端无判别——调用方自证）。线程约束：链式单线程。</p>
+     *
+     * @param v 元组头 oid（u32 语义）
+     * @return 本实例（链式）
+     */
+    public TupleBytes headerOid(long v) {
+        this.headerOid = v;
+        return this;
+    }
+
+    /**
      * 标记 0-based 列为 null（null 位图占位，不写数据字节）。
      *
      * @param cols 列号（可变参，可反复调用）
@@ -94,6 +115,17 @@ public final class TupleBytes {
      */
     public TupleBytes i2(int v) {
         return scalar("int2", 2, new byte[]{(byte) v, (byte) (v >>> 8)});
+    }
+
+    /**
+     * int1 列（单字节有符号，OG 独有——relcmprs/attcmprmode/attkvtype）。
+     *
+     * @param v 8 位值（低 8 位写出）
+     * @return 本实例（链式）
+     * @throws IllegalStateException 下一待写列 kind 不是 int1
+     */
+    public TupleBytes i1(int v) {
+        return scalar("int1", 1, new byte[]{(byte) v});
     }
 
     /**
@@ -436,12 +468,15 @@ public final class TupleBytes {
     }
 
     /**
-     * 数据区起点（自 tuple 起算的 t_hoff）：MAXALIGN(23 + bitmapLen)。
+     * 数据区起点（自 tuple 起算的 t_hoff）：MAXALIGN(23 + bitmapLen + 头 oid 4B)——
+     * 虚拟头 oid 槽（oidhdr）表示 9.2 式元组头 oid，物理上居位图之后、数据区之前的
+     * [t_hoff-4,t_hoff)（实锚：OG pg_class 元组 bitmap 5B + oid 4B → t_hoff=32）；
+     * 无头 oid 档即 MAXALIGN(23 + bitmapLen)。
      *
      * @return t_hoff 字节数
      */
     public int tHoff() {
-        return align(TUPLE_BITS_OFFSET + bitmapLen(), 8);
+        return align(TUPLE_BITS_OFFSET + bitmapLen() + (hdrOid() ? 4 : 0), 8);
     }
 
     /**
@@ -459,6 +494,11 @@ public final class TupleBytes {
         writeU16(out, 2, hasNull() ? HEAP_HASNULL : 0);
         out[4] = (byte) tHoff();
         System.arraycopy(data, 0, out, 5, data.length);
+        if (hdrOid()) {
+            // 虚拟头 oid：元组偏移 t_hoff-4 → payload 偏移 t_hoff-22（payload 自 tuple 偏移 23 起接）
+            writeU16(out, tHoff() - 22, (int) (headerOid & 0xFFFF));
+            writeU16(out, tHoff() - 20, (int) (headerOid >>> 16));
+        }
         return out;
     }
 
@@ -476,6 +516,10 @@ public final class TupleBytes {
         writeU16(out, 20, hasNull() ? HEAP_HASNULL : 0);
         out[22] = (byte) tHoff();
         System.arraycopy(data, 0, out, TUPLE_BITS_OFFSET, data.length);
+        if (hdrOid()) {
+            writeU16(out, tHoff() - 4, (int) (headerOid & 0xFFFF));
+            writeU16(out, tHoff() - 2, (int) (headerOid >>> 16));
+        }
         return out;
     }
 
@@ -492,17 +536,18 @@ public final class TupleBytes {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         if (hasNull()) {
             byte[] bitmap = new byte[bitmapLen()];
-            for (int i = 0; i < kinds.length; i++) {
+            int base = hdrOid() ? 1 : 0;   // 虚拟头 oid 槽不占 null 位（位图按实列序）
+            for (int i = base; i < kinds.length; i++) {
                 if (!isNull[i]) {
-                    bitmap[i / 8] |= (byte) (1 << (i % 8));   // 1=非 null
+                    bitmap[(i - base) / 8] |= (byte) (1 << ((i - base) % 8));   // 1=非 null
                 }
             }
             out.writeBytes(bitmap);
         }
         int pos = tHoff();   // 下一列的 tuple 起点相对偏移（位图已含在内）
         for (int i = 0; i < kinds.length; i++) {
-            if (isNull[i]) {
-                continue;
+            if ((i == 0 && hdrOid()) || isNull[i]) {
+                continue;   // 虚拟头 oid 槽零数据消耗（值在垫区，payload()/tuple() 落位）
             }
             Cell c = cells[i];
             if (c == null) {
@@ -543,7 +588,8 @@ public final class TupleBytes {
      * @throws IllegalStateException 已无待写活列（写入次数超过活列数）
      */
     private int nextLiveColumn() {
-        while (cursor < kinds.length && (isNull[cursor] || cells[cursor] != null)) {
+        while (cursor < kinds.length && (cursor == 0 && hdrOid()
+                || isNull[cursor] || cells[cursor] != null)) {
             cursor++;
         }
         if (cursor >= kinds.length) {
@@ -594,7 +640,16 @@ public final class TupleBytes {
      * @return natts | 0（本 DSL 不写其它 infomask2 位）
      */
     private int natts() {
-        return kinds.length & HEAP_NATTS_MASK;
+        return (kinds.length - (hdrOid() ? 1 : 0)) & HEAP_NATTS_MASK;
+    }
+
+    /**
+     * 词典首位是否为虚拟头 oid 槽（TupleDecoder.OIDHDR_KIND）。
+     *
+     * @return true 表示 kinds[0] 是 oidhdr（Task 7 OG 词典）
+     */
+    private boolean hdrOid() {
+        return kinds.length > 0 && TupleBytes.OIDHDR.equals(kinds[0]);
     }
 
     /**

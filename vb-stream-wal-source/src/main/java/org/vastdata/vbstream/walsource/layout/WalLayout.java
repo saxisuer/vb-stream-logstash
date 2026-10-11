@@ -305,6 +305,133 @@ public interface WalLayout {
     }
 
     /**
+     * 本描述符是否属 openGauss 方言族（5.x：9.2 系 heap 记录结构 + SQL 面差异）。
+     *
+     * <p>消费面（Task 7 catalog OG 适配）：① heap 视图字段偏移——OG 的
+     * xl_heap_update/delete 走 SizeOfOld* 老结构（字段前移），INSERT 的
+     * INIT_PAGE 变体在 xlrec 前多 pd_xid_base u64（语料锚，见
+     * {@code HeapViews} 各工厂）；② {@code CatalogBootstrap} 的引导 SQL 方言
+     * （LSN 函数 {@code pg_current_xlog_location()}——OG 无 flush 档，及 pg_class
+     * 种子的 OG 列单投影）。缺省 false＝V17/V18 现行 vanilla 行为，路径字节零变化。</p>
+     *
+     * @return true 表示 openGauss 方言档（仅 OG）
+     */
+    default boolean openGaussDialect() {
+        return false;
+    }
+
+    /**
+     * catalog pg_class 元组的 oid 是否在 9.2 式元组头（[t_hoff-4,t_hoff)）而非数据列。
+     *
+     * <p>OG 5.0.0 的 pg_class 元组 oid 居元组头（t_hoff=32、oid@28，infomask2
+     * natts=40 实锚——区别于 V17/V18 的 kinds[0]="oid" 数据列口径）。消费面
+     * （Task 7）：{@code TupleDecoder} 以虚拟前导 kind {@code "oidhdr"} 把头 oid
+     * 注入解码值行槽 0，使 ClassRow 的词典槽位镜像与 V17/V18 对齐（值行长度 =
+     * 词典长度 + {@link #classValsSlotDelta()}）。缺省 false。</p>
+     *
+     * @return true 表示 oid 在元组头（仅 OG）
+     */
+    default boolean classOidInTupleHeader() {
+        return false;
+    }
+
+    /**
+     * pg_class 解码值行相对物理词典（{@link #pgClassKinds()}）槽位的整体位移。
+     *
+     * <p>OG 档为 1：class 腿解码在词典前注入虚拟头 oid 槽（见
+     * {@link #classOidInTupleHeader()}），值行槽位 = 物理词典槽位 + 1（relname
+     * 物理 0 → 值行 1，恰与 V17/V18 的 oid@0/relname@1 口径对齐；reltoastrelid
+     * 物理 11 → 值行 12、relkind 物理 20 → 值行 21）。消费面：
+     * {@code CatalogRow.ClassRow#fromDecoded} 与 CatalogReplay 的采纳值行组装。
+     * 缺省 0＝V17/V18 值行槽位即词典槽位。</p>
+     *
+     * @return 值行槽位位移（V17/18=0，OG=1）
+     */
+    default int classValsSlotDelta() {
+        return 0;
+    }
+
+    /**
+     * pg_attribute 解码词典中 attnum 的槽位（0 起）。
+     *
+     * <p>OG 词典 24 项含 attstattarget@3（PG≤16 位次——V17 起移尾），使 attnum
+     * 落槽 5（V17/V18 为 4）。消费面：{@code CatalogRow.AttrRow#fromDecoded} 与
+     * CatalogReplay 的 attr 采纳值行组装。缺省 4＝V17/V18 现行值。</p>
+     *
+     * @return attnum 槽位（V17/18=4，OG=5）
+     */
+    default int attrAttnumIndex() {
+        return 4;
+    }
+
+    /**
+     * pg_class 解码词典中 reldeltarelid（OG 列存 delta 表 oid）的物理槽位。
+     *
+     * <p>列存表 fail-fast 判别列之一（reldeltarelid≠0 → 列存）；V17/V18 无此列，
+     * 缺省 -1 表示"本档无该判别面"（存储引擎护栏整体不激活）。OG=13（attnum 14，
+     * live 实查锚）。值行消费时加 {@link #classValsSlotDelta()}。</p>
+     *
+     * @return 物理词典槽位（V17/18=-1 缺席，OG=13）
+     */
+    default int classReldeltarelidIndex() {
+        return -1;
+    }
+
+    /**
+     * pg_class 解码词典中 relcudescrelid（OG 列存 cudesc 表 oid）的物理槽位。
+     *
+     * <p>列存表（ORIENTATION=COLUMN）的主判别列：relcudescrelid≠0 即列存
+     * （og-plan 实测：og_t_colstore 行 relcudescrelid=16447）。V17/V18 无此列
+     * 缺省 -1。OG=15（attnum 16，live 实查锚）。</p>
+     *
+     * @return 物理词典槽位（V17/18=-1 缺席，OG=15）
+     */
+    default int classRelcudescrelidIndex() {
+        return -1;
+    }
+
+    /**
+     * pg_class 解码词典中 parttype（OG 分区判别列）的物理槽位。
+     *
+     * <p>OG 分区表的父表 relkind 仍 'r'，分区语义由本列承担（'n'=普通 /
+     * 'p'=分区父表，og-plan 实测）。fail-fast 判别列：≠'n' 即 ISE。V17/V18 无此列
+     * 缺省 -1。OG=31（attnum 32，live 实查锚）。</p>
+     *
+     * @return 物理词典槽位（V17/18=-1 缺席，OG=31）
+     */
+    default int classParttypeIndex() {
+        return -1;
+    }
+
+    /**
+     * pg_class 解码词典中 reloptions（OG 词典内为 text——护栏消费面）的物理槽位。
+     *
+     * <p>OG 的 UStore（storage_type=ustore）与段页式（segment=on）仅经 reloptions
+     * 可判（relam 恒 0，og-plan 实测 og_t_ustore 行与 astore 仅 reloptions 分叉）
+     * ——故 OG 词典该列 kind 为 "text"（V17/V18 为 skip，无消费面）。fail-fast：
+     * 含 "storage_type=ustore" / "segment=on" 即 ISE。V17/V18 无此判别缺省 -1。
+     * OG=34（attnum 35，live 实查锚）。</p>
+     *
+     * @return 物理词典槽位（V17/18=-1 缺席，OG=34）
+     */
+    default int classReloptionsIndex() {
+        return -1;
+    }
+
+    /**
+     * pg_class 解码词典中 relbucket（OG bucket/段页式判别列）的物理槽位。
+     *
+     * <p>OG 普通表 relbucket 为 NULL、段页式表（SEGMENT=ON）实测 relbucket=2
+     * （og-plan og_t_seg 行）；判别：非 null 且 ≠0 即 ISE。V17/V18 无此列缺省
+     * -1。OG=37（attnum 38，live 实查锚）。</p>
+     *
+     * @return 物理词典槽位（V17/18=-1 缺席，OG=37）
+     */
+    default int classRelbucketIndex() {
+        return -1;
+    }
+
+    /**
      * 判定本描述符是否覆盖给定服务端版本号。
      *
      * <p>按大版本全区间判定（如 V18 覆盖 180000-189999，含小版本与发行版位）。</p>

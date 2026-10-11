@@ -20,6 +20,13 @@ import java.util.List;
  * relfilenode，并按 interest oid 定位 tracked 双 ctid（v2 扩第三目录 pg_namespace
  * ——schema 名解析的字典源）。
  *
+ * <p><strong>openGauss 档差异（Task 7）</strong>：位点函数
+ * {@code pg_current_xlog_location()}（9.2 系命名，无 flush 档）；pg_class 种子按
+ * OG 40 数据列显式列名投影（oid 系统列另列于首，共 42 表达式）且逐行施加存储
+ * 引擎护栏（列存/分区/段页式/bucket/UStore 种子期即 ISE，与流内护栏同谓词）；
+ * pg_attribute / pg_namespace 种子与 relfilenode 回填 SQL 三版通用（OG 实测同名
+ * 列可直接取位）。</p>
+ *
  * <p><strong>一致性顺序（调用方契约）</strong>：槽 P₀ 须已由调用方先经
  * {@code PhysicalSlotManager.ensureSlot} 取得（建槽自身的 WAL 写入落在引导快照之前）
  * → 本类在 <strong>REPEATABLE READ 单事务</strong>内执行：首句
@@ -45,11 +52,44 @@ public final class CatalogBootstrap {
             "SELECT ctid::text, attrelid, attname, atttypid, attnum, attisdropped"
                     + " FROM pg_attribute WHERE attnum > 0";
 
-    /** pg_class 全行种子查询（不限 relkind：toast/index 行也在跟踪面；v2 增选 relkind——
-     * 表过滤的分派键，char 输出经 getText 为裸单字符）。 */
+    /** pg_class 全行种子查询（V17/V18：不限 relkind：toast/index 行也在跟踪面；v2 增选
+     * relkind——表过滤的分派键，char 输出经 getText 为裸单字符）。 */
     private static final String CLASS_SEED_SQL =
             "SELECT ctid::text, oid, relname, relnamespace, reltype, reloftype,"
                     + " relowner, relam, relfilenode, reltoastrelid, relkind::text FROM pg_class";
+
+    /**
+     * openGauss pg_class 种子投影的显式列单（attnum 升序 40 数据列，live 实查锚
+     * 2026-10-12 og-plan）——Task 7：OG 档种子 SQL 按本列单显式列名投影（oid 系统
+     * 列另列于首），其中 reldeltarelid/relcudescrelid/parttype/reloptions/relbucket
+     * 五列是存储引擎护栏的种子期判别面（与 CatalogReplay 流内护栏同谓词）。
+     */
+    private static final String[] OG_CLASS_COLUMNS = {
+            "relname", "relnamespace", "reltype", "reloftype", "relowner", "relam",
+            "relfilenode", "reltablespace", "relpages", "reltuples", "relallvisible",
+            "reltoastrelid", "reltoastidxid", "reldeltarelid", "reldeltaidx",
+            "relcudescrelid", "relcudescidx", "relhasindex", "relisshared", "relpersistence",
+            "relkind", "relnatts", "relchecks", "relhasoids", "relhaspkey",
+            "relhasrules", "relhastriggers", "relhassubclass", "relcmprs", "relhasclusterkey",
+            "relrowmovement", "parttype", "relfrozenxid", "relacl", "reloptions",
+            "relreplident", "relfrozenxid64", "relbucket", "relbucketkey", "relminmxid",
+    };
+
+    /** OG_CLASS_COLUMNS 投影列的 1 起结果集列号 = 3 + 列单序（ctid=1、oid=2）。 */
+    private static final int OG_IX_RELNAME = 3;
+    private static final int OG_IX_RELNAMESPACE = 4;
+    private static final int OG_IX_RELTYPE = 5;
+    private static final int OG_IX_RELOFTYPE = 6;
+    private static final int OG_IX_RELOWNER = 7;
+    private static final int OG_IX_RELAM = 8;
+    private static final int OG_IX_RELFILENODE = 9;
+    private static final int OG_IX_RELTOASTRELID = 14;
+    private static final int OG_IX_RELDELTA = 16;
+    private static final int OG_IX_RELCUDESC = 18;
+    private static final int OG_IX_RELKIND = 23;
+    private static final int OG_IX_PARTTYPE = 34;
+    private static final int OG_IX_RELOPTIONS = 37;
+    private static final int OG_IX_RELBUCKET = 40;
 
     /** pg_namespace 全行种子查询（v2 扩链第三 watched 目录，schema 名解析源）。 */
     private static final String NSP_SEED_SQL =
@@ -111,7 +151,7 @@ public final class CatalogBootstrap {
             tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
             // flush LSN 必须先于全部种子查询读取（终审 C1）：保证 B ≤ 种子快照时点 S——
             // 种子快照后的任何提交其记录末尾必 > B，进重放窗口；(B,S] 重叠由 upsert 幂等消化
-            long flushLsn = currentFlushLsn(tx);
+            long flushLsn = currentFlushLsn(tx, layout);
             seedRelfilenodes(stores);
             int attrCount = seedAttrRows(stores);
             int classCount = seedClassRows(stores);
@@ -192,22 +232,87 @@ public final class CatalogBootstrap {
     }
 
     /**
+     * pg_class 种子 SQL（版本感知，Task 7 OG 适配）：V17/V18 用既有 11 表达式投影；
+     * OG 档按 {@link #OG_CLASS_COLUMNS} 显式列名投影（oid + 40 数据列，relkind 带
+     * ::text 转换）——五判别列随投影携带，供种子期存储引擎护栏消费。
+     *
+     * <p>线程约束：纯函数（SQL 文本组装），并发安全。</p>
+     *
+     * @param layout 版本布局描述符（openGaussDialect 决定投影分派）
+     * @return 种子查询 SQL
+     */
+    static String classSeedSql(WalLayout layout) {
+        if (!layout.openGaussDialect()) {
+            return CLASS_SEED_SQL;
+        }
+        StringBuilder sql = new StringBuilder("SELECT ctid::text, oid");
+        for (String col : OG_CLASS_COLUMNS) {
+            sql.append(", ").append("relkind".equals(col) ? "relkind::text" : col);
+        }
+        return sql.append(" FROM pg_class").toString();
+    }
+
+    /**
+     * 引导首句的当前位点函数 SQL（版本感知，Task 7）：V17/V18 用
+     * {@code pg_current_wal_flush_lsn()}（write 位点可能领先 flush——START_REPLICATION
+     * 起点用 write 会被拒）；openGauss 5.0.0 无 flush 档（9.2 系命名），用
+     * {@code pg_current_xlog_location()}（og-plan 实测可用）——一致性次序契约
+     * （首句读、先于全部种子查询）不变。
+     *
+     * @param layout 版本布局描述符（openGaussDialect 决定函数名）
+     * @return 单值 LSN 查询 SQL
+     */
+    static String flushLsnSql(WalLayout layout) {
+        return layout.openGaussDialect()
+                ? "SELECT pg_current_xlog_location()"
+                : "SELECT pg_current_wal_flush_lsn()";
+    }
+
+    /**
      * pg_class 全行种子：ctid 折键 + ClassRow 落 classRows（不限 relkind——toast/index
      * 行也在跟踪面，INPLACE 对象与 tracked toast 依赖它们；v2 增投影 relkind）。
+     * <b>OG 档（Task 7）</b>：按显式列单投影取位，且逐行施加<b>存储引擎护栏</b>
+     * （reldeltarelid/relcudescrelid/parttype/reloptions/relbucket 五判别列，与
+     * CatalogReplay 流内护栏同谓词）——库内已存在列存/分区/段页式/bucket/UStore
+     * 表时种子期即 ISE（消息含 relname/oid）。
      *
      * @param stores 状态容器
      * @return 灌入行数
      * @throws SQLException 查询失败
+     * @throws IllegalStateException OG 档种子行命中不支持存储形态
      */
     private int seedClassRows(CatalogStores stores) throws SQLException {
+        boolean og = layout.openGaussDialect();
         int count = 0;
         try (Statement st = connection.createStatement();
-             ResultSet rs = st.executeQuery(CLASS_SEED_SQL)) {
+             ResultSet rs = st.executeQuery(classSeedSql(layout))) {
             while (rs.next()) {
-                stores.classRows().put(parseCtidKey(rs.getString(1)), new CatalogRow.ClassRow(
-                        rs.getLong(2), rs.getString(3), rs.getLong(4), rs.getLong(5),
-                        rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9),
-                        rs.getLong(10), rs.getString(11)));
+                if (og) {
+                    long reldelta = rs.getLong(OG_IX_RELDELTA);
+                    long relcudesc = rs.getLong(OG_IX_RELCUDESC);
+                    String parttype = rs.getString(OG_IX_PARTTYPE);
+                    String reloptions = rs.getString(OG_IX_RELOPTIONS);
+                    long relbucketRaw = rs.getLong(OG_IX_RELBUCKET);
+                    Long relbucket = rs.wasNull() ? null : relbucketRaw;
+                    String violation = CatalogReplay.storageEngineViolation(
+                            reldelta == 0 ? null : reldelta, relcudesc == 0 ? null : relcudesc,
+                            parttype, reloptions, relbucket);
+                    if (violation != null) {
+                        throw new IllegalStateException(String.format(
+                                "openGauss unsupported storage engine in seeded pg_class: relname=%s oid=%d, %s",
+                                rs.getString(OG_IX_RELNAME), rs.getLong(2), violation));
+                    }
+                    stores.classRows().put(parseCtidKey(rs.getString(1)), new CatalogRow.ClassRow(
+                            rs.getLong(2), rs.getString(OG_IX_RELNAME), rs.getLong(OG_IX_RELNAMESPACE),
+                            rs.getLong(OG_IX_RELTYPE), rs.getLong(OG_IX_RELOFTYPE), rs.getLong(OG_IX_RELOWNER),
+                            rs.getLong(OG_IX_RELAM), rs.getLong(OG_IX_RELFILENODE),
+                            rs.getLong(OG_IX_RELTOASTRELID), rs.getString(OG_IX_RELKIND)));
+                } else {
+                    stores.classRows().put(parseCtidKey(rs.getString(1)), new CatalogRow.ClassRow(
+                            rs.getLong(2), rs.getString(3), rs.getLong(4), rs.getLong(5),
+                            rs.getLong(6), rs.getLong(7), rs.getLong(8), rs.getLong(9),
+                            rs.getLong(10), rs.getString(11)));
+                }
                 count++;
             }
         }
@@ -306,13 +411,15 @@ public final class CatalogBootstrap {
      * 用它会被拒，spike 注记；REPEATABLE READ 不冻结该全局量，<strong>必须先于全部
      * 种子查询调用</strong>——使返回值 B ≤ 种子快照时点 S（种子快照后的提交记录末尾
      * 必 &gt; B、进重放窗口），(B,S] 窗口重叠由 ctid 键控 upsert 幂等重放消化）。
+     * 函数名版本感知（Task 7）：OG 档 {@code pg_current_xlog_location()}（无 flush 档）。
      *
-     * @param tx 事务语句（保证与种子同一事务）
+     * @param tx     事务语句（保证与种子同一事务）
+     * @param layout 版本布局描述符（openGaussDialect 决定位点函数）
      * @return flush LSN（打包 long，读取时点 ≤ 种子快照时点）
      * @throws SQLException 查询失败
      */
-    private static long currentFlushLsn(Statement tx) throws SQLException {
-        try (ResultSet rs = tx.executeQuery("SELECT pg_current_wal_flush_lsn()")) {
+    private static long currentFlushLsn(Statement tx, WalLayout layout) throws SQLException {
+        try (ResultSet rs = tx.executeQuery(flushLsnSql(layout))) {
             rs.next();
             return Lsn.parse(rs.getString(1));
         }

@@ -56,7 +56,9 @@ public final class CatalogReplay {
     private static final int TUPLE_BITS_OFFSET = 23;
 
     // 派生档槽位（与 pgClassKinds() 词典列序一致，位号同 CatalogRow.ClassRow 的 IX_* 私有镜像——两处须同步；
-    // 词典前八槽 V17/V18 同序，reltoastrelid 槽位随版本漂移经 layout.classToastRelidIndex() 取）
+    // 词典前八槽 V17/V18 同序，reltoastrelid/relkind 槽位随版本漂移经 layout 访问器取；
+    // OG 档经 classDecodeKinds() 的虚拟头 oid 前导槽使前八槽位恰与本镜像对齐（Task 7），
+    // toast/relkind 值行槽位 = 访问器 + layout.classValsSlotDelta()）
     /** 词典槽位：oid（列 1）。 */
     private static final int IX_CLASS_OID = 0;
 
@@ -82,7 +84,7 @@ public final class CatalogReplay {
     private static final int IX_CLASS_RELFILENODE = 7;
 
     // attr 面精确采纳的五槽位（与 pgAttributeKinds() 词典列序一致，位号同 CatalogRow.AttrRow 的 IX_* 私有镜像——两处须同步；
-    // 前五槽 V17/V18 同序，attisdropped 槽位随版本漂移经 layout.attrDroppedIndex() 取）
+    // 前三槽三版同序，attnum/attisdropped 槽位随版本漂移经 layout.attrAttnumIndex()/attrDroppedIndex() 取）
     /** 词典槽位：attrelid（列 1）。 */
     private static final int IX_ATTR_ATTRELID = 0;
 
@@ -92,11 +94,20 @@ public final class CatalogReplay {
     /** 词典槽位：atttypid（列 3）。 */
     private static final int IX_ATTR_ATTTYPEID = 2;
 
-    /** 词典槽位：attnum（列 5）。 */
-    private static final int IX_ATTR_ATTNUM = 4;
+    // attnum 槽位（V17/V18=4、OG=5）经 layout.attrAttnumIndex() 取——IX_ATTR_ATTNUM
+    // 已删除，与 CatalogRow.AttrRow 同步（Task 7）
 
     private final WalLayout layout;
     private final TupleDecoder decoder;
+
+    /**
+     * pg_class 腿的解码词典（惰性缓存，Task 7 OG 适配）：V17/V18 即
+     * {@code layout.pgClassKinds()}；OG 档在物理词典前注入虚拟头 oid 槽
+     * （{@link TupleDecoder#OIDHDR_KIND}——9.2 式元组头 oid 的值行注入面），
+     * 使值行槽位与 V17/V18 口径对齐（见 {@code CatalogRow.ClassRow#fromDecoded}
+     * 注记）。构造后只读，线程安全。
+     */
+    private String[] classDecodeKinds;
 
     /** 截断自愈校验器（null = 禁用：未知 oldCtid 保留 skip + 计数行为）。 */
     private final SelfHealer healer;
@@ -156,6 +167,140 @@ public final class CatalogReplay {
      */
     public static long ctidKey(int block, int offnum) {
         return ((long) block << 16) | offnum;
+    }
+
+    /**
+     * pg_class 腿的解码词典（Task 7 OG 适配）：V17/V18 透传
+     * {@code layout.pgClassKinds()}；OG 档前置虚拟头 oid 槽（见字段注记）——
+     * 值行长度 = 物理词典 + {@code layout.classValsSlotDelta()}、槽 0 = 元组头 oid。
+     *
+     * <p>边界与异常语义：产物缓存复用（构造后只读数组，调用方不得改写）。
+     * 线程约束：惰性初始化竞态无害（幂等赋值、数组内容恒定）。</p>
+     *
+     * @return pg_class 解码词典（V17/18=物理词典 / OG=前导 oidhdr + 物理词典）
+     */
+    private String[] classDecodeKinds() {
+        if (classDecodeKinds == null) {
+            String[] phys = layout.pgClassKinds();
+            if (!layout.classOidInTupleHeader()) {
+                classDecodeKinds = phys;
+            } else {
+                String[] aug = new String[phys.length + 1];
+                aug[0] = TupleDecoder.OIDHDR_KIND;
+                System.arraycopy(phys, 0, aug, 1, phys.length);
+                classDecodeKinds = aug;
+            }
+        }
+        return classDecodeKinds;
+    }
+
+    /**
+     * 存储引擎护栏（Task 7 OG 适配）：判别一条 pg_class 值行是否落在 M1 不支持的
+     * openGauss 存储形态上——列存（relcudescrelid/reldeltarelid≠0）、分区表
+     * （parttype≠'n'）、段页式/bucket（relbucket 非 null 且 ≠0，段页式实测=2）、
+     * UStore/段页式（reloptions 含 storage_type=ustore / segment=on）。
+     *
+     * <p>关键步骤：五判别槽位经 layout 访问器取（V17/V18 全 -1 即护栏整体不激活，
+     * 零回归）；值行槽位 = 物理词典槽位 + classValsSlotDelta()；null 列（relbucket
+     * 普通表为 NULL、reloptions 常见 NULL）按无判别跳过；char 列解码为左引号单
+     * 字符（{@code 'n'}）经剥引号收敛。命中即抛 ISE（消息含 relname/oid——
+     * fail-fast 面与 vanilla 路径零交集）。线程约束：纯函数。</p>
+     *
+     * @param vals pg_class 解码值行（与 {@link #classDecodeKinds()} 同长）
+     * @throws IllegalStateException 命中任一不支持存储形态
+     */
+    private void guardOgStorageEngine(Object[] vals) {
+        int delta = layout.classValsSlotDelta();
+        String relname = String.valueOf(vals[IX_CLASS_RELNAME]);
+        long oid = ((Number) vals[IX_CLASS_OID]).longValue();
+        String violation = storageEngineViolation(
+                guardLong(vals, layout.classReldeltarelidIndex(), delta),
+                guardLong(vals, layout.classRelcudescrelidIndex(), delta),
+                guardText(vals, layout.classParttypeIndex(), delta),
+                guardText(vals, layout.classReloptionsIndex(), delta),
+                guardLong(vals, layout.classRelbucketIndex(), delta));
+        if (violation != null) {
+            throw new IllegalStateException(String.format(
+                    "openGauss unsupported storage engine: relname=%s oid=%d, %s", relname, oid, violation));
+        }
+    }
+
+    /**
+     * 存储形态判别的共享谓词（值行与 JDBC 种子两侧同源，Task 7）：输入五判别列的
+     * 收敛值（null = 列缺席/NULL），返回违例描述或 null。
+     *
+     * <p>判别依据（og-plan 容器实测，2026-10-12）：列存表 relcudescrelid=16447 /
+     * reldeltarelid=16441；分区父表 parttype='p'；段页式表（SEGMENT=ON）
+     * relbucket=2 且 reloptions 含 segment=on；UStore 表 reloptions 含
+     * storage_type=ustore（relam 恒 0 无分叉）。线程约束：纯函数。</p>
+     *
+     * @param reldelta     reldeltarelid（null=缺席/NULL）
+     * @param relcudesc    relcudescrelid（null=缺席/NULL）
+     * @param parttype     parttype 裸单字符（null=缺席/NULL）
+     * @param reloptions   reloptions 原文（null=缺席/NULL）
+     * @param relbucket    relbucket（null=缺席/NULL）
+     * @return 违例描述；合规 null
+     */
+    static String storageEngineViolation(Long reldelta, Long relcudesc,
+            String parttype, String reloptions, Long relbucket) {
+        if (relcudesc != null && relcudesc != 0) {
+            return "column store (relcudescrelid=" + relcudesc + ")";
+        }
+        if (reldelta != null && reldelta != 0) {
+            return "column store delta table (reldeltarelid=" + reldelta + ")";
+        }
+        if (parttype != null && !parttype.isEmpty() && parttype.charAt(0) != 'n') {
+            return "partitioned table (parttype=" + parttype.charAt(0) + ")";
+        }
+        if (relbucket != null && relbucket != 0) {
+            return "bucket/segment-page table (relbucket=" + relbucket + ")";
+        }
+        if (reloptions != null) {
+            if (reloptions.contains("storage_type=ustore")) {
+                return "UStore table (reloptions storage_type=ustore)";
+            }
+            if (reloptions.contains("segment=on")) {
+                return "segment-page table (reloptions segment=on)";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 护栏槽位取值收敛为 Long（null 容错——槽位缺席 -1、列 NULL、或非 Number 均回
+     * null，判别面按"无信息"跳过）。
+     *
+     * @param vals    值行
+     * @param physIdx 物理词典槽位（-1 缺席）
+     * @param delta   值行槽位位移
+     * @return Long 值或 null
+     */
+    private static Long guardLong(Object[] vals, int physIdx, int delta) {
+        if (physIdx < 0) {
+            return null;
+        }
+        Object v = vals[physIdx + delta];
+        return v instanceof Number n ? n.longValue() : null;
+    }
+
+    /**
+     * 护栏槽位取值收敛为裸文本（char 列剥左引号；缺席/NULL 回 null）。
+     *
+     * @param vals    值行
+     * @param physIdx 物理词典槽位（-1 缺席）
+     * @param delta   值行槽位位移
+     * @return 文本或 null
+     */
+    private static String guardText(Object[] vals, int physIdx, int delta) {
+        if (physIdx < 0) {
+            return null;
+        }
+        Object v = vals[physIdx + delta];
+        if (v == null) {
+            return null;
+        }
+        String s = v.toString();
+        return s.isEmpty() || s.charAt(0) != '\'' ? s : s.substring(1);
     }
 
     /**
@@ -487,12 +632,15 @@ public final class CatalogReplay {
             }
         }
         List<HeapEvent> classEvents = heapEvents(r, stores.pgClassRelfilenode(),
-                layout.pgClassKinds(), stores.rawClassTails(), stores.classRows()::get,
+                classDecodeKinds(), stores.rawClassTails(), stores.classRows()::get,
                 stores.metrics(), stores);
         for (HeapEvent ev : classEvents) {
             if (ev.op() == HeapEvent.DEL) {
                 stores.classRows().remove(ev.oldCtid());
             } else {
+                // 存储引擎护栏（Task 7 OG 适配）：INS/UPD 的 pg_class 行施加面判别
+                // 列存/分区/段页式/bucket/UStore——识别即 ISE（vanilla 档槽位缺席不激活）
+                guardOgStorageEngine(ev.row());
                 if (ev.op() == HeapEvent.UPD) {
                     stores.classRows().remove(ev.oldCtid());
                 }
@@ -525,8 +673,9 @@ public final class CatalogReplay {
         }
         // v2 扩链第三腿（Task 4）：pg_namespace 行事件——施加次序在 class 之后（三腿
         // 字典互不依赖，次序仅固定以保确定性）。nspRowLookup 非 null 兼作"非 attr 面"
-        // 判据——截断 skip 不触发 attr 精确采纳（误采 pg_attribute 行产垃圾 NspRow）
-        List<HeapEvent> nspEvents = heapEvents(r, stores.pgNspRelnode(), CatalogRow.NspRow.kinds(),
+        // 判据——截断 skip 不触发 attr 精确采纳（误采 pg_attribute 行产垃圾 NspRow）。
+        // 词典版本感知（Task 7）：OG 七数据列 + 虚拟头 oid 槽
+        List<HeapEvent> nspEvents = heapEvents(r, stores.pgNspRelnode(), CatalogRow.NspRow.kinds(layout),
                 stores.rawNspTails(), null, stores.nspRows()::get, stores.metrics(), null);
         for (HeapEvent ev : nspEvents) {
             if (ev.op() == HeapEvent.DEL) {
@@ -544,7 +693,7 @@ public final class CatalogReplay {
     /**
      * pg_class 截断更新的值编码重建（spike {@code reconstructClassTruncated} 移植，
      * 发现 24 + 审查 High-1 读区回填）——prefix 落在读区（≤{@code 读区末尾}）时由
-     * 已知旧行 {@link CatalogRow.ClassRow#encodeReadRegion()} 重编码前缀，中段取自
+     * 已知旧行 {@link CatalogRow.ClassRow#encodeReadRegion(WalLayout)} 重编码前缀，中段取自
      * 记录；后缀零填充<strong>仅在读区之外合法</strong>，与读区（V18 [0,116) / V17
      * [0,112)，由 layout 的 toast 偏移锚定）的重叠段按
      * 旧行读区字节回填（suffix 截断省略的尾段与旧元组逐字节相同是其定义，回填即
@@ -608,33 +757,35 @@ public final class CatalogReplay {
                 assembled[bitmapLen + i] = readRegion[i];
             }
         }
-        return finishReconstruction(assembled, tHoff, infomask, infomask2, layout.pgClassKinds());
+        return finishReconstruction(assembled, tHoff, infomask, infomask2, classDecodeKinds());
     }
 
     /**
      * pg_namespace 截断更新的值编码重建（v2 扩链，{@link #reconstructClassTruncated}
-     * 的 nsp 面同构）——prefix 落在读区（≤{@link CatalogRow.NspRow#READ_REGION_LEN}
-     * = 72）时由已知旧行 {@link CatalogRow.NspRow#encodeReadRegion()} 重编码前缀，
+     * 的 nsp 面同构）——prefix 落在读区（V17/V18 ≤{@link CatalogRow.NspRow#READ_REGION_LEN}
+     * = 72 / OG ≤80，经 {@link CatalogRow.NspRow#readRegionLen(WalLayout)} 取）时由已知
+     * 旧行 {@link CatalogRow.NspRow#encodeReadRegion(WalLayout)} 重编码前缀，
      * 中段取自记录；后缀零填充仅在读区之外合法，与读区的重叠段按旧行读区字节回填
      * （语义同 class 面的 High-1：典型形态是 ALTER SCHEMA ... RENAME——prefix 落
      * oid/共有名前缀、suffix 起点越入 name 尾垫/owner 区）。
      *
-     * <p>关键步骤与边界语义同 {@link #reconstructClassTruncated}（读区末尾改用
-     * {@link CatalogRow.NspRow#READ_REGION_LEN}，值编码 prefix 上界同读区长——
-     * 读区三列全在投影面内，无 class 面 [88,116) 段不投影列的部分编码限制）；
+     * <p>关键步骤与边界语义同 {@link #reconstructClassTruncated}（读区末尾与词典
+     * 版本感知——OG 档读区 80B、词典含虚拟头 oid 槽；读区三列全在投影面内，无
+     * class 面 [88,116) 段不投影列的部分编码限制）；
      * 返回 null 表示 prefix 越过读区（落 rawTail splice）；线程约束：纯函数。</p>
      *
      * @param r      走读完成的 UPDATE 记录
      * @param b0     新页块引用（须携带 data）
      * @param oldRow 旧行值模型（来自 nsp 行字典）
-     * @return 重建产物；prefix &gt; 72 为 null
+     * @return 重建产物；prefix &gt; 读区长为 null
      */
     private Reconstruction reconstructNspTruncated(WalRecord r, BlockRef b0, CatalogRow.NspRow oldRow) {
         int[] p = truncParams(r, b0);
         int prefix = p[0];
         int suffix = p[1];
         int cur = p[2];
-        if (prefix > CatalogRow.NspRow.READ_REGION_LEN) {
+        int readEnd = CatalogRow.NspRow.readRegionLen(layout);
+        if (prefix > readEnd) {
             return null;
         }
         byte[] raw = r.raw();
@@ -649,7 +800,7 @@ public final class CatalogReplay {
         } else {
             out.write(raw, cur, bitmapLen);    // 位图 + 垫齐
             cur += bitmapLen;
-            out.write(oldRow.encodeReadRegion(), 0, prefix);
+            out.write(oldRow.encodeReadRegion(layout), 0, prefix);
             out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 中段
         }
         out.write(new byte[suffix], 0, suffix);    // 后缀零填充占位（读区重叠段下方回填）
@@ -658,18 +809,17 @@ public final class CatalogReplay {
         // 读区末尾时，重叠段从旧行读区编码取精确值
         int dataLen = assembled.length - bitmapLen;
         int zeroStart = dataLen - suffix;
-        int readEnd = CatalogRow.NspRow.READ_REGION_LEN;
         if (zeroStart < 0) {
             return null;    // 防御：suffix 超数据区长（畸形记录）——落 tail/自愈兜底
         }
         if (zeroStart < readEnd) {
-            byte[] readRegion = oldRow.encodeReadRegion();
+            byte[] readRegion = oldRow.encodeReadRegion(layout);
             int backfillEnd = Math.min(dataLen, readEnd);
             for (int i = zeroStart; i < backfillEnd; i++) {
                 assembled[bitmapLen + i] = readRegion[i];
             }
         }
-        return finishReconstruction(assembled, tHoff, infomask, infomask2, CatalogRow.NspRow.kinds());
+        return finishReconstruction(assembled, tHoff, infomask, infomask2, CatalogRow.NspRow.kinds(layout));
     }
 
     /**
@@ -844,7 +994,11 @@ public final class CatalogReplay {
             return null;
         }
         CatalogRow.ClassRow row = end.row();
-        Object[] vals = new Object[layout.pgClassKinds().length];
+        // 值行组装（Task 7 OG 适配）：长度/漂移槽位与 classDecodeKinds() 的解码值行
+        // 同构——OG 档前八列槽位恰与 IX_* 镜像对齐（零位移），toast/relkind 槽位
+        // = 访问器（物理词典槽位）+ classValsSlotDelta()
+        int delta = layout.classValsSlotDelta();
+        Object[] vals = new Object[layout.pgClassKinds().length + delta];
         vals[IX_CLASS_OID] = row.relOid();
         vals[IX_CLASS_RELNAME] = row.relname();
         vals[IX_CLASS_RELNAMESPACE] = row.relnamespace();
@@ -853,8 +1007,8 @@ public final class CatalogReplay {
         vals[IX_CLASS_RELOWNER] = row.relowner();
         vals[IX_CLASS_RELAM] = row.relam();
         vals[IX_CLASS_RELFILENODE] = row.relfilenode();
-        vals[layout.classToastRelidIndex()] = row.reltoastrelid();
-        vals[layout.classRelkindIndex()] = row.relkind();
+        vals[layout.classToastRelidIndex() + delta] = row.reltoastrelid();
+        vals[layout.classRelkindIndex() + delta] = row.relkind();
         repairTracked(stores, row, newCtid);
         noteAdoption(row.relOid());
         stores.metrics().inc(CatalogStores.CatalogMetrics.SELF_HEALED);
@@ -932,7 +1086,7 @@ public final class CatalogReplay {
         vals[IX_ATTR_ATTRELID] = row.attrelid();
         vals[IX_ATTR_ATTNAME] = row.attname();
         vals[IX_ATTR_ATTTYPEID] = row.atttypid();
-        vals[IX_ATTR_ATTNUM] = (short) row.attnum();
+        vals[layout.attrAttnumIndex()] = (short) row.attnum();
         vals[layout.attrDroppedIndex()] = row.attisdropped();
         if (metrics != null) {
             metrics.inc(CatalogStores.CatalogMetrics.SELF_HEALED);

@@ -22,7 +22,13 @@ import java.time.ZoneOffset;
  * ISO-8601 字符串。值 → Java 类型映射：bool→Boolean、char→String（左引号单字符，
  * 与 spike 渲染逐字一致）、name/text/timestamp→String、bytea→byte[]、int2→Short、
  * int4→Integer、int8/oid→Long（oid 无符号语义）、float4→Float、float8→Double、
- * dropped/skip/null→null。</p>
+ * int1→Byte（OG 独有单字节有符号，Task 7）、dropped/skip/null→null。</p>
+ *
+ * <p><b>OG 虚拟前导槽（Task 7 catalog 适配）</b>：词典首位为 {@link #OIDHDR_KIND}
+ * （"oidhdr"）时表示 openGauss 的 9.2 式元组头 oid（[t_hoff-4,t_hoff) 垫区内）——
+ * 值注入值行槽 0、不占 natts 与 null 位、零数据区消耗，值行长度 = natts+1，使 OG 的
+ * pg_class/pg_namespace 值行槽位与 V17/V18 的 oid 数据列口径对齐。V17/V18 词典不含
+ * 该 kind，解码行为零变化。</p>
  *
  * <p><b>v2 词典扩容（Task 7 硬前置①）</b>：date/time/timetz/timestamptz/uuid/numeric
  * 六 kind 以<b>磁盘 datum 原始字节</b>交付（date=byte[4] i32 天、time/timestamptz=
@@ -48,6 +54,15 @@ public final class TupleDecoder {
 
     /** HeapTupleHeader 的 t_bits 偏移（offsetof(HeapTupleHeaderData, t_bits)=23）。 */
     private static final int TUPLE_BITS_OFFSET = 23;
+
+    /**
+     * 虚拟前导词典 kind（Task 7 OG 适配）：占词典首位的"9.2 式元组头 oid"槽——
+     * 值取自 [t_hoff-4,t_hoff) 的垫区（不占 natts/null 位/数据区消耗），注入值行
+     * 槽 0 使 OG 的 catalog 值行槽位与 V17/V18 的 oid 数据列口径对齐。仅
+     * openGauss 档的 pg_class / pg_namespace 解码词典使用（经 CatalogReplay 的
+     * classDecodeKinds / NspRow.kinds(layout) 拼装），V17/V18 词典不含本 kind。
+     */
+    public static final String OIDHDR_KIND = "oidhdr";
 
     /** 短外部 varlena 指针 tag（VARATT_IS_1B_E：首字节恰为 0x01，vartag 随后）。 */
     private static final int VARLENA_TAG_1B_EXTERNAL = 0x01;
@@ -177,30 +192,43 @@ public final class TupleDecoder {
     private Object[] decodeTupleData(byte[] src, int tupleStart, int tHoff, int infomask, int infomask2, String[] kinds) {
         int natts = infomask2 & HEAP_NATTS_MASK;
         boolean hasNull = (infomask & HEAP_HASNULL) != 0;
+        // OG 档虚拟前导槽（Task 7）：词典首位 "oidhdr" 表示 9.2 式元组头 oid（
+        // [t_hoff-4,t_hoff)——落在位图与数据区之间的垫区内，本方法可见字节内），
+        // 不占 natts、不占 null 位、零数据区消耗；值行长度 = natts + 1 且槽 0 = oid，
+        // 使下游槽位镜像与 V17/V18 的 oid 数据列口径对齐
+        boolean hdrOid = kinds.length > 0 && OIDHDR_KIND.equals(kinds[0]);
+        int dictCols = kinds.length - (hdrOid ? 1 : 0);
+        int base = hdrOid ? 1 : 0;
+        if (natts > dictCols) {
+            throw new IllegalStateException("tuple has " + natts + " atts but dictionary has " + dictCols);
+        }
         byte[] bitmap = null;
         if (hasNull) {
             bitmap = new byte[(natts + 7) / 8];
             System.arraycopy(src, tupleStart + TUPLE_BITS_OFFSET, bitmap, 0, bitmap.length);
         }
-        if (natts > kinds.length) {
-            throw new IllegalStateException("tuple has " + natts + " atts but dictionary has " + kinds.length);
+        Object[] vals = new Object[natts + base];
+        if (hdrOid) {
+            // 元组头 oid：t_hoff-4 起 u32（9.2 式 HeapTupleHeader 末成员——垫区内，
+            // 三入口（载荷/页内/entry）的 tupleStart+tHoff 即数据区起点，倒退 4B 即 oid）
+            vals[0] = u32(src, tupleStart + tHoff - 4) & 0xFFFFFFFFL;
         }
-        Object[] vals = new Object[natts];
         int c = tupleStart + tHoff;
         for (int i = 0; i < natts; i++) {
             if (bitmap != null && (bitmap[i / 8] & (1 << (i % 8))) == 0) {
-                vals[i] = null;
+                vals[i + base] = null;
                 continue;
             }
-            switch (kinds[i]) {
-                case "int2" -> { c = tupleStart + align(c - tupleStart, 2); vals[i] = (short) u16(src, c); c += 2; }
-                case "int4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i] = u32(src, c); c += 4; }
-                case "int8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i] = u64(src, c); c += 8; }
-                case "oid" -> { c = tupleStart + align(c - tupleStart, 4); vals[i] = u32(src, c) & 0xFFFFFFFFL; c += 4; }
-                case "float4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i] = Float.intBitsToFloat(u32(src, c)); c += 4; }
-                case "float8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i] = Double.longBitsToDouble(u64(src, c)); c += 8; }
-                case "bool" -> { vals[i] = src[c] != 0; c += 1; }
-                case "char" -> { vals[i] = "'" + (char) (src[c] & 0x7F); c += 1; }
+            switch (kinds[i + base]) {
+                case "int1" -> { vals[i + base] = src[c]; c += 1; }   // OG 独有（relcmprs/attcmprmode/attkvtype）
+                case "int2" -> { c = tupleStart + align(c - tupleStart, 2); vals[i + base] = (short) u16(src, c); c += 2; }
+                case "int4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i + base] = u32(src, c); c += 4; }
+                case "int8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i + base] = u64(src, c); c += 8; }
+                case "oid" -> { c = tupleStart + align(c - tupleStart, 4); vals[i + base] = u32(src, c) & 0xFFFFFFFFL; c += 4; }
+                case "float4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i + base] = Float.intBitsToFloat(u32(src, c)); c += 4; }
+                case "float8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i + base] = Double.longBitsToDouble(u64(src, c)); c += 8; }
+                case "bool" -> { vals[i + base] = src[c] != 0; c += 1; }
+                case "char" -> { vals[i + base] = "'" + (char) (src[c] & 0x7F); c += 1; }
                 case "name" -> {   // NameData：定宽 64B，NUL 截断
                     c = tupleStart + align(c - tupleStart, 4);
                     int n = 64;
@@ -211,33 +239,33 @@ public final class TupleDecoder {
                         }
                     }
                     // 显式 UTF-8：与 spike 平台默认字符集的有意差异（跨环境确定性）
-                    vals[i] = new String(src, c, n, StandardCharsets.UTF_8);
+                    vals[i + base] = new String(src, c, n, StandardCharsets.UTF_8);
                     c += 64;
                 }
                 case "timestamp" -> {   // i64 微秒，epoch 2000 起点
                     c = tupleStart + align(c - tupleStart, 8);
-                    vals[i] = renderTimestamp(u64(src, c));
+                    vals[i + base] = renderTimestamp(u64(src, c));
                     c += 8;
                 }
-                case "text" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i] = readTextDatum(src, c, next); c = next[0]; }
-                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i] = readDatumBytes(src, c, next); c = next[0]; }
+                case "text" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i + base] = readTextDatum(src, c, next); c = next[0]; }
+                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i + base] = readDatumBytes(src, c, next); c = next[0]; }
                 case "date" -> {   // i32 天（epoch 2000-01-01）——datum 原始字节，解读在渲染矩阵
                     c = tupleStart + align(c - tupleStart, 4);
-                    vals[i] = slice(src, c, 4);
+                    vals[i + base] = slice(src, c, 4);
                     c += 4;
                 }
                 case "time", "timestamptz" -> {   // i64 微秒——datum 原始字节
                     c = tupleStart + align(c - tupleStart, 8);
-                    vals[i] = slice(src, c, 8);
+                    vals[i + base] = slice(src, c, 8);
                     c += 8;
                 }
                 case "timetz" -> {   // i64 微秒 + i32 区偏移，共 12B——datum 原始字节
                     c = tupleStart + align(c - tupleStart, 8);
-                    vals[i] = slice(src, c, 12);
+                    vals[i + base] = slice(src, c, 12);
                     c += 12;
                 }
                 case "uuid" -> {   // 16B 网络序，'c' 对齐（1 字节）——datum 原始字节
-                    vals[i] = slice(src, c, 16);
+                    vals[i + base] = slice(src, c, 16);
                     c += 16;
                 }
                 case "skip" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; skipVarlena(src, c, next); c = next[0]; }
