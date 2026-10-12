@@ -496,22 +496,33 @@ final class OgParityBaseline {
      * （值截 64 附原长/NULL 字面/列序权威 TableMeta/BEFORE·AFTER 缺位 {@code -}），
      * 但攒进内存列表而非 CDC logger。
      *
-     * <p>线程约束：单写者（wal-receiver 线程回调）；{@link #blocks()} 在 WalSource
-     * close（含接收线程 join）之后调用——happens-before 经线程结束建立。</p>
+     * <p><b>2PC 元数据面（T7 增）</b>：{@link #begins()} 逐块保留 {@code BatchBegin}
+     * 强类型事件（twoPhase/gid）——基准路 proto v1 无两阶段帧族，PREPARE→COMMIT
+     * PREPARED 在逻辑路以普通 B..C 块出现（解码推迟到 COMMIT PREPARED 时点，
+     * og-plan 2026-10-12 实测锚：prepared xid 的块出现在更晚的普通事务块之后、
+     * ROLLBACK PREPARED 零帧），故 {@code assertParity} 的块模型不含 kind/gid
+     * （归一化裁定：基准路 NORMAL ↔ wal 路 TWO_PHASE+gid 是同一服务端事务的两侧
+     * 表述），两阶段语义断言走本方法的事件面。</p>
+     *
+     * <p>线程约束：单写者（wal-receiver 线程回调）；{@link #blocks()} 与
+     * {@link #begins()} 在 WalSource close（含接收线程 join）之后调用——
+     * happens-before 经线程结束建立。</p>
      */
     static final class WalCapture implements ChangeOutputListener {
 
         private final List<OgBlock> done = new ArrayList<>();
+        private final List<BatchBegin> begins = new ArrayList<>();
         private Pending cur;
 
         /**
-         * 批量回放开始：开待决桶缓存头字段（commitLsn/commitTs 双路对齐面；kind/gid
-         * 不入块——基准路 proto v1 恒 NORMAL/null，两阶段对拍是 T7+ 面记档）。
+         * 批量回放开始：开待决桶缓存头字段（commitLsn/commitTs 双路对齐面）+ 强类型
+         * 头事件入 {@link #begins}（2PC 场景的 kind/gid 断言面，见类 javadoc）。
          *
          * @param begin 事务头事件
          */
         @Override
         public void onBegin(BatchBegin begin) {
+            begins.add(begin);
             cur = new Pending(begin.xid(), begin.commitLsn(), begin.commitTs());
         }
 
@@ -561,6 +572,16 @@ final class OgParityBaseline {
          */
         List<OgBlock> blocks() {
             return List.copyOf(done);
+        }
+
+        /**
+         * 逐块头事件快照（须在 WalSource close 之后调用）——2PC 场景的 twoPhase/gid
+         * 断言面（块模型不含 kind/gid 的归一化裁定见类 javadoc）。
+         *
+         * @return BatchBegin 事件（出现序，与 {@link #blocks()} 一一对应）
+         */
+        List<BatchBegin> begins() {
+            return List.copyOf(begins);
         }
 
         /**
