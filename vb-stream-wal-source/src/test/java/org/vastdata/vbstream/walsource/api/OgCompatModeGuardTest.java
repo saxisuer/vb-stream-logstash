@@ -20,27 +20,30 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * openGauss 档启动期兼容模式护栏的离线测试（M2 Task 1）——OG 档 DML 面请求在场时探测
- * 库级 {@code pg_database.datcompatibility}，<strong>非 PG 档 ISE</strong>（附档位与
- * M3/M4 指引），两块断言面：
+ * openGauss 档启动期兼容模式护栏的离线测试（M2 Task 1 落地，M3 Task 3 白名单放宽
+ * {'PG'} → {'PG','A'}）——OG 档 DML 面请求在场时探测库级
+ * {@code pg_database.datcompatibility}，<strong>白名单外档位 ISE</strong>（附档位与
+ * M4 指引），两块断言面：
  * <ol>
- *   <li><b>档位判定面</b>（{@code WalSource.isPgCompatMode}，伪 JDBC 脚本化
- *       {@link #DATCOMPAT_QUERY}）：'PG' 白名单放行；'A'（Oracle 风格）/ 'B'（MySQL
- *       风格）/ 'C'（PG 兼容历史别名——og-plan 实测 5.0.0 仍接受建库且存储值与 'PG'
- *       相异，未在 M2 验证面）判定非 PG 档；探测不可判定（无行/null/空白值/探测
+ *   <li><b>档位判定面</b>（{@code WalSource.isDmlSupportedCompatMode}，伪 JDBC 脚本化
+ *       {@link #DATCOMPAT_QUERY}）：'PG'/'A'（Oracle 风格，M3 起支持——A 档原生分区
+ *       DML 面经 pg_partition 第四字典捕获）白名单放行；'B'（MySQL 风格，M4）/
+ *       'C'（PG 兼容历史别名——og-plan 实测 5.0.0 仍接受建库且存储值与 'PG' 相异，
+ *       未验证）判定非支持档；探测不可判定（无行/null/空白值/探测
  *       SQLException）<strong>fail-open 放行</strong>——护栏是兼容性预检不是正确性
- *       锚，可判定的 A/B 档照 ISE，不可判定面静默砖死启动不如 WARN 放行。</li>
- *   <li><b>全路径 fail-fast 面</b>（伪 Driver 顶替 DriverManager，复用
+ *       锚，可判定的 B/'C' 档照 ISE，不可判定面静默砖死启动不如 WARN 放行。</li>
+ *   <li><b>全路径面</b>（伪 Driver 顶替 DriverManager，复用
  *       {@link OgWalSourceConfigTest} 的脚本化设施）：Main 形态（listener + dml 缺省
- *       true）在 'A' 档库上 start() 抛 ISE——消息含档位值与 M3/M4 指引，且护栏先于
- *       槽副作用（槽查询未被触达）；'PG' 档放行 + DML 面装配的断言面在
- *       {@link OgWalSourceConfigTest} 的 ⑤ 反转用例。</li>
+ *       true）在 'B' 档库上 start() 抛 ISE——消息含档位值与 M4 指引，且护栏先于
+ *       槽副作用（槽查询未被触达）；'A' 档库（M3 放行）与 'PG' 档库（M2 放行，
+ *       {@link OgWalSourceConfigTest} ⑤ 反转用例）正常装配 DML 面。</li>
  * </ol>
  * 依据（og-plan 容器 2026-10-12 实测）：postgres 缺省库 {@code datcompatibility='A'}、
  * {@code CREATE DATABASE m2pg DBCOMPATIBILITY 'PG'} 库为 {@code 'PG'}——PG 档的表示
  * 形态即 'PG' 单值（空/NULL 不是 PG 档表示，归不可判定面）。M1 全部 OG IT 存活依据：
  * 护栏仅在 DML 面请求在场（listener + vb.wal.dml=true）时探测——catalog-only 形态
- * （无 listener 或显式 dml=false）与兼容模式无关（M1 IT 即跑在 'A' 缺省库上全绿）。
+ * （无 listener 或显式 dml=false）与兼容模式无关（M1 IT 即跑在 'A' 缺省库上全绿；
+ * M3 起 'A' 档库对 DML 面同样开门）。
  */
 class OgCompatModeGuardTest {
 
@@ -56,18 +59,22 @@ class OgCompatModeGuardTest {
     @TempDir
     Path walDir;
 
-    /** 可判定档位面：'PG' 白名单放行；'A'/'B'/'C' 判定非 PG 档（C 是 PG 兼容历史别名但未在 M2 验证面）。 */
+    /** 可判定档位面：'PG'/'A' 白名单放行（M3 起 A 档开门）；'B'/'C' 判定非支持档（C 是 PG 兼容历史别名但未验证）。 */
     @Test
     void definiteCompatModesResolveAgainstWhitelist() throws Exception {
         OgWalSourceConfigTest.FakeJdbc pg = OgWalSourceConfigTest.FakeJdbc.scripted()
                 .rows(DATCOMPAT_QUERY, new Object[] {"PG"}).build();
-        assertTrue(WalSource.isPgCompatMode(pg.connection()), "'PG' 档须放行（M2 支持面）");
+        assertTrue(WalSource.isDmlSupportedCompatMode(pg.connection()), "'PG' 档须放行（M2 支持面）");
         assertTrue(pg.executed.contains(DATCOMPAT_QUERY), "探测 SQL 形态锚（实现与测试字面一致）");
-        for (String mode : new String[] {"A", "B", "C"}) {
+        OgWalSourceConfigTest.FakeJdbc oracle = OgWalSourceConfigTest.FakeJdbc.scripted()
+                .rows(DATCOMPAT_QUERY, new Object[] {"A"}).build();
+        assertTrue(WalSource.isDmlSupportedCompatMode(oracle.connection()),
+                "'A' 档须放行（M3 起 Oracle 风格档开门——postgres 缺省库即此档）");
+        for (String mode : new String[] {"B", "C"}) {
             OgWalSourceConfigTest.FakeJdbc jdbc = OgWalSourceConfigTest.FakeJdbc.scripted()
                     .rows(DATCOMPAT_QUERY, new Object[] {mode}).build();
-            assertFalse(WalSource.isPgCompatMode(jdbc.connection()),
-                    "'" + mode + "' 档须判定非 PG（A=M3 / B=M4 / C 历史别名未验证）");
+            assertFalse(WalSource.isDmlSupportedCompatMode(jdbc.connection()),
+                    "'" + mode + "' 档须判定非支持（B=M4 / C 历史别名未验证）");
         }
     }
 
@@ -76,30 +83,77 @@ class OgCompatModeGuardTest {
     void undeterminableProbeFailsOpen() throws Exception {
         OgWalSourceConfigTest.FakeJdbc noRow = OgWalSourceConfigTest.FakeJdbc.scripted()
                 .rows(DATCOMPAT_QUERY).build();
-        assertTrue(WalSource.isPgCompatMode(noRow.connection()), "无行（pg_database 查不到当前库）按不可判定放行");
+        assertTrue(WalSource.isDmlSupportedCompatMode(noRow.connection()), "无行（pg_database 查不到当前库）按不可判定放行");
         OgWalSourceConfigTest.FakeJdbc nullValue = OgWalSourceConfigTest.FakeJdbc.scripted()
                 .rows(DATCOMPAT_QUERY, new Object[] {null}).build();
-        assertTrue(WalSource.isPgCompatMode(nullValue.connection()), "null 档位值按不可判定放行");
+        assertTrue(WalSource.isDmlSupportedCompatMode(nullValue.connection()), "null 档位值按不可判定放行");
         OgWalSourceConfigTest.FakeJdbc blank = OgWalSourceConfigTest.FakeJdbc.scripted()
                 .rows(DATCOMPAT_QUERY, new Object[] {" "}).build();
-        assertTrue(WalSource.isPgCompatMode(blank.connection()), "空白档位值按不可判定放行");
-        assertTrue(WalSource.isPgCompatMode(probeThrowingConnection()),
+        assertTrue(WalSource.isDmlSupportedCompatMode(blank.connection()), "空白档位值按不可判定放行");
+        assertTrue(WalSource.isDmlSupportedCompatMode(probeThrowingConnection()),
                 "探测 SQLException（权限/瞬断）按不可判定放行——fail-open 优于静默砖死启动");
     }
 
     /**
-     * Main 形态（listener 在场 + vb.wal.dml 缺省 true）在 'A' 档库上 start() 启动期 ISE：
-     * 消息含档位值与 M3/M4 指引，且护栏先于槽副作用——槽存在性查询未被触达（FakeJdbc
-     * 未脚本面一经调用即 AssertionError，本用例显式断言槽查询缺席）。
+     * Main 形态（listener 在场 + vb.wal.dml 缺省 true）在 'A' 档库上 start() 正常装配
+     * DML 面（M3 Task 3 放行——白名单 {'PG','A'}）：探测 SQL 真实下发（护栏在装配
+     * 路径上）+ start 正常返回 + {@code dmlEnabled()} 保持 true。脚本面与
+     * {@link OgWalSourceConfigTest} ⑤ 的 PG 档放行用例同构（state 预置 pgVersion=5
+     * 检查点走续传，绕开引导的 OG 内部 SQL 适配）。
      */
     @Test
-    void ogStartWithDmlListenerOnNonPgCompatDatabaseFailsFastBeforeSlotSideEffects() throws Exception {
+    void ogStartWithDmlListenerOnACompatDatabaseAssemblesDmlFace() throws Exception {
         long storedLsn = 0x10028L;
         new StateStore(stateDir, 5).checkpoint(new CatalogStores(), storedLsn);
         OgWalSourceConfigTest.FakeJdbc jdbc = OgWalSourceConfigTest.FakeJdbc.scripted()
                 .rows("SELECT current_setting('server_version_num')", new Object[] {"90204"})
                 .rows("SELECT version()", new Object[] {"(openGauss 5.0.0 build abc) compiled at 2023"})
                 .rows(DATCOMPAT_QUERY, new Object[] {"A"})
+                .rows("SELECT current_setting('server_version_num')::int", new Object[] {"90204"})
+                .rows(OgWalSourceConfigTest.SLOT_QUERY, new Object[] {"0/10000"})
+                .build();
+        Driver real = DriverManager.getDriver("jdbc:postgresql://localhost:5432/postgres");
+        Driver fake = OgWalSourceConfigTest.proxyDriver(jdbc);
+        DriverManager.deregisterDriver(real);
+        DriverManager.registerDriver(fake);
+        Properties cfg = new Properties();
+        cfg.setProperty(WalSource.KEY_OG_RX_MODE, "external");
+        cfg.setProperty(WalSource.KEY_OG_RX_DIR, walDir.toString());
+        cfg.setProperty(WalSource.KEY_STATE_DIR, stateDir.toString());
+        ChangeOutputListener noop = new ChangeOutputListener() {
+            @Override public void onBegin(ChangeOutputListener.BatchBegin begin) { }
+            @Override public void onRow(ChangeOutputListener.RowChange row) { }
+            @Override public void onEnd(ChangeOutputListener.BatchEnd end) { }
+            @Override public void onAborted(ChangeOutputListener.BatchAborted aborted) { }
+        };
+        WalSource source = new WalSource(cfg, noop);
+        try {
+            source.start();
+            assertTrue(jdbc.executed.contains(DATCOMPAT_QUERY),
+                    "A 档放行也须先探测库级兼容模式（护栏在装配路径上）");
+            assertTrue(source.dmlEnabled(),
+                    "'A' 档库上 DML listener 须正常装配（M3 放行——白名单 {'PG','A'}）");
+        } finally {
+            source.close();
+            DriverManager.deregisterDriver(fake);
+            DriverManager.registerDriver(real);
+        }
+    }
+
+    /**
+     * Main 形态（listener 在场 + vb.wal.dml 缺省 true）在 'B' 档库上 start() 启动期 ISE
+     * （M2 Task 1 用例的 M3 连动——原 'A' 档输入面随白名单放宽换 'B'）：消息含档位值
+     * 与 M4 指引，且护栏先于槽副作用——槽存在性查询未被触达（FakeJdbc 未脚本面一经
+     * 调用即 AssertionError，本用例显式断言槽查询缺席）。
+     */
+    @Test
+    void ogStartWithDmlListenerOnBCompatDatabaseFailsFastBeforeSlotSideEffects() throws Exception {
+        long storedLsn = 0x10028L;
+        new StateStore(stateDir, 5).checkpoint(new CatalogStores(), storedLsn);
+        OgWalSourceConfigTest.FakeJdbc jdbc = OgWalSourceConfigTest.FakeJdbc.scripted()
+                .rows("SELECT current_setting('server_version_num')", new Object[] {"90204"})
+                .rows("SELECT version()", new Object[] {"(openGauss 5.0.0 build abc) compiled at 2023"})
+                .rows(DATCOMPAT_QUERY, new Object[] {"B"})
                 .build();
         Driver real = DriverManager.getDriver("jdbc:postgresql://localhost:5432/postgres");
         Driver fake = OgWalSourceConfigTest.proxyDriver(jdbc);
@@ -118,11 +172,11 @@ class OgCompatModeGuardTest {
         WalSource source = new WalSource(cfg, noop);
         try {
             IllegalStateException ise = assertThrows(IllegalStateException.class, source::start,
-                    "'A' 档库 + DML 面请求在场须启动期 ISE（M2 仅支持 PG 兼容模式库）");
-            assertTrue(ise.getMessage().contains("datcompatibility=A"),
+                    "'B' 档库 + DML 面请求在场须启动期 ISE（M4 支持面——白名单 {'PG','A'}）");
+            assertTrue(ise.getMessage().contains("datcompatibility=B"),
                     "ISE 消息须含实际档位值: " + ise.getMessage());
-            assertTrue(ise.getMessage().contains("M3") && ise.getMessage().contains("M4"),
-                    "ISE 消息须附 M3（A 档）/ M4（B 档）里程碑指引: " + ise.getMessage());
+            assertTrue(ise.getMessage().contains("M4"),
+                    "ISE 消息须附 M4（B 档）里程碑指引: " + ise.getMessage());
             assertFalse(jdbc.executed.stream().anyMatch(sql -> sql.contains("pg_replication_slots")),
                     "护栏须先于槽副作用（槽查询未被触达）");
         } finally {

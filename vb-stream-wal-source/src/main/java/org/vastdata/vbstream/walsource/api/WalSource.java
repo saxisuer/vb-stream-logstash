@@ -48,7 +48,8 @@ import java.util.function.LongSupplier;
  * （M2 Task 1 撤销 M1 的 WARN 降级——{@code ogCatalogOnly} 位退役；listener 在场且
  * dml 开着时 postApply/pendingFloor 经 startOg 注入 sink 惰性串接 ChangeStream）+
  * <strong>库级兼容模式护栏</strong>（DML 面请求在场时探测 {@code pg_database.
- * datcompatibility}，可判定的非 PG 档启动期 ISE 附档位与 M3/M4 指引；探测不可判定
+ * datcompatibility}，白名单 {'PG','A'}——M3 起 'A' 档[Oracle 风格]放行；可判定的
+ * 白名单外档位['B'/'C']启动期 ISE 附档位与 M4 指引；探测不可判定
  * WARN 放行——catalog 面与兼容模式无关，M1 OG IT 即在 'A' 档缺省库全绿）；
  * 观测面（consumedLsn/metrics/terminalFailure/检查点/槽推进）经同步器同源透传。</p>
  *
@@ -451,19 +452,21 @@ public final class WalSource implements AutoCloseable {
 
     /**
      * openGauss 5.0.0 档装配分支（M1 Task 6 落地，M2 Task 1 增 DML 面装配 + 兼容模式
-     * 护栏，spec 2026-10-12 §1）：判别命中 OG 布局后由 {@link #start()} 转入——SQL 会话
-     * 已建（URL 前缀按 {@code vb.wal.og.jdbc.prefix} 分流），此后委派
-     * {@link CatalogSynchronizer#startOg}（槽 OG 变体 → state 决策 → bootstrap →
-     * 字节源装配）。
+     * 护栏，M3 Task 3 白名单放宽 {'PG'} → {'PG','A'}）：判别命中 OG 布局后由
+     * {@link #start()} 转入——SQL 会话已建（URL 前缀按 {@code vb.wal.og.jdbc.prefix}
+     * 分流），此后委派 {@link CatalogSynchronizer#startOg}（槽 OG 变体 → state 决策
+     * → bootstrap → 字节源装配）。
      *
-     * <p>关键步骤：①<strong>兼容模式护栏（M2 Task 1）</strong>——DML 面请求在场
-     * （{@link #dmlEnabled()}：listener + vb.wal.dml=true）时先探测库级
-     * {@code pg_database.datcompatibility}（{@link #queryDbCompatMode}），可判定的非
-     * PG 档启动期 ISE（附档位值与 M3/M4 里程碑指引）；不可判定（无行/空白值/探测
+     * <p>关键步骤：①<strong>兼容模式护栏（M2 Task 1，M3 Task 3 放宽）</strong>——DML
+     * 面请求在场（{@link #dmlEnabled()}：listener + vb.wal.dml=true）时先探测库级
+     * {@code pg_database.datcompatibility}（{@link #queryDbCompatMode}），可判定的
+     * 白名单外档位（'B'/'C'）启动期 ISE（附档位值与 M4 里程碑指引——白名单
+     * {@link #OG_DML_COMPAT_MODES} = {'PG','A'}）；不可判定（无行/空白值/探测
      * SQLException）WARN 放行。护栏只在 DML 面请求时探测的依据：不兼容面是 DML 解码
-     * 语义（三档分区表实现不同，spec §0），catalog 同步面与兼容模式无关——M1 全部
-     * OG IT 即跑在 'A' 档的 postgres 缺省库上全绿（og-plan 实测 datcompatibility 值：
-     * postgres='A'、DBCOMPATIBILITY 'PG' 库='PG'）；显式 {@code -Dvb.wal.dml=false}
+     * 语义（三档分区表实现不同，spec §0——'A' 档原生分区已随 M3 pg_partition 第四
+     * 字典捕获），catalog 同步面与兼容模式无关——M1 全部 OG IT 即跑在 'A' 档的
+     * postgres 缺省库上全绿（og-plan 实测 datcompatibility 值：postgres='A'、
+     * DBCOMPATIBILITY 'PG' 库='PG'）；显式 {@code -Dvb.wal.dml=false}
      * 等价声明 catalog-only 意图，不 ISE。②DML 面与 PG 17/18 路同构装配（M1 的
      * WARN 降级形态已废）：{@code dmlEnabled()} 时 postApply（惰性 ChangeStream 的
      * onRecord）与 pendingFloor（待决桶下界供应者）经 startOg 注入 sink——先施加
@@ -475,17 +478,17 @@ public final class WalSource implements AutoCloseable {
      *
      * @param layout 判别出的 openGauss 布局描述符
      * @throws SQLException 槽管理/引导查询失败
-     * @throws IllegalStateException DML 面请求在场且库级兼容模式可判定为非 PG 档
+     * @throws IllegalStateException DML 面请求在场且库级兼容模式可判定为白名单外档位（'B'/'C'）
      */
     private void startOpenGauss(WalLayout layout) throws SQLException {
         if (dmlEnabled()) {
             String compat = queryDbCompatMode(sqlConnection);
-            if (compat != null && !OG_PG_COMPAT_MODE.equals(compat)) {
-                throw new IllegalStateException("openGauss 档 DML 面仅支持 PG 兼容模式库: 当前库 "
+            if (compat != null && !OG_DML_COMPAT_MODES.contains(compat)) {
+                throw new IllegalStateException("openGauss 档 DML 面仅支持 PG/A 兼容模式库: 当前库 "
                         + "datcompatibility=" + compat
-                        + "（A 档=Oracle 风格支持属 M3、B 档=MySQL 风格属 M4、C 档为 PG 兼容"
-                        + "历史别名但未在 M2 验证面——请以 DBCOMPATIBILITY 'PG' 建库；仅需 "
-                        + "catalog 同步面可 -Dvb.wal.dml=false 显式声明，catalog 面与兼容模式无关）");
+                        + "（B 档=MySQL 风格支持属 M4、C 档为 PG 兼容历史别名未验证——请以 "
+                        + "DBCOMPATIBILITY 'PG' 或 'A' 建库；仅需 catalog 同步面可 "
+                        + "-Dvb.wal.dml=false 显式声明，catalog 面与兼容模式无关）");
             }
             if (compat == null) {
                 LOG.warn("openGauss 库级兼容模式探测不可判定（无行/空值/探测失败）——护栏按放行处理"
@@ -757,19 +760,21 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * openGauss 兼容模式 PG 档白名单值（M2 Task 1，og-plan 容器 2026-10-12 实测钉死）：
-     * {@code CREATE DATABASE ... DBCOMPATIBILITY 'PG'} 库的 {@code pg_database.
-     * datcompatibility} 列恰回 {@code "PG"} 单值；'A'=Oracle 风格（postgres 缺省库
-     * 即此档）、'B'=MySQL 风格、'C'=PG 兼容历史别名（5.0.0 仍接受建库且存储值与
-     * 'PG' 相异，未在 M2 验证面）。
+     * openGauss DML 面兼容模式白名单（M2 Task 1 落地 {'PG'}，M3 Task 3 放宽为
+     * {'PG','A'}；档位值域 og-plan 容器 2026-10-12 实测钉死）：{@code CREATE
+     * DATABASE ... DBCOMPATIBILITY 'PG'} 库的 {@code pg_database.datcompatibility}
+     * 列恰回 {@code "PG"} 单值；'A'=Oracle 风格（postgres 缺省库即此档，M3 起支持
+     * ——A 档原生分区的 DML 捕获经 pg_partition 第四字典落地）；'B'=MySQL 风格
+     * （M4）；'C'=PG 兼容历史别名（5.0.0 仍接受建库且存储值与 'PG' 相异，未验证
+     * ——维持白名单外，ISE 附 M4 指引）。
      */
-    static final String OG_PG_COMPAT_MODE = "PG";
+    static final Set<String> OG_DML_COMPAT_MODES = Set.of("PG", "A");
 
     /**
      * 查当前库的 openGauss 兼容模式档位（护栏的探测面，M2 Task 1）。
      *
      * <p>关键步骤：单行查询 {@code pg_database.datcompatibility}（探测 SQL 以 og-plan
-     * 实测钉死——见 {@link #OG_PG_COMPAT_MODE} javadoc 的档位值域）；无行、null 或
+     * 实测钉死——见 {@link #OG_DML_COMPAT_MODES} javadoc 的档位值域）；无行、null 或
      * 空白值归一化为 null（不可判定面——OG 对各档的表示形态已实测，空/NULL 不是
      * PG 档表示）；SQLException 捕获后 WARN 并归 null（护栏是兼容性预检不是正确性
      * 锚，探测瞬断静默砖死启动不如放行可观测）。边界：连接须已建立（start 装配线程
@@ -795,16 +800,18 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * 当前库是否 PG 兼容档（{@link #queryDbCompatMode} 的判定面，供护栏与离线测试）：
-     * 'PG' 白名单放行；可判定的其他档位（'A'/'B'/'C'）false；不可判定（探测失败/空值）
-     * true——fail-open 语义，与 startOpenGauss 护栏分支一致。
+     * 当前库是否 DML 面支持的兼容档（{@link #queryDbCompatMode} 的判定面，供护栏与
+     * 离线测试；M2 Task 1 落地，M3 Task 3 白名单放宽）：白名单
+     * {@link #OG_DML_COMPAT_MODES} = {'PG','A'} 放行；可判定的白名单外档位
+     * （'B'/'C'）false；不可判定（探测失败/空值）true——fail-open 语义，与
+     * startOpenGauss 护栏分支一致。
      *
      * @param connection 已建立的 SQL 会话
-     * @return true = PG 档或不可判定（放行）；false = 可判定的非 PG 档
+     * @return true = 白名单档（'PG'/'A'）或不可判定（放行）；false = 可判定的白名单外档位
      */
-    static boolean isPgCompatMode(Connection connection) {
+    static boolean isDmlSupportedCompatMode(Connection connection) {
         String mode = queryDbCompatMode(connection);
-        return mode == null || OG_PG_COMPAT_MODE.equals(mode);
+        return mode == null || OG_DML_COMPAT_MODES.contains(mode);
     }
 
     /**

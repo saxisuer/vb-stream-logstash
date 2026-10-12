@@ -64,8 +64,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class OgWalSourceConfigTest {
 
-    /** 槽存在性查询语句（vanilla/OG 共用——pg_replication_slots 视图两系同形）。 */
-    private static final String SLOT_QUERY =
+    /** 槽存在性查询语句（vanilla/OG 共用——pg_replication_slots 视图两系同形；包可见供 {@link OgCompatModeGuardTest} 放行用例脚本化）。 */
+    static final String SLOT_QUERY =
             "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = ? AND slot_type = 'physical'";
 
     /** 检查点目录（startOg 续传路径用例的落盘面）。 */

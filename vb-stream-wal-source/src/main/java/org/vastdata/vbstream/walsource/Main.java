@@ -51,9 +51,9 @@ public final class Main {
 
     /**
      * 冒烟入口：收集配置 → 起门面（DML 面默认开——OutputRenderer 注入；openGauss 档
-     * 起库级兼容模式护栏——非 PG 兼容档库启动期 ISE 附档位与 M3/M4 指引，PG 档库
-     * DML 面与 PG 17/18 路同构装配，M2 Task 1；仅 catalog 形态可
-     * {@code -Dvb.wal.dml=false} 显式声明）→ 周期统计行循环 → hook 优雅停。
+     * 起库级兼容模式护栏——白名单 {'PG','A'} 外档位库启动期 ISE 附档位与 M4 指引，
+     * 'PG'/'A' 档库 DML 面与 PG 17/18 路同构装配，M2 Task 1 / M3 Task 3 放宽；仅
+     * catalog 形态可 {@code -Dvb.wal.dml=false} 显式声明）→ 周期统计行循环 → hook 优雅停。
      *
      * <p>关键步骤：① 六键 + state 三键 + v2 两键（tables/dml）逐一
      * {@code System.getProperty} 非 null 才入 Properties（null 不覆盖门面默认值）；

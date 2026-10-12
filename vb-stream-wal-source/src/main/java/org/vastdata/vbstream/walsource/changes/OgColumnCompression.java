@@ -115,8 +115,10 @@ final class OgColumnCompression {
      * <p>边界与异常语义：mode 未注册（含 0x7F）抛 ISE 附 mode；DELTA 落在
      * attlen&lt;=0 列抛 ISE（压缩侧只对定宽数字列选 DELTA）；DELTA bytes&gt;7 抛
      * ISE；PREFIX len=0 抛 ISE（空前缀不构成压缩，C 侧 Assert）；meta 越界抛
-     * 数组越界（上游页/MULTI_INSERT 走读不变量已保证压缩区自洽）。线程约束：
-     * 纯读，并发安全。</p>
+     * 数组越界（上游页/MULTI_INSERT 走读不变量已保证压缩区自洽）。已知不校验
+     * {@code deltaBytes <= attlen}（差值宽于列宽属格式错位，C 侧由构造期不变量
+     * 隐含）——列存场景待未来项[接线语境已实证消失——M2 T4 行存不可达三源实证]。
+     * 线程约束：纯读，并发安全。</p>
      *
      * @param meta   压缩头字节（MULTI_INSERT 压缩区或页 special 区内容）
      * @param off    本列 meta 起点
@@ -221,7 +223,9 @@ final class OgColumnCompression {
 
     /**
      * NUMSTR 的 meta 占位（该 mode meta 区仅 1B mode 字节，无专属区——测试与
-     * 未来走列装配的便捷面）。
+     * 未来走列装配的便捷面）。已知 attlen 校验旁路（便捷面不接列词典，NUMSTR
+     * 应仅落 -1/-2 数字串列的口径由调用方自负）——列存场景待未来项[接线语境
+     * 已实证消失——M2 T4 行存不可达三源实证]。
      *
      * @return mode=CMPR_NUMSTR 的单字节 meta 产物
      */
@@ -273,7 +277,10 @@ final class OgColumnCompression {
      * 基值按 attlen 宽小端有符号读出，相加后按宽度两补截断回 attlen 字节。类型
      * 表（g_number_types）：int8(20)/int2(21)/int4(23)/oid(26)/date(1082)/
      * time(1083)/timestamp(1114)/timestamptz(1184)/time_stamp(12089)——宽度语义
-     * 由 attlen 承载（2/4/8 字节），表外 oid ISE。</p>
+     * 由 attlen 承载（2/4/8 字节），表外 oid ISE。已知 bytes==0 分支先于
+     * typeOid==0（dropped 列）检查返回——dropped 列在此形态得基值字节而非 null
+     * （与 bytes&gt;0 分支的 null 语义不一致，走列推进不受影响）——列存场景待
+     * 未来项[接线语境已实证消失——M2 T4 行存不可达三源实证]。</p>
      *
      * @throws IllegalStateException typeOid 不在数字类型表且非 0（dropped）
      */
