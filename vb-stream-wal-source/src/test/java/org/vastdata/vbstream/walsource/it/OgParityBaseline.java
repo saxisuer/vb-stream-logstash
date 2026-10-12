@@ -59,17 +59,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       {@code 'u'}=unchanged-TOAST 哨兵</li>
  * </ul>
  *
- * <p><b>A 档值面方言归一化（M3 T5 实测锚，og-plan 2026-10-13）</b>：A 档（Oracle 风格）
- * 库的 date 输出函数带零时段后缀（{@code '2026-10-07'::date::text} 渲
- * {@code 2026-10-07 00:00:00}；PG 档渲 {@code 2026-10-07}）——其余 16 类型两档文本
+ * <p><b>A 档值面差异（M3 T5 实测锚 + fix round 1 探针修正，og-plan 2026-10-13）</b>：
+ * A 档（Oracle 风格）库的 <b>date 列底层 timestamp 化</b>——DDL 关键字 {@code date}
+ * 映射 atttypid=1114（{@code pg_type} 实查 typlen=8，时段完整存储、整秒粒度；PG 档
+ * 恒 1082/4B 日粒度且带时段输入<b>静默截断为日</b>）。因此 wal 直解路对 A 档 date 列
+ * 按列 typeOid 走 <b>timestamp 渲染</b>（{@code DiskValueRenderer} 的 typeOid 分派
+ * ——时段零真值损失）、基准路 't' 值经服务端 timestamp_out 同形，<b>双路天然逐字节
+ * 一致，无需任何归一化</b>（专项钉 {@code OgDmlParityIT.aCompatDateColumnKeeps
+ * TimeOfDayViaTimestampStorageParity}）；经类型直引的 catalog-date 列
+ * （{@code pg_catalog.date}，oid 1082 在 A 档库仍可建列）实测渲 PG 同形
+ * {@code 2026-10-07}（零时段后缀属 timestamp 列专属，非 date 输出函数方言）——
+ * date 家族双档双路径<b>全程零分叉</b>，归一化器无 A 档分支。其余 16 类型两档文本
  * 逐字面全等（float/numeric/time/timetz/timestamp(tz)/bool/bytea/uuid/json 矩阵
- * 双档对拍实测）。wal 直解路的 {@code DiskValueRenderer} 按 PG text 渲磁盘 datum
- * （spec §2 不动面），基准路 't' 值经服务端输出函数随库档位走——<b>date 列在 A 档
- * 是同一磁盘 datum（i32 epoch-2000 天）的两种方言文本</b>。归一化：A 档
- * {@link Normalizer} 对 date 列的 't' 值剥 {@code " 00:00:00"} 后缀（后缀缺席即原样
- * 保留、日期面逐字节比对不降强——值错误照常 diff 红）。主代码渲染面的 OG 方言分支
- * （wal 路对 A 档渲 Oracle 形态）按 M2 先例记档延期（本归一化是测试层的等价收敛，
- * 非对拍放宽）。</p>
+ * 双档对拍实测）。</p>
  *
  * <p><b>时序契约（spike 坑 2/3）</b>：publication 必须先于被解码事务存在、
  * {@code publication_names} 槽选项必传——IT 固定时序：建 publication → 建逻辑槽 → 写
@@ -101,9 +103,6 @@ final class OgParityBaseline {
 
     /** 值渲染截断阈值（对齐 {@code OutputRenderer}/engine ConsoleRenderer 的 64 字符规则）。 */
     private static final int VALUE_TRUNCATE_LIMIT = 64;
-
-    /** date 类型的 pg_type oid（R 帧列 typeId 携带——A 档方言归一化的分派键，见类 javadoc）。 */
-    private static final int OID_DATE = 1082;
 
     /** 私有构造器：静态工具面，不可实例。 */
     private OgParityBaseline() {
@@ -231,7 +230,7 @@ final class OgParityBaseline {
             OgTestEnv.CompatMode mode) throws SQLException {
         String url = OgTestEnv.sqlJdbcUrl(mode.database())
                 + "?replication=database&assumeMinServerVersion=9.4&ApplicationName=" + APP_NAME;
-        Normalizer n = new Normalizer(mode == OgTestEnv.CompatMode.A);
+        Normalizer n = new Normalizer();
         try (Connection c = DriverManager.getConnection(url, OgTestEnv.PARITY_ROLE,
                 OgTestEnv.PARITY_ROLE_PASSWORD)) {
             PGReplicationStream stream = c.unwrap(PGConnection.class).getReplicationAPI()
@@ -311,13 +310,6 @@ final class OgParityBaseline {
         private final Map<Integer, Relation> relations = new LinkedHashMap<>();
         private Pending cur;
 
-        /** A 档方言归一化开关（{@code CompatMode.A} 的 capture 构造期定格，见类 javadoc）。 */
-        private final boolean aCompatDialect;
-
-        Normalizer(boolean aCompatDialect) {
-            this.aCompatDialect = aCompatDialect;
-        }
-
         /**
          * 单帧分发：类型字节路由到 B/R/I/U/D/C 六个已锚定分支，其余（'T' truncate、
          * 两阶段族、未知）抛 ISE 显式拒绝——M2 对拍面外形态静默吞会产出缺行假绿。
@@ -393,14 +385,13 @@ final class OgParityBaseline {
             b.get();   // replica-identity 字节（'d'/'f'——渲染面不用，'K'/'O' 已携带实际身份）
             int ncols = b.getShort();
             List<String> cols = new ArrayList<>(ncols);
-            List<Integer> typeOids = new ArrayList<>(ncols);
             for (int i = 0; i < ncols; i++) {
                 b.get();   // 列 flags Int8（1=复制身份列——渲染按 'K' 段实际形态走，不消费）
                 cols.add(cstring(b));
-                typeOids.add(b.getInt());   // typeId（A 档 date 方言归一化的分派键，类 javadoc）
+                b.getInt();   // typeId
                 b.getInt();   // typmod
             }
-            relations.put(relId, new Relation(ns + "." + rel, cols, typeOids));
+            relations.put(relId, new Relation(ns + "." + rel, cols));
         }
 
         /**
@@ -438,7 +429,7 @@ final class OgParityBaseline {
          * @param rel   表身份（relId 解析；null 即 ISE——R 帧缺位属帧序破坏）
          * @param after 新元组列值
          */
-        private String renderRow(String dml, Relation rel, List<TupCol> after) {
+        private static String renderRow(String dml, Relation rel, List<TupCol> after) {
             return renderRow(dml, rel, (char) 0, null, after);
         }
 
@@ -454,7 +445,7 @@ final class OgParityBaseline {
          * @param old       旧元组列值（null = 无旧段）
          * @param neu       新元组列值（DELETE 传 null）
          */
-        private String renderRow(String dml, Relation rel, char oldKind, List<TupCol> old,
+        private static String renderRow(String dml, Relation rel, char oldKind, List<TupCol> old,
                 List<TupCol> neu) {
             assertTrue(rel != null, "行帧先于关系 R 帧（relId 未解析）——帧序破坏");
             return "%s %s BEFORE=%s AFTER=%s".formatted(dml, rel.qualified,
@@ -471,34 +462,33 @@ final class OgParityBaseline {
          * @param skipAbsent 'K' 段形态（'n' = 缺席占位而非 NULL）
          * @return tuple 文本
          */
-        private String tupleOf(List<TupCol> cols, Relation rel, boolean skipAbsent) {
+        private static String tupleOf(List<TupCol> cols, Relation rel, boolean skipAbsent) {
             List<String> parts = new ArrayList<>();
             for (int i = 0; i < rel.columns.size() && i < cols.size(); i++) {
                 TupCol col = cols.get(i);
                 if (skipAbsent && col.kind == 'n') {
                     continue;
                 }
-                parts.add(rel.columns.get(i) + "=" + valueOf(col, rel.typeOids.get(i)));
+                parts.add(rel.columns.get(i) + "=" + valueOf(col));
             }
             return parts.toString();
         }
 
         /**
          * 单列值文本：'n'→NULL 字面、'u'→{@link ToastAssembler#UNCHANGED_TOAST_TEXT}
-         * （与 wal 直解路的哨兵渲染同形）、't'→（A 档先做 date 方言归一化）文本截断。
+         * （与 wal 直解路的哨兵渲染同形）、't'→文本截断。
          *
-         * @param col    解析列值
-         * @param typeOid 列类型 oid（A 档方言归一化分派键）
+         * @param col 解析列值
          * @return 列值文本
          */
-        private String valueOf(TupCol col, int typeOid) {
+        private static String valueOf(TupCol col) {
             if (col.kind == 'n') {
                 return "NULL";
             }
             if (col.kind == 'u') {
                 return ToastAssembler.UNCHANGED_TOAST_TEXT;
             }
-            String s = aCompatDialect ? normalizeACompatDialect(typeOid, col.text) : col.text;
+            String s = col.text;
             return s.length() > VALUE_TRUNCATE_LIMIT
                     ? s.substring(0, VALUE_TRUNCATE_LIMIT) + "...(" + s.length() + "B)"
                     : s;
@@ -554,24 +544,6 @@ final class OgParityBaseline {
             }
             return sb.toString().trim();
         }
-    }
-
-    /**
-     * A 档值面方言归一化（类 javadoc"A 档值面方言归一化"段的实现）：date 列（oid 1082）
-     * 的基准路文本剥零时段后缀 {@code " 00:00:00"}——A 档 date 输出函数带此时段后缀
-     * （Oracle 风格），与 wal 路按 PG text 渲同一磁盘 datum 分叉；后缀缺席即原样保留
-     * （PG 档形态/防御面——日期数字面照常参与逐字节比对，归一化不吞值错误）。其余类型
-     * 双档文本实测全等，直通。纯函数。
-     *
-     * @param typeOid 列类型 oid（R 帧 typeId）
-     * @param text    基准路 't' 原文
-     * @return 归一化文本（date 且带后缀时剥后缀；其余原样）
-     */
-    static String normalizeACompatDialect(int typeOid, String text) {
-        if (typeOid == OID_DATE && text.endsWith(" 00:00:00")) {
-            return text.substring(0, text.length() - " 00:00:00".length());
-        }
-        return text;
     }
 
     /**
@@ -802,8 +774,8 @@ final class OgParityBaseline {
     record OgBlock(long xid, long commitLsn, Instant commitTs, List<String> rows, long changes) {
     }
 
-    /** 归一化器的关系缓存条目：限定名 + 列名序列（列序权威）+ 逐列类型 oid（方言归一化键）。 */
-    private record Relation(String qualified, List<String> columns, List<Integer> typeOids) {
+    /** 归一化器的关系缓存条目：限定名 + 列名序列（列序权威）。 */
+    private record Relation(String qualified, List<String> columns) {
     }
 
     /** TupleData 单列解析值：kind（'t'/'n'/'u'）+ 文本（仅 't' 有值）。 */

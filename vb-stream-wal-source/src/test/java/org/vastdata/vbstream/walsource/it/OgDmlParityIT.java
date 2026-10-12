@@ -72,9 +72,12 @@ import static org.junit.jupiter.api.Assertions.fail;
  * （A 档 = Oracle 风格）整套重跑；<b>对拍断言零放宽</b>（两路仍按 xid 交集逐行 diff
  * 空，A 档 PG 档共用同一 assertParity 与全部字面断言）。A 档实测差异面（og-plan
  * 2026-10-13 双档矩阵对拍）：①{@code ''} 空串在 A 档入库即 NULL（服务端语义——两路
- * 同见 NULL，对拍天然吸收）；②date 输出函数带零时段后缀——基准路方言归一化收敛
- * （{@link OgParityBaseline} 类 javadoc"A 档值面方言归一化"段），其余 16 类型双档
- * 文本全等。槽名 A 档带 {@code _a} 后缀（物理槽是集群级对象，跨库重名会互踩清理面）。</p>
+ * 同见 NULL，对拍天然吸收）；②<b>date 列底层 timestamp 化</b>——A 档 DDL 把
+ * {@code date} 映射 atttypid=1114（8B 存时段，整秒粒度；PG 档 1082/4B 日粒度且带时段
+ * 输入静默截断），wal 路按列 typeOid 走 timestamp 渲染、基准路 timestamp_out 同形
+ * ——<b>时段零真值损失</b>，双路天然一致（专项钉 {@link #aCompatDateColumnKeepsTimeOfDayViaTimestampStorageParity}
+ * ——fix round 1 探针锚）；其余 16 类型双档文本全等。槽名 A 档带 {@code _a} 后缀
+ * （物理槽是集群级对象，跨库重名会互踩清理面）。</p>
  *
  * <p><b>空块语义（OG 分叉记档）</b>：OG pgoutput 对无已发布变更的事务（如 DDL）仍发
  * B..C 空块（vanilla PG 15+ 跳过空事务）——基准路 capture 的 expectedTxns 是 C 帧
@@ -385,6 +388,51 @@ class OgDmlParityIT {
             exec(conn, "DELETE FROM parity.t_types WHERE id = 3");
             conn.commit();
         });
+    }
+
+    /**
+     * 场景 2b（A 档专形，fix round 1 实测锚）：A 档 <b>date 列底层 timestamp 化</b>——
+     * DDL 关键字 {@code date} 映射 atttypid=1114（{@code pg_type} 实查 typlen=8；PG 档
+     * 恒 1082/4B 日粒度——og-plan 2026-10-13 探针）。三面钉：
+     * <ul>
+     *   <li><b>时段完整存储与渲染零损失</b>：{@code '2026-10-13 14:30:25'} 原样存取
+     *       ——wal 路按列 typeOid 1114 走 timestamp 渲染、基准路 timestamp_out 同形，
+     *       双路 diff 空 + wal 路字面含时段（对拍不吞值）；</li>
+     *   <li><b>整秒粒度锚</b>：微秒输入被服务端截断（Oracle DATE 语义——
+     *       {@code .123456} 存 {@code 14:30:25}）；</li>
+     *   <li><b>零时段形态</b>：纯日期值渲 {@code 00:00:00} 时段（timestamp 渲染恒
+     *       HH:MM:SS，与基准路 timestamp_out 同形）。</li>
+     * </ul>
+     * PG 档对照：date 列输入带时段<b>静默截断为日</b>（{@code '2026-10-13 14:30:25'}
+     * 存 {@code 2026-10-13}）——两档真语义分叉，故本用例仅 A 档（无 PG 孪生）。
+     */
+    @Test
+    void aCompatDateColumnKeepsTimeOfDayViaTimestampStorageParity() throws Exception {
+        String[] ddl = {
+                "CREATE TABLE parity.t_adate (id int4 NOT NULL, d date, PRIMARY KEY (id))",
+                "ALTER TABLE parity.t_adate REPLICA IDENTITY FULL",
+        };
+        List<OgBlock> blocks = runParity(OgTestEnv.CompatMode.A, "A 档 date 时段", "adate", ddl,
+                new String[]{"parity.t_adate"}, 1, 1, 0, conn -> {
+                    conn.setAutoCommit(false);
+                    exec(conn, "INSERT INTO parity.t_adate VALUES (1, '2026-10-13 14:30:25')");
+                    exec(conn, "INSERT INTO parity.t_adate VALUES (2, DATE '2026-10-07')");
+                    exec(conn, "INSERT INTO parity.t_adate VALUES (3, '2026-10-13 14:30:25.123456')");
+                    exec(conn, "UPDATE parity.t_adate SET d = '2026-12-31 23:59:59' WHERE id = 1");
+                    conn.commit();
+                }).capture().blocks();
+        assertEquals(1, blocks.size(), "A 档 date 时段: 应恰一个事务块:\n" + blocks);
+        List<String> rows = blocks.get(0).rows();
+        assertEquals(4, rows.size(), "四行（3 I + 1 U）:\n" + rows);
+        assertEquals("INSERT parity.t_adate BEFORE=- AFTER=[id=1, d=2026-10-13 14:30:25]", rows.get(0),
+                "时段值应完整存取（wal 路 typeOid 1114 走 timestamp 渲染——零真值损失）");
+        assertEquals("INSERT parity.t_adate BEFORE=- AFTER=[id=2, d=2026-10-07 00:00:00]", rows.get(1),
+                "纯日期值渲 00:00:00 时段（timestamp 渲染恒 HH:MM:SS，与基准路 timestamp_out 同形）");
+        assertEquals("INSERT parity.t_adate BEFORE=- AFTER=[id=3, d=2026-10-13 14:30:25]", rows.get(2),
+                "微秒输入被服务端截断（Oracle DATE 整秒粒度锚）");
+        assertEquals("UPDATE parity.t_adate BEFORE=[id=1, d=2026-10-13 14:30:25]"
+                + " AFTER=[id=1, d=2026-12-31 23:59:59]", rows.get(3),
+                "UPDATE 前后像双含时段（FULL 身份整行前像）");
     }
 
     // ---- 场景 3：TOAST 三形态 + 重启 unchanged ----
