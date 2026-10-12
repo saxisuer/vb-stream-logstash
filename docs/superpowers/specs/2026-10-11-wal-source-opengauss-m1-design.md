@@ -65,7 +65,7 @@ walsender 死亡会触发 HA 状态机使整个实例退出；合法物理客户
 | `DirectWalSource` | receive | 新增 | v3 裸协议：`replication=true` startup（**md5 + OG sha256 挑战**——从 opengauss-jdbc 移植，sha256 是服务端默认不可回避）→ IDENTIFY_SYSTEM → xlogpos 段对齐 → START_REPLICATION [SLOT] → 'w'/'k' 解析 → 65B 'r' 反馈 + 心跳线程 → 断线重连 |
 | `CatalogBootstrap` | replay | 改动 | 种子 SQL 列单适配 OG 41/24 列；B 函数 `pg_current_xlog_location()`（无 flush 档） |
 | `CatalogReplay`/`CatalogSynchronizer` | replay | 改动 | 偏移全经 layout 取（现有模式）；三修正逻辑零改动；UStore/列存/bucket 识别后拒绝 |
-| `WalSource` 配置面 | api | 改动 | 新键：`vb.wal.og.source=file|direct`、`vb.wal.og.rx.mode=managed|external`、`vb.wal.og.rx.dir`、`vb.wal.og.rx.bin`（默认 pg_receivexlog） |
+| `WalSource` 配置面 | api | 改动 | 新键：`vb.wal.og.source=file|direct`、`vb.wal.og.rx.mode=managed|external`、`vb.wal.og.rx.dir`、`vb.wal.og.rx.bin`（默认 pg_receivexlog）（实施期另增第五键 `vb.wal.og.jdbc.prefix`，见 §0 勘误注记） |
 | `StateStore` | state | 改动 | pgVersion 校验面加 OG 档（formatVersion 兼容扩展） |
 
 `WalStreamWalker` 零改动：页头 24B、rem_len@16 与现代版同构；记录头 32B 走
@@ -141,4 +141,6 @@ write 位点起流在极端写入停顿下的表现；OG PRUNE 格式是唯一�
   包名无冲突共存）；测试增 Testcontainers 镜像 `opengauss/opengauss:5.0.0`（multi-arch 已确认）。
 - 配置键（openGauss 档增量）：`vb.wal.og.source`（默认 file）、`vb.wal.og.rx.mode`
   （默认 managed）、`vb.wal.og.rx.dir`（默认 wal-og-queue）、`vb.wal.og.rx.bin`
-  （默认 pg_receivexlog）。PG 17/18 档配置键与行为零变化。
+  （默认 pg_receivexlog）、`vb.wal.og.jdbc.prefix`（默认 `jdbc:postgresql:`——SQL 会话
+  驱动 URL 前缀分流，实施期 Task 6 增设，见 §0 勘误注记）。PG 17/18 档配置键与行为
+  零变化。
