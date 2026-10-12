@@ -1,6 +1,10 @@
 package org.vastdata.vbstream.walsource.replay;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.TupleBytes;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
@@ -301,6 +305,45 @@ class OgCatalogReplayTest {
         assertEquals(1, stores.classRows().size(), " astore 行应正常落字典");
     }
 
+    /**
+     * 用例 ⑩（Task 10 实修——OG 系统列合法下界）：tableoid（attnum -7）/
+     * xc_node_id（-8）的 pg_attribute 行 INS 施加不抛且<b>不打"疑似词典错位"
+     * WARN</b>——合法下界经 {@code og.attrMinSystemAttnum()}=-8 取（og-plan
+     * 容器 live 实查负 attnum 集 [-8,-1]，Task 9 审查 Minor-1 点名实修）；
+     * 系统列行按 attnum&lt;=0 口径不落字典。负对照：attnum=-9 仍 WARN——
+     * 真错位诊断信号不被本次放宽吞掉。
+     */
+    @Test
+    void ogSystemColumnsMinusSevenEightSkipWithoutMisalignmentWarn() {
+        Logger replayLogger = (Logger) LoggerFactory.getLogger(CatalogReplay.class);
+        ListAppender<ILoggingEvent> capture = new ListAppender<>();
+        capture.start();
+        replayLogger.addAppender(capture);
+        try {
+            CatalogStores stores = freshStores();
+            WalRecord ins = rec(ogRecord(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, 1,
+                    ATTR_RELNODE, 0, ogAttrTuple(-7).payload()).mainData(insertMain(1, false)).build());
+            assertDoesNotThrow(() -> replay.applyCatalogRecord(ins, stores),
+                    "tableoid（-7）是 OG 合法系统列——不得抛");
+            WalRecord ins2 = rec(ogRecord(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, 1,
+                    ATTR_RELNODE, 0, ogAttrTuple(-8).payload()).mainData(insertMain(2, false)).build());
+            assertDoesNotThrow(() -> replay.applyCatalogRecord(ins2, stores),
+                    "xc_node_id（-8）是 OG 合法系统列——不得抛");
+            assertTrue(capture.list.isEmpty(), "-7/-8 合法系统列不得打词典错位 WARN: " + capture.list);
+            assertFalse(stores.attrRows().containsKey(CatalogReplay.ctidKey(0, 1)), "系统列不落字典");
+            assertFalse(stores.attrRows().containsKey(CatalogReplay.ctidKey(0, 2)), "系统列不落字典");
+
+            capture.list.clear();
+            WalRecord bad = rec(ogRecord(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, 1,
+                    ATTR_RELNODE, 0, ogAttrTuple(-9).payload()).mainData(insertMain(3, false)).build());
+            assertDoesNotThrow(() -> replay.applyCatalogRecord(bad, stores));
+            assertEquals(1, capture.list.size(), "attnum=-9 越过 OG 下界仍须 WARN");
+            assertTrue(capture.list.get(0).getFormattedMessage().contains("疑似词典错位"));
+        } finally {
+            replayLogger.detachAppender(capture);
+        }
+    }
+
     // ---- 测试基建：OG 元组 DSL 与记录拼装 -----------------------------------------
 
     /**
@@ -407,6 +450,40 @@ class OgCatalogReplayTest {
             t.nullAt(35);
         }
         return t;
+    }
+
+    /**
+     * pg_attribute OG 词典（24 列）的 attnum 参数化元组 DSL——列序与值面同用例 ③
+     * （attnum 槽 5 / attisdropped 槽 14 / int1 独有列消耗），供系统列合法下界
+     * 用例（⑩）以 -7/-8/-9 反复构造。
+     *
+     * @param attnum attnum 列值（负值即系统列形态）
+     * @return 已写满全部列的 DSL
+     */
+    private TupleBytes ogAttrTuple(int attnum) {
+        return TupleBytes.of(og.pgAttributeKinds())
+                .oid(16389)          // attrelid
+                .name("v")           // attname
+                .oid(26)             // atttypid（oid 类型——tableoid/xc_node_id 实型）
+                .i32(-1)             // attstattarget（OG 位次：attnum 4）
+                .i2(-1)              // attlen
+                .i2(attnum)          // attnum（槽 5——参数面）
+                .i32(0)              // attndims
+                .i32(-1)             // attcacheoff
+                .i32(-1)             // atttypmod
+                .bool(true)          // attbyval
+                .ch('i')             // attalign
+                .ch('x')             // attstorage
+                .bool(true)          // attnotnull
+                .bool(false)         // atthasdef
+                .bool(false)         // attisdropped（槽 14）
+                .bool(true)          // attislocal
+                .i1(0)               // attcmprmode（int1，OG 独有）
+                .i32(0)              // attinhcount（OG int4）
+                .oid(0)              // attcollation
+                .nullAt(19, 20, 21)  // attacl/attoptions/attfdwoptions
+                .skipVarlena("m")    // attinitdefval
+                .i1(0);              // attkvtype（int1，OG 独有）
     }
 
     /**

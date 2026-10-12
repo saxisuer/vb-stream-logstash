@@ -635,8 +635,10 @@ public final class CatalogReplay {
                     // pg_attribute 的负 attnum INS 与种子查询的过滤口径一致，Task 13）
                     stores.attrRows().put(ev.newCtid(), row);
                     stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
-                } else if (row.attnum() == 0 || row.attnum() < -6) {
-                    // 解码异常指示：合法系统列 attnum ∈ [-6,-1]，越界值意味着词典/字节错位
+                } else if (row.attnum() == 0 || row.attnum() < layout.attrMinSystemAttnum()) {
+                    // 解码异常指示：合法系统列 attnum ∈ [下界,-1]（vanilla -6 / OG -8，经
+                    // layout 取——Task 10 实修：OG 的 tableoid/xc_node_id 是 -7/-8 合法列），
+                    // 越界值意味着词典/字节错位
                     LOG.warn("pg_attribute 行解码异常 attnum={}（attrelid={} attname={}）——疑似词典错位",
                             row.attnum(), row.attrelid(), row.attname());
                 }

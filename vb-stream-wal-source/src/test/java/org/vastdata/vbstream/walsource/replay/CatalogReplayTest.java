@@ -1,5 +1,8 @@
 package org.vastdata.vbstream.walsource.replay;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.Test;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.TupleBytes;
@@ -13,6 +16,8 @@ import org.vastdata.vbstream.walsource.layout.WalRecordParser;
 import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
 import java.util.List;
+
+import org.slf4j.LoggerFactory;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -447,6 +452,37 @@ class CatalogReplayTest {
         assertTrue(stores.attrRows().isEmpty());
         assertEquals(1L, stores.metrics().get(CatalogStores.CatalogMetrics.SKIPPED_TRUNCATED),
                 "attr 侧截断 skip 须计入 skippedTruncated");
+    }
+
+    /**
+     * 用例 6b（Task 10 实修的 vanilla 零回归锚）：系统列 attnum 诊断下界经 layout 取
+     * ——V18 档 tableoid=-6 是合法系统列（PG 12+ 删 oid 系统列后重编号，PG 18 实查
+     * 负 attnum 集 [-6,-1]），INS 施加不抛且不打"疑似词典错位"WARN、行不落字典；
+     * attnum=-7 在 vanilla 档越过下界仍须 WARN（OG 的 tableoid 位次，vanilla 视角
+     * 是错位信号——本用例钉死 OG 放宽不稀释 vanilla 诊断面）。
+     */
+    @Test
+    void vanillaSystemColumnMinusSixPassesWhileMinusSevenStillWarns() {
+        Logger replayLogger = (Logger) LoggerFactory.getLogger(CatalogReplay.class);
+        ListAppender<ILoggingEvent> capture = new ListAppender<>();
+        capture.start();
+        replayLogger.addAppender(capture);
+        try {
+            CatalogStores stores = freshStores();
+            WalRecord ins = rec(insertRecord(ATTR_RELNODE, 0, 1, attrTuple(100, "tableoid", 26, -6, false).payload()));
+            assertDoesNotThrow(() -> replay.applyCatalogRecord(ins, stores),
+                    "vanilla tableoid（-6）是合法系统列——不得抛");
+            assertTrue(capture.list.isEmpty(), "-6 合法系统列不得打词典错位 WARN: " + capture.list);
+            assertFalse(stores.attrRows().containsKey(CatalogReplay.ctidKey(0, 1)), "系统列不落字典");
+
+            capture.list.clear();
+            WalRecord bad = rec(insertRecord(ATTR_RELNODE, 0, 2, attrTuple(100, "bogus", 26, -7, false).payload()));
+            assertDoesNotThrow(() -> replay.applyCatalogRecord(bad, stores));
+            assertEquals(1, capture.list.size(), "vanilla 档 attnum=-7 越过下界仍须 WARN");
+            assertTrue(capture.list.get(0).getFormattedMessage().contains("疑似词典错位"));
+        } finally {
+            replayLogger.detachAppender(capture);
+        }
     }
 
     /**

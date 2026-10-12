@@ -432,6 +432,23 @@ public interface WalLayout {
     }
 
     /**
+     * pg_attribute 系统列 attnum 的合法下界（含）。
+     *
+     * <p>消费面：{@code CatalogReplay} 的 attr 行事件诊断——attnum==0 或低于本下界
+     * 即"疑似词典错位"WARN（真错位信号；合法负 attnum 系统列行不落字典、不告警）。
+     * 数值随方言分叉（两档均 live 实查锚，2026-10-12）：vanilla PG 12+ 删 oid 系统
+     * 列后系统列重编号至 tableoid=-6（PG 18 实查 {@code t} 的负 attnum 集
+     * [-6,-1]）；openGauss 沿 9.2 系编号多两列——tableoid=-7、xc_node_id=-8
+     * （og-plan 容器实查 {@code public.t_corpus} 负 attnum 集 [-8,-1] 无 -2）。
+     * 缺省 -6＝V17/V18 现行 vanilla 口径，路径行为不变。</p>
+     *
+     * @return 合法系统列 attnum 下界（V17/18=-6，OG=-8）
+     */
+    default int attrMinSystemAttnum() {
+        return -6;
+    }
+
+    /**
      * walker 是否容忍<strong>整零页</strong>（页界遇整页全零且页头魔数不符 → 跳过整页
      * 计 zeroPageSkips，而非再同步/ISE）——Task 8 零页容忍门控面。
      *

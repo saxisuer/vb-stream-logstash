@@ -466,6 +466,14 @@ public final class WalLayoutVOpenGauss implements WalLayout {
         return 37;
     }
 
+    /** {@inheritDoc}——-8：OG 沿 9.2 系系统列编号，tableoid=-7、xc_node_id=-8
+     *  （og-plan 容器 live 实查 public.t_corpus 负 attnum 集 [-8,-1] 无 -2——
+     *  2026-10-12，Task 10 实修：CatalogReplay 词典错位 WARN 的合法下界）。 */
+    @Override
+    public int attrMinSystemAttnum() {
+        return -8;
+    }
+
     /** {@inheritDoc}——true（Task 8 零页容忍档）：pg_receivexlog 落盘段对服务端流内
      *  跳过的未初始化页/段尾零区以零填充补位（og-plan 容器 strace 实锚 write(8192B
      *  全零) 连发），file 通道 walker 页界撞整零页时跳过整页计 zeroPageSkips——
