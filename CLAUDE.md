@@ -119,7 +119,7 @@ java --add-opens java.base/jdk.internal.ref=ALL-UNNAMED \
 # org.vastdata.vbstream.reader.cdc；引擎 offset 默认落 data/reader-offsets.dat（已 gitignore）
 ```
 
-vb-stream-wal-source（WAL 直解源冒烟，前置同上 docker compose PG——物理复制零额外服务端配置，**DML 面需 wal_level=logical**[src/docker 已是]；**openGauss 5.0.0 档 M1 亦可用**——自有容器+认证+pg_hba 前提与快速开始见模块 README 的"openGauss 5.0.0 快速开始"节；详见其模块 CLAUDE.md/README）——配置全走 `-Dvb.wal.*` 十一基础键（host/port/db/user/pass/slot + state.dir/state.interval.ms/state.events + v2 DML 两键 `vb.wal.tables`[表白名单，空=全放行] / `vb.wal.dml`[默认 true，false 回纯 v1 catalog 形态]）+ OG 档五键 `vb.wal.og.source/rx.mode/rx.dir/rx.bin/jdbc.prefix`（仅 OG 档读取；默认 localhost:5432/postgres、槽 wal_source、state 禁用，全表见模块 README）：
+vb-stream-wal-source（WAL 直解源冒烟，前置同上 docker compose PG——物理复制零额外服务端配置，**DML 面需 wal_level=logical**[src/docker 已是]；**openGauss 5.0.0 档 M1 亦可用**——自有容器+认证+pg_hba 前提与快速开始见模块 README 的"openGauss 5.0.0 快速开始"节；详见其模块 CLAUDE.md/README）——配置三层合并（2026-10-12 起：工作目录 `walconfig.properties` 基础值[模板 `src/docker/walconfig-pg|og.properties`，键名与 -D 同形，白名单外键 WARN 忽略；`-Dvb.config=<路径>` 整份替换，缺文件 ISE] → `-Dvb.wal.*` 同键覆盖 → 默认值兜底），十一基础键（host/port/db/user/pass/slot + state.dir/state.interval.ms/state.events + v2 DML 两键 `vb.wal.tables`[表白名单，空=全放行] / `vb.wal.dml`[默认 true，false 回纯 v1 catalog 形态]）+ OG 档五键 `vb.wal.og.source/rx.mode/rx.dir/rx.bin/jdbc.prefix`（仅 OG 档读取；默认 localhost:5432/postgres、槽 wal_source、state 禁用，全表见模块 README）：
 
 ```bash
 mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt

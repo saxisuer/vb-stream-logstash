@@ -16,11 +16,16 @@ external 重组 / 2PC / engine `ConsoleRenderer` 格式复刻输出），并经*
 ```bash
 cd src/docker && docker compose up -d && cd ../..     # PG 18 @ localhost:55432
 mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+cp src/docker/walconfig-pg.properties ./walconfig.properties   # 配置文件形态（也可走下方 -D 形态）
 java -cp "vb-stream-wal-source/target/classes:$(cat vb-stream-wal-source/target/cp.txt)" \
-     -Dvb.wal.host=localhost -Dvb.wal.port=55432 \
-     -Dvb.wal.state.dir=/tmp/wal-source-state \
      org.vastdata.vbstream.walsource.Main
 ```
+
+**配置三层合并**（2026-10-12 起）：工作目录 `walconfig.properties` 基础值（键名与
+`-D` 参数完全同形——本 README 键表直接照抄；白名单外键 WARN 忽略）→ `-Dvb.wal.*`
+系统属性同键覆盖 → 门面默认值兜底。默认文件不存在即纯 `-D` 形态（与文件支持前行为
+一致）；`-Dvb.config=<路径>` 整份指定外部文件（指向不存在 fail-fast）。模板：
+`src/docker/walconfig-pg.properties`（本档）/ `walconfig-og.properties`（openGauss 档）。
 
 （macOS/Linux classpath 分隔符 `:`，Windows 为 `;`。无需 `--add-opens`——本模块零
 Chronicle 依赖。运行期每 10s 打一行 `smoke:` 周期统计 INFO——消费前沿 LSN + 计数器 +
@@ -35,11 +40,21 @@ M1 范围 = catalog 同步 + WAL 接收（**不含 DML 输出**，M2 范围）�
 ASTORE（UStore/列存/段页式/bucket 表识别即启动期 ISE），仅单机/无 replconninfo 形态。
 Main 冒烟默认注入的 DML 输出面在 OG 档**自动降级 catalog-only**（启动 WARN 一行——
 `vb.wal.dml` 无须显式置 false；M2 落地 DML 面后自动恢复）。
-起容器与运行：
+起容器与运行（配置文件形态——零 `-D`；Windows 宿主机无 pg_receivexlog，模板已选
+`direct` 通道）：
 
 ```bash
 docker run -d --name og-m1 -e GS_PASSWORD=openGauss@123 -p 15700:5432 opengauss/opengauss:5.0.0   # 等就绪 ~60s
 mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+cp src/docker/walconfig-og.properties ./walconfig.properties
+java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/cp.txt)" \
+     org.vastdata.vbstream.walsource.Main
+# （Windows classpath 分隔符 ';'，macOS/Linux 为 ':'；-Dvb.wal.* 同键可临时覆盖文件值）
+```
+
+等价的纯 `-D` 形态：
+
+```bash
 java -cp "vb-stream-wal-source/target/classes:$(cat vb-stream-wal-source/target/cp.txt)" \
      -Dvb.wal.port=15700 -Dvb.wal.user=gaussdb -Dvb.wal.pass=openGauss@123 \
      -Dvb.wal.og.jdbc.prefix=jdbc:opengauss: \

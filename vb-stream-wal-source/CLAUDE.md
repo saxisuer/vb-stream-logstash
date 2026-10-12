@@ -342,6 +342,14 @@ storage_type=ustore/segment=on）——护栏读区越界零填充段按不可�
 
 ## 配置面（`vb.wal.*` 十一基础键 + openGauss 档五键，`WalSource`/`StateConfig` 单一来源）
 
+**冒烟面三层合并**（2026-10-12 起，仅宿主层——`WalSource` 库 API 不动）：工作目录
+`walconfig.properties` 基础值（键名与 `-D` 参数完全同形；按十六键白名单过滤，白名单外
+键 WARN 忽略；文件/系统属性空串值均视为未设）→ `-Dvb.wal.*` 系统属性同键覆盖 → 门面
+构造器默认值兜底。默认文件不存在即纯 `-D` 形态（与文件支持前行为一致）；`-Dvb.config=
+<路径>` 整份替换默认查找（指向不存在/不可读/内容坏启动期 ISE fail-fast；该键是保留键
+不进门面配置）。实现在 `WalConfigFile`（顶层，与 `Main` 平级，模板
+`src/docker/walconfig-pg.properties` / `walconfig-og.properties`）。
+
 | 键 | 默认 | 语义 |
 |---|---|---|
 | `vb.wal.host` | `localhost` | PG 主机 |
@@ -373,7 +381,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**343 用例 = 离线 296 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
+**350 用例 = 离线 303 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
@@ -397,7 +405,9 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；`api` WalSourceConfigTest
   5 / OgWalSourceConfigTest 14（OG 五键解析/缺省值/IAE 面 + 全装配门面 README/Main
   形态 DML listener WARN 降级锚[伪 Driver 顶替 DriverManager 驱动 start() 全路径，
-  终审 I-1]）；ModuleBuildTest 1。
+  终审 I-1]）；顶层 WalConfigFileTest 7（2026-10-12 配置文件层——白名单过滤/空串
+  未设/缺文件空集与 vb.config fail-fast/保留键不入 props/Main 三层合并次序）；
+  ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
   `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
   REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 19（v2 双路对拍——engine

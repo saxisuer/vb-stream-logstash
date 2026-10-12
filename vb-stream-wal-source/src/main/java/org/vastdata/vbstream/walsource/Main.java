@@ -15,7 +15,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
- * WAL 直解源冒烟入口（接收形态，Task 9）：读 {@code -Dvb.wal.*} 配置起 {@link WalSource}，
+ * WAL 直解源冒烟入口（接收形态，Task 9）：读配置起 {@link WalSource}——三层合并
+ * （工作目录 {@code walconfig.properties} 基础值，2026-10-12 起 → {@code -Dvb.wal.*}
+ * 系统属性同键覆盖 → {@link WalSource} 构造器默认值兜底，见 {@link WalConfigFile}），
  * 主线程每 10s 打一行周期统计 INFO（消费前沿 + 计数器 + census 前 3 形态），Ctrl-C 经
  * shutdown hook 优雅 close。
  *
@@ -61,10 +63,11 @@ public final class Main {
      * 边界：主线程被中断（非 hook 路径）恢复中断位后主动 {@code source.close()} 兜底
      * （close 幂等——hook 再触发为 no-op）。</p>
      *
-     * @param args 未用（配置全部走 -D 系统属性）
+     * @param args 未用（配置：工作目录 walconfig.properties / -Dvb.config=<路径> /
+     *              -Dvb.wal.* 系统属性三层合并，见 {@link WalConfigFile}）
      */
     public static void main(String[] args) {
-        WalSource source = new WalSource(collectConfig(), new OutputRenderer());
+        WalSource source = new WalSource(collectConfig(WalConfigFile.loadBase()), new OutputRenderer());
         try {
             source.start();
         } catch (Exception e) {
@@ -102,15 +105,19 @@ public final class Main {
 
     /**
      * 收集 {@code vb.wal.*} 六键 + state 三键 + v2 两键（tables/dml）+ openGauss 档五键
-     * （M1 Task 6，spec §7）系统属性为门面配置。
+     * （M1 Task 6，spec §7）配置：文件层基础值 + 系统属性覆盖。
      *
-     * <p>关键步骤：逐键 {@code System.getProperty}，仅非 null 值入 Properties——缺键留给
+     * <p>关键步骤：文件层（{@link WalConfigFile#loadBase()} 已过白名单）整体打底 →
+     * 逐键 {@code System.getProperty} 覆盖（非 null 且非空串才入——空串视为未设，
+     * {@code -Dvb.wal.state.dir=} 语义与缺键同归默认禁用）→ 缺键留给
      * {@link WalSource} 构造器取默认值（单一默认值来源，Main 不复刻）。</p>
      *
+     * @param fileBase 文件层基础值（生产来自 WalConfigFile.loadBase，测试可注入）
      * @return 配置载体（可能只含部分键）
      */
-    private static Properties collectConfig() {
+    static Properties collectConfig(Properties fileBase) {
         Properties cfg = new Properties();
+        cfg.putAll(fileBase);
         copySysProp(WalSource.KEY_HOST, cfg);
         copySysProp(WalSource.KEY_PORT, cfg);
         copySysProp(WalSource.KEY_DB, cfg);
@@ -131,14 +138,15 @@ public final class Main {
     }
 
     /**
-     * 单键拷贝：系统属性存在才写入配置载体。
+     * 单键拷贝：系统属性存在且非空串才写入配置载体（空串视为未设——shell 传空与缺键
+     * 同归门面默认值，与文件层空串语义一致）。
      *
      * @param key 系统属性键（与门面配置键同形，{@code vb.wal.*}）
      * @param cfg 目标配置载体
      */
     private static void copySysProp(String key, Properties cfg) {
         String value = System.getProperty(key);
-        if (value != null) {
+        if (value != null && !value.isEmpty()) {
             cfg.setProperty(key, value);
         }
     }
