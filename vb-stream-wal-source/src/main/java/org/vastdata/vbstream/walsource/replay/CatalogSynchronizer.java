@@ -74,6 +74,12 @@ public final class CatalogSynchronizer {
 
     private static final Logger LOG = LoggerFactory.getLogger(CatalogSynchronizer.class);
 
+    /** pg_attribute 的固定 oid（pg_type.h 系统 oid——OG 映射目录段号直认面，relOidOf）。 */
+    private static final long PG_ATTRIBUTE_OID = 1249L;
+
+    /** pg_class 的固定 oid（同上——OG 映射目录段号直认面，relOidOf）。 */
+    private static final long PG_CLASS_OID = 1259L;
+
     private final CatalogStores stores;
     private final CatalogReplay replay;
 
@@ -1196,11 +1202,28 @@ public final class CatalogSynchronizer {
          * 形态），miss 再按 oid 直认（元数据形态）——两遍线性扫描，relfilenode 命中
          * 即止（同库引导下唯一，v1 块匹配同口径）。
          *
+         * <p><b>openGauss 映射目录接缝（M2 T7 修复 C）</b>：OG 的 pg_attribute/
+         * pg_class 两目录是 relation-mapped——pg_class 行的 relfilenode <b>列值为 0</b>，
+         * 物理段号只经 {@code pg_relation_filenode()} 可得（og-plan 实测锚：oid 1249/1259
+         * 行 relfilenode=0、filenode()=14294/14313），线性扫描对这两目录的物理段号恒
+         * miss——字典三表的 heap 记录在 {@code XactGrouper} 解析为未知关系且 miss 被缓存，
+         * 字典形态变更信号（如事务内 ADD COLUMN 的 attr 行）失效 TableMeta 缓存的面被
+         * 关死。故反查前先与引导期回填的两 watched 段号比对，命中直认固定 oid——vanilla
+         * 侧两段号与列值同源（引导回填即列值），命中返回同值，行为面零差异。</p>
+         *
          * @param relNodeOrOid relfilenode 或关系 oid
          * @return 关系 oid；字典无匹配 empty
          */
         @Override
         public OptionalLong relOidOf(long relNodeOrOid) {
+            if (relNodeOrOid != 0) {
+                if (relNodeOrOid == stores.pgAttrRelfilenode()) {
+                    return OptionalLong.of(PG_ATTRIBUTE_OID);
+                }
+                if (relNodeOrOid == stores.pgClassRelfilenode()) {
+                    return OptionalLong.of(PG_CLASS_OID);
+                }
+            }
             for (CatalogRow.ClassRow row : stores.classRows().values()) {
                 if (row.relfilenode() == relNodeOrOid) {
                     return OptionalLong.of(row.relOid());

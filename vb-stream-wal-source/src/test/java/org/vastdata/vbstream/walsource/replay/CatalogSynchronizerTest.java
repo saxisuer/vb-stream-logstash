@@ -314,6 +314,40 @@ class CatalogSynchronizerTest {
         assertEquals(Optional.empty(), snapshot.schemaOf(102), "relnamespace 无对应 nsp 行时 schemaOf 为 empty");
     }
 
+    /**
+     * 用例 9b（openGauss 映射目录接缝，M2 T7 修复 C 的离线锚）：OG 的 pg_attribute/
+     * pg_class 两目录 relation-mapped——pg_class 行的 relfilenode <b>列值为 0</b>、物理
+     * 段号只在引导期经 {@code pg_relation_filenode()} 回填进 watched 段号
+     * （og-plan 实测锚：oid 1249/1259 行列值 0、filenode 14294/14313）——relOidOf 的
+     * 线性扫描对物理段号恒 miss 会把字典三表 heap 记录解析为未知关系（XactGrouper 的
+     * TableMeta 缓存失效面被关死，事务内 DDL 后行解码 ISE）。断言：watched 段号命中
+     * 直认固定 oid；常规反查/oid 直认路径零回归。
+     */
+    @Test
+    void relOidOfResolvesMappedCatalogRelfilenodesViaWatchedSeam() {
+        CatalogStores stores = new CatalogStores();
+        // OG 形态：pg_attribute/pg_class 自身的 ClassRow relfilenode 列值 0（映射目录）
+        stores.classRows().put(CatalogReplay.ctidKey(0, 1),
+                new CatalogRow.ClassRow(1249, "pg_attribute", 11, 12, 0, 10, 0, 0, 0, "r"));
+        stores.classRows().put(CatalogReplay.ctidKey(0, 2),
+                new CatalogRow.ClassRow(1259, "pg_class", 11, 13, 0, 10, 0, 0, 0, "r"));
+        stores.classRows().put(CatalogReplay.ctidKey(0, 3),
+                new CatalogRow.ClassRow(100, "t1", 11, 14, 0, 10, 0, 200, 0, "r"));
+        stores.pgAttrRelfilenode(14294);
+        stores.pgClassRelfilenode(14313);
+        CatalogSynchronizer sync = new CatalogSynchronizer(stores,
+                new CatalogReplay(layout, new TupleDecoder(layout)));
+
+        CatalogSnapshot snapshot = sync.snapshot();
+        assertEquals(OptionalLong.of(1249L), snapshot.relOidOf(14294),
+                "映射目录物理段号经 watched 段号直认 pg_attribute oid（列值 0 的扫描盲区接缝）");
+        assertEquals(OptionalLong.of(1259L), snapshot.relOidOf(14313),
+                "pg_class 同形态直认");
+        assertEquals(OptionalLong.of(100L), snapshot.relOidOf(200), "常规 relfilenode 反查零回归");
+        assertEquals(OptionalLong.of(100L), snapshot.relOidOf(100), "oid 直认零回归");
+        assertEquals(OptionalLong.empty(), snapshot.relOidOf(9999), "未知段号仍 empty");
+    }
+
     // ---- 测试基建：记录拼装（CatalogReplayTest 同源转录，双源互证） ----------------
 
     /**
