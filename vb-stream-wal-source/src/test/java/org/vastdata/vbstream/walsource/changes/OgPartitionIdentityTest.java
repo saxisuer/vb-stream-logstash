@@ -9,6 +9,7 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.layout.WalRecordParser;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -113,7 +114,7 @@ class OgPartitionIdentityTest {
     @Test
     void ogPartitionToastExternalPointerReassemblesViaPartitionToastChunks() {
         Fixture fx = fixture();
-        byte[] value = "partition-toast-payload".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] value = "partition-toast-payload".getBytes(StandardCharsets.UTF_8);
         fx.toastChunks(100, 32902L, 777L, value, 7);
         byte[] tuple = TupleBytes.of("int4", "text")
                 .i32(1).externalTextPointer(value.length + 4, value.length, 0, 777L, PART_TOAST_REL)
