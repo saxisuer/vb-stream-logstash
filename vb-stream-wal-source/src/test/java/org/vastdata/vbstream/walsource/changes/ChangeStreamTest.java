@@ -270,7 +270,7 @@ class ChangeStreamTest {
             return feed(WalBytes.xactRecord(HeapOps.XLOG_XACT_COMMIT, xid, 2_000_000_000_000L, 0));
         }
 
-        /** toast 关系上的 chunk multi-insert（与 XactGrouperTest 同形）。 */
+        /** toast 关系上的 chunk multi-insert（与 XactGrouperTest 同形——datalen 只计 tail + SHORTALIGN 填充）。 */
         void toastChunks(int xid, long valueId, byte[] value, int chunkSize) {
             ByteArrayOutputStream data = new ByteArrayOutputStream();
             ByteArrayOutputStream m = new ByteArrayOutputStream();
@@ -289,8 +289,11 @@ class ChangeStreamTest {
                 put16(m, i + 1);
             }
             for (byte[] p : payloads) {
-                put16(data, p.length);
+                put16(data, p.length - 5);                      // datalen 只计 tail（真几何锚，M2 T7）
                 data.writeBytes(p);
+                if ((data.size() & 1) != 0) {
+                    data.write(0);                              // SHORTALIGN 填充（奇长 entry）
+                }
             }
             feed(WalBytes.record(HeapOps.RM_HEAP2_ID, HeapOps.XLOG_HEAP2_MULTI_INSERT, xid)
                     .block(0, SPC, DB, TOAST_REL, 0).data(data.toByteArray())

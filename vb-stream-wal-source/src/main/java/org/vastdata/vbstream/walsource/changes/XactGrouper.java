@@ -162,6 +162,16 @@ public final class XactGrouper {
     /** toast chunk 表的三列解码词典（chunk_id oid / chunk_seq int4 / chunk_data bytea）。 */
     private static final String[] TOAST_CHUNK_KINDS = {"oid", "int4", "bytea"};
 
+    /**
+     * MULTI_INSERT 块 data 单 entry 的头宽（openGauss M2 T7 修复 A）：{@code datalen u16}
+     * + {@code xl_heap_header 5B}——datalen <b>只计 tail</b>（t_len − offsetof(t_bits)），
+     * entry 总占 SHORTALIGN(7+datalen)（起点 2 对齐 + 奇长尾填充）。几何出处双源：
+     * CatalogReplay v1 走读（spike S1c 真 COPY 语料）+ T3 九条 OG 真 COPY 语料 185-entry
+     * 收口（OG==vanilla 同几何）；旧 walk 的 {@code 2+datalen}（datalen 含头自洽编码）在
+     * v2 对拍 IT 从未被真 COPY 记录覆盖——T3 concern 1 记档移交本修复。
+     */
+    private static final int MULTI_INSERT_ENTRY_HEADER = 7;
+
     /** 未决 2PC 挂起桶的 WARN 护栏阈值（正常业务挂起窗口秒级，持续增长 = 终态泄漏信号）。 */
     private static final int PREPARED_PENDING_WARN_THRESHOLD = 1000;
 
@@ -691,7 +701,9 @@ public final class XactGrouper {
 
     /**
      * heap2（RM_HEAP2）记录：仅 MULTI_INSERT 是行承载面（PRUNE 三态等与行发射无关，
-     * 属页维护）——命中用户表逐 entry 解码，toast 关系转 chunk 采集。
+     * 属页维护）——命中用户表逐 entry 解码，toast 关系转 chunk 采集。data 路径的 entry
+     * 几何见 {@link #MULTI_INSERT_ENTRY_HEADER}（datalen 只计 tail、步进
+     * SHORTALIGN(7+datalen)，M2 T7 修复 A）；FPI 镜像路径按 offsets 行指针走页内 tuple。
      *
      * @param rec heap2 记录
      */
@@ -715,18 +727,20 @@ public final class XactGrouper {
         HeapViews.MultiInsertView v = HeapViews.MultiInsertView.parse(rec, layout);
         if (blk.hasData()) {
             byte[] raw = rec.raw();
+            int end = blk.dataOff() + blk.dataLen();
             int off = blk.dataOff();
             for (int i = 0; i < v.ntuples(); i++) {
-                if (off + 2 > blk.dataOff() + blk.dataLen()) {
+                off = shortAlign(off);   // entry 起点 2 对齐（真几何锚，见 multiInsertEntry 步进注记）
+                if (off + MULTI_INSERT_ENTRY_HEADER > end) {
                     throw new IllegalStateException("multi_insert entry 越界: i=" + i);
                 }
                 int datalen = u16(raw, off);
-                if (off + 2 + datalen > blk.dataOff() + blk.dataLen()) {
+                if (off + MULTI_INSERT_ENTRY_HEADER + datalen > end) {
                     throw new IllegalStateException("multi_insert entry 越界: i=" + i + ", datalen=" + datalen);
                 }
                 appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
                         null, decoder.decodeEntry(raw, off, res.kinds()));
-                off += 2 + datalen;
+                off += MULTI_INSERT_ENTRY_HEADER + datalen;
             }
         } else {
             byte[] page = requireImage(rec, blk);
@@ -775,17 +789,19 @@ public final class XactGrouper {
         }
         HeapViews.MultiInsertView v = HeapViews.MultiInsertView.parse(rec, layout);
         byte[] raw = rec.raw();
+        int end = blk.dataOff() + blk.dataLen();
         int off = blk.dataOff();
         for (int i = 0; i < v.ntuples(); i++) {
-            if (off + 2 > blk.dataOff() + blk.dataLen()) {
+            off = shortAlign(off);   // entry 起点 2 对齐（真几何锚，见 multiInsertEntry 步进注记）
+            if (off + MULTI_INSERT_ENTRY_HEADER > end) {
                 throw new IllegalStateException("toast multi_insert entry 越界: i=" + i);
             }
             int datalen = u16(raw, off);
-            if (off + 2 + datalen > blk.dataOff() + blk.dataLen()) {
+            if (off + MULTI_INSERT_ENTRY_HEADER + datalen > end) {
                 throw new IllegalStateException("toast multi_insert entry 越界: i=" + i + ", datalen=" + datalen);
             }
             toast.onChunkRow(relNode, decoder.decodeEntry(raw, off, TOAST_CHUNK_KINDS));
-            off += 2 + datalen;
+            off += MULTI_INSERT_ENTRY_HEADER + datalen;
         }
     }
 
@@ -1323,6 +1339,17 @@ public final class XactGrouper {
      */
     private static int u16(byte[] b, int o) {
         return (b[o] & 0xFF) | ((b[o + 1] & 0xFF) << 8);
+    }
+
+    /**
+     * SHORTALIGN 到 2（MULTI_INSERT entry 起点/步进的对齐面——与 CatalogReplay v1 走读
+     * 的 {@code (cur + 1) & ~1} 同式，M2 T7 修复 A）。
+     *
+     * @param v 待对齐偏移
+     * @return 向上取整到偶数的偏移
+     */
+    private static int shortAlign(int v) {
+        return (v + 1) & ~1;
     }
 
     /**

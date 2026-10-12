@@ -477,6 +477,32 @@ class XactGrouperTest {
         assertEquals(1, fx.grouper.reconstructedTruncatedRows(), "重建观测计数恰一次");
     }
 
+    /**
+     * MULTI_INSERT data 路径的真几何 entry walk（openGauss M2 T7 修复 A 的离线锚，
+     * T3 concern 1 清账）：块 data 逐 entry {@code [datalen u16][xl_heap_header 5B]
+     * [tail datalen 字节]}、<b>起点 2 对齐、步进 SHORTALIGN(7+datalen)</b>——datalen
+     * 只计 tail（CatalogReplay v1 走读 + T3 九条真 COPY 语料 185-entry 双源钉死）。
+     * 构造首个 entry 的 7+datalen 为<b>奇数</b>（tail=6 → 13），步进若按旧 walk 的
+     * {@code 2+datalen=8} 或漏 2 对齐，第二条 entry 必错位（解出垃圾或 ISE）——
+     * 两行值全对才证明 walk 几何正确。真实 WAL 的对拍验收归 IT 的 COPY 场景
+     * （{@code OgDmlParityIT}——OgTestEnv CopyManager STDIN 形态）。
+     */
+    @Test
+    void multiInsertDataPathWalksShortalignEntryGeometry() {
+        Fixture fx = fixture();
+        fx.multiInsert(100, 0,
+                TupleBytes.of("int4", "text").i32(1).text("a").payload(),
+                TupleBytes.of("int4", "text").i32(2).text("bb").payload());
+        fx.commit(100);
+
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=2",
+                "ROW INSERT public.t_stream before=null after={id=1, name=a}",
+                "ROW INSERT public.t_stream before=null after={id=2, name=bb}",
+                "END xid=100 emitted=2 exp=2"), fx.listener.events,
+                "两 entry 全对才证明 SHORTALIGN(7+datalen) walk 几何（首 entry 奇长必经对齐填充）");
+    }
+
     /** TableMeta 缓存失效：pg_attribute 上的 heap 记录到达即全清缓存，DDL 后新列即时可见。 */
     @Test
     void catalogHeapRecordInvalidatesTableMetaCache() {
@@ -747,10 +773,21 @@ class XactGrouperTest {
             return feed(WalBytes.xactRecord(HeapOps.XLOG_XACT_ABORT, xid, COMMIT_MICROS, toplevel));
         }
 
-        /** toast 关系上的 chunk multi-insert（entry = [datalen u16][三列 payload]）。 */
+        /**
+         * 用户表 multi-insert（真几何 entry 流）：entry = {@code [datalen u16（只计 tail）]
+         * [xl_heap_header 5B][tail]}、entry 间按 SHORTALIGN(7+datalen) 显式补填充字节
+         * （真实 WAL 的注册块数据含对齐填充——M2 T7 修复 A 后 walk 按同几何消费）。
+         *
+         * @param xid      事务 id
+         * @param toplevel 顶层标记（0 = 无标记）
+         * @param payloads 逐 entry 的完整 payload（[xl_heap_header 5B][tail]）
+         */
+        void multiInsert(int xid, int toplevel, byte[]... payloads) {
+            feed(multiInsertRecord(HeapOps.RM_HEAP2_ID, USER_REL, xid, toplevel, payloads));
+        }
+
+        /** toast 关系上的 chunk multi-insert（entry 真几何同 {@link #multiInsert}——三列 chunk 行）。 */
         void toastChunks(int xid, long valueId, byte[] value, int chunkSize) {
-            ByteArrayOutputStream data = new ByteArrayOutputStream();
-            ByteArrayOutputStream m = new ByteArrayOutputStream();
             List<byte[]> payloads = new ArrayList<>();
             for (int off = 0, seq = 0; off < value.length; off += chunkSize, seq++) {
                 int len = Math.min(chunkSize, value.length - off);
@@ -759,19 +796,39 @@ class XactGrouperTest {
                 payloads.add(TupleBytes.of("oid", "int4", "bytea")
                         .oid(valueId).i32(seq).bytes(chunk).payload());
             }
+            feed(multiInsertRecord(HeapOps.RM_HEAP2_ID, TOAST_REL, xid, 0, payloads.toArray(byte[][]::new)));
+        }
+
+        /**
+         * MULTI_INSERT 记录拼装：main = [flags u8][pad u8][ntuples u16][offsets u16[]]，
+         * 块 data = 逐 entry 真几何（datalen 只计 tail + SHORTALIGN 显式填充）。
+         *
+         * @param rmid     资源管理器 id（RM_HEAP2_ID）
+         * @param relNode  目标关系 relfilenode
+         * @param xid      事务 id
+         * @param toplevel 顶层标记（0 = 无标记）
+         * @param payloads 逐 entry 的完整 payload
+         * @return 已喂入前的记录字节
+         */
+        private byte[] multiInsertRecord(int rmid, long relNode, int xid, int toplevel, byte[]... payloads) {
+            ByteArrayOutputStream data = new ByteArrayOutputStream();
+            ByteArrayOutputStream m = new ByteArrayOutputStream();
             m.write(0);                                         // flags u8@0
             m.write(0);                                         // C padding@1
-            put16(m, payloads.size());                          // ntuples u16@2
-            for (int i = 0; i < payloads.size(); i++) {
+            put16(m, payloads.length);                          // ntuples u16@2
+            for (int i = 0; i < payloads.length; i++) {
                 put16(m, i + 1);                                // offsets u16[]@4
             }
             for (byte[] p : payloads) {
-                put16(data, p.length);                          // entry 的 datalen 前缀
+                put16(data, p.length - 5);                      // datalen 只计 tail（真几何锚）
                 data.writeBytes(p);
+                if ((data.size() & 1) != 0) {
+                    data.write(0);                              // SHORTALIGN 填充（奇长 entry）
+                }
             }
-            feed(WalBytes.record(HeapOps.RM_HEAP2_ID, HeapOps.XLOG_HEAP2_MULTI_INSERT, xid)
-                    .block(0, SPC, DB, TOAST_REL, 0).data(data.toByteArray())
-                    .main(m.toByteArray()).build());
+            return WalBytes.record(rmid, HeapOps.XLOG_HEAP2_MULTI_INSERT, xid)
+                    .toplevel(toplevel).block(0, SPC, DB, relNode, 0).data(data.toByteArray())
+                    .main(m.toByteArray()).build();
         }
 
         private WalLayout layout() {
