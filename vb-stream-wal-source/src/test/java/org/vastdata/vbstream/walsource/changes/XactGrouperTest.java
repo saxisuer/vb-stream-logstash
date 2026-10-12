@@ -1,6 +1,11 @@
 package org.vastdata.vbstream.walsource.changes;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.TupleBytes;
@@ -528,6 +533,39 @@ class XactGrouperTest {
                         .findFirst().orElseThrow());
     }
 
+    /**
+     * 终审 I1 痕迹锚：字典 miss 的 heap 行（OG 分区 DML 的 relfilenode 落 pg_partition、
+     * v1 三表字典天然解析不到——即落此面）留下 <b>DEBUG 痕迹</b>：首次 miss 恰一条
+     * （含 relfilenode 与"分区"指涉），同 relfilenode 第二条记录走 TableMeta 缓存不再
+     * 重复打；miss 行不发射（fail-safe 跳过零变化）。ListAppender 挂 XactGrouper
+     * logger 断言（M1 捕获形态）。
+     */
+    @Test
+    void dictionaryMissHeapRowLeavesDebugTraceOncePerRelfilenode() {
+        Logger grouperLog = (Logger) LoggerFactory.getLogger(XactGrouper.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        grouperLog.addAppender(appender);
+        grouperLog.setLevel(Level.DEBUG);
+        try {
+            Fixture fx = fixture();
+            long unknownRel = 99901L;
+            fx.insertUnknownRel(100, unknownRel);   // 首次 miss：一条 DEBUG
+            fx.insertUnknownRel(100, unknownRel);   // 缓存命中：不重复打
+
+            List<String> traces = appender.list.stream()
+                    .filter(e -> e.getLevel() == Level.DEBUG)
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .filter(m -> m.contains(String.valueOf(unknownRel)))
+                    .toList();
+            assertEquals(1, traces.size(), "首次 miss 恰一条 DEBUG 痕迹（缓存后不重复），实得: " + traces);
+            assertTrue(traces.get(0).contains("分区"), "痕迹须指涉分区 DML 面，实得: " + traces.get(0));
+            assertTrue(fx.listener.events.isEmpty(), "miss 行不发射（fail-safe 跳过零变化）");
+        } finally {
+            grouperLog.detachAppender(appender);
+        }
+    }
+
     // ---- 测试基建 ----
 
     /**
@@ -594,6 +632,18 @@ class XactGrouperTest {
             byte[] main = new byte[3];
             return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, xid)
                     .toplevel(toplevel).block(0, SPC, DB, USER_REL, 0).data(payload).main(main).build());
+        }
+
+        /**
+         * 一条指定 relfilenode 上的用户表形态 INSERT（relfilenode 不在 stub 快照 =
+         * 字典 miss 面——OG 分区 DML 的 relfilenode 落 pg_partition 即此同构，终审
+         * I1 痕迹锚的最小输入）。
+         */
+        WalRecord insertUnknownRel(int xid, long relNode) {
+            byte[] payload = TupleBytes.of("int4", "text").i32(1).text("x").payload();
+            byte[] main = new byte[3];
+            return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, xid)
+                    .block(0, SPC, DB, relNode, 0).data(payload).main(main).build());
         }
 
         /** 一条 UPDATE（CONTAINS_OLD 前像在 main 尾、新元组在块 data）。 */

@@ -33,7 +33,9 @@ import java.util.Set;
  * relfilenode 全窗零命中——母表不在匹配面；分区子表按物理表独立匹配。V17/V18 的
  * 分区子表是 pg_class 'r' 行（独立 relname），白名单写子表全名即命中。OG 的分区
  * 仅在 pg_partition（无 pg_class/pg_attribute 行，列字典挂母表 oid）——不在 v1
- * 三表字典解析面，resolve 对分区 relfilenode 天然 fail-safe miss（静默跳过），
+ * 三表字典解析面，resolve 对分区 relfilenode 天然 fail-safe miss（有痕跳过：miss 的
+ * DEBUG 痕迹在调用方 {@code XactGrouper.resolveCached}、引导期的节流 WARN 在
+ * {@code CatalogBootstrap}——终审 I1），
  * "分区子表独立匹配白名单"在 OG 档的完整落地需 pg_partition 字典（M3/后续记档）。
  * V17/V18 路径（含两参兼容构造器）零变化。</p>
  *

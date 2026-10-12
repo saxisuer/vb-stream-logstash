@@ -275,7 +275,10 @@ public final class CatalogBootstrap {
      * <b>存储引擎护栏</b>（reldeltarelid/relcudescrelid/parttype/reloptions/
      * relbucket 五判别列，与 CatalogReplay 流内护栏同谓词）——库内已存在列存/
      * 段页式/bucket/UStore 表时种子期即 ISE（消息含 relname/oid）；分区母表
-     * （parttype='p'）放行入字典（M2 语义"不砖 + fail-safe 跳过"，与流内护栏同放宽）。
+     * （parttype='p'）放行入字典（M2 语义"不砖 + fail-safe 跳过"，与流内护栏同放宽），
+     * 且检出即打<b>整引导恰一行节流 WARN</b>（含母表计数与首张 relname——"有痕跳过"
+     * 承诺的 seed 期痕迹面，终审 I1；逐 relfilenode 的字典 miss 痕迹在 XactGrouper
+     * 的 DEBUG 面）。
      *
      * @param stores 状态容器
      * @return 灌入行数
@@ -285,6 +288,8 @@ public final class CatalogBootstrap {
     private int seedClassRows(CatalogStores stores) throws SQLException {
         boolean og = layout.openGaussDialect();
         int count = 0;
+        String firstPartitionParent = null;
+        int partitionParents = 0;
         try (Statement st = connection.createStatement();
              ResultSet rs = st.executeQuery(classSeedSql(layout))) {
             while (rs.next()) {
@@ -303,6 +308,12 @@ public final class CatalogBootstrap {
                                 "openGauss unsupported storage engine in seeded pg_class: relname=%s oid=%d, %s",
                                 rs.getString(OG_IX_RELNAME), rs.getLong(2), violation));
                     }
+                    if (parttype != null && !parttype.isEmpty() && parttype.charAt(0) == 'p') {
+                        partitionParents++;
+                        if (firstPartitionParent == null) {
+                            firstPartitionParent = rs.getString(OG_IX_RELNAME);
+                        }
+                    }
                     stores.classRows().put(parseCtidKey(rs.getString(1)), new CatalogRow.ClassRow(
                             rs.getLong(2), rs.getString(OG_IX_RELNAME), rs.getLong(OG_IX_RELNAMESPACE),
                             rs.getLong(OG_IX_RELTYPE), rs.getLong(OG_IX_RELOFTYPE), rs.getLong(OG_IX_RELOWNER),
@@ -316,6 +327,14 @@ public final class CatalogBootstrap {
                 }
                 count++;
             }
+        }
+        if (partitionParents > 0) {
+            // 终审 I1：M2 "分区 = 不砖 + 有痕跳过" 的运行时痕——seed 期恰一行 WARN（节流），
+            // 字典 miss 的逐行痕迹在 XactGrouper DEBUG 面（relfilenode 级）
+            LOG.warn("openGauss 库存在 {} 张分区母表（如 {}）——分区 DML 行将有痕跳过"
+                            + "（分区 relfilenode 落 pg_partition，v1 三表字典 miss；DML 发射计数可观测），"
+                            + "完整捕获归 M3 的 pg_partition 第四字典",
+                    partitionParents, firstPartitionParent);
         }
         return count;
     }

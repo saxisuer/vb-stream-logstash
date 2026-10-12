@@ -3,12 +3,16 @@ package org.vastdata.vbstream.walsource.it;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.postgresql.copy.CopyManager;
+import org.postgresql.core.BaseConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.replication.ReplicationConfig;
 import org.vastdata.vbstream.walsource.api.WalSource;
 import org.vastdata.vbstream.walsource.changes.OutputRenderer;
 
+import java.io.IOException;
+import java.io.StringReader;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -67,7 +71,9 @@ import static org.junit.jupiter.api.Assertions.fail;
  * ROLLBACK PREPARED 弃桶 / COMMIT PREPARED 发射 {@code kind=TWO_PHASE}+gid /
  * 挂起期 wal-source 停机重启续传重放重建桶）/ 普通双段 DML 中途停续（Task 12 场景 6
  * ——at-least-once 重发双路一致）/ 流内 CREATE SCHEMA nsp 字典面（Task 4 延期项清账）
- * / 干扰矩阵（Task 12——catalog 风暴线程下场景 1/TOAST 复跑 ×2）。表形态
+ * / COPY 批量装载 MULTI_INSERT 真几何（终审 I2——vanilla 侧修复 A 的真字节回归锚，
+ * pgjdbc CopyManager STDIN 100 行）/ 干扰矩阵（Task 12——catalog 风暴线程下场景 1/TOAST
+ * 复跑 ×2）。表形态
  * {@code REPLICA IDENTITY FULL}——UPDATE
  * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要
  * 本机 Docker。</p>
@@ -148,6 +154,16 @@ class DualPathParityIT {
     private static final String[] TOAST_TABLE_DDL = {
             "CREATE TABLE parity.t_parity_toast (id int4, w text)",
             "ALTER TABLE parity.t_parity_toast REPLICA IDENTITY FULL",
+    };
+
+    /**
+     * 场景 17 表 DDL（终审 I2）：COPY 批量装载对拍——三列（int4/text/numeric）+ FULL
+     * 前像；沿 OG {@code OgDmlParityIT} 场景 1f 的表形态翻译（id/name/v 同构，奇长
+     * text 值由 CSV 载荷构造）。
+     */
+    private static final String[] COPY_TABLE_DDL = {
+            "CREATE TABLE parity.t_copy (id int4 NOT NULL, name text, v numeric, PRIMARY KEY (id))",
+            "ALTER TABLE parity.t_copy REPLICA IDENTITY FULL",
     };
 
     /** 场景 3 重启回查用例的检查点目录（@TempDir 每用例独立——一目录一活实例契约）。 */
@@ -917,6 +933,42 @@ class DualPathParityIT {
         assertToastFootprints(out.walLines());
     }
 
+    // ---- 场景 17：COPY 批量装载 MULTI_INSERT 真几何（终审 I2 补面）----
+
+    /**
+     * COPY 批量装载对拍（终审 I2 修复——vanilla 侧修复 A 的真字节回归锚）：T7 修复 A
+     * 改的 heap2 MULTI_INSERT entry walk（{@code SHORTALIGN(7+datalen)} 步进）是
+     * <b>所有档位共享的 vanilla 路径</b>，此前 vanilla 正确性只有 OG 九条真 COPY 语料
+     * 的同几何推导 + 手造单测背书——PG 上从未有真 COPY 端到端对拍（修复前是隐性 bug、
+     * 修复后是隐性正确，同一盲区两次，本场景闭掉）。客户端侧 pgjdbc
+     * {@link CopyManager} COPY FROM STDIN 100 行单事务（沿 OG {@code OgDmlParityIT}
+     * 场景 1f 配方翻译），走 heap2 MULTI_INSERT 记录——块 data 逐 entry
+     * {@code [datalen u16 只计 tail][xl_heap_header][tail]}、步进 SHORTALIGN(7+datalen)
+     * ；CSV 载荷含 NULL/奇长 text 值（奇长 entry 钉对齐面——walk 错位在第二 entry 起
+     * 即红）。断言面：双路归一化 diff 空 + wal 路专项（恰 100 行 INSERT、首行值全对、
+     * NULL 解析）。
+     */
+    @Test
+    void copyBatchMultiInsertVanillaParityAcrossPaths() throws Exception {
+        StringBuilder csv = new StringBuilder();
+        for (int i = 1; i <= 100; i++) {
+            // CSV 格式的 NULL 是非引号空串（\N 是 TEXT 格式缺省——vanilla/OG 同语义）
+            String name = (i % 3 == 0) ? "" : "row-" + i + (i % 2 == 0 ? "-odd" : "");
+            String val = (i % 4 == 0) ? "" : i + ".25";
+            csv.append(i).append(',').append(name).append(',').append(val).append('\n');
+        }
+        List<String> walLines = runParityWal("COPY 批量装载", 1, COPY_TABLE_DDL, conn -> {
+            copyIn(conn, "COPY parity.t_copy FROM STDIN WITH (FORMAT csv)", csv.toString());
+        });
+        List<String> copyRows = walLines.stream().filter(l -> l.contains("INSERT parity.t_copy")).toList();
+        assertEquals(100, copyRows.size(), "100 行 COPY 应逐 entry 全解出（walk 错位在第二 entry 起即红）:\n"
+                + String.join("\n", walLines));
+        assertTrue(copyRows.get(0).contains("AFTER=[id=1, name=row-1, v=1.25]"),
+                "首行值全对（datalen/步进面错位即首行即红）:\n" + copyRows.get(0));
+        assertTrue(copyRows.get(2).contains("name=NULL"),
+                "CSV 空串应解为 NULL:\n" + copyRows.get(2));
+    }
+
     // ---- 对拍骨架 ----
 
     /**
@@ -1346,6 +1398,25 @@ class DualPathParityIT {
             for (String sql : sqls) {
                 st.execute(sql);
             }
+        }
+    }
+
+    /**
+     * 客户端侧 COPY FROM STDIN（场景 17，终审 I2）：pgjdbc {@link CopyManager} 流式
+     * 灌入——vanilla PG 上服务端文件 COPY 需超级用户且路径受限，客户端 STDIN 形态是
+     * 两版本通用的真 COPY 路径（服务端 heap2 MULTI_INSERT 记录与文件形态同源）。
+     *
+     * @param conn 场景连接（pgjdbc——unwrap BaseConnection 取 CopyManager）
+     * @param sql  COPY 命令
+     * @param csv  载荷文本
+     * @throws SQLException COPY 失败或 IO 中断
+     */
+    private static void copyIn(Connection conn, String sql, String csv) throws SQLException {
+        try {
+            CopyManager cp = new CopyManager(conn.unwrap(BaseConnection.class));
+            cp.copyIn(sql, new StringReader(csv));
+        } catch (IOException e) {
+            throw new SQLException("COPY FROM STDIN 流读写失败", e);
         }
     }
 

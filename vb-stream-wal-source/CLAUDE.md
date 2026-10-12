@@ -374,7 +374,11 @@ opengauss-jdbc 的码 11 应答缺 ITERATION_STRING 尾缀且用 2048 旧迭代�
   parttype='p' 的 ISE 放宽（种子/流内双面——母表行入字典无害）。**M2 分区面 = 不砖 +
   有痕跳过而非捕获（R1 裁定，显式呈报与"全量"意图的偏差）**：分区 relfilenode 不在 v1
   三表字典（pg_partition 未 watched），分区 DML 行 fail-safe miss 有痕跳过（发射恰 1
-  控制行、零泄漏、无终态失败）；完整捕获需第四 watched 字典归 M3（A 档原生分区是天然
+  控制行、零泄漏、无终态失败）；**运行时痕迹面（终审 I1 修复，2026-10-12）**：引导
+  seed 检出分区母表 → 整引导恰一行节流 WARN（`CatalogBootstrap`，含母表计数/首张
+  relname/M3 指引；vanilla 投影无 parttype 列零扰动）+ 逐 relfilenode 字典 miss 的
+  DEBUG（`XactGrouper.resolveCached`，缓存后不重复）+ Main 周期行 `dml=` 发射计数；
+  完整捕获需第四 watched 字典归 M3（A 档原生分区是天然
   归宿）。依据：一张分区表砖全库不可接受 + M3 半数地基重做。
 - **映射目录段号直认**（T7 修复 C，`CatalogSynchronizer.reOidOf`）：OG 的 pg_attribute/
   pg_class 是 relation-mapped——pg_class 行 relfilenode **列值为 0**，物理段号只经
@@ -492,7 +496,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**414 用例 = 离线 348 + Testcontainers IT 66（PG 40 + openGauss 26；需本机 Docker）**
+**419 用例 = 离线 352 + Testcontainers IT 67（PG 41 + openGauss 26；需本机 Docker）**
 （2026-10-12 M2 收口 surefire 逐类对账口径）。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
@@ -507,15 +511,16 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   交付上限）/ direct 子包（**M1 裸 v3 客户端**：V3ProtocolChannelTest 6 / OgAuthTest 6
   （sha256 码 11/码 10-3.0 签名/md5 三认证面）/ DirectWalSourceStreamTest 6 /
   DirectWalSourceFeedbackTest 2（65B 'r' 反馈 + 心跳））；`replay` CatalogReplayTest
-  16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 9（含引导前沿种子
+  16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 10（含引导前沿种子
   过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚 + M2 T7 修复 C 映射目录段号直认
   接缝锚）/ SelfHealerTest 4 / **OG 档**：
   OgCatalogReplayTest 11（头 oid/护栏/OG 词典/attnum -7/-8 合法下界——②b 已随修复 B
-  反转为 parttype='p' 放行断言）/ OgCatalogBootstrapSqlTest 4；`state` StateStoreTest 10
+  反转为 parttype='p' 放行断言）/ OgCatalogBootstrapSqlTest 4 / **OgCatalogBootstrapSeedWarnTest
+  3（终审 I1：分区母表 seed 节流 WARN 恰一行——ListAppender 断言 + vanilla 零 WARN 锚）**；`state` StateStoreTest 10
   （往返/CRC 拒载/版本拒载/
   pgVersion 参数化错配拒载——17 写 17、18 写 18，终审 I1；formatVersion 3 dmlFloorLsn
   往返 + OG 档 majorVersion=5）/ StateConfigTest 5；`changes`（v2 DML 面：
-  DiskValueRendererTest 18 / XactGrouperTest 21（含 M2 T7 修复 A 的 MULTI_INSERT
+  DiskValueRendererTest 18 / XactGrouperTest 22（含 M2 T7 修复 A 的 MULTI_INSERT
   SHORTALIGN 真几何锚）/ ToastAssemblerTest 13（含 lz4 双形态
   解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 11（含 M2 T5 OG 档
   parttype 判别闸——V17/V18 用例零改动零回归）/
@@ -533,7 +538,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
   `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
-  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 19（v2 双路对拍——engine
+  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 20（v2 双路对拍——engine
   逻辑解码路 in-process vs wal 直解路 DML 面同容器对拍，xid 交集逐行 diff 空：场景
   1 系基础 DML 六形态 + 类型矩阵边界值 + DDL-in-txn as-of + TOAST 三存储形态/重启
   unchanged + 2PC 四形态 + **普通 DML 中途停续（Task 12——at-least-once 重发双路一致，

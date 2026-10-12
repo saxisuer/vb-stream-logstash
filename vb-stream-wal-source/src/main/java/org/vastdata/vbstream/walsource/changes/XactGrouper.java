@@ -837,7 +837,10 @@ public final class XactGrouper {
      * 解析关系到表身份 + 列词典（缓存面）——命中直接应答；miss 时先探字典三表
      * （pg_class/pg_attribute/pg_namespace 上的 heap 记录 = DDL 类变更信号 →
      * <b>全清缓存</b>，策略依据见类 javadoc），再走 {@link TableFilter} 完整解析
-     * （miss 亦缓存，防 toast/索引关系逐记录重扫）。
+     * （miss 亦缓存，防 toast/索引关系逐记录重扫）。首次 miss 打一条 <b>DEBUG 痕迹</b>
+     * （relfilenode 级，缓存后不重复）——M2 "分区 DML 有痕跳过"的逐行痕迹面：OG 分区
+     * relfilenode 落 pg_partition、v1 三表字典解析不到即落此面（终审 I1；miss 是噪声
+     * 表常态故仅 DEBUG 不 WARN，seed 期的节流 WARN 在 CatalogBootstrap）。
      *
      * <p>边界与异常语义：字典三表返回 null（调用方按跳过处理，不缓存——三表记录
      * 本身不产生行）。线程约束：单写者。</p>
@@ -857,6 +860,10 @@ public final class XactGrouper {
             return null;
         }
         TableMeta meta = filter.resolve(relNode).orElse(null);
+        if (meta == null) {
+            LOG.debug("关系未解析（白名单外/字典无行——OG 档分区 DML 的 relfilenode 落"
+                    + " pg_partition 即此面，M2 有痕跳过）: relfilenode={}", relNode);
+        }
         Resolved res = new Resolved(meta, meta == null ? null : kindsOf(meta));
         metaCache.put(relNode, res);
         return res;

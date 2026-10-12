@@ -93,7 +93,10 @@ dummy_standby 非 immediately_reserve）；收流通道 `-Dvb.wal.og.source=file
   按 xid 交集逐行 diff 空）。
 - ⚠️ **分区 = 不砖 + 有痕跳过而非捕获（R1 裁定——与"全量"意图的偏差，在此显式呈报）**：
   OG 分区子表不在 pg_class（分区行在 pg_partition，列挂母表 oid），分区 DML 行字典 miss
-  **有痕跳过**（fail-safe：零泄漏、无终态失败；母表行入字典不再砖引导）。完整捕获需第四
+  **有痕跳过**（fail-safe：零泄漏、无终态失败；母表行入字典不再砖引导）。**运行时痕迹面**
+  （终审 I1 修复）：引导 seed 检出分区母表时打整引导恰一行节流 WARN（含母表计数/首张
+  relname/M3 指引）+ 字典 miss 的逐 relfilenode DEBUG（XactGrouper，缓存后不重复）+
+  Main 周期行 `dml=[buckets/rows]` 发射计数。完整捕获需第四
   watched 字典（pg_partition），归 M3（A 档原生分区是天然归宿）。
 - ⚠️ **attcmprmode 列压缩在行存面 DDL 天然不可达**：服务端三路 DDL 语法全拒（普通表
   attcmprmode∈{0,127}）——DELTA/DICT/PREFIX/NUMSTR 四算法解压纯函数已备（零接线），
@@ -162,8 +165,8 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   attcmprmode 护栏 + 分区 fail-safe / A-B 档兼容护栏）——基准路 = opengauss-jdbc 逻辑流
   + 独立归一化器，认证走专用角色 m2par_base + pg_hba sha256 行（gaussdb 走复制流撞
   码 11 的认证死角绕开）**。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（414 用例 = 离线 348 + Testcontainers
-  IT 66——PG 40 + openGauss 26，后者需本机 Docker）。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（419 用例 = 离线 352 + Testcontainers
+  IT 67——PG 41 + openGauss 26，后者需本机 Docker）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
 
