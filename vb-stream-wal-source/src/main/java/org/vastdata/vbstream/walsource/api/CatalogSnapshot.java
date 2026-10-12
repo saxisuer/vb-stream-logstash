@@ -74,6 +74,24 @@ public interface CatalogSnapshot {
     Optional<String> relkindOf(long relOid);
 
     /**
+     * 指定关系的 parttype（<b>openGauss 独有列</b> pg_class.parttype 的 as-of 视图：
+     * 'n' 普通表 / 'p' 分区母表——og-plan m2pg[PG 档] live 实查值域恰 {'n','p'}，
+     * 2026-10-12；OG 档分区表的母表 relkind 仍 'r'，分区语义由本列承担）。
+     *
+     * <p>M2 T5 前置接缝：{@code TableFilter} 的 OG 档判别消费本方法。缺省 empty =
+     * "不可判"——V17/V18 无该列（快照实现不覆写），openGauss 档生产快照当前亦未
+     * 供数（M1 三表字典无该列投影，且 M1 存储护栏使 parttype≠'n' 行在种子/流内
+     * 双面 ISE——护栏放松后接线）；消费方（TableFilter OG 分支）对 empty 按
+     * fail-open 放行，与 V17/V18 无此闸的行为面一致。</p>
+     *
+     * @param relOid 关系 oid
+     * @return parttype 单字符（'n'/'p'）；不可判（无该列/未供数）为 empty
+     */
+    default Optional<String> parttypeOf(long relOid) {
+        return Optional.empty();
+    }
+
+    /**
      * 指定关系的表名（pg_class.relname 的 as-of 视图——白名单 {@code schema.table}
      * 匹配与 TableMeta 组装面）。
      *

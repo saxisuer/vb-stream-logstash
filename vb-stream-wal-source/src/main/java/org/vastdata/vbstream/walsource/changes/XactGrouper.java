@@ -217,14 +217,15 @@ public final class XactGrouper {
      *
      * @param snapshot  catalog as-of 快照（表身份/列序查询面）
      * @param whitelist 表白名单（{@code schema.table} 全名集；null/空 = 全放行）
-     * @param layout    版本布局描述符（SizeOfHeapUpdate/Delete 等 heap 结构尺寸）
+     * @param layout    版本布局描述符（SizeOfHeapUpdate/Delete 等 heap 结构尺寸；亦经
+     *                  {@link TableFilter} 三参构造器作 OG 档 parttype 判别门控——M2 T5）
      * @param toast     TOAST 重组器（chunk 采集 + 终态淘汰；null = 采集禁用——纯无宽值形态）
      * @param out       变更事件输出契约实现（发射线程 = 本类单写者线程）
      */
     public XactGrouper(CatalogSnapshot snapshot, Set<String> whitelist, WalLayout layout,
                        ToastAssembler toast, ChangeOutputListener out) {
         this.snapshot = snapshot;
-        this.filter = new TableFilter(snapshot, whitelist);
+        this.filter = new TableFilter(snapshot, whitelist, layout);
         this.layout = layout;
         this.decoder = new TupleDecoder(layout, toast);
         this.toast = toast;
