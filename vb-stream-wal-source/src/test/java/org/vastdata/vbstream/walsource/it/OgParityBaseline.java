@@ -258,11 +258,13 @@ final class OgParityBaseline {
                 }
                 case 'R' -> parseRelation(b);
                 case 'I' -> {
+                    assertTrue(cur != null, "I 帧先于任何 B 帧（孤儿行）");
                     int relId = b.getInt();
                     expectSectionKind(b, 'N', "INSERT");
                     cur.rows.add(renderRow("INSERT", relations.get(relId), parseTuple(b, "N")));
                 }
                 case 'U' -> {
+                    assertTrue(cur != null, "U 帧先于任何 B 帧（孤儿行）");
                     int relId = b.getInt();
                     char oldKind = readOldSectionKind(b, "UPDATE");
                     List<TupCol> old = parseTuple(b, String.valueOf(oldKind));
@@ -271,6 +273,7 @@ final class OgParityBaseline {
                     cur.rows.add(renderRow("UPDATE", relations.get(relId), oldKind, old, neu));
                 }
                 case 'D' -> {
+                    assertTrue(cur != null, "D 帧先于任何 B 帧（孤儿行）");
                     int relId = b.getInt();
                     char oldKind = readOldSectionKind(b, "DELETE");
                     cur.rows.add(renderRow("DELETE", relations.get(relId), oldKind,
