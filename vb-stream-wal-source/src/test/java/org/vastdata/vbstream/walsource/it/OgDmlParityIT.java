@@ -825,8 +825,8 @@ class OgDmlParityIT {
 
     /**
      * 单场景对拍骨架（无 state.dir 档，PG 档缺省形态——M2 既有签名，OgDmlOgSpecificIT
-     * 消费面）：委派 {@link #runParity(OgTestEnv.CompatMode, String, String[], String[], long, long, long, SqlConsumer)}
-     * 的 {@code CompatMode.PG} 形态。
+     * 消费面）：委派兼容档参数化形态（本类内 8 参重载，首参
+     * {@code OgTestEnv.CompatMode}）的 {@code CompatMode.PG} 档。
      *
      * @param scenario      场景名（断言消息上下文）
      * @param slotSuffix    槽名后缀（前缀 m2par_logic_/m2par_wal_ 固定）
