@@ -37,6 +37,23 @@
 | md5 认证全通（SQL 与 replication 连接，§2.2——gaussdb 改 md5 后） | 对 **JDBC 逻辑流**存在认证死角：口令 sha256 存储的 gaussdb 走复制流撞**码 11 混合挑战**（opengauss-jdbc 应答缺 iteration 尾缀且 2048 旧迭代数，真 5.0.0 服务端恒拒）+ OG 复制连接在 pg_hba **只匹配 `replication` 关键字行**——解法 = 专用角色 m2par_base + `host replication m2par_base all sha256` 首行（码 10 RFC5802 驱动实现正确；调研期"gaussdb 口令 md5 化"路在部署上不可依赖） | T6 driver trace + 服务端日志实证——task-6 报告 |
 | XACT 记录解析重写（§一 1.1/§三 changes 行，按 9.2 格式推） | OG 实况：**无 252 TOPLEVEL_XID 标记**（子事务归并走终态 subxacts 补偿）、COMMIT_COMPACT(0x60) 在用（按源码推导布局解析兜底）、RM_XACT_ID=1 同 vanilla；2PC 完整可用（max_prepared_transactions=200） | T2 源码钉死 + 12+2 语料锚——task-2 报告 |
 
+> **M3 已落地（2026-10-13）**：openGauss 5.0.0 **A 兼容模式 + 分区捕获**按
+> `docs/superpowers/specs/2026-10-13-wal-source-opengauss-m3-design.md` 完成 T0-T6——
+> 兼容模式护栏白名单放宽为 {'PG','A'}（B/'C' 维持 ISE 附 M4 指引；A 档列存表
+> ORIENTATION=COLUMN 仍引导期 ISE——ASTORE 限定）+ **pg_partition 第四 watched 字典**
+> （bootstrap 种子/ctid 重放/stores 容器/StateStore v4）——**分区 DML 行正常捕获**
+> （母表身份输出、白名单母表名/分区名双匹配、流内 DDL 竞速 as-of、跨分区 UPDATE 迁移
+> = DELETE+INSERT 两行），M2 勘误表"分区不砖 + 有痕跳过（归 M3）"的临时语义就此退役
+> （有痕跳过仅余链断/DROP 后迟到行 fail-safe 形态）；A 档 v2 全场景 + 分区专项经双路
+> 对拍全量验收（基准路同 M2）。**下表勘误**为 M3 实施期实测对设计预设的修正（原段
+> 落保留作历史，以表为准）：
+
+| 设计期推导/预判 | 实测裁定 | 依据 |
+|---|---|---|
+| 分区行输出 = 分区名（M3 spec §0 预设——vanilla pgoutput 缺省 + 用户记忆双背书） | **PARTITION_NAME=mother**——OG pgoutput 逻辑流对分区 DML 的 R/I 帧报**母表身份**（relId=母表 pg_class oid、母表列集），分区名全程零出现；A 档与 PG 档采样同形。TableMeta 身份=母表、白名单**母表名匹配=基准形态**（写母表名覆盖全部分区；分区名降兼容增强，运行期双查）、对拍归一化器免映射 | M3 spike 锚② 实测——`docs/wal-source-opengauss-m3-spike.md` |
+| A 档 Oracle 系类型 WAL 存储面差异未验（M3 spec 风险注记②，按排障修预案） | 唯一值面分叉 = `date`：A 档 DDL 关键字 `date` 映射 **atttypid=1114（底层 timestamp，8B 存时段；Oracle DATE 整秒粒度——微秒输入服务端截断）**；wal 路按列 typeOid 走 timestamp 渲染、基准路 timestamp_out 同形——**时段零真值损失、双路天然逐字节一致，无需归一化**（首版"date 输出方言"归一化前提被证伪，死分支移除）；其余 16 类型双档逐字面全等；`pg_catalog.date` 直引（1082）A 档渲 PG 同形（探针记档） | T5 fix round 1 探针（m2probe_a vs m2pg）——task-5 报告 |
+| EXCHANGE PARTITION = 字典换绑段号（spike 锚④ 记档，未预见碰撞面） | EXCHANGE 换绑段号存在 **oid 碰撞**——OG 建表 relfilenode==oid、换绑双向对调段号使分区 'p' 行新段号恰等于交换对方普通表的 oid，三表反查 miss 后 oid 直认兜底误命中普通表；修复 = OG 档 resolve **第四字典属主优先且不回退**（"链断不回退三表"语义收紧） | T5 实测红转绿（commit `9d98f38`）——task-5 报告 |
+
 调研目标：评估 `vb-stream-wal-source`（现支持 PG 17/18）适配 **PG 9.2（openGauss 内核基线）**
 的工作量与可行性。方法：①vanilla PG 9.2 与 openGauss 5.0.0 双 Docker 容器实测（协议面/SQL 面/
 WAL 字节面）；②REL9_2_STABLE 与 openGauss v5.0.0 源码头文件核对；③pgjdbc 42.7.13 与

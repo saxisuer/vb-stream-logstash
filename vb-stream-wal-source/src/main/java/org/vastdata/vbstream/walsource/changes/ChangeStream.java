@@ -103,6 +103,17 @@ public final class ChangeStream {
     }
 
     /**
+     * DML 观测面：OG 档分区身份链断裂计数（M3 T2 fail-safe 观测——透传
+     * {@link XactGrouper#partitionChainMisses()}；Main 周期 smoke 行
+     * {@code partMiss=} 数据源）。
+     *
+     * @return 会话累计链断跳过的分区行数（vanilla 档恒 0；任意线程可读）
+     */
+    public long partitionChainMisses() {
+        return grouper.partitionChainMisses();
+    }
+
+    /**
      * 待决桶重放下界（Task 11 挂起桶跨检查点修复——透传
      * {@link XactGrouper#pendingFloorLsn()}）：检查点落盘 / 槽推进封顶 / 续传流起点
      * 回退三面的数据源。

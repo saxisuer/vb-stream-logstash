@@ -25,8 +25,9 @@ package org.vastdata.vbstream.walsource.changes;
  * L12270-12274 + ATDisableROTCompress 双护栏；PG 档 m2pg 与 A 档 postgres 双库
  * 同拒）；vanilla PG 14 的 {@code SET COMPRESSION} 语法在 OG 不存在；全库
  * pg_class.relcmprs ≤ 1（PAGE_PLAIN 不算压缩）、attcmprmode ∈ {0, 0x7F}。即本面
- * 在 5.0.0 全新行存面<b>天然不可达</b>（压缩路径仅列存/历史升级库可达，A 档列存
- * 留 M3）——本类按任务书降级条款"解压面照常实现 + 手造向量测"交付，黄金向量
+ * 在 5.0.0 全新行存面<b>天然不可达</b>（压缩路径仅列存/历史升级库可达；列存
+ * CU 族是独立机制且长期非目标——M3 spec §4 列存/段页式除非呈报不做）——本类按
+ * 任务书降级条款"解压面照常实现 + 手造向量测"交付，黄金向量
  * 依压缩侧源码语义手造（真实服务端字节不可采，记档 task-4-report）。</p>
  *
  * <p><b>挂接点裁定</b>：任务书预设"挂 varlena 接缝（ToastAssembler 同族）"经

@@ -1033,6 +1033,21 @@ public final class XactGrouper {
     }
 
     /**
+     * DML 观测面：OG 档分区身份链断裂计数（透传
+     * {@link TableFilter#partitionChainMisses()}——M3 T2 的 fail-safe 观测面：
+     * 第四字典命中 'p' 行但 parentid 在 classRows 无行[引导竞速窄缝]或 DROP 后迟到行，
+     * 行照常跳过不砖流；vanilla 档恒 0——分区链不存在）。
+     *
+     * <p>LongAdder {@code sum()} 快照读，任意时点读安全（Main 周期 smoke 行
+     * {@code partMiss=} 数据源）。</p>
+     *
+     * @return 会话累计链断跳过的分区行数
+     */
+    public long partitionChainMisses() {
+        return filter.partitionChainMisses();
+    }
+
+    /**
      * 行入桶：值渲染（静态 {@link DiskValueRenderer}）+ RowChange 组装 + 桶记账
      * expectedChanges++（aborted 过滤前口径）。
      *

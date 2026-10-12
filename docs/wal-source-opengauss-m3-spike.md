@@ -165,3 +165,28 @@ ctid 重放的末态采纳。
    本 spike 的 m3pub/m3slot 已随探针清理（DROP SLOT 在探针收尾）。
 5. 测试残留：m2pg/m2probe_a 中的 t_m3_*/a_m3_* 分区表族与 t_exch/a_exch 保留（后续任务
    可复用重建）；og-plan 容器本 spike 结束时保持运行。
+
+## 6. T5 追记（2026-10-13，实测补充/修正本 spike 未预见面）
+
+- **EXCHANGE 换绑段号的 oid 碰撞（锚④ 未预见的碰撞面）**：锚④ 记录了"EXCHANGE 换绑
+  段号"本身，但 T5 分区专项首跑实测发现碰撞——OG 建表 relfilenode==oid、换绑双向对调
+  段号使分区 'p' 行新段号的数值**恰等于交换对方普通表的 oid**，三表 relfilenode 反查
+  miss 后 `relOidOf` 的 oid 直认兜底误命中普通表（第四字典身份链没机会进）。修复 =
+  `TableFilter.resolve` OG 档**第四字典属主优先且不回退**（partitionOf 命中即走母表
+  身份链；链断 fail-safe 跳过同样不回退——"链断不回退三表"语义收紧），commit
+  `9d98f38`，离线锚 TableFilterTest ⑯。
+- **A 档 date 值面探针终态（T5 fix round 1，og-plan m2probe_a[A 档] vs m2pg[PG 档]）**：
+  A 档 DDL 关键字 `date` 映射 **atttypid=1114（底层 timestamp，typlen=8）**——时段完整
+  存储（`DATE '2026-10-13 14:30:25'` 原样存取；微秒输入被服务端截断，Oracle DATE 整秒
+  粒度锚）；PG 档 `date` 恒 1082/4B 日粒度且带时段输入**静默截断为日**（两档真语义分叉
+  在输入侧，wal 源忠实转储无决策面）。wal 直解路按列 typeOid 走 timestamp 渲染、基准路
+  timestamp_out 同形——**时段零真值损失、双路天然逐字节一致，无需任何归一化**（T5 首版
+  "date 输出方言后缀归一化"的前提被证伪，死分支整体移除）。`pg_catalog.date` 直引
+  （真 1082，A 档库仍可建）实测渲 **PG 同形** `2026-10-07`——首版所见"零时段后缀"全部
+  来自 `date` 关键字→timestamp 映射的 timestamp_out，非 date 输出函数方言（直引 1082
+  同形结论无 committed 测试锚，按最小侵入裁定仅记档不补钉）。其余 16 类型双档逐字面
+  全等；A 档 `''` 空串入库即 NULL（服务端语义，两路一致非对拍面）。
+- **白名单双匹配的运行期双查落定（§2 重排第 2 点的实现裁定，T2）**：resolve 分区链内
+  先按母表全名查 Set、未中再按分区名查（schema 取母表解析值）——不采用解析期预展开
+  （白名单解析早于引导的装配次序不成立 + 分区集是活的，静态展开在首个分区 DDL 后即
+  过期）；分区名条目命中不外溢（写 `public.p1` 只命中 p1 路由的行）。

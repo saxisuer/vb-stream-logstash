@@ -169,3 +169,11 @@ M2 T0-T7 实施期实测对本文六处前提/预判的修正：
    miss 有痕跳过（发射恰 1 控制行、零泄漏、无终态失败）；完整捕获需第四 watched 字典，
    归 M3（A 档原生分区是天然归宿）。依据 = §4 "分区深度按任务⑤实测裁剪"弹性条款 +
    一张分区表砖全库不可接受。
+7. **（M3 追记，2026-10-13）第 6 条的"分区跳过语义"已在 M3 退役**：M3
+   （`2026-10-13-wal-source-opengauss-m3-design.md`）pg_partition 第四 watched 字典
+   落地后分区 DML 行**正常捕获**——且 M3 T0 实测 **PARTITION_NAME=mother**（OG
+   pgoutput 逻辑流对分区 DML 报母表身份，分区名零出现）反转了 M3 spec §0 预设
+   [分区名输出]与 §3 [TableMeta 身份=分区名]：TableMeta 身份=母表、白名单母表名匹配
+   升基准形态（分区名降兼容增强）、对拍归一化器免映射。本节第 6 条的 seed 节流 WARN
+   与逐 relfilenode miss DEBUG 痕迹面随捕获语义分别删除/保留为噪声常态 miss 痕迹；
+   有痕跳过仅余链断与 DROP 后迟到行两 fail-safe 形态。

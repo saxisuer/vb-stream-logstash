@@ -492,7 +492,7 @@ public final class WalSource implements AutoCloseable {
             }
             if (compat == null) {
                 LOG.warn("openGauss 库级兼容模式探测不可判定（无行/空值/探测失败）——护栏按放行处理"
-                        + "（非 PG 档 ISE 仅对可判定档位生效）");
+                        + "（白名单外档位 ISE 仅对可判定档位生效）");
             }
         }
         Consumer<WalRecord> postApply = dmlEnabled() ? rec -> changeStreamOrInit(layout).onRecord(rec) : null;
@@ -634,6 +634,22 @@ public final class WalSource implements AutoCloseable {
     public long dmlReconstructedTruncatedRows() {
         ChangeStream cs = changeStream;
         return cs == null ? 0L : cs.reconstructedTruncatedRows();
+    }
+
+    /**
+     * DML 观测面：OG 档分区身份链断裂计数（M3 T2 fail-safe 观测——透传
+     * {@link ChangeStream#partitionChainMisses()}；Main 周期 smoke 行
+     * {@code partMiss=} 数据源）。
+     *
+     * <p>链断两形态（第四字典命中 'p' 行但 parentid 悬空 / DROP PARTITION 后迟到行）
+     * 行照常跳过不砖流；vanilla 档分区链不存在恒 0。changeStream 惰性建（接收线程
+     * 首条记录前 null → 0，与"无链断"同面）。</p>
+     *
+     * @return 会话累计链断跳过的分区行数（DML 面未装配/尚无记录为 0）
+     */
+    public long dmlPartitionChainMisses() {
+        ChangeStream cs = changeStream;
+        return cs == null ? 0L : cs.partitionChainMisses();
     }
 
     /**
