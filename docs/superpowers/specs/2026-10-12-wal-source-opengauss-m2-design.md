@@ -129,3 +129,43 @@ T8 文档。
 
 配置键零新增（v2 的 `vb.wal.tables`/`vb.wal.dml` 在 OG 档激活即用）；依赖零新增。
 M1 的五键语义不变（`vb.wal.og.*`）。
+
+---
+
+## 勘误注记（2026-10-12 实施期回填，T8 追加——原文保留作历史，以本节为准）
+
+M2 T0-T7 实施期实测对本文六处前提/预判的修正：
+
+1. **§0 "attcmprmode 列压缩 + parttype 分区（PG 档语义）"的 attcmprmode 面前提被推翻**：
+   attcmprmode 列压缩在 OG 5.0.0 **行存面 DDL 天然不可达**（三路 DDL 语法全拒 +
+   tablecmds.cpp 双护栏 + 全库目录扫三源；普通表 attcmprmode∈{0,127}）。T4 交付改为
+   DELTA/DICT/PREFIX/NUMSTR 四算法 + meta 走读**纯函数零接线**（黄金向量手造——服务端
+   字节不可采）；验收由 §5 "各支持档值往返"降为轻量护栏（压缩 DDL 服务端拒绝判别串 +
+   attcmprmode∈{0,127} 库侧钉 + DML 对拍不受扰）。压缩形态实为元组级 HEAP_COMPRESSED
+   0x0010 + 页字典（**非 §1 预设的 varlena 接缝 tag**——接缝预设一并推翻）；A 档列存
+   （M3）走 compress_kits CU 族不同源，勿复用本类。
+2. **§0/§3 "分区子表独立匹配白名单、母表不承载行"前提被推翻**：OG 分区子表**不在
+   pg_class**（无 pg_class/pg_attribute 行，列挂母表 oid；分区行在 pg_partition，母表
+   relkind='r' + parttype 值域恰 {'n','p'}）——白名单按子表独立匹配不可达。T5 实测路由
+   = heap INSERT 落**分区自身 relfilenode**（pg_partition 'p' 行，range/list 四锚
+   32809/32810/32821/32822，母表零命中）。
+3. **§1 "MULTI_INSERT 语料锚 rmid=9/info 0x30"系任务链误读**：实测 info=0xD0（=0x50|
+   INIT_PAGE）×15 + 0x50×2；真布局 = [INIT_PAGE 前置 pd_xid_base u64]flags u8 +
+   isCompressed bool@1 + ntuples u16@2 + offsets（INIT_PAGE 省略）+ LogCSN 殿后，entry
+   几何 OG==vanilla（2 对齐 + SHORTALIGN(7+datalen)，datalen 只计 tail）。
+4. **§3 "子事务归并（TOPLEVEL_XID/ASSIGNMENT）格式对齐后零改动消费"的 TOPLEVEL_XID
+   半边被推翻**：OG 流**无 252 TOPLEVEL_XID 标记**（源码钉死）——子事务归并改**终态
+   subxacts 经 mergeSubBuckets 补偿**（输出时序等价实证）；映射缺位子回滚多发一条
+   BatchAborted（onAborted 零输出，对拍无感）。
+5. **§0/§5 验收形态落定 PARITY=LOGICAL**：T0 spike 三路实测
+   （`docs/wal-source-opengauss-m2-spike.md`）——opengauss-jdbc `logical()` in-process
+   逻辑流可用（proto v1；两处帧级差异：B 帧 xid Int64 / TupleData Int16 ncols 前缀，
+   归一化器独立新写不共享 engine PgOutputDecoder），路 B 断言式基座无消费方不建；2PC
+   语义断言走捕获器 begins() 事件面（proto v1 下 PREPARE→COMMIT PREPARED 以普通 B..C
+   块出现、解码推迟到 COMMIT PREPARED 时点）。
+6. **§5 验收② "分区捕获正确"按 R1 裁定降级（显式呈报与"全量"意图的偏差）**：M2 分区面
+   = **不砖 + 有痕跳过**而非捕获——parttype='p' 存储护栏放宽（母表行入字典无害，
+   种子/流内双面），分区 DML 行因 pg_partition 不在 v1 三表 watched 字典而 fail-safe
+   miss 有痕跳过（发射恰 1 控制行、零泄漏、无终态失败）；完整捕获需第四 watched 字典，
+   归 M3（A 档原生分区是天然归宿）。依据 = §4 "分区深度按任务⑤实测裁剪"弹性条款 +
+   一张分区表砖全库不可接受。

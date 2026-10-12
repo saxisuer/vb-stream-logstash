@@ -103,3 +103,34 @@ MSG#6 len=26 type=C  hex: 43 00 00 00 00 00 02 90 c8 e8 00 00 00 00 02 90 c9 48 
 6. pg_recvlogical 逐帧追加 `\n` + stderr 污染（仅路①；选型路② 无此问题）
 7. gsql 输出 "total time" 页脚会污染 hex 采样（grep 纯行，沿用调研期经验）
 8. vanilla pgjdbc 对 OG 逻辑流首读即 FATAL（勿在 OG 面上尝试 vanilla 驱动）
+
+## 4. M2 实施期回填（T6/T7 实测对本文的修正，2026-10-12 收口补记）
+
+1. **路②"可行"的认证死角出入（T6 实测锚——driver `loggerLevel=TRACE` + 服务端 pg_log +
+   hba 逐形态试验）**：本探测在 og-plan 上成立的前提是 gaussdb 口令已 md5 化（type=1）；
+   真部署面（口令 sha256 存储，镜像默认 `password_encryption_type=2`）上 gaussdb 走逻辑
+   复制流首连即 `FATAL: Invalid username/password`——两因素叠加：①**OG 复制连接在
+   pg_hba 只匹配 `replication` 关键字行**（库 `all`/库名行均不匹配——镜像缺省
+   `host all all 0.0.0.0/0 sha256` 行救不了它）；②命中 `host replication gaussdb ...
+   md5` 行 + 口令 sha256 存储 → 服务端发**码 11（AUTH_REQ_MD5_SHA256 混合挑战）**，而
+   opengauss-jdbc 的码 11 应答**缺 ITERATION_STRING 尾缀且用 2048 旧迭代数**，对真 5.0.0
+   服务端恒被拒（与 M1 OgAuth javadoc 记档的驱动分叉同源——M1 绕开手段是裸 v3 自研
+   认证，JDBC 路无法绕；`trust` 被服务端拒远程）。**解法**（T6 落地）：专用角色
+   `m2par_base`（LOGIN+REPLICATION，口令 sha256 存储）+ pg_hba 首插
+   `host replication m2par_base all sha256`（码 10 RFC5802，驱动实现正确；角色限定——
+   gaussdb 连接不经此行，M1 的码 11 验证面不变）。坑 1 的 JDBC 远程行
+   `host replication gaussdb 0.0.0.0/0 md5` 仅在口令 md5 存储时可用。
+2. **§2 归一化器映射表的两点补充（T6/T7 实测）**：①OG 的 'K' 段（DEFAULT 身份 old-key）
+   是 **ncols=全列宽 + 'n' 占位形态**（vanilla 'K' 只发键列）——缺席占位不入像 vs wal
+   路尾列补 null 渲 NULL，对拍场景用 FULL 身份规避；②B 帧 finalLsn 与 C 帧 commitLsn
+   同值（实测锚），归一化器取 C 帧。
+3. **T6 预判"DDL-in-txn 需归一化器 R 缓存帧序快照"被证伪（T7 og-plan 投探实锤）**：
+   **OG 逻辑解码器对事务内 DDL 的后续行静默丢弃**——帧序恰 `B..R(旧列)..I(首行)..C`，
+   DDL 后新事务以新列 R 帧正常解码；DDL 前行根本不与 DDL 后 R 帧同现，"最新覆盖渲染错
+   位"的场景不存在，帧序快照无消费方。该丢弃行为是 **OG 基准路已知限制**（服务端能力
+   差非接缝错位），DDL-in-txn 场景以双侧精确断言重塑（wal 路逐字面三行 + 基准路 DDL
+   事务块恰一行钉丢弃面 + DDL 后控制事务 full parity）。
+4. **2PC 基准路形态（T7 实测，proto v1）**：无 two_phase 槽选项下 PREPARE→COMMIT
+   PREPARED 以**普通 B..C 块**出现（解码推迟到 COMMIT PREPARED 时点——prepared xid 块
+   可出现在更晚普通事务块之后；ROLLBACK PREPARED 零帧）——归一化块模型不含 kind/gid，
+   两阶段语义断言走捕获器 `begins()` 事件面（twoPhase+gid 精确断言）。

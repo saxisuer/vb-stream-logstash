@@ -1209,7 +1209,10 @@ public final class CatalogSynchronizer {
          * miss——字典三表的 heap 记录在 {@code XactGrouper} 解析为未知关系且 miss 被缓存，
          * 字典形态变更信号（如事务内 ADD COLUMN 的 attr 行）失效 TableMeta 缓存的面被
          * 关死。故反查前先与引导期回填的两 watched 段号比对，命中直认固定 oid——vanilla
-         * 侧两段号与列值同源（引导回填即列值），命中返回同值，行为面零差异。</p>
+         * 侧两目录同为映射目录（relfilenode 列值同为 0，引导回填值同经
+         * {@code pg_relation_filenode()} 取自映射），常态下初映射段号==oid，直认与既有
+         * oid 直认同值同果；目录被 VACUUM FULL/CLUSTER 重写（段号≠oid）后旧代码恒 miss
+         * （vanilla 潜在盲区），直认面只增命中不改既有命中——对两档均非行为回退。</p>
          *
          * @param relNodeOrOid relfilenode 或关系 oid
          * @return 关系 oid；字典无匹配 empty

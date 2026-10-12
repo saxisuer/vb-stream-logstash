@@ -11,13 +11,16 @@ relfilenode、toast 映射、dropped 占位语义）与 **B. WAL 接收**（物�
 CREATE SCHEMA）证明两路 CDC 输出逐字节等价；**openGauss 5.0.0 适配 M1（2026-10-11
 spec，2026-10-12 落地）**在 v1 catalog 面上增第三布局档——判别（90204 撞号经
 version() 文本消解）→ OG 布局描述符 → 双通道收流（sidecar 文件 tail / 裸 v3 直连）
-→ catalog 引导/重放 OG 适配（见"openGauss 5.0.0 档"节；**M2（2026-10-12 spec）起 DML 面
-开门装配**——T1 已落兼容模式护栏 + 撤销 M1 WARN 降级，XACT/MULTI_INSERT/列压缩/分区
-等 OG 差异接缝按 T2-T7 分期落地）。设计全文见
+→ catalog 引导/重放 OG 适配（见"openGauss 5.0.0 档"节；**M2（2026-10-12 spec，同日落地）
+DML 面收官**——兼容模式护栏 + XACT/MULTI_INSERT/列压缩/分区四接缝 + v2 六场景双路对拍
+全量验收，见"openGauss 5.0.0 档 M2"节）。设计全文见
 `docs/superpowers/specs/2026-10-05-wal-source-module-design.md`、
 `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` 与
 `docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md` 与
-`docs/superpowers/specs/2026-10-12-wal-source-opengauss-m2-design.md`（先导实验
+`docs/superpowers/specs/2026-10-12-wal-source-opengauss-m2-design.md`（M2 DML 面已收官，
+2026-10-12 同日落地——兼容模式护栏[PG 档 only，A/B 档启动期 ISE 附 M3/M4 指引] +
+XACT/MULTI_INSERT/列压缩/分区四接缝 + v2 六场景双路对拍[基准路=OG 逻辑解码]全量验收，
+见"openGauss 5.0.0 档 M2"节；先导实验
 `docs/wal-direct-decode-spike.md` + OG 调研
 `docs/wal-source-opengauss-adaptation-research.md`）。
 
@@ -241,18 +244,13 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 
 ## openGauss 5.0.0 档（M1 catalog 面，2026-10-11 spec / 2026-10-12 落地）
 
-**范围**：v1 catalog 同步面（引导 + 重放 + 检查点/槽推进）+ WAL 接收双通道；**DML 面
-M2 起（2026-10-12 M2 T1）开门装配——`ogCatalogOnly` WARN 降级位退役，listener 在场且
+**范围**：v1 catalog 同步面（引导 + 重放 + 检查点/槽推进）+ WAL 接收双通道；DML 面已随
+M2 落地（见下节）——`ogCatalogOnly` WARN 降级位退役（M2 T1），listener 在场且
 dml 开着时 postApply/pendingFloor 经 `startOg` 接缝档与 PG 17/18 路同构注入（惰性
-ChangeStream）+ 库级兼容模式护栏：探测 `pg_database.datcompatibility`（og-plan 实测：
-postgres 缺省库='A'、DBCOMPATIBILITY 'PG' 库='PG'、'C' 为 PG 兼容历史别名[5.0.0 仍接受
-建库且存储值与 'PG' 相异，未在 M2 验证面]），可判定的非 PG 档（A/B/C）启动期 ISE 附
-档位与 M3/M4 指引、探测不可判定（无行/空值/SQLException）WARN 放行；**护栏只在 DML
-面请求在场时探测**——catalog 同步面与兼容模式无关（M1 全部 OG IT 即跑在 'A' 档缺省库
-上全绿），显式 `-Dvb.wal.dml=false` 等价声明 catalog-only 意图不 ISE**。存储引擎
+ChangeStream）+ 库级兼容模式护栏（详述见下节"兼容模式限制"）。存储引擎
 只做 ASTORE；版本只做 5.0.0（90204 撞号经
 `forServer(int, String)` 的 version() 文本判别）。调研全文见
-`docs/wal-source-opengauss-adaptation-research.md`（文首有 M1 落地状态与勘误回填）。
+`docs/wal-source-opengauss-adaptation-research.md`（文首有 M1/M2 落地状态与勘误回填）。
 
 **判别与布局差异要点**（`WalLayoutVOpenGauss`，逐常量标注 og-plan 容器实测锚）：
 页魔数 0xD074 / 短页头 24B 含私有 `xlp_total_len@20` / **记录头 32B**（term u32@4
@@ -303,9 +301,9 @@ storage_type=ustore/segment=on）——护栏读区越界零填充段按不可�
 `OgDualChannelParityIT`（双通道对拍——file vs direct 同窗口记录序列全等
   [lsn/totLen/rmid/info]，窗口按两路覆盖较小者归一）。
 
-**已知限制（OG 档增量，详版记档见各任务报告）**：
-- **MULTI_INSERT 解析即 ISE**：OG 档 main 布局未语料锚定（og-plan 32KB 窗口 283 条零
-  multi_insert；候选锚 rmid=9 info 0x30 已造）——fail-fast 优于盲解错位，M2 补。
+**已知限制（OG 档增量，详版记档见各任务报告；~~MULTI_INSERT 解析即 ISE~~ 已勾销——M2 T3
+转录真布局解除，见下节；~~`ogCatalogOnly` WARN 降级~~ 已勾销——M2 T1 退役，DML 面 OG 档
+同构装配）**：
 - **MultiXactId 变体未锚**：xmax 为 MultiXactId 时 UPDATE/DELETE 走全量 SizeOfHeap
   （u64 xmax 布局，前缀漂移）——常量锚常态逻辑日志形态，变体到达即偏移错位 ISE。
 - **挂 replconninfo 的 HA 形态不在支持面**（"build walsender 自杀"雷区）——仅单机/
@@ -315,6 +313,105 @@ storage_type=ustore/segment=on）——护栏读区越界零填充段按不可�
   无丢失）；槽推进对 write 档 restart_lsn 的观察面已验（推进成功才断言落位）。
 - **`advanceLsnCast` 直写字段**（唯一写点 startOg）：未来新增非 startOg 的 OG 装配路径
   会静默回落失败 cast——新装配路径须同步覆写（Task 9 记档）。
+
+## openGauss 5.0.0 档 M2（DML 面，2026-10-12 spec / 2026-10-12 落地）
+
+**范围**：v2 DML 面在 OG 档全量开门——`vb.wal.tables`/`vb.wal.dml` 两键直接生效（配置零
+新增）；v2 六场景（基础 DML 六形态/17 类型边界值/TOAST 三形态+重启 unchanged/DDL-in-txn
+as-of/2PC 四形态/中途停续）经双路对拍在 PG 兼容库 m2pg 全量验收，v2 changes 包状态机/
+TOAST/输出渲染结构零改动（OG 差异经四个接缝吸收，沿 M1 档位门控纪律）。
+
+**兼容模式限制**：DML 面仅支持 PG 兼容模式库（`DBCOMPATIBILITY 'PG'`；'C' 为 PG 兼容历史
+别名——5.0.0 仍接受建库且存储值与 'PG' 相异，未在 M2 验证面）；库级护栏探测
+`pg_database.datcompatibility`（og-plan 实测：postgres 缺省库='A' 即 Oracle 风格、'PG'
+库='PG'），可判定的非 PG 档（A/B/C）启动期 ISE 附档位与 M3/M4 指引、不可判定（无行/
+空值/SQLException）WARN 放行；**护栏只在 DML 请求在场时探测**——catalog 同步面与兼容
+模式无关（M1 全部 OG IT 即跑在 'A' 档缺省库上全绿），显式 `-Dvb.wal.dml=false` 等价声明
+catalog-only 意图不 ISE。
+
+**对拍形态（PARITY=LOGICAL，T0 spike 裁定——`docs/wal-source-opengauss-m2-spike.md`）**：
+基准路 = opengauss-jdbc `logical()` in-process 逻辑流（proto_version=1，publication 须先于
+被解码事务存在）+ 归一化器（`it/OgParityBaseline.Normalizer`，spike §2 布局逐字段独立
+新写——**不共享 engine PgOutputDecoder**：OG pgoutput 两处帧级差异 B 帧 xid Int64 /
+TupleData Int16 ncols 前缀；显式拒绝 'T'/两阶段族帧）；wal 路 = `WalSource` DML 面
+direct 通道；按 xid 交集逐行 diff 空（`DualPathParityIT` 形态复刻：expectedChanges 语义
+归一化 + 重复块全等容忍 + 交集外窗口差 INFO 留痕）。**认证死角（T6 实测锚，driver trace +
+服务端日志）**：gaussdb 走逻辑复制流撞**码 11**（AUTH_REQ_MD5_SHA256 混合挑战——
+opengauss-jdbc 的码 11 应答缺 ITERATION_STRING 尾缀且用 2048 旧迭代数，真 5.0.0 服务端
+恒拒），且 OG 复制连接在 pg_hba **只匹配 `replication` 关键字行**（库 `all`/库名行均不救）；
+解法 = 专用角色 `m2par_base`（口令 sha256 存储）+ pg_hba 首插
+`host replication m2par_base all sha256`（码 10 RFC5802 驱动实现正确；角色限定——gaussdb
+不经此行，M1 DirectWalSource 的码 11 验证面不变）。spike 路②在 og-plan"可行"系容器口令
+已 md5 化所致，与真部署面有出入（spike 文档已回填）。
+
+**OG 差异接缝（T2-T7 落地）**：
+
+- **XACT**（T2，`OgXactView`[layout] + XactGrouper 接缝）：四记录族 + 五 opcode 转录；
+  **OG 流无 252 TOPLEVEL_XID 标记**（源码钉死）——子事务归并改**终态 subxacts 经
+  mergeSubBuckets 补偿**（输出时序等价实证）；映射缺位子回滚多发一条 BatchAborted
+  （onAborted 零输出，对拍无感）；COMMIT_COMPACT(0x60) 按源码推导布局解析兜底；
+  RM_XACT_ID=1 同 vanilla；2PC 完整可用（max_prepared_transactions=200）。
+- **MULTI_INSERT**（T3，`HeapViews.MultiInsertView.parseOg` OG 分支——M1 ISE 解除）：main =
+  [INIT_PAGE 前置 pd_xid_base u64]flags u8 + isCompressed bool@1 + ntuples u16@2 +
+  offsets（INIT_PAGE 省略）+ LogCSN 殿后（九条真字节语料收口；任务链候选锚"info 0x30"系
+  误读——实测 0xD0[=0x50|INIT_PAGE]×15 + 0x50×2）；entry 几何 OG==vanilla（2 对齐 +
+  SHORTALIGN(7+datalen)，datalen 只计 tail）；isCompressed≠0（页字典压缩表）ISE 属 M2
+  范围外 fail-fast。**修复 A（T7，v2 存量真 bug）**：XactGrouper entry walk 原按
+  `off += 2+datalen` 步进与真几何差 5B——第二 entry 起错位，手造测试按 5+tail 自洽编码
+  掩盖；修为真几何 + 手造 DSL 编码口径连动 + COPY 100 行对拍场景闭环。
+- **列压缩**（T4，`OgColumnCompression`[changes]）：DELTA/DICT/PREFIX/NUMSTR 四算法 +
+  meta 走读纯函数（pagecompress.cpp 转录）**零接线**——**attcmprmode 列压缩在 OG 5.0.0
+  行存面 DDL 天然不可达**（三路 DDL 语法全拒 + tablecmds.cpp 双护栏 + 全库目录扫三源；
+  普通表 attcmprmode∈{0,127}），压缩形态实为元组级 HEAP_COMPRESSED 0x0010 + 页字典
+  （非 varlena tag——spec 接缝预设推翻）；M3 警示：A 档列存走 compress_kits CU 族
+  不同源勿复用本类。
+- **分区**（T5，TableFilter OG 档判别闸 + 修复 B）：路由 = heap INSERT 落**分区自身
+  relfilenode**（pg_partition 'p' 行，range/list 四锚 32809/32810/32821/32822，母表零
+  命中）；**分区子表不在 pg_class**（无 pg_class/pg_attribute 行，列挂母表 oid；母表
+  relkind='r' + parttype 值域恰 {'n','p'}）——"子表独立匹配白名单"前提被推翻。落地 =
+  三参构造器 openGaussDialect 门控（relkind 'r' 收窄 + parttype 闸/未知 miss/不可判
+  fail-open，V17/V18 行为零变化）；**修复 B（T7，R1 裁定）**：M1 存储护栏对
+  parttype='p' 的 ISE 放宽（种子/流内双面——母表行入字典无害）。**M2 分区面 = 不砖 +
+  有痕跳过而非捕获（R1 裁定，显式呈报与"全量"意图的偏差）**：分区 relfilenode 不在 v1
+  三表字典（pg_partition 未 watched），分区 DML 行 fail-safe miss 有痕跳过（发射恰 1
+  控制行、零泄漏、无终态失败）；完整捕获需第四 watched 字典归 M3（A 档原生分区是天然
+  归宿）。依据：一张分区表砖全库不可接受 + M3 半数地基重做。
+- **映射目录段号直认**（T7 修复 C，`CatalogSynchronizer.reOidOf`）：OG 的 pg_attribute/
+  pg_class 是 relation-mapped——pg_class 行 relfilenode **列值为 0**，物理段号只经
+  `pg_relation_filenode()` 可得，线性反查对两目录物理段号恒 miss（in-txn DDL 后行按陈旧
+  词典解码 ISE 的根因）；修复 = 反查前与引导期回填的两 watched 段号比对，命中直认固定
+  oid 1249/1259。vanilla 侧两目录同为映射目录（常态初映射段号==oid，直认与 oid 直认
+  同值同果；目录重写后只增命中不改既有命中——顺带修 vanilla 潜在盲区）。直认段号是引导
+  期回填值，VACUUM FULL/CLUSTER 重写后与 M1 块匹配面同样陈旧（v1 已声明非目标）。
+
+**对拍基准路已知限制（服务端能力差，非接缝错位）**：
+
+- **OG 逻辑解码器对事务内 DDL 的后续行静默丢弃**（og-plan 投探实锤——帧序恰
+  `B..R(旧列)..I(首行)..C`，DDL 后新事务以新列 R 帧正常解码）：DDL-in-txn 场景重塑为
+  双侧精确断言（wal 路三行逐字面——前段两列/后段三列/UPDATE 前像新列渲 NULL；基准路
+  DDL 事务块恰一行钉丢弃面；DDL 后控制事务 full parity），断言强度不降。
+- **2PC 基准路形态（proto v1）**：无 two_phase 槽选项，PREPARE→COMMIT PREPARED 以普通
+  B..C 块出现（解码推迟到 COMMIT PREPARED 时点——prepared xid 块可出现在更晚普通事务
+  块之后；ROLLBACK PREPARED 零帧）——归一化块模型不含 kind/gid，两阶段语义断言走
+  `WalCapture.begins()` 事件面（twoPhase+gid 精确断言）。
+- **值面分叉两处（场景内已避开，主代码渲染面 OG 方言分支超 M2 A/B 范围——M3+ 议）**：
+  ①float 文本输出 (0,1) 区间前导零省略 + float4 缺省 6 位有效数字；②UPDATE 未变
+  external TOAST 列 OG 恒发完整重写值（heap_update 重写 toast 值），非 vanilla 的 'u'
+  占位——双路一致由 parity 承载。
+- **DEFAULT 身份前像分叉**：OG 的 'K' 段是 ncols=全列宽 + 'n' 占位形态（vanilla 'K' 只发
+  键列）——基准路缺席占位不入像 vs wal 路尾列补 null 渲 NULL，对拍场景用 FULL 身份规避。
+
+**验收**（OG IT 增至 26 用例，`OgTestEnv` 扩展三兼容档库 m2pg/m2a/m2b + 基准路角色）：
+`OgParitySmokeIT` 1（T6 冒烟——单事务 I→U→D 三行双路 diff 空 + 字面锚）、`OgDmlParityIT`
+13（v2 六场景 OG 档全量：1a-1f 基础六形态含 COPY 100 行 MULTI_INSERT 真几何/2 类型矩阵
+边界值/3a+3b TOAST 三形态与重启 unchanged/4 DDL-in-txn 双侧精确断言/5a+5b 2PC 挂起弃桶
+COMMIT PREPARED 与挂起重启续传/6 中途停续 state.dir 两轮）、`OgDmlOgSpecificIT` 3
+（attcmprmode 护栏——压缩 DDL 服务端拒绝判别串 + attcmprmode∈{0,127} 库侧钉 + 对拍
+不受扰；分区 fail-safe 母表白名单内/外两形态——修复 B 端到端锚，分区行零泄漏）、
+`OgCompatGuardIT` 2（m2a/m2b 档 ISE 三断言[档位值/M3-M4 指引/PG 建库指引] + 槽副作用
+缺席——ISE 先于建槽）；M1 五组 IT 零改动全绿。OgDmlOgSpecificIT 以 `new OgDmlParityIT()`
+实例复用包内共享骨架（无 JUnit 生命周期介入——后者若引入 @BeforeEach 依赖会静默漂移，
+记档备查）。
 
 ## 已知限制
 
@@ -395,28 +492,38 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**353 用例 = 离线 306 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
+**414 用例 = 离线 348 + Testcontainers IT 66（PG 40 + openGauss 26；需本机 Docker）**
+（2026-10-12 M2 收口 surefire 逐类对账口径）。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
   "两版 toast 偏移差恰 4B"自检锚；**OG 档**：OgWalRecordParserTest 4（真实语料 283 条
   全窗走读 + 四锚记录 + prev 链自洽）/ OgPruneViewTest 6（9.2 系 CLEAN 老格式 + 撞号
   门控）/ WalLayoutVOpenGaussTest 5 / WalLayoutsOgDiscriminatorTest 5（90204 撞号
-  文本判别））；`receive` WalStreamWalkerTest 14（锚定协议含 mid-stream 漂移免疫 +
+  文本判别）/ **OgXactViewTest 6（M2 T2：XACT 四记录族手造 + 语料锚——含无 252
+  TOPLEVEL_XID 的终态 subxacts 归并面）/ OgMultiInsertViewTest 4（M2 T3：九条真 COPY
+  语料收口 + 手造变体）**）；`receive` WalStreamWalkerTest 14（锚定协议含 mid-stream 漂移免疫 +
   OG 整零页容忍）/ FileWalSourceTest 10（目录 tail + .partial 预分配全零的前向扫描
   交付上限）/ direct 子包（**M1 裸 v3 客户端**：V3ProtocolChannelTest 6 / OgAuthTest 6
   （sha256 码 11/码 10-3.0 签名/md5 三认证面）/ DirectWalSourceStreamTest 6 /
   DirectWalSourceFeedbackTest 2（65B 'r' 反馈 + 心跳））；`replay` CatalogReplayTest
   16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 9（含引导前沿种子
-  过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚）/ SelfHealerTest 4 / **OG 档**：
-  OgCatalogReplayTest 11（头 oid/护栏/OG 词典/attnum -7/-8 合法下界）/ 
-  OgCatalogBootstrapSqlTest 4；`state` StateStoreTest 10（往返/CRC 拒载/版本拒载/
+  过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚 + M2 T7 修复 C 映射目录段号直认
+  接缝锚）/ SelfHealerTest 4 / **OG 档**：
+  OgCatalogReplayTest 11（头 oid/护栏/OG 词典/attnum -7/-8 合法下界——②b 已随修复 B
+  反转为 parttype='p' 放行断言）/ OgCatalogBootstrapSqlTest 4；`state` StateStoreTest 10
+  （往返/CRC 拒载/版本拒载/
   pgVersion 参数化错配拒载——17 写 17、18 写 18，终审 I1；formatVersion 3 dmlFloorLsn
   往返 + OG 档 majorVersion=5）/ StateConfigTest 5；`changes`（v2 DML 面：
-  DiskValueRendererTest 18 / XactGrouperTest 20 / ToastAssemblerTest 13（含 lz4 双形态
-  解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 7 /
+  DiskValueRendererTest 18 / XactGrouperTest 21（含 M2 T7 修复 A 的 MULTI_INSERT
+  SHORTALIGN 真几何锚）/ ToastAssemblerTest 13（含 lz4 双形态
+  解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 11（含 M2 T5 OG 档
+  parttype 判别闸——V17/V18 用例零改动零回归）/
   PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
-  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；`api` WalSourceConfigTest
+  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7；**OG 档（M2）**：
+  OgXactGrouperSeamTest 5（OG XACT 接缝——终态 subxacts 归并/COMMIT_COMPACT/2PC 面，
+  T2）/ OgColumnCompressionTest 21（四算法黄金向量 + meta 走读 + 失败负例，T4））；
+  `api` WalSourceConfigTest
   5 / OgWalSourceConfigTest 14（OG 五键解析/缺省值/IAE 面 + 全装配门面 README/Main
   形态 DML listener 装配锚[伪 Driver 顶替 DriverManager 驱动 start() 全路径，M2 T1
   反转 M1 的 WARN 降级断言——PG 档库 dmlEnabled 保持 true]）/ OgCompatModeGuardTest 3
@@ -439,7 +546,10 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   风暴/随机 CHECKPOINT 干扰下 DDL 全场景对拍，@RepeatedTest(2) + RENAME 最小复现）、
   `WalLifecycleIT` 5（检查点续传/损坏回落全新引导/丢页末态追平 resyncs==0/门面全装配/
   引导窗口并发 DDL 不丢行）、`Wal17SyncIT` 7（17 对抗精简版 + 生命周期 + 跨版本分发
-  拒绝与 V18 注入 fail-fast 零副作用）；**openGauss 档 7 用例**（`opengauss/opengauss:5.0.0`
-  `OgTestEnv` 单例，详见"openGauss 5.0.0 档"节验收段）：`OgCatalogSyncIT` 1 /
-  `OgLifecycleIT` 3 / `OgInstanceSurvivalIT` 1 / `OgGoldenWireIT` 1 /
-  `OgDualChannelParityIT` 1。
+  拒绝与 V18 注入 fail-fast 零副作用）；**openGauss 档 26 用例**（`opengauss/opengauss:5.0.0`
+  `OgTestEnv` 单例——M1 五组：`OgCatalogSyncIT` 1 / `OgLifecycleIT` 3 /
+  `OgInstanceSurvivalIT` 1 / `OgGoldenWireIT` 1 / `OgDualChannelParityIT` 1；**M2 四组
+  （2026-10-12）**：`OgParitySmokeIT` 1（对拍冒烟）/ `OgDmlParityIT` 13（v2 六场景 OG
+  档全量对拍）/ `OgDmlOgSpecificIT` 3（attcmprmode 护栏 + 分区 fail-safe 两形态）/
+  `OgCompatGuardIT` 2（A/B 档启动期 ISE + 槽副作用缺席）——详见"openGauss 5.0.0 档 M2"
+  节验收段）。

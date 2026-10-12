@@ -27,12 +27,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p><strong>Task 7 真容器冒烟已实证三目录末态对拍全等</strong>（throwaway harness，
  * DDL 序列含 CREATE TABLE/SCHEMA/RENAME/INSERT/UPDATE）——本 IT 把它固化为正式验收：
  * 场景面加宽（DROP COLUMN/TRUNCATE 二连/toast 宽行/交错 DDL/CHECKPOINT×3）并叠加
- * 干扰线程。DML 场景刻意避开 JDBC CopyManager 批量路径（OG MULTI_INSERT 解析仍 ISE，
- * Task 8 语料锚 rmid=9 info 0x30 已记档 deferred——逐条 INSERT 不触发该记录形态）。</p>
+ * 干扰线程。DML 场景刻意避开 JDBC CopyManager 批量路径（M1 期 OG MULTI_INSERT 解析
+ * 即 ISE；M2 T3/T7 已转录真几何并以 COPY 场景对拍验收，本 IT 保持逐条 INSERT 形态
+ * ——catalog 面对拍不依赖 MULTI_INSERT）。</p>
  *
- * <p><strong>场景刻意避开的 OG 护栏面</strong>：不建列存（ORIENTATION=COLUMN）/分区/
- * 段页式表——种子期与流内护栏对这类表 ISE（Task 7 设计取舍），场景含它即测的是
- * 护栏而非对拍。</p>
+ * <p><strong>场景刻意避开的 OG 护栏面</strong>：不建列存（ORIENTATION=COLUMN）/段页式
+ * 表——种子期与流内护栏对这类表 ISE（M1 Task 7 设计取舍），场景含它即测的是护栏而非
+ * 对拍；分区表护栏已按 M2 T7 修复 B 放宽（parttype='p' 母表行放行入字典），M1 场景
+ * 面维持不含分区——分区 DML 行为的验收在 M2 对拍 IT。</p>
  */
 class OgCatalogSyncIT extends OgSyncItBase {
 

@@ -34,10 +34,11 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 `org.vastdata.vbstream.walsource.cdc`；Ctrl-C 优雅退出含最终 best-effort 检查点 + 槽
 推进；启动失败 exit 1。）
 
-## openGauss 5.0.0 快速开始（M2 DML 面开门）
+## openGauss 5.0.0 快速开始（M1 catalog + M2 DML 面）
 
-catalog 同步 + WAL 接收（M1 面）+ **DML 输出面（M2 起——`vb.wal.dml` 缺省 true 即装配，
-兼容模式护栏先探测）**；存储引擎只做 ASTORE（UStore/列存/段页式/bucket 表识别即启动期
+catalog 同步 + WAL 接收（M1 面）+ **DML 输出面（M2 已落地——`vb.wal.dml` 缺省 true 即装配，
+兼容模式护栏先探测；v2 六场景经双路对拍全量验收，能力与限制见下文"M2 DML 面能力与
+限制"）**；存储引擎只做 ASTORE（UStore/列存/段页式/bucket 表识别即启动期
 ISE），仅单机/无 replconninfo 形态。**DML 面仅支持 PG 兼容模式库**（`DBCOMPATIBILITY
 'PG'`）：Main 冒烟默认注入 DML 输出面，在非 PG 档库（如镜像缺省 postgres 库是 'A' 档
 Oracle 风格）上启动期 ISE 附档位与 M3/M4 指引；仅需 catalog 同步面可显式
@@ -83,6 +84,23 @@ host replication gaussdb 0.0.0.0/0 md5
 dummy_standby 非 immediately_reserve）；收流通道 `-Dvb.wal.og.source=file|direct`
 （缺省 file=sidecar pg_receivexlog 落目录 tail；direct=裸 v3 协议直连，两通道 IT 对拍
 记录序列全等）。OG 五键全表见模块 `CLAUDE.md` 配置面节。
+
+**M2 DML 面能力与限制**（详版见模块 `CLAUDE.md`"openGauss 5.0.0 档 M2"节）：
+
+- ✅ **v2 六场景全量**：基础 DML 六形态（含 COPY 批量 MULTI_INSERT 真几何）/17 类型边界值/
+  TOAST 三形态 + 重启 unchanged/DDL-in-txn as-of/2PC 四形态/中途停续——经**双路对拍**
+  验收（基准路 = opengauss-jdbc 逻辑流 proto v1 + 独立归一化器；wal 路 = 本模块 DML 面；
+  按 xid 交集逐行 diff 空）。
+- ⚠️ **分区 = 不砖 + 有痕跳过而非捕获（R1 裁定——与"全量"意图的偏差，在此显式呈报）**：
+  OG 分区子表不在 pg_class（分区行在 pg_partition，列挂母表 oid），分区 DML 行字典 miss
+  **有痕跳过**（fail-safe：零泄漏、无终态失败；母表行入字典不再砖引导）。完整捕获需第四
+  watched 字典（pg_partition），归 M3（A 档原生分区是天然归宿）。
+- ⚠️ **attcmprmode 列压缩在行存面 DDL 天然不可达**：服务端三路 DDL 语法全拒（普通表
+  attcmprmode∈{0,127}）——DELTA/DICT/PREFIX/NUMSTR 四算法解压纯函数已备（零接线），
+  A 档列存（M3）走 compress_kits CU 族不同源。
+- ❌ **A/B 兼容档库整库不支持**（启动期 ISE 附档位与 M3/M4 指引——DML 面仅
+  DBCOMPATIBILITY 'PG' 库）；MultiXactId 变体未锚（到达即错位 ISE）；页字典压缩表
+  （MULTI_INSERT isCompressed≠0）ISE——均 M3+ 范围。
 
 配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键，默认值即下表；单一来源
 `WalSource`/`StateConfig`）：
@@ -135,14 +153,17 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   engine Main 装配）与 wal 直解路各自独立槽位捕获输出，按 xid 交集**逐行 diff 为空**；
   六场景（基础 DML 六形态 / 17 类型边界值 / TOAST 三形态 + 重启 unchanged / DDL-in-txn
   as-of / 2PC 四形态 / 中途停续）+ CREATE SCHEMA + 干扰矩阵。
-- **openGauss 档（M1）**：`opengauss/opengauss:5.0.0` Testcontainers 五组 IT——catalog
-  末态对拍（65 轮干扰 + 宽 DDL，断言面 vanilla 同源逐行全等）+ 生命周期（检查点续传/
-  损坏回落/门面全装配）+ 实例存活红线（5 轮双 kill 向量：服务端 walsender 终止 +
-  客户端裸 socket 关闭，每轮 SELECT 1 + 日志无 gaussdb exit）+ 黄金 wire 对拍（真流上
-  'k' 恰 33B / 65B 'r' 反馈 peer_role=3/peer_state=7 私有帧形）+ 双通道对拍（file vs
-  direct 同窗口记录序列全等）。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（342 用例 = 离线 295 + Testcontainers
-  IT 47——PG 40 + openGauss 7，后者需本机 Docker）。
+- **openGauss 档（M1 + M2）**：`opengauss/opengauss:5.0.0` Testcontainers 九组 IT——M1
+  五组（catalog 末态对拍[65 轮干扰 + 宽 DDL，断言面 vanilla 同源逐行全等] + 生命周期
+  [检查点续传/损坏回落/门面全装配] + 实例存活红线[5 轮双 kill 向量：服务端 walsender
+  终止 + 客户端裸 socket 关闭，每轮 SELECT 1 + 日志无 gaussdb exit] + 黄金 wire 对拍
+  [真流上 'k' 恰 33B / 65B 'r' 反馈 peer_role=3/peer_state=7 私有帧形] + 双通道对拍
+  [file vs direct 同窗口记录序列全等]）+ **M2 四组（对拍冒烟 / v2 六场景 OG 档全量对拍 /
+  attcmprmode 护栏 + 分区 fail-safe / A-B 档兼容护栏）——基准路 = opengauss-jdbc 逻辑流
+  + 独立归一化器，认证走专用角色 m2par_base + pg_hba sha256 行（gaussdb 走复制流撞
+  码 11 的认证死角绕开）**。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（414 用例 = 离线 348 + Testcontainers
+  IT 66——PG 40 + openGauss 26，后者需本机 Docker）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
 
@@ -152,9 +173,10 @@ pglz 与 lz4 解压/行内压缩/未变列 `<toast-unchanged>`/重启回查）�
 as-of、RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重发、PG 17+18
 双版本。
 
-**✅ 支持（openGauss 5.0.0 档，M1 catalog 面）**：catalog 同步（引导 + ctid 重放 + 末态
-对拍全等）、双通道收流（file/direct 对拍一致）、检查点续传与槽推进、实例存活红线。
-DML 输出是 M2 范围。
+**✅ 支持（openGauss 5.0.0 档，M1 catalog + M2 DML[PG 兼容库]）**：catalog 同步（引导 +
+ctid 重放 + 末态对拍全等）、双通道收流（file/direct 对拍一致）、检查点续传与槽推进、
+实例存活红线；**DML 面 v2 六场景全量**（基础 DML 六形态含 COPY MULTI_INSERT/17 类型/
+TOAST/DDL-in-txn as-of/2PC/中途停续——双路对拍验收，见上文"M2 DML 面能力与限制"）。
 
 **❌ 不支持（触发时的行为）**：
 - **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，
@@ -164,8 +186,10 @@ DML 输出是 M2 范围。
 - **VACUUM FULL/CLUSTER** → 字典跟踪但 DML 语义未承诺
 - **dropped 列** → wal `∅` vs engine 不发——已知分叉面
 - **openGauss 档**：UStore/列存/段页式/bucket 表 → 启动期/流内 ISE（只做 ASTORE）；
-  OG MULTI_INSERT → 解析即 ISE（main 布局未语料锚定，M2 补）；MultiXactId 变体 → 未锚
-  （到达即错位 ISE）；挂 replconninfo 的 HA 形态 → 不在支持面
+  A/B 兼容档库 → 启动期 ISE 附 M3/M4 指引（DML 面仅 PG 档库）；**分区 DML → 有痕跳过**
+  （不砖 + 零泄漏，完整捕获归 M3）；attcmprmode 列压缩 → 行存 DDL 天然不可达（服务端
+  拒绝）；页字典压缩表（MULTI_INSERT isCompressed≠0）与 MultiXactId 变体 → ISE/未锚；
+  挂 replconninfo 的 HA 形态 → 不在支持面
 
 ## 已知限制（详版见模块 CLAUDE.md）
 

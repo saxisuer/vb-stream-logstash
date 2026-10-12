@@ -21,6 +21,22 @@
 | 段文件"完成段恒 16MB 零垫尾" | **pg_receivexlog 预分配 16MB 全零 `.partial`**（文件长度≠接收进度——tail 面须前向扫描最后非零字节） | strace + 对拍实证（旧逻辑静默丢 ~760 条尾记录）——实测裁定见 task-8 报告 |
 | `?::pg_lsn` cast（沿 vanilla SQL） | **OG 无 pg_lsn 类型**——cast 每检查点一条 ERROR、槽推进恒失败，须档位化去 cast | pg_type 实查 + 修复后 restart_lsn 真实持久推进——实测裁定见 task-9 报告 |
 
+> **M2 已落地（2026-10-12）**：openGauss 5.0.0 **DML 面**（PG 兼容模式库）按
+> `docs/superpowers/specs/2026-10-12-wal-source-opengauss-m2-design.md` 完成 T0-T8——
+> 库级兼容模式护栏（PG 档 only，A/B 档启动期 ISE 附 M3/M4 指引）+ XACT/MULTI_INSERT/
+> 列压缩/分区四个 OG 差异接缝 + **v2 六场景双路对拍全量**（基准路 = opengauss-jdbc 逻辑流
+> + 独立归一化器——T0 spike `docs/wal-source-opengauss-m2-spike.md` 裁定 PARITY=LOGICAL，
+> 修正本文 §三"对拍基准缺失/退化场景化断言"的预判）。**下表勘误**为 M2 实施期实测对本文
+> 若干推导/预判的修正（原段落保留作历史，以表为准）：
+
+| 调研期推导/预判 | 实测裁定 | 依据 |
+|---|---|---|
+| attcmprmode 列压缩是 changes 包风险面（§2.1 TOAST 行/§三 changes 行） | **行存面 DDL 天然不可达**——三路 DDL 语法全拒 + tablecmds.cpp 双护栏 + 全库目录扫三源（relcmprs≤1、普通表 attcmprmode∈{0,127}）；压缩形态实为元组级 HEAP_COMPRESSED 0x0010 + 页字典（非 varlena tag）。M2 交付 = 四算法解压纯函数零接线（A 档列存走 compress_kits CU 族不同源，M3 勿复用） | T4 三源实测——task-4 报告 |
+| TableFilter 的 'r'/'p' 判别改 parttype 语义（§2.1/§三 replay 行）——分区判别可平移 | parttype 语义成立，但**分区子表不在 pg_class**（无 pg_class/pg_attribute 行，列挂母表 oid；分区行在 pg_partition，母表 relkind='r' + parttype 值域恰 {'n','p'}）——白名单按子表独立匹配不可达；路由 = INSERT 落**分区自身 relfilenode**（pg_partition 'p' 行）。M2 分区面 = 不砖 + 有痕跳过（pg_partition 第四 watched 字典归 M3） | T5 range/list 四锚实测——task-5 报告 |
+| DML 面对拍退化为"场景化断言"（§三 测试行：engine 逻辑解码路跑不了 openGauss） | **OG 逻辑解码路可用**——opengauss-jdbc `logical()` proto v1 收 OG pgoutput 帧（两处帧级差异：B 帧 xid Int64 / TupleData Int16 ncols 前缀），双路对拍 PARITY=LOGICAL 成立，v2 六场景全量验收 | M2 spike 三路实测 + T6/T7 对拍 IT |
+| md5 认证全通（SQL 与 replication 连接，§2.2——gaussdb 改 md5 后） | 对 **JDBC 逻辑流**存在认证死角：口令 sha256 存储的 gaussdb 走复制流撞**码 11 混合挑战**（opengauss-jdbc 应答缺 iteration 尾缀且 2048 旧迭代数，真 5.0.0 服务端恒拒）+ OG 复制连接在 pg_hba **只匹配 `replication` 关键字行**——解法 = 专用角色 m2par_base + `host replication m2par_base all sha256` 首行（码 10 RFC5802 驱动实现正确；调研期"gaussdb 口令 md5 化"路在部署上不可依赖） | T6 driver trace + 服务端日志实证——task-6 报告 |
+| XACT 记录解析重写（§一 1.1/§三 changes 行，按 9.2 格式推） | OG 实况：**无 252 TOPLEVEL_XID 标记**（子事务归并走终态 subxacts 补偿）、COMMIT_COMPACT(0x60) 在用（按源码推导布局解析兜底）、RM_XACT_ID=1 同 vanilla；2PC 完整可用（max_prepared_transactions=200） | T2 源码钉死 + 12+2 语料锚——task-2 报告 |
+
 调研目标：评估 `vb-stream-wal-source`（现支持 PG 17/18）适配 **PG 9.2（openGauss 内核基线）**
 的工作量与可行性。方法：①vanilla PG 9.2 与 openGauss 5.0.0 双 Docker 容器实测（协议面/SQL 面/
 WAL 字节面）；②REL9_2_STABLE 与 openGauss v5.0.0 源码头文件核对；③pgjdbc 42.7.13 与
