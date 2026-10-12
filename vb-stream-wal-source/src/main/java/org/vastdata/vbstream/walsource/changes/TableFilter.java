@@ -1,5 +1,7 @@
 package org.vastdata.vbstream.walsource.changes;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 
@@ -8,6 +10,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * 用户表过滤器 + {@link TableMeta} 组装器（v2 MS2）——把 heap 块反查出的关系
@@ -26,28 +30,34 @@ import java.util.Set;
  * {@link CatalogSnapshot#parttypeOf} 不可判（empty）fail-open 放行（与 V17/V18
  * 无此闸的行为面一致）。</p>
  *
- * <p><b>白名单物理表匹配规则（spec §3，路由实测锚定）</b>：白名单匹配对象 =
- * <b>物理承载行的表</b>——og-plan m2pg 实测（range t5_rng p1=32809/p2=32810 +
- * list t5_lst pa=32821/pb=32822 四锚，rmid=10 heap INSERT 块引用）：INSERT 的
- * heap 记录全部路由到<b>分区自己的 relfilenode</b>（pg_partition 'p' 行），母表
- * relfilenode 全窗零命中——母表不在匹配面；分区子表按物理表独立匹配。V17/V18 的
- * 分区子表是 pg_class 'r' 行（独立 relname），白名单写子表全名即命中。OG 的分区
- * 仅在 pg_partition（无 pg_class/pg_attribute 行，列字典挂母表 oid）——不在 v1
- * 三表字典解析面，resolve 对分区 relfilenode 天然 fail-safe miss（有痕跳过：miss 的
- * DEBUG 痕迹在调用方 {@code XactGrouper.resolveCached}、引导期的节流 WARN 在
- * {@code CatalogBootstrap}——终审 I1），
- * "分区子表独立匹配白名单"在 OG 档的完整落地需 pg_partition 字典（M3/后续记档）。
- * V17/V18 路径（含两参兼容构造器）零变化。</p>
+ * <p><b>openGauss 档分区身份链（M3 T2，T0 锚②语义重排）</b>：OG 原生分区的 heap
+ * 记录路由到<b>分区自己的 relfilenode</b>（pg_partition 'p' 行——不在 pg_class
+ * 三表字典，og-plan m2pg 四锚实测）；三表解析 miss 且 OG 档时走第四步分区链：
+ * {@link CatalogSnapshot#partitionOf} 反查分区行 → parentid 母表链 → 按<b>母表
+ * 身份</b>放行与组装（TableMeta = schema.母表名 + 母表 pg_class oid + 母表列集
+ * ——列挂母表 oid，M2 T5 事实；基准路 pgoutput R/I 帧同形，锚②
+ * {@code PARTITION_NAME=mother}：wal 路渲分区名对拍必 diff）。<b>白名单基准形态
+ * = 母表名匹配</b>（写母表名即覆盖其全部分区）；<b>分区名条目 = 兼容增强</b>——
+ * 运行期双查（先母表全名、未中再分区全名，schema 取母表解析值）：解析期预展开
+ * （把分区名静态展开进白名单集）需要构造期字典且 ADD/DROP PARTITION 后即过期，
+ * 双查的匹配面随第四字典 as-of 走、每行一次 Set 查询成本可忽略——口径落定记档。
+ * <b>链断 fail-safe 有痕跳过</b>（沿 nsp redirect miss 先例）：第四字典有分区行
+ * 但母表链解析不出（parentid 悬空/字典半损）——WARN 一次（全局节流）+
+ * {@link #partitionChainMisses()} 计数，行照常跳过不砖流。</p>
  *
  * <p>放行时组装 {@link TableMeta}：schema 经 relnamespace→pg_namespace.nspname
  * 解析、columns 取 {@link CatalogSnapshot#columnsOf} 的有序含 dropped 占位投影。
  * miss 面（relkind/系统模式/白名单/字典无行）一律 {@link Optional#empty()}——
- * 调用方（v2 桶发射）据此静默跳过该块，不抛不告警（噪声表属常态）。</p>
+ * 调用方（v2 桶发射）据此静默跳过该块，不抛不告警（噪声表属常态；分区链断的
+ * 有痕面除外，见上）。</p>
  *
  * <p>线程约束：持快照与白名单两不可变引用，查询面委派快照的弱一致语义
- * （见 {@link CatalogSnapshot}）——任意线程并发调用安全。</p>
+ * （见 {@link CatalogSnapshot}）；链断计数（LongAdder）与 WARN 节流位
+ * （AtomicBoolean）并发安全——任意线程并发调用安全。</p>
  */
 public final class TableFilter {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TableFilter.class);
 
     /** 系统模式排除集：watched 目录（pg_catalog）与其 toast（pg_toast）、SQL 标准视图
      * （information_schema）所在模式——这些 'r' 表是目录/基础设施，不属变更流语义。 */
@@ -59,6 +69,12 @@ public final class TableFilter {
 
     /** OG 方言档门控（构造期定格）：true 时第一闸走 parttype 语义（见类 javadoc）。 */
     private final boolean ogDialect;
+
+    /** 分区链断的跳过计数（沿 nsp redirect miss 先例——逐次递增，观测面）。 */
+    private final LongAdder partitionChainMisses = new LongAdder();
+
+    /** 链断 WARN 全局节流位（整实例恰一次——后续链断走 DEBUG + 计数）。 */
+    private final AtomicBoolean partitionChainWarned = new AtomicBoolean();
 
     /**
      * 装配过滤器（v2 兼容形态：vanilla 语义，不消费 parttype）。
@@ -96,16 +112,47 @@ public final class TableFilter {
      * parttype]/系统模式/白名单）全过返回组装好的 {@link TableMeta}。
      *
      * <p>关键步骤：①{@link CatalogSnapshot#relOidOf(long)} 双入口归一到关系 oid，
-     * 字典无行（未引导/已删除/未登记）即 empty——OG 档的分区 relfilenode 即落此面
-     * （不在 pg_class，fail-safe miss）；②relkind（OG 档再叠 parttype）/系统模式/
-     * 白名单逐闸过滤；③组装 TableMeta（schema/table/列序投影）。边界与异常语义：
-     * 任一闸不过或字典缺行返回 empty（不抛——miss 是常态而非异常）；relnamespace
-     * 无对应 nsp 行（字典半损）视同 miss。线程约束：并发安全（见类 javadoc）。</p>
+     * 字典无行（未引导/已删除/未登记）即 empty；②relkind（OG 档再叠 parttype）/
+     * 系统模式/白名单逐闸过滤；③组装 TableMeta（schema/table/列序投影）。OG 档
+     * 的三表 miss 不即终：分区 relfilenode（不在 pg_class——路由落 pg_partition
+     * 'p' 行）转 {@link #resolvePartitionAnchored} 第四步身份链（M3 T2，见类
+     * javadoc）；vanilla 档三表 miss 即终（零变化锚）。边界与异常语义：任一闸不过
+     * 或字典缺行返回 empty（不抛——miss 是常态而非异常；分区链断除外：WARN 一次 +
+     * 计数的有痕面）；relnamespace 无对应 nsp 行（字典半损）视同 miss。线程约束：
+     * 并发安全（见类 javadoc）。</p>
      *
      * @param relNodeOrOid relfilenode（heap 块反查形态）或关系 oid（元数据直查形态）
      * @return 表身份 + 列序；miss 为 empty
      */
     public Optional<TableMeta> resolve(long relNodeOrOid) {
+        Optional<TableMeta> resolved = resolveThreeTable(relNodeOrOid);
+        if (resolved.isPresent() || !ogDialect) {
+            return resolved;
+        }
+        return resolvePartitionAnchored(relNodeOrOid);
+    }
+
+    /**
+     * 分区链断的跳过计数观测面（沿 nsp redirect miss 先例）——链断逐次递增、
+     * volatile 读；正常 miss（第四字典无行/白名单不中）不计数。
+     *
+     * @return 本实例会话累计链断跳过次数
+     */
+    public long partitionChainMisses() {
+        return partitionChainMisses.sum();
+    }
+
+    /**
+     * 三表（pg_class/pg_attribute/pg_namespace）解析面——v2 既有路径逐字节不变：
+     * relOidOf 归一 → relkind[OG 档含 parttype]/系统模式/白名单 → TableMeta 组装。
+     *
+     * <p>边界与异常语义同 {@link #resolve}（vanilla 档即本方法的全部语义）。
+     * 线程约束：并发安全（见类 javadoc）。</p>
+     *
+     * @param relNodeOrOid relfilenode 或关系 oid
+     * @return 表身份 + 列序；三表面 miss 为 empty
+     */
+    private Optional<TableMeta> resolveThreeTable(long relNodeOrOid) {
         OptionalLong oidOpt = snapshot.relOidOf(relNodeOrOid);
         if (oidOpt.isEmpty()) {
             return Optional.empty();
@@ -127,11 +174,107 @@ public final class TableFilter {
         if (!whitelist.isEmpty() && !whitelist.contains(schema.get() + "." + name.get())) {
             return Optional.empty();
         }
+        return Optional.of(assembleMeta(oid, schema.get(), name.get()));
+    }
+
+    /**
+     * OG 档分区身份链（M3 T2 第四步，T0 锚②）：分区 relfilenode 经第四字典反查
+     * 分区行 → parentid 母表链 → 按<b>母表身份</b>过闸与组装。
+     *
+     * <p>关键步骤：①{@link CatalogSnapshot#partitionOf} 反查（'p' 行路由锚）——
+     * 无行即正常 miss（未知关系/未引导，零痕迹）；②母表闸——relkindOf(parentid)
+     * 缺行 = <b>链断</b>（parentid 悬空——WARN 一次 + 计数）；形态闸不过（非用户
+     * 表 kind）为正常 miss；③schema 解析缺行（nsp 半损）= 链断、系统模式为正常
+     * miss；nameOf 缺行 = 链断；④白名单<b>双匹配</b>（母表全名 OR 分区全名——
+     * schema 取母表解析值；母表名 = 基准形态，分区名 = 兼容增强）；⑤TableMeta =
+     * 母表 oid/母表名/母表列集（columnsOf(parentid)）。边界与异常语义：链断与
+     * 正常 miss 同返 empty（fail-safe 跳过不抛——差面只在内嵌痕迹/计数）；列集
+     * 空（母表无 attr 行的字典半损）照常组装（空列的 TableMeta 由解码层自然
+     * 兜住，与三表面同口径）。线程约束：并发安全（计数/WARN 节流原子面）。</p>
+     *
+     * @param partitionRelfilenode 分区物理段号（heap 记录路由锚）
+     * @return <b>母表身份</b>的表身份 + 母表列序；miss/链断为 empty
+     */
+    private Optional<TableMeta> resolvePartitionAnchored(long partitionRelfilenode) {
+        Optional<CatalogSnapshot.PartitionIdentity> part = snapshot.partitionOf(partitionRelfilenode);
+        if (part.isEmpty()) {
+            return Optional.empty();   // 第四字典无行：正常 miss（未知段号/未引导）
+        }
+        CatalogSnapshot.PartitionIdentity identity = part.get();
+        long parentOid = identity.parentid();
+
+        Optional<String> relkind = snapshot.relkindOf(parentOid);
+        if (relkind.isEmpty()) {
+            notePartitionChainMiss(partitionRelfilenode, identity, "母表不在 pg_class 字典（parentid 悬空）");
+            return Optional.empty();
+        }
+        if (!isUserTableKind(relkind.get(), parentOid)) {
+            return Optional.empty();   // 母表行在但形态/列闸不过：正常 miss
+        }
+        Optional<String> schema = snapshot.schemaOf(parentOid);
+        if (schema.isEmpty()) {
+            notePartitionChainMiss(partitionRelfilenode, identity, "母表 relnamespace 无 nsp 行（字典半损）");
+            return Optional.empty();
+        }
+        if (SYSTEM_SCHEMAS.contains(schema.get())) {
+            return Optional.empty();
+        }
+        Optional<String> name = snapshot.nameOf(parentOid);
+        if (name.isEmpty()) {
+            notePartitionChainMiss(partitionRelfilenode, identity, "母表 relname 缺行（字典半损）");
+            return Optional.empty();
+        }
+        if (!whitelist.isEmpty()) {
+            String motherFullName = schema.get() + "." + name.get();
+            String partitionFullName = schema.get() + "." + identity.relname();
+            if (!whitelist.contains(motherFullName) && !whitelist.contains(partitionFullName)) {
+                return Optional.empty();
+            }
+        }
+        return Optional.of(assembleMeta(parentOid, schema.get(), name.get()));
+    }
+
+    /**
+     * TableMeta 组装公共面（三表/分区链同构）：columnsOf 的有序含 dropped 占位
+     * 投影转 {@link ColumnMeta} 列表。
+     *
+     * @param oid    关系 oid（分区链形态 = 母表 oid）
+     * @param schema 模式名
+     * @param name   表名（分区链形态 = 母表名）
+     * @return 组装好的 TableMeta
+     */
+    private TableMeta assembleMeta(long oid, String schema, String name) {
         List<ColumnMeta> columns = new ArrayList<>();
         for (CatalogSnapshot.Column col : snapshot.columnsOf(oid)) {
             columns.add(new ColumnMeta(col.attnum(), col.name(), col.typeOid(), col.dropped()));
         }
-        return Optional.of(new TableMeta(oid, schema.get(), name.get(), columns));
+        return new TableMeta(oid, schema, name, columns);
+    }
+
+    /**
+     * 分区链断的有痕跳过（沿 nsp redirect miss 先例）：递增
+     * {@code partitionChainMisses} 计数 + <b>整实例恰一次 WARN</b>（含
+     * relfilenode/分区名/parentid 上下文与原因——常见形态：第四字典与 pg_class
+     * 字典半损/窗口期 DDL），后续链断走 DEBUG（防刷屏）。
+     *
+     * <p>线程约束：LongAdder/AtomicBoolean 原子面，并发安全（WARN"恰一次"跨线程
+     * 由 CAS 保证）。</p>
+     *
+     * @param relfilenode 链断的分区段号
+     * @param identity    第四字典命中的分区身份
+     * @param why         链断原因（诊断上下文）
+     */
+    private void notePartitionChainMiss(long relfilenode, CatalogSnapshot.PartitionIdentity identity, String why) {
+        partitionChainMisses.increment();
+        if (partitionChainWarned.compareAndSet(false, true)) {
+            LOG.warn("openGauss 分区身份链断裂——分区行 fail-safe 跳过: relfilenode={}, partition={},"
+                    + " parentid={}, 原因={}（后续链断只递增 partitionChainMisses 计数不再告警；"
+                    + "常见形态：第四字典与 pg_class 字典半损/窗口期 DDL，重启全新引导自愈）",
+                    relfilenode, identity.relname(), identity.parentid(), why);
+        } else {
+            LOG.debug("分区身份链断裂跳过: relfilenode={}, partition={}, parentid={}, 原因={}",
+                    relfilenode, identity.relname(), identity.parentid(), why);
+        }
     }
 
     /**

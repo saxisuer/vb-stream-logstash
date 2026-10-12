@@ -89,10 +89,13 @@ import java.util.Set;
  *
  * <p><b>TableMeta 缓存</b>（控制器裁定，Task 4 提醒）：{@link TableFilter#resolve}
  * 每行 7 趟线性扫——本层按 relfilenode 缓存解析结果；失效策略取最简可靠形态：
- * <b>pg_class/pg_attribute/pg_namespace 三张字典表（固定 oid 1259/1249/2615）上的
- * heap 记录到达即全清缓存</b>（用户表形态/列序只经这三张表的变更改变；toast chunk
- * 与索引记录不清——高频且不影响形态）。oid 计数器 wraparound 使 relfilenode 撞键的
- * 理论残留与 v1 块匹配同口径。缺省身份映射（relfilenode==oid）下三表可直认。</p>
+ * <b>字典 watched 表上的 heap 记录到达即全清缓存</b>——pg_class/pg_attribute/
+ * pg_namespace 三表（固定 oid 1259/1249/2615）恒在，openGauss 档（M3 T2）叠第四表
+ * pg_partition（oid 9016，经 {@code relOidOf} watched 段号直认——ADD/DROP/MERGE/
+ * SPLIT/EXCHANGE 分区 DDL 使分区路由链即时失效，EXCHANGE 换挂母表后的首行即按新
+ * 身份渲染；vanilla 档无该表零侵入）。toast chunk 与索引记录不清——高频且不影响
+ * 形态。oid 计数器 wraparound 使 relfilenode 撞键的理论残留与 v1 块匹配同口径。
+ * 缺省身份映射（relfilenode==oid）下三表可直认。</p>
  *
  * <p><b>TOAST 接线</b>：toast 关系（relkind 't'）上的 INSERT/MULTI_INSERT 解码为
  * 三列 chunk 行喂 {@link ToastAssembler#onChunkRow}；<b>每条用户表行施加后清窗 +
@@ -158,6 +161,15 @@ public final class XactGrouper {
 
     /** 字典三表的固定 oid（pg_attribute/pg_class/pg_namespace——缓存失效触发键）。 */
     private static final Set<Long> SHAPE_CATALOG_OIDS = Set.of(1249L, 1259L, 2615L);
+
+    /**
+     * pg_partition 的固定 oid（openGauss M3 第四 watched 目录——M3 spike T0 坑 2：
+     * 自身 relfilenode 14318 ≠ oid 9016，{@code relOidOf} 的 watched 段号直认接缝
+     * 把 pg_partition 段号上的 heap 记录归一到本 oid，本类据此识别"第四字典形态
+     * 变更信号"触发 TableMeta 缓存全清；og-plan live 实查锚）。OG 档专属（vanilla
+     * 引导不回填该段号，直认不可命中）。
+     */
+    private static final long PG_PARTITION_OID = 9016L;
 
     /** toast chunk 表的三列解码词典（chunk_id oid / chunk_seq int4 / chunk_data bytea）。 */
     private static final String[] TOAST_CHUNK_KINDS = {"oid", "int4", "bytea"};
@@ -834,19 +846,20 @@ public final class XactGrouper {
     }
 
     /**
-     * 解析关系到表身份 + 列词典（缓存面）——命中直接应答；miss 时先探字典三表
-     * （pg_class/pg_attribute/pg_namespace 上的 heap 记录 = DDL 类变更信号 →
-     * <b>全清缓存</b>，策略依据见类 javadoc），再走 {@link TableFilter} 完整解析
-     * （miss 亦缓存，防 toast/索引关系逐记录重扫）。首次 miss 打一条 <b>DEBUG 痕迹</b>
-     * （relfilenode 级，缓存后不重复）——M2 "分区 DML 有痕跳过"的逐行痕迹面：OG 分区
-     * relfilenode 落 pg_partition、v1 三表字典解析不到即落此面（终审 I1；miss 是噪声
-     * 表常态故仅 DEBUG 不 WARN，seed 期的节流 WARN 在 CatalogBootstrap）。
+     * 解析关系到表身份 + 列词典（缓存面）——命中直接应答；miss 时先探字典 watched
+     * 表（pg_class/pg_attribute/pg_namespace 三表恒在、openGauss 档叠 pg_partition
+     * 第四表——其上的 heap 记录 = DDL 类变更信号 → <b>全清缓存</b>，策略依据见类
+     * javadoc），再走 {@link TableFilter} 完整解析（miss 亦缓存，防 toast/索引关系
+     * 逐记录重扫；OG 档分区 relfilenode 经 TableFilter 的第四字典身份链解析为母表
+     * 身份——M3 T2）。首次 miss 打一条 <b>DEBUG 痕迹</b>（relfilenode 级，缓存后
+     * 不重复；miss 是噪声表常态故仅 DEBUG——分区链断的 WARN/计数面在
+     * {@link TableFilter#partitionChainMisses()}）。
      *
-     * <p>边界与异常语义：字典三表返回 null（调用方按跳过处理，不缓存——三表记录
-     * 本身不产生行）。线程约束：单写者。</p>
+     * <p>边界与异常语义：字典 watched 表返回 null（调用方按跳过处理，不缓存——
+     * 字典表记录本身不产生行）。线程约束：单写者。</p>
      *
      * @param relNode relfilenode（heap 块形态）
-     * @return 解析结果（meta=null 表示非用户表）；字典三表命中为 null
+     * @return 解析结果（meta=null 表示非用户表）；字典 watched 表命中为 null
      */
     private Resolved resolveCached(long relNode) {
         Resolved hit = metaCache.get(relNode);
@@ -854,19 +867,33 @@ public final class XactGrouper {
             return hit;
         }
         OptionalLong oid = snapshot.relOidOf(relNode);
-        if (oid.isPresent() && SHAPE_CATALOG_OIDS.contains(oid.getAsLong())) {
+        if (oid.isPresent() && isShapeCatalogOid(oid.getAsLong())) {
             metaCache.clear();
             LOG.debug("字典表 heap 记录到达，TableMeta 缓存全清: oid={}", oid.getAsLong());
             return null;
         }
         TableMeta meta = filter.resolve(relNode).orElse(null);
         if (meta == null) {
-            LOG.debug("关系未解析（白名单外/字典无行——OG 档分区 DML 的 relfilenode 落"
-                    + " pg_partition 即此面，M2 有痕跳过）: relfilenode={}", relNode);
+            LOG.debug("关系未解析（白名单外/字典无行/OG 分区链断——miss 属噪声表常态）: relfilenode={}", relNode);
         }
         Resolved res = new Resolved(meta, meta == null ? null : kindsOf(meta));
         metaCache.put(relNode, res);
         return res;
+    }
+
+    /**
+     * 判定 oid 是否"字典形态变更信号"（TableMeta 缓存全清触发键）：三表固定 oid
+     * 恒触发；openGauss 档再叠 pg_partition（M3 第四字典——ADD/DROP/MERGE/SPLIT/
+     * EXCHANGE 等分区 DDL 全是 pg_partition 上的 heap 记录族，T0 锚④；经
+     * {@code relOidOf} 的 watched 段号直认归一到 9016）。OG 门控保证 vanilla 档
+     * 对 oid 9016 的既有语义零变化（不触发全清、走正常解析面）。
+     *
+     * @param oid 关系 oid
+     * @return true = 该 oid 上的 heap 记录到达应全清 TableMeta 缓存
+     */
+    private boolean isShapeCatalogOid(long oid) {
+        return SHAPE_CATALOG_OIDS.contains(oid)
+                || (layout.openGaussDialect() && oid == PG_PARTITION_OID);
     }
 
     /**

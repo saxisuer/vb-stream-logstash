@@ -28,11 +28,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * OG 档引导分区母表 WARN 痕迹的离线断言（终审 I1 修复）——"有痕跳过"承诺的运行时
- * 落地面：seedClassRows 检出 parttype='p' 行（放行入字典的同一判别列）时，整个引导
- * <b>恰一行 WARN</b>（节流）携带 relname 与"分区 DML 行将有痕跳过——完整捕获归 M3"
- * 指引；无分区母表、或 V17/V18 vanilla 引导（投影根本不含 parttype 列）零 WARN
- * ——vanilla 零回归锚。
+ * OG 档引导分区母表痕迹面的离线断言——M2 终审 I1 的"有痕跳过"WARN 已随 M3 T2
+ * 分区捕获落地<b>退役</b>（"分区 DML 行将有痕跳过"承诺失效——分区行经第四字典
+ * 正常捕获，seed 期跳过指引是过时噪声）；本测试钉退役后的契约：检出 parttype='p'
+ * 行（仍放行入字典——"不砖"语义零变化）<b>零 WARN</b>；无分区母表、或 V17/V18
+ * vanilla 引导（投影根本不含 parttype 列）同零 WARN——vanilla 零回归锚。
  *
  * <p>驱动形态：动态代理脚本化 JDBC 会话（{@code api} 包 FakeJdbc 的同构本地小样，
  * replay 包不可见故就地复刻）按 bootstrap 真实调用序回放——SET TRANSACTION /
@@ -73,13 +73,12 @@ class OgCatalogBootstrapSeedWarnTest {
     }
 
     /**
-     * 用例 ①：OG 引导检出两张分区母表 → <b>整引导恰一行 WARN</b>（节流语义——两张
-     * 'p' 行不产生两行日志），消息含首张母表 relname、分区母表计数、"分区 DML"跳过
-     * 语义与 "M3" 指引四锚；分区母表行仍放行入字典（"不砖"语义零变化——stores 行数
-     * 含 'p' 行）。
+     * 用例 ①：OG 引导检出两张分区母表 → <b>零 WARN</b>（M3 T2 捕获落地后 M2 的
+     * "有痕跳过"seed WARN 退役——分区 DML 行经第四字典正常捕获，跳过指引是过时
+     * 噪声）；分区母表行仍放行入字典（"不砖"语义零变化——stores 行数含 'p' 行）。
      */
     @Test
-    void ogSeedWithPartitionParentsWarnsExactlyOnce() throws SQLException {
+    void ogSeedWithPartitionParentsStaysQuietAfterCaptureLanded() throws SQLException {
         ScriptedJdbc jdbc = baseScript(WalLayoutVOpenGauss.INSTANCE)
                 .row(ogClassRow(16390L, "t_part_range", 16390L, "p"))
                 .row(ogClassRow(16391L, "t_part_list", 16391L, "p"))
@@ -89,13 +88,7 @@ class OgCatalogBootstrapSeedWarnTest {
 
         new CatalogBootstrap(jdbc.connection(), WalLayoutVOpenGauss.INSTANCE).bootstrap(stores);
 
-        List<ILoggingEvent> warns = warns();
-        assertEquals(1, warns.size(), "两张分区母表 → 节流后恰一行 WARN，实得: " + warns);
-        String msg = warns.get(0).getFormattedMessage();
-        assertTrue(msg.contains("t_part_range"), "WARN 须含分区母表 relname，实得: " + msg);
-        assertTrue(msg.contains("2"), "WARN 须含分区母表计数，实得: " + msg);
-        assertTrue(msg.contains("分区 DML"), "WARN 须含分区 DML 跳过语义，实得: " + msg);
-        assertTrue(msg.contains("M3"), "WARN 须含 M3 指引，实得: " + msg);
+        assertEquals(0, warns().size(), "分区捕获落地后 seed 期零 WARN（M2 跳过痕退役），实得: " + warns());
         assertEquals(3, stores.classRows().size(), "'p' 行仍放行入字典（不砖语义零变化）");
     }
 

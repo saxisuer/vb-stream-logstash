@@ -81,9 +81,9 @@ public interface CatalogSnapshot {
      * <p>M2 T5 前置接缝：{@code TableFilter} 的 OG 档判别消费本方法。缺省 empty =
      * "不可判"——V17/V18 无该列（快照实现不覆写），openGauss 档生产快照当前亦未
      * 供数（ClassRow/CatalogStores 无该列投影——M2 T7 存储护栏已对 parttype='p'
-     * 放行入字典，但 parttype 值面仍不随字典携带；供数接线与 pg_partition 第四
-     * 字典一并归 M3）；消费方（TableFilter OG 分支）对 empty 按
-     * fail-open 放行，与 V17/V18 无此闸的行为面一致。</p>
+     * 放行入字典，但 parttype 值面仍不随字典携带；M3 分区身份链经 pg_partition
+     * 第四字典（{@link #partitionOf}）承担，不依赖本列供数）；消费方（TableFilter
+     * OG 分支）对 empty 按 fail-open 放行，与 V17/V18 无此闸的行为面一致。</p>
      *
      * @param relOid 关系 oid
      * @return parttype 单字符（'n'/'p'）；不可判（无该列/未供数）为 empty
@@ -111,6 +111,36 @@ public interface CatalogSnapshot {
      * @return 关系 oid；字典无匹配为 empty
      */
     OptionalLong relOidOf(long relNodeOrOid);
+
+    /**
+     * 分区 relfilenode → 分区身份链投影（<b>openGauss M3 第四字典面</b>，T0 锚②）：
+     * openGauss 原生分区的 heap 记录路由到分区自己的 relfilenode（pg_partition
+     * 'p' 行，不在 pg_class 三表字典），本方法把该段号反查为分区名 + <b>母表
+     * pg_class oid</b>（parentid）——消费方（{@code TableFilter} 的 OG 分区身份链）
+     * 再经 parentid 取母表身份/列集，变更归属按<b>母表</b>建模（基准路 pgoutput
+     * R/I 帧同形，{@code PARTITION_NAME=mother}）。
+     *
+     * <p>缺省恒 empty：V17/V18 无 pg_partition、openGauss 档未引导/未回填第四腿时
+     * 的 no-op 锚——分区链消费面严格 OG 档门控，vanilla 路径零侵入。</p>
+     *
+     * @param relfilenode 分区物理段号（heap 记录路由锚）
+     * @return 分区身份（分区名 + 母表 oid）；第四字典无该段号的行（母表行 'r' 的
+     *         relfilenode 恒 0、普通关系段号天然 miss）为 empty
+     */
+    default Optional<PartitionIdentity> partitionOf(long relfilenode) {
+        return Optional.empty();
+    }
+
+    /**
+     * 分区身份链的最小投影（pg_partition 'p' 行的路由面五字段之三元——消费面
+     * 恰需分区名与母表 oid；relfilenode 即查询键、reltoastrelid 归 TOAST 挂靠面
+     * 不进本投影）。
+     *
+     * @param relname  分区名（pg_partition.relname，定宽 name）
+     * @param parentid 母表 pg_class oid（'p' 行 parentid@68；母表行该列=自身 oid）
+     */
+    record PartitionIdentity(String relname, long parentid) {
+    }
 
     /**
      * 一列的字典投影（pg_attribute 行的最小值面）。

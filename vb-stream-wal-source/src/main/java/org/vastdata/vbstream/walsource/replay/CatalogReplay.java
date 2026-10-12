@@ -228,8 +228,8 @@ public final class CatalogReplay {
      * bucket（relbucket 非 null 且 ≠0，段页式实测=2）、UStore/段页式（reloptions 含
      * storage_type=ustore / segment=on）。<b>分区母表（parttype='p'）放行入字典</b>
      * （M2 T7，T5 R1 裁定）：母表不承载行（路由实测——分区 DML 落 pg_partition
-     * relfilenode），入字典无行流副作用；分区 DML 行的字典 miss 是 M2 fail-safe
-     * 有痕跳过语义，完整捕获归 M3 的 pg_partition 第四字典。
+     * relfilenode），入字典无行流副作用；M3 T2 起分区 DML 行经 pg_partition 第四
+     * 字典身份链捕获（归一到母表身份），母表行正是该链的 parentid 锚。
      *
      * <p>关键步骤：五判别槽位经 layout 访问器取（V17/V18 全 -1 即护栏整体不激活，
      * 零回归）；值行槽位 = 物理词典槽位 + classValsSlotDelta()；null 列（relbucket

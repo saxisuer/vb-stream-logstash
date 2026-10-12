@@ -26,13 +26,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       table does not support compression"，og-plan 实测锚）；普通表 attcmprmode 只取
  *       {0, 127=CMPR_UNDEF}（无真压缩 mode——T4 值域锚）且 DML 对拍不受扰。四算法纯函数
  *       的黄金向量归 T4 离线交付（OgColumnCompression*）。</li>
- *   <li><b>分区 DML 捕获（裁定 3，T5/R1 结论）</b>：M2 语义 = <b>不砖 + fail-safe
- *       有痕跳过</b>——分区母表行入字典（T7 修复 B：存储护栏 parttype='p' 放行，本 IT
- *       是其端到端锚——修复前引导期即 ISE）；分区 DML 行落 pg_partition relfilenode
- *       的三表字典 miss 跳过（发射计数不含分区行）。<b>完整捕获不断言</b>（M3 的
- *       pg_partition 第四字典）。母表白名单两形态（内/外）：行为可断言面 = 两形态下
- *       分区行同样缺席（路由落子表 relfilenode、字典 miss 先于白名单闸——T5 实测），
- *       控制普通表行两形态照常发射。</li>
+ *   <li><b>分区 DML 捕获（M3 T2 落地——T0 锚② 语义重排）</b>：分区母表行入字典
+ *       （T7 修复 B：存储护栏 parttype='p' 放行）；分区 DML 行落 pg_partition
+ *       relfilenode，经第四字典身份链归一到<b>母表身份</b>捕获（TableMeta =
+ *       schema.母表名 + 母表 oid + 母表列集——基准路 pgoutput R/I 帧同形，锚②
+ *       {@code PARTITION_NAME=mother}）。母表白名单两形态（内/外）：在内 = 分区行
+ *       以母表名发射（4 行 + 控制行 1 行同桶）；在外 = 分区行照常 miss、控制行照常
+ *       发射。分区名（p1/pa）全程零出现（渲染面归一锚）。</li>
  * </ul>
  *
  * <p>复用 {@link OgDmlParityIT} 的对拍骨架与场景重置面（包内共享）。需本机 Docker。</p>
@@ -85,42 +85,46 @@ class OgDmlOgSpecificIT {
     }
 
     /**
-     * 分区 DML fail-safe（不砖 + 发射计数不含分区行）：range+list 各一 + 控制普通表，
-     * 单事务混写——断言 wal 路无终态失败、恰一个桶恰一行（仅控制行；分区行字典
-     * miss 跳过）、流持续可用。白名单形态 A（母表在内）。
+     * 分区 DML 捕获（M3 T2，白名单形态 A——母表在内）：range+list 各一 + 控制普通表，
+     * 单事务混写——断言 wal 路无终态失败、恰一个桶恰五行实付（4 分区行 + 1 控制行），
+     * 分区行以<b>母表名</b>（parity.t_prange/parity.t_plist）发射、分区名
+     * （p1/p2/pa/pb）零出现（锚② {@code PARTITION_NAME=mother} 渲染面归一）。
      *
      * @throws Exception 连接/启动路径的底层异常
      */
     @Test
-    void partitionDmlFailsSafeWithMotherInWhitelist() throws Exception {
-        runPartitionScenario("分区 fail-safe（母表在内）", "ogp1",
-                new String[]{"parity.t_prange", "parity.t_plist", "parity.t_ctrl"});
+    void partitionDmlCapturedUnderMotherIdentityWithMotherInWhitelist() throws Exception {
+        runPartitionScenario("分区捕获（母表在内）", "ogp1",
+                new String[]{"parity.t_prange", "parity.t_plist", "parity.t_ctrl"}, 5);
     }
 
     /**
-     * 分区 DML fail-safe 的白名单形态 B（母表在外——白名单只钉控制表）：行为面与
-     * 形态 A 等价（分区 relfilenode 的字典 miss 先于白名单闸，T5 路由实测锚——母表
-     * 不承载行、白名单内外对分区行同为 miss；完整分区白名单归 M3 第四字典）。
+     * 分区 DML 捕获的白名单形态 B（母表在外——白名单只钉控制表）：分区行按母表身份
+     * 双匹配（母表名/分区名都不中）照常 miss——恰一行实付（控制行）、分区表名零泄漏
+     * （控制普通表行不受分区面扰动）。
      *
      * @throws Exception 连接/启动路径的底层异常
      */
     @Test
-    void partitionDmlFailsSafeWithMotherOutOfWhitelist() throws Exception {
-        runPartitionScenario("分区 fail-safe（母表在外）", "ogp2",
-                new String[]{"parity.t_ctrl"});
+    void partitionDmlOutOfWhitelistStaysExcludedWithControlRowIntact() throws Exception {
+        runPartitionScenario("分区捕获（母表在外）", "ogp2",
+                new String[]{"parity.t_ctrl"}, 1);
     }
 
     /**
      * 分区场景共享体：重置（控制表 + range/list 分区表——母表行经 T7 修复 B 入字典，
      * 修复前引导期即砖）→ 起 wal 路（direct + 白名单按形态）→ 单事务混写（分区 4 行 +
-     * 控制 1 行）→ await 桶 1 → 断言恰一行（控制行）、分区行零泄漏、无终态失败。
+     * 控制 1 行）→ await 桶 1 → 断言实付行数按白名单形态（5=分区行捕获 / 1=排除）、
+     * 无终态失败、分区名零出现。
      *
-     * @param scenario  场景名
-     * @param suffix    槽名后缀
-     * @param whitelist DML 白名单（形态 A 含母表 / 形态 B 只含控制表）
+     * @param scenario     场景名
+     * @param suffix       槽名后缀
+     * @param whitelist    DML 白名单（形态 A 含母表 / 形态 B 只含控制表）
+     * @param expectedRows 期望实付行数（形态 A=5 含分区行 / 形态 B=1 仅控制行）
      * @throws Exception 连接/启动路径的底层异常
      */
-    private void runPartitionScenario(String scenario, String suffix, String[] whitelist) throws Exception {
+    private void runPartitionScenario(String scenario, String suffix, String[] whitelist, int expectedRows)
+            throws Exception {
         OgDmlParityIT.resetScenario(new String[]{
                 "CREATE TABLE parity.t_ctrl (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_ctrl REPLICA IDENTITY FULL",
@@ -146,14 +150,14 @@ class OgDmlOgSpecificIT {
                 conn.commit();
             }
             OgDmlParityIT.await(() -> wal.dmlEmittedBuckets() >= 1,
-                    scenario + ": wal 路未发射控制行桶（buckets=" + wal.dmlEmittedBuckets()
+                    scenario + ": wal 路未发射事务桶（buckets=" + wal.dmlEmittedBuckets()
                             + ", terminal=" + wal.receiverTerminalFailure() + "）");
             assertTrue(wal.receiverTerminalFailure().isEmpty(),
                     scenario + ": 分区 DML 不砖——接收器不得终态失败: "
                             + wal.receiverTerminalFailure().map(Throwable::toString).orElse(""));
-            assertEquals(1, wal.dmlEmittedBuckets(), scenario + ": 应恰一个桶（控制行事务）");
-            assertEquals(1, wal.dmlEmittedRows(),
-                    scenario + ": 应恰一行实付——分区行属 pg_partition relfilenode 字典 miss（fail-safe 跳过，M3 第四字典前不捕获）");
+            assertEquals(1, wal.dmlEmittedBuckets(), scenario + ": 应恰一个桶（单事务混写）");
+            assertEquals(expectedRows, wal.dmlEmittedRows(),
+                    scenario + ": 实付行数应按白名单形态（母表在内=分区行捕获 5 行 / 在外=仅控制行 1 行）");
         } finally {
             wal.close();
             harness.cleanupSlots();
@@ -162,12 +166,18 @@ class OgDmlOgSpecificIT {
         // 捕获块断言在 close 之后（WalCapture 的 happens-before 经接收线程 join 建立）
         List<OgBlock> blocks = capture.blocks();
         assertEquals(1, blocks.size(), scenario + ": 捕获块数");
-        assertEquals(1, blocks.get(0).rows().size(), scenario + ": 块内行数");
-        assertTrue(blocks.get(0).rows().get(0).contains("parity.t_ctrl"),
-                scenario + ": 唯一行应是控制表行:\n" + blocks.get(0).rows().get(0));
-        assertTrue(!blocks.get(0).rows().get(0).contains("t_prange")
-                && !blocks.get(0).rows().get(0).contains("t_plist"),
-                scenario + ": 分区行不得泄漏进发射面");
+        assertEquals(expectedRows, blocks.get(0).rows().size(), scenario + ": 块内行数");
+        assertTrue(blocks.get(0).rows().stream().anyMatch(r -> r.contains("parity.t_ctrl")),
+                scenario + ": 控制表行应在发射面:\n" + blocks.get(0).rows());
+        if (expectedRows > 1) {
+            assertTrue(blocks.get(0).rows().stream().filter(r -> r.contains("parity.t_prange")).count() == 2
+                            && blocks.get(0).rows().stream().filter(r -> r.contains("parity.t_plist")).count() == 2,
+                    scenario + ": 分区行应以母表名各两行发射（锚② PARTITION_NAME=mother）:\n"
+                            + blocks.get(0).rows());
+        }
+        assertTrue(blocks.get(0).rows().stream().noneMatch(r ->
+                        r.contains(".p1") || r.contains(".p2") || r.contains(".pa") || r.contains(".pb")),
+                scenario + ": 分区名不得出现在渲染面（归一到母表名）:\n" + blocks.get(0).rows());
     }
 
     /** 兜底清理：分区场景异常路径的 wal 关闭与两路槽删除（正常路径场景内已完成）。 */

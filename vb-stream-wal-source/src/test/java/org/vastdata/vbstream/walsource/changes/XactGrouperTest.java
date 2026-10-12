@@ -534,11 +534,12 @@ class XactGrouperTest {
     }
 
     /**
-     * 终审 I1 痕迹锚：字典 miss 的 heap 行（OG 分区 DML 的 relfilenode 落 pg_partition、
-     * v1 三表字典天然解析不到——即落此面）留下 <b>DEBUG 痕迹</b>：首次 miss 恰一条
-     * （含 relfilenode 与"分区"指涉），同 relfilenode 第二条记录走 TableMeta 缓存不再
-     * 重复打；miss 行不发射（fail-safe 跳过零变化）。ListAppender 挂 XactGrouper
-     * logger 断言（M1 捕获形态）。
+     * 字典 miss 痕迹锚：未登记 relfilenode 的 heap 行留下 <b>DEBUG 痕迹</b>：首次
+     * miss 恰一条（含 relfilenode 上下文），同 relfilenode 第二条记录走 TableMeta
+     * 缓存不再重复打；miss 行不发射。M2 终审 I1 曾以"OG 分区 DML 落 pg_partition
+     * 字典 miss"为该面的主场景——M3 T2 分区身份链落地后分区 relfilenode 正常捕获，
+     * 该面回归纯"噪声表/未知关系"常态（M2 的分区指涉文案随之退役）。ListAppender
+     * 挂 XactGrouper logger 断言（M1 捕获形态）。
      */
     @Test
     void dictionaryMissHeapRowLeavesDebugTraceOncePerRelfilenode() {
@@ -559,7 +560,7 @@ class XactGrouperTest {
                     .filter(m -> m.contains(String.valueOf(unknownRel)))
                     .toList();
             assertEquals(1, traces.size(), "首次 miss 恰一条 DEBUG 痕迹（缓存后不重复），实得: " + traces);
-            assertTrue(traces.get(0).contains("分区"), "痕迹须指涉分区 DML 面，实得: " + traces.get(0));
+            assertTrue(traces.get(0).contains("relfilenode"), "痕迹须含 relfilenode 上下文，实得: " + traces.get(0));
             assertTrue(fx.listener.events.isEmpty(), "miss 行不发射（fail-safe 跳过零变化）");
         } finally {
             grouperLog.detachAppender(appender);

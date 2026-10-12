@@ -1,6 +1,13 @@
 package org.vastdata.vbstream.walsource.changes;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalLayoutV18;
@@ -32,8 +39,40 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * og-plan 实测值域 {'n','p'}）、parttype 闸 'n'/'p' 放行 + 未知值 miss + 不可判
  * fail-open；白名单物理表匹配锚（分区 relfilenode 不在 v1 三表字典——fail-safe
  * miss）；V17/V18 档与两参兼容构造器忽略 parttype 闸（零变化锚）。</p>
+ *
+ * <p><b>OG 档分区身份链面（openGauss M3 T2，用例 ⑫-⑮）</b>：三表解析 miss 后经
+ * 第四字典（{@code partitionOf}）反查分区行 → parentid 母表链 → TableMeta 身份 =
+ * <b>母表</b>（锚② {@code PARTITION_NAME=mother} 语义重排——基准形态）；白名单
+ * <b>双匹配</b>四形态（母表名命中=基准 / 分区名命中=兼容增强 / 双命中 / 都不中）；
+ * 链断 fail-safe（WARN 一次 + partitionChainMisses 计数）；vanilla 档无视分区链
+ * （零变化锚）。端到端（组装器 + TOAST + 缓存失效）在 OgPartitionIdentityTest。</p>
  */
 class TableFilterTest {
+
+    /** 链断 WARN 断言面：TableFilter logger 的捕获器（用例 ⑭ 挂/摘）。 */
+    private Logger filterLog;
+
+    private ListAppender<ILoggingEvent> appender;
+
+    /**
+     * 挂 ListAppender 捕获 {@link TableFilter} 日志（链断 WARN"恰一次"断言面）。
+     */
+    @BeforeEach
+    void setUp() {
+        filterLog = (Logger) LoggerFactory.getLogger(TableFilter.class);
+        appender = new ListAppender<>();
+        appender.start();
+        filterLog.addAppender(appender);
+        filterLog.setLevel(Level.DEBUG);
+    }
+
+    /**
+     * 摘除 appender，防泄漏到后续测试类。
+     */
+    @AfterEach
+    void tearDown() {
+        filterLog.detachAppender(appender);
+    }
 
     /**
      * 内存假快照：class 行（oid → relfilenode/relname/relnamespace/relkind）+
@@ -49,6 +88,7 @@ class TableFilterTest {
         private final Map<Long, String> parttypes = new HashMap<>();
         private final Map<Long, String> nspnames = new HashMap<>();
         private final Map<Long, List<Column>> columns = new LinkedHashMap<>();
+        private final Map<Long, CatalogSnapshot.PartitionIdentity> partitions = new HashMap<>();
 
         /**
          * 登记一张 pg_class 行投影 + 其模式解析所需的 pg_namespace 行。
@@ -77,6 +117,18 @@ class TableFilterTest {
          */
         void parttype(long oid, String parttype) {
             parttypes.put(oid, parttype);
+        }
+
+        /**
+         * 登记一条第四字典分区行（pg_partition 'p' 行的最小投影——M3 T2 分区身份
+         * 链的输入面）。
+         *
+         * @param relfilenode 分区物理段号（heap 记录路由锚）
+         * @param relname     分区名
+         * @param parentid    母表 pg_class oid
+         */
+        void partition(long relfilenode, String relname, long parentid) {
+            partitions.put(relfilenode, new CatalogSnapshot.PartitionIdentity(relname, parentid));
         }
 
         /**
@@ -150,6 +202,12 @@ class TableFilterTest {
                 }
             }
             return relfilenodes.containsKey(relNodeOrOid) ? OptionalLong.of(relNodeOrOid) : OptionalLong.empty();
+        }
+
+        /** {@inheritDoc}——登记分区行直供；未登记 empty（第四字典无行面）。 */
+        @Override
+        public Optional<PartitionIdentity> partitionOf(long relfilenode) {
+            return Optional.ofNullable(partitions.get(relfilenode));
         }
     }
 
@@ -352,5 +410,119 @@ class TableFilterTest {
         TableFilter filter = new TableFilter(ogSnapshot(), Set.of());
         assertTrue(filter.resolve(30003).isPresent(), "两参构造器（无 layout）保持 relkind 'p' 放行");
         assertTrue(filter.resolve(30004).isPresent(), "两参构造器不消费 parttype——'x' 值照常放行");
+    }
+
+    /**
+     * 造一套覆盖 OG 档分区身份链面的假快照（M3 T2）：母表 t_mom（'r'+parttype 'p'，
+     * 两列——母表列序断言面）+ 两分区 p1/p2（第四字典行，段号 39001/39002——不在
+     * pg_class relfilenode 面）。分区名/母表名与既有 ⑧-⑪ 快照共用 t_mom/t_plain。
+     *
+     * @return 已登记分区链的 OG 档假快照
+     */
+    private static FakeSnapshot ogPartitionSnapshot() {
+        FakeSnapshot s = ogSnapshot();
+        s.column(2001, new CatalogSnapshot.Column(2, "v", 25, false));   // 母表第二列
+        s.partition(39001, "p1", 2001);
+        s.partition(39002, "p2", 2001);
+        return s;
+    }
+
+    /**
+     * 用例 ⑫（M3 T2 身份链）：分区 relfilenode（heap 记录路由锚——不在三表字典）经
+     * 第四字典反查 + parentid 母表链解析出 <b>母表身份</b> 的 TableMeta——schema=public、
+     * table=t_mom（<b>非分区名 p1</b>）、relOid=母表 oid、columns=<b>母表列序</b>
+     * （锚② {@code PARTITION_NAME=mother} 语义重排：基准路 R/I 帧报母表身份，wal 路
+     * 渲分区名即对拍必 diff）。
+     */
+    @Test
+    void ogPartitionRelfilenodeResolvesMotherIdentityWithMotherColumns() {
+        WalLayout og = WalLayoutVOpenGauss.INSTANCE;
+        TableFilter filter = new TableFilter(ogPartitionSnapshot(), Set.of(), og);
+        TableMeta meta = filter.resolve(39001).orElseThrow();
+        assertEquals("public", meta.schema(), "分区行身份 = 母表 schema（锚② 归一到母表）");
+        assertEquals("t_mom", meta.table(), "分区行身份 = 母表表名（非分区名 p1——锚② PARTITION_NAME=mother）");
+        assertEquals(2001L, meta.relOid(), "TableMeta 携母表 pg_class oid（身份键）");
+        assertEquals(2, meta.columns().size(), "列集 = 母表列序（列挂母表 oid——M2 T5 事实）");
+        assertEquals(new ColumnMeta(1, "id", 23, false), meta.columns().get(0));
+        assertEquals(new ColumnMeta(2, "v", 25, false), meta.columns().get(1));
+    }
+
+    /**
+     * 用例 ⑬（白名单双匹配四形态）：白名单匹配对象 = 解析后的<b>母表身份</b>——
+     * 母表名条目是<b>基准形态</b>（写 public.t_mom 覆盖其全部分区 p1/p2）；分区名
+     * 条目是兼容增强（写 public.p1 只命中 p1 路由的行，<b>不</b>覆盖 p2）；双命中
+     * 与母表名单独命中同果；都不中 miss。分区名条目按<b>运行期双查</b>实现（先按
+     * 母表全名查、未中再按分区全名查——as-of 随第四字典走，ADD/DROP PARTITION 后
+     * 不过期）。
+     */
+    @Test
+    void ogWhitelistDualMatchCoversMotherBaselineAndPartitionAlias() {
+        WalLayout og = WalLayoutVOpenGauss.INSTANCE;
+        FakeSnapshot snapshot = ogPartitionSnapshot();
+
+        TableFilter byMother = new TableFilter(snapshot, Set.of("public.t_mom"), og);
+        assertTrue(byMother.resolve(39001).isPresent(), "母表名条目=基准形态：覆盖分区 p1 路由的行");
+        assertTrue(byMother.resolve(39002).isPresent(), "母表名条目覆盖全部分区（p2 同放行）");
+
+        TableFilter byPartition = new TableFilter(snapshot, Set.of("public.p1"), og);
+        assertTrue(byPartition.resolve(39001).isPresent(), "分区名条目=兼容增强：命中 p1 路由的行");
+        assertTrue(byPartition.resolve(39002).isEmpty(), "分区名条目不外溢——p2 路由的行不命中 public.p1");
+
+        TableFilter byBoth = new TableFilter(snapshot, Set.of("public.t_mom", "public.p1"), og);
+        assertTrue(byBoth.resolve(39001).isPresent(), "双命中形态与母表名单独命中同果");
+
+        TableFilter byNeither = new TableFilter(snapshot, Set.of("public.t_plain"), og);
+        assertTrue(byNeither.resolve(39001).isEmpty(), "母表名/分区名都不中 → miss");
+    }
+
+    /**
+     * 用例 ⑭（链断 fail-safe）：第四字典有分区行但 parentid 悬空（母表不在 pg_class
+     * 字典——字典半损/窗口期 DDL 形态）——resolve 返回 empty（跳过该行、不抛）且
+     * 留痕：<b>整实例恰一次 WARN</b>（含 relfilenode/分区名/parentid 上下文）+
+     * {@code partitionChainMisses} 计数逐次递增（沿 nsp redirect miss 先例）；不同
+     * relfilenode 的第二次链断不重复 WARN（全局节流）。正常 miss（第四字典无行、
+     * 白名单不中）零 WARN。
+     */
+    @Test
+    void ogPartitionChainBrokenFailsSafeWithWarnOnceAndCounter() {
+        WalLayout og = WalLayoutVOpenGauss.INSTANCE;
+        FakeSnapshot snapshot = ogSnapshot();
+        snapshot.partition(39005, "p_orphan", 2077);   // parentid 2077 不在 pg_class 字典
+        TableFilter filter = new TableFilter(snapshot, Set.of(), og);
+
+        assertTrue(filter.resolve(39005).isEmpty(), "链断分区行 fail-safe 跳过（empty 不抛）");
+        assertEquals(1, filter.partitionChainMisses(), "链断计数递增");
+        assertTrue(filter.resolve(39005).isEmpty());
+        assertEquals(2, filter.partitionChainMisses(), "同 relfilenode 再查计数照增（调用方缓存不在此面）");
+
+        snapshot.partition(39006, "p_orphan2", 2078);  // 第二个链断 relfilenode
+        assertTrue(filter.resolve(39006).isEmpty());
+        assertEquals(3, filter.partitionChainMisses());
+
+        List<ILoggingEvent> warns = appender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertEquals(1, warns.size(), "链断 WARN 全局恰一次（节流），实得: " + warns);
+        String msg = warns.get(0).getFormattedMessage();
+        assertTrue(msg.contains("39005") && msg.contains("p_orphan") && msg.contains("2077"),
+                "WARN 须含 relfilenode/分区名/parentid 上下文，实得: " + msg);
+
+        assertTrue(filter.resolve(99999).isEmpty(), "第四字典无行的正常 miss 零痕迹");
+        assertEquals(3, filter.partitionChainMisses(), "正常 miss 不进链断计数");
+        assertTrue(appender.list.stream().noneMatch(e -> e.getLevel() == Level.WARN
+                        && e.getFormattedMessage().contains("99999")),
+                "正常 miss 不打 WARN");
+    }
+
+    /**
+     * 用例 ⑮（V17/V18 零变化锚）：同一快照（第四字典行在场）在 vanilla 档（V18
+     * 布局）完全无视分区链——分区 relfilenode 仍 fail-safe miss，分区身份链严格
+     * OG 档位门控。
+     */
+    @Test
+    void vanillaDialectIgnoresPartitionChainEntirely() {
+        TableFilter filter = new TableFilter(ogPartitionSnapshot(), Set.of(), WalLayoutV18.INSTANCE);
+        assertTrue(filter.resolve(39001).isEmpty(),
+                "V17/V18 档不消费第四字典——分区 relfilenode 仍 miss（零变化锚）");
     }
 }

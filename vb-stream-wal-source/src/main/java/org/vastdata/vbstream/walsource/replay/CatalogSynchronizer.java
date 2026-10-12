@@ -80,6 +80,14 @@ public final class CatalogSynchronizer {
     /** pg_class 的固定 oid（同上——OG 映射目录段号直认面，relOidOf）。 */
     private static final long PG_CLASS_OID = 1259L;
 
+    /**
+     * pg_partition 的固定 oid（openGauss M3 第四 watched 目录——M3 spike T0 坑 2：
+     * 自身 relfilenode 14318 ≠ oid 9016，故须按物理段号注册 watched 面、relOidOf
+     * 段号直认接缝同 pg_attribute/pg_class；og-plan live 实查锚）。仅 OG 档引导
+     * 回填 {@code pgPartitionRelfilenode} 后该直认可命中（vanilla 恒 0 惰性）。
+     */
+    private static final long PG_PARTITION_OID = 9016L;
+
     private final CatalogStores stores;
     private final CatalogReplay replay;
 
@@ -1202,8 +1210,8 @@ public final class CatalogSynchronizer {
          * 形态），miss 再按 oid 直认（元数据形态）——两遍线性扫描，relfilenode 命中
          * 即止（同库引导下唯一，v1 块匹配同口径）。
          *
-         * <p><b>openGauss 映射目录接缝（M2 T7 修复 C）</b>：OG 的 pg_attribute/
-         * pg_class 两目录是 relation-mapped——pg_class 行的 relfilenode <b>列值为 0</b>，
+         * <p><b>openGauss 映射目录接缝（M2 T7 修复 C + M3 第四腿）</b>：OG 的
+         * pg_attribute/pg_class 两目录是 relation-mapped——pg_class 行的 relfilenode <b>列值为 0</b>，
          * 物理段号只经 {@code pg_relation_filenode()} 可得（og-plan 实测锚：oid 1249/1259
          * 行 relfilenode=0、filenode()=14294/14313），线性扫描对这两目录的物理段号恒
          * miss——字典三表的 heap 记录在 {@code XactGrouper} 解析为未知关系且 miss 被缓存，
@@ -1212,7 +1220,11 @@ public final class CatalogSynchronizer {
          * 侧两目录同为映射目录（relfilenode 列值同为 0，引导回填值同经
          * {@code pg_relation_filenode()} 取自映射），常态下初映射段号==oid，直认与既有
          * oid 直认同值同果；目录被 VACUUM FULL/CLUSTER 重写（段号≠oid）后旧代码恒 miss
-         * （vanilla 潜在盲区），直认面只增命中不改既有命中——对两档均非行为回退。</p>
+         * （vanilla 潜在盲区），直认面只增命中不改既有命中——对两档均非行为回退。
+         * <b>M3 第四腿同构</b>：pg_partition 自身 relfilenode（14318）≠ oid（9016），
+         * 反查前与 {@code pgPartitionRelfilenode} 比对直认 9016——该段号上的 heap
+         * 记录（分区 DDL 族）由此可被 {@code XactGrouper} 识别为字典形态变更信号
+         * （TableMeta 缓存失效第四调用点）；vanilla 档回填值恒 0 不可命中。</p>
          *
          * @param relNodeOrOid relfilenode 或关系 oid
          * @return 关系 oid；字典无匹配 empty
@@ -1226,6 +1238,9 @@ public final class CatalogSynchronizer {
                 if (relNodeOrOid == stores.pgClassRelfilenode()) {
                     return OptionalLong.of(PG_CLASS_OID);
                 }
+                if (relNodeOrOid == stores.pgPartitionRelfilenode()) {
+                    return OptionalLong.of(PG_PARTITION_OID);
+                }
             }
             for (CatalogRow.ClassRow row : stores.classRows().values()) {
                 if (row.relfilenode() == relNodeOrOid) {
@@ -1238,6 +1253,28 @@ public final class CatalogSynchronizer {
                 }
             }
             return OptionalLong.empty();
+        }
+
+        /**
+         * 分区身份链查询（openGauss M3 第四字典面）：partitionRows 值域首配
+         * relfilenode 且行身份为 'p'（分区行——母表 'r' 行 relfilenode 恒 0 不入
+         * 路由面），命中投影为分区名 + parentid（消费方经 parentid 取母表身份/列集，
+         * 锚② {@code PARTITION_NAME=mother}）。
+         *
+         * <p>vanilla 档 partitionRows 恒空（引导不回填第四腿）——天然 empty，与
+         * 接口缺省同果。线程约束：ConcurrentHashMap 弱一致迭代（与类 javadoc 同口径）。</p>
+         *
+         * @param relfilenode 分区物理段号（heap 记录路由锚）
+         * @return 分区身份；第四字典无 'p' 行匹配为 empty
+         */
+        @Override
+        public Optional<PartitionIdentity> partitionOf(long relfilenode) {
+            for (CatalogRow.PartitionRow row : stores.partitionRows().values()) {
+                if (row.relfilenode() == relfilenode && "p".equals(row.parttype())) {
+                    return Optional.of(new PartitionIdentity(row.relname(), row.parentid()));
+                }
+            }
+            return Optional.empty();
         }
 
         /**

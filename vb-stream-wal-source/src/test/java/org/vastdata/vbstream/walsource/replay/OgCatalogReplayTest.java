@@ -106,9 +106,9 @@ class OgCatalogReplayTest {
 
     /**
      * 用例 ②b（M2 T7 修复 B 反转）：段页式 bucket/UStore 两护栏仍 ISE；分区母表
-     * （parttype='p'，relkind 仍 'r'）<b>放行入字典</b>——M2 分区语义 = "不砖 +
-     * fail-safe 有痕跳过"：母表行入字典无害（路由实测母表不承载行——T5 锚），分区
-     * DML 行落 pg_partition relfilenode 的字典 miss 跳过（完整捕获归 M3 第四字典）。
+     * （parttype='p'，relkind 仍 'r'）<b>放行入字典</b>——母表行入字典无害（路由
+     * 实测母表不承载行——T5 锚），且是 M3 T2 分区身份链的 parentid 锚（第四字典
+     * 'p' 行的 parentid 指向它——链路消费面在 TableFilter/OgPartitionIdentityTest）。
      */
     @Test
     void partitionMotherAdmittedWhileBucketAndUstoreRowsTripStorageEngineGuard() {
