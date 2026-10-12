@@ -71,7 +71,11 @@ public final class OgTestEnv {
      */
     public static final String DATABASE_M2PG = "m2pg";
 
-    /** M2 预留库（'A' 档 = Oracle 风格，M3 范围——建库面先行，测试面随 M3 落）。 */
+    /**
+     * A 档（Oracle 风格）全量场景库（M2 建库预留 → <b>M3 T4 升格</b>——M3 T3 护栏放行
+     * 'A' 档后本库承载 A 档对拍场景；档位经 {@link #verifyCompatModeDatabases()} 容器
+     * 初始化期核验，场景面经 {@link CompatMode} 参数化由 T5 消费）。
+     */
     public static final String DATABASE_M2A = "m2a";
 
     /** M2 预留库（'B' 档 = MySQL 风格，M4 范围——建库面先行，测试面随 M4 落）。 */
@@ -85,6 +89,46 @@ public final class OgTestEnv {
 
     /** 基准路复制角色口令（sha256 存储——经 hba sha256 行走码 10 RFC5802 挑战）。 */
     public static final String PARITY_ROLE_PASSWORD = "M2Base#2026";
+
+    /**
+     * IT 矩阵的兼容档维度（M3 Task 4——同套场景双库跑的参数化基建，T5 消费）：枚举值
+     * 携带各自的全量场景库名与期望档位值，对拍场景代码以本维度参数化后即可在 PG/A 两库
+     * 零复制复跑（{@code OgParityBaseline} 的建槽/收流面按 {@link #database()} 取库）。
+     *
+     * <p><b>场景库形态沿 M2 的 m2pg 先例</b>：表/publication 是 per-IT reset 场景面
+     * （{@code OgParitySmokeIT}/{@code OgDmlParityIT} 的 resetScenario），复制角色与
+     * hba 行是集群级共享面（{@code m2par_base} 的 {@code host replication ... all}
+     * 行匹配任意库——m2a 天然覆盖）；本枚举承载的是"库级身份"这一最小共享面 +
+     * {@link #verifyCompatModeDatabases()} 的档位核验。'B' 档（m2b）不进枚举——M4
+     * 范围且无对拍消费方（仅护栏 ISE 面）。</p>
+     */
+    public enum CompatMode {
+
+        /** PG 兼容档（m2pg——M2 对拍面原库）。 */
+        PG(DATABASE_M2PG, "PG"),
+
+        /** A 档 = Oracle 风格（m2a——M3 T3 护栏放行后的 A 档全量场景库）。 */
+        A(DATABASE_M2A, "A");
+
+        private final String database;
+
+        private final String compatibility;
+
+        CompatMode(String database, String compatibility) {
+            this.database = database;
+            this.compatibility = compatibility;
+        }
+
+        /** @return 本档的全量场景库名。 */
+        public String database() {
+            return database;
+        }
+
+        /** @return 期望的 {@code pg_database.datcompatibility} 档位值。 */
+        public String compatibility() {
+            return compatibility;
+        }
+    }
 
     /** 容器内数据目录（pg_hba.conf 所在，镜像固定路径）。 */
     private static final String PG_DATA = "/var/lib/opengauss/data";
@@ -118,6 +162,7 @@ public final class OgTestEnv {
         ensureReplicationHba();
         prepareWalCopyDir();
         ensureM2Databases();
+        verifyCompatModeDatabases();
         ensureParityBaselineRole();
         LOG.info("openGauss 测试容器就绪: {} 密码认证面=码11(md5 hba+sha256 存储) 段bind={} M2三库=[{},{},{}]",
                 sqlJdbcUrl(), HOST_WAL_DIR, DATABASE_M2PG, DATABASE_M2A, DATABASE_M2B);
@@ -227,6 +272,42 @@ public final class OgTestEnv {
             throw new IllegalStateException("M2 库 " + database + "（DBCOMPATIBILITY '" + compat
                     + "'）创建/检查失败——M2 对拍面硬前提", e);
         }
+    }
+
+    /**
+     * 兼容档库的真实档位核验（M3 Task 4——m2a 升格 A 档全量场景库的漂移护栏）：
+     * 逐 {@link CompatMode} 档查 {@code pg_database.datcompatibility}，缺席或档位值
+     * 不符即 ISE。
+     *
+     * <p>动机：{@link #ensureM2Databases} 的 CREATE DATABASE 若因环境/镜像差异落到
+     * 别的档位（或库被外部改写），后续 IT 的护栏结论与对拍断言全部失真且逐用例报错
+     * 难以归因——容器初始化期 fail-fast 优于逐用例红。核验面只含对拍消费档
+     * （PG/A）；m2b 是 M4 预留面，不核验。</p>
+     */
+    private static void verifyCompatModeDatabases() {
+        try (Connection c = newSqlConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT datcompatibility FROM pg_database WHERE datname = ?")) {
+            for (CompatMode mode : CompatMode.values()) {
+                ps.setString(1, mode.database());
+                String actual;
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new IllegalStateException("兼容档场景库 " + mode.database()
+                                + " 缺席（ensureM2Databases 建库面失效）");
+                    }
+                    actual = rs.getString(1).trim();
+                }
+                if (!mode.compatibility().equals(actual)) {
+                    throw new IllegalStateException("兼容档场景库 " + mode.database()
+                            + " 档位漂移: 期望 datcompatibility='" + mode.compatibility()
+                            + "' 实得 '" + actual + "'——对拍场景结论将失真，容器初始化期拒绝");
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("兼容档场景库档位核验查询失败", e);
+        }
+        LOG.info("兼容档场景库档位核验通过: PG={} A={}", DATABASE_M2PG, DATABASE_M2A);
     }
 
     /**

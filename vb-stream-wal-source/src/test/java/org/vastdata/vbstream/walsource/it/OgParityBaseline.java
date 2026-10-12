@@ -36,6 +36,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 路②）——opengauss-jdbc 5.0.0-og in-process 逻辑流收 OG pgoutput 二进制帧 + 归一化器
  * 对成 v2 事务块对齐面，与 {@code WalSource} DML 面（wal 直解路）按 xid 交集逐行 diff。
  *
+ * <p><b>兼容档参数化（M3 Task 4）</b>：建槽/删槽/收流三入口各有
+ * {@link OgTestEnv.CompatMode} 参数化重载（缺省单参形态等价 PG 档，M2 既有 IT 零改动）
+ * ——同套对拍场景经维度参数化后可在 m2pg（PG 档）与 m2a（A 档）双库零复制复跑，
+ * T5 的 A 档全量复验消费。</p>
+ *
  * <p><b>为什么不用 engine 的 {@code PgOutputDecoder}</b>：OG 帧与 vanilla 有两处帧级差异
  * ——B 帧 xid 是 Int64（vanilla Int32）与 TupleData 带 Int16 ncols 前缀（vanilla 列读到
  * 消息尾），归一化器按 spike 文档 {@code docs/wal-source-opengauss-m2-spike.md} §2 的
@@ -56,7 +61,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p><b>时序契约（spike 坑 2/3）</b>：publication 必须先于被解码事务存在、
  * {@code publication_names} 槽选项必传——IT 固定时序：建 publication → 建逻辑槽 → 写
- * DML → {@link #capture} 起流收帧（槽建于 DML 前，起流晚于提交也完整收达）。</p>
+ * DML → {@link #capture} 起流收帧（槽建于 DML 前，起流晚于提交也完整收达）。
+ * <b>分区表发布面（M3 T4 实测锚，og-plan 2026-10-13）</b>：OG 的
+ * {@code FOR ALL TABLES} publication <b>不含分区表</b>——分区 DML 帧零到达（对拍窗口
+ * 恒空块）；对拍分区场景的 publication 须显式 {@code FOR TABLE <母表>}。</p>
  *
  * <p><b>驱动坑位（spike §3 坑 5）</b>：{@code stream.close()} 恒抛 EOF 竞态异常（吞掉）；
  * {@code readPending()} 不暴露服务端断流——drain 循环空闲期周期
@@ -94,7 +102,19 @@ final class OgParityBaseline {
      * @throws SQLException 建槽失败（如重名残留）
      */
     static void createLogicalSlot(String slotName) throws SQLException {
-        try (Connection c = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG);
+        createLogicalSlot(slotName, OgTestEnv.CompatMode.PG);
+    }
+
+    /**
+     * 建逻辑槽的兼容档参数化形态（M3 Task 4——T5 的 A 档全量复验按
+     * {@link OgTestEnv.CompatMode} 维度选库，同套场景双库跑零复制）。
+     *
+     * @param slotName 槽名（测试前缀，避开 M1 物理槽清理面）
+     * @param mode     兼容档（取场景库名）
+     * @throws SQLException 建槽失败（如重名残留）
+     */
+    static void createLogicalSlot(String slotName, OgTestEnv.CompatMode mode) throws SQLException {
+        try (Connection c = OgTestEnv.newSqlConnection(mode.database());
              PreparedStatement ps = c.prepareStatement(
                      "SELECT * FROM pg_create_logical_replication_slot(?, 'pgoutput')")) {
             ps.setString(1, slotName);
@@ -114,7 +134,17 @@ final class OgParityBaseline {
      * @param slotName 槽名
      */
     static void dropLogicalSlotQuietly(String slotName) {
-        try (Connection c = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+        dropLogicalSlotQuietly(slotName, OgTestEnv.CompatMode.PG);
+    }
+
+    /**
+     * 静默删逻辑槽的兼容档参数化形态（M3 Task 4——槽是库级对象，删槽须与建槽同库）。
+     *
+     * @param slotName 槽名
+     * @param mode     兼容档（取场景库名）
+     */
+    static void dropLogicalSlotQuietly(String slotName, OgTestEnv.CompatMode mode) {
+        try (Connection c = OgTestEnv.newSqlConnection(mode.database())) {
             List<Long> pids = new ArrayList<>();
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery(
@@ -166,7 +196,25 @@ final class OgParityBaseline {
      */
     static List<OgBlock> capture(String slotName, String publication, long expectedTxns, long timeoutMs)
             throws SQLException {
-        String url = OgTestEnv.sqlJdbcUrl(OgTestEnv.DATABASE_M2PG)
+        return capture(slotName, publication, expectedTxns, timeoutMs, OgTestEnv.CompatMode.PG);
+    }
+
+    /**
+     * 起流收帧的兼容档参数化形态（M3 Task 4——复制连接按 {@link OgTestEnv.CompatMode}
+     * 取场景库；认证面沿 {@code OgTestEnv.PARITY_ROLE} 的 hba 行，{@code all} 通配任意库，
+     * m2a 免追加角色/hba——T5 的 A 档全量复验入口）。
+     *
+     * @param slotName      逻辑槽名（兼容档参数化 {@link #createLogicalSlot(String, OgTestEnv.CompatMode)} 所建）
+     * @param publication   publication 名
+     * @param expectedTxns  期望收到的已提交事务数（C 帧计数）
+     * @param timeoutMs     drain 上限（毫秒）
+     * @param mode          兼容档（取场景库名）
+     * @return 归一化事务块（出现序；行文本与 wal 直解路渲染面对齐）
+     * @throws SQLException 连接/起流/活性探测失败
+     */
+    static List<OgBlock> capture(String slotName, String publication, long expectedTxns, long timeoutMs,
+            OgTestEnv.CompatMode mode) throws SQLException {
+        String url = OgTestEnv.sqlJdbcUrl(mode.database())
                 + "?replication=database&assumeMinServerVersion=9.4&ApplicationName=" + APP_NAME;
         Normalizer n = new Normalizer();
         try (Connection c = DriverManager.getConnection(url, OgTestEnv.PARITY_ROLE,
@@ -232,6 +280,15 @@ final class OgParityBaseline {
      * 行（值取 't' 文本、'n'→NULL/'K' 段缺席、'u'→unchanged-TOAST 哨兵——与
      * {@code OutputRenderer} 的行格式逐字面同构）、C 闭块（commitLsn 取第一 LSN 字段）。
      * abort 事务不发帧（proto v1 语义），与 wal 路过滤 aborted 一致。
+     *
+     * <p><b>分区行同形（M3 T4，T0 锚② 的端到端确认）</b>：{@code PARTITION_NAME=mother}
+     * ——OG pgoutput 对分区 DML 的 R/I/U/D 帧报<b>母表身份</b>（relId=母表 oid、
+     * relname=母表名、ncols=母表列集，og-plan 实测帧证据），wal 直解路经 pg_partition
+     * 第四字典身份链（M3 T2）同归一母表名——本归一化器对分区行与普通表行走<b>同一
+     * 处理路径，免映射、无分派分支</b>；分区名在双路渲染面全程零出现。配套前提两条
+     * （og-plan 2026-10-13 实测锚）：分区表须显式 {@code FOR TABLE <母表>} 发布（见类
+     * javadoc 时序契约段）；母表 {@code REPLICA IDENTITY FULL} 传播到分区行——U/D 帧
+     * 带 'O' 整行旧元组（DEFAULT 身份的 'K' 段占位分叉天然规避）。</p>
      */
     private static final class Normalizer {
 
