@@ -8,6 +8,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -22,10 +23,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 档 start 正常装配 DML 面（{@code dmlEnabled()} 保持 true）；'B' 档启动期 ISE
  * <b>fail-fast</b>：异常消息含档位值（{@code datcompatibility=B}）与里程碑指引
  * （M4），且护栏先于槽副作用——物理槽不被创建（离线 "ISE 先于槽副作用" 锚在真容器
- * 的复验面）。
+ * 的复验面）；<b>A 档列存表 ISE（M3 Task 5）</b>——{@code ORIENTATION=COLUMN} 建表
+ * 触发引导种子面的存储引擎护栏（ASTORE 限定，与流内护栏同谓词）。
  *
  * <p>离线档位判定面归 {@code OgCompatModeGuardTest}（伪 JDBC 脚本化）；本 IT 只钉
- * 真容器两档的启动期行为。需本机 Docker。</p>
+ * 真容器的启动期行为。需本机 Docker。</p>
  */
 class OgCompatGuardIT {
 
@@ -60,6 +62,47 @@ class OgCompatGuardIT {
     @Test
     void m2bMysqlCompatDatabaseFailsFastDmlFaceWithM4Guidance() throws Exception {
         assertUnsupportedCompatDatabaseFailsFast(OgTestEnv.DATABASE_M2B, "B");
+    }
+
+    /**
+     * A 档列存表 ISE（M3 Task 5 Step 3——ASTORE 限定的 A 档真容器复验）：m2a 内
+     * {@code CREATE TABLE ... WITH (ORIENTATION=COLUMN)}（列存表 pg_class 行
+     * relcudescrelid≠0）后 Main 形态启动——引导种子面的存储引擎护栏（与流内护栏
+     * 同谓词，M1 Task 7）启动期 ISE：消息含 {@code unsupported storage engine}、
+     * 违例串 {@code column store} 与表名。与档位护栏的次序差记档：兼容档护栏先于
+     * 建槽（零槽副作用），本护栏在引导期（槽已建）——finally 兜底清槽 + <b>删列存表
+     * （关键——m2a 是 A 档对拍场景库，残留列存表会砖掉全部 A 档对拍 IT 的引导）</b>。
+     *
+     * @throws Exception 连接/启动路径的底层异常
+     */
+    @Test
+    void m2aColumnStoreTableFailsFastOnSeedStorageGuard() throws Exception {
+        String slot = "m3par_guard_col";
+        String table = "t_guard_col";
+        OgTestEnv.dropPhysicalSlotQuietly(slot);
+        try (Connection c = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2A); Statement st = c.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS " + table);
+            st.execute("CREATE TABLE " + table + " (id int4, v text) WITH (ORIENTATION=COLUMN)");
+        }
+        WalSource wal = new WalSource(guardShapedConfig(OgTestEnv.DATABASE_M2A, slot), new WalCapture());
+        try {
+            IllegalStateException ise = assertThrows(IllegalStateException.class, wal::start,
+                    "A 档库内列存表（ORIENTATION=COLUMN）应在引导种子面触发存储护栏 ISE（ASTORE 限定）");
+            String msg = ise.getMessage();
+            assertTrue(msg != null && msg.contains("unsupported storage engine"),
+                    "ISE 消息须含护栏判别串 unsupported storage engine: " + msg);
+            assertTrue(msg != null && msg.contains("column store"),
+                    "ISE 消息须含列存违例串 column store: " + msg);
+            assertTrue(msg != null && msg.contains(table),
+                    "ISE 消息须含表名 " + table + ": " + msg);
+        } finally {
+            wal.close();
+            try (Connection c = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2A);
+                 Statement st = c.createStatement()) {
+                st.execute("DROP TABLE " + table);   // 列存表残留会砖 m2a 全部对拍 IT 的引导
+            }
+            OgTestEnv.dropPhysicalSlotQuietly(slot);
+        }
     }
 
     /**

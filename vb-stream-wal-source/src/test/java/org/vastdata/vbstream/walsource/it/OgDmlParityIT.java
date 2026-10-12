@@ -66,6 +66,16 @@ import static org.junit.jupiter.api.Assertions.fail;
  *       由重复块全等容忍面吸收。</li>
  * </ul>
  *
+ * <p><b>A 档全量复验（M3 Task 5 Step 1——T4 参数化基建的消费面）</b>：全部 13 场景经
+ * {@link OgTestEnv.CompatMode} 维度参数化（场景体零复制——每个场景是单一
+ * {@code xxxScenario(CompatMode)} 方法，PG/A 两档 {@code @Test} 各自委派），在 m2a
+ * （A 档 = Oracle 风格）整套重跑；<b>对拍断言零放宽</b>（两路仍按 xid 交集逐行 diff
+ * 空，A 档 PG 档共用同一 assertParity 与全部字面断言）。A 档实测差异面（og-plan
+ * 2026-10-13 双档矩阵对拍）：①{@code ''} 空串在 A 档入库即 NULL（服务端语义——两路
+ * 同见 NULL，对拍天然吸收）；②date 输出函数带零时段后缀——基准路方言归一化收敛
+ * （{@link OgParityBaseline} 类 javadoc"A 档值面方言归一化"段），其余 16 类型双档
+ * 文本全等。槽名 A 档带 {@code _a} 后缀（物理槽是集群级对象，跨库重名会互踩清理面）。</p>
+ *
  * <p><b>空块语义（OG 分叉记档）</b>：OG pgoutput 对无已发布变更的事务（如 DDL）仍发
  * B..C 空块（vanilla PG 15+ 跳过空事务）——基准路 capture 的 expectedTxns 是 C 帧
  * 计数，含场景内建槽后的 DDL 空块（场景 6 的段二 ADD COLUMN）；wal 路对空块零发射，
@@ -80,10 +90,10 @@ class OgDmlParityIT {
 
     private static final Logger LOG = LoggerFactory.getLogger(OgDmlParityIT.class);
 
-    /** 对拍 schema（m2pg 内——reset 以 schema CASCADE 整体清场）。 */
+    /** 对拍 schema（m2pg/m2a 内——reset 以 schema CASCADE 整体清场）。 */
     private static final String SCHEMA = "parity";
 
-    /** publication 名（FOR ALL TABLES——m2pg 专用库）。 */
+    /** publication 名（FOR ALL TABLES——m2pg/m2a 专用库）。 */
     private static final String PUBLICATION = "m2par_pub";
 
     /** 两路各自的追平等待上限（毫秒）——含 wal 路引导余量。 */
@@ -100,6 +110,9 @@ class OgDmlParityIT {
 
     private String physicalSlot;
 
+    /** 当前用例的兼容档（缺省 PG——{@link #slots} 的 A 档槽名后缀依据）。 */
+    private OgTestEnv.CompatMode mode = OgTestEnv.CompatMode.PG;
+
     /** 当前用例的 WalSource（AfterEach 兜底关闭）。 */
     private WalSource wal;
 
@@ -108,12 +121,22 @@ class OgDmlParityIT {
     /** 场景 1a：单事务多语句 I/U/D 混合 + 全 NULL 行——行序与值双路逐字节对齐。 */
     @Test
     void multiStatementTxnParityAcrossPaths() throws Exception {
+        multiStatementTxnScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 1a 的 A 档全量复验形态（M3 T5——场景体零复制，见类 javadoc）。 */
+    @Test
+    void multiStatementTxnParityAcrossPathsACompat() throws Exception {
+        multiStatementTxnScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void multiStatementTxnScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, flag bool, val numeric,"
                         + " d date, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        runParity("基础 DML 多语句", "dml1", ddl, new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
+        runParity(compatMode, "基础 DML 多语句", "dml1", ddl, new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
             conn.setAutoCommit(false);
             exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'alice', true, 12.345, '2026-10-07')");
             exec(conn, "INSERT INTO parity.t_parity VALUES (2, NULL, false, NULL, NULL)");
@@ -129,14 +152,25 @@ class OgDmlParityIT {
     /** 场景 1b：双连接交错事务——两路各自两个事务桶、桶内行归属正确、提交序一致。 */
     @Test
     void interleavedTxnsParityAcrossPaths() throws Exception {
+        interleavedTxnsScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 1b 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void interleavedTxnsParityAcrossPathsACompat() throws Exception {
+        interleavedTxnsScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void interleavedTxnsScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, flag bool, val numeric,"
                         + " d date, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        runParity("交错事务", "dml2", ddl, new String[]{"parity.t_parity"}, 2, 2, 0, conn -> {
-            try (Connection c1 = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG);
-                 Connection c2 = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+        String db = compatMode.database();
+        runParity(compatMode, "交错事务", "dml2", ddl, new String[]{"parity.t_parity"}, 2, 2, 0, conn -> {
+            try (Connection c1 = OgTestEnv.newSqlConnection(db);
+                 Connection c2 = OgTestEnv.newSqlConnection(db)) {
                 c1.setAutoCommit(false);
                 c2.setAutoCommit(false);
                 exec(c1, "INSERT INTO parity.t_parity VALUES (1, 'a1', true, 1.1, '2026-10-07')");
@@ -152,11 +186,21 @@ class OgDmlParityIT {
     /** 场景 1c：回滚零输出——两路都无回滚事务的块，随后的提交事务对拍完整。 */
     @Test
     void rolledBackTxnEmitsNothingOnBothPaths() throws Exception {
+        rolledBackTxnScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 1c 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void rolledBackTxnEmitsNothingOnBothPathsACompat() throws Exception {
+        rolledBackTxnScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void rolledBackTxnScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        runParity("回滚零输出", "dml3", ddl, new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
+        runParity(compatMode, "回滚零输出", "dml3", ddl, new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
             conn.setAutoCommit(false);
             exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'doomed')");
             conn.rollback();
@@ -175,11 +219,21 @@ class OgDmlParityIT {
      */
     @Test
     void savepointSubTxnFilteredRowsParity() throws Exception {
+        savepointSubTxnScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 1d 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void savepointSubTxnFilteredRowsParityACompat() throws Exception {
+        savepointSubTxnScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void savepointSubTxnScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        runParity("子事务 SAVEPOINT", "dml4", ddl, new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
+        runParity(compatMode, "子事务 SAVEPOINT", "dml4", ddl, new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
             conn.setAutoCommit(false);
             exec(conn, "INSERT INTO parity.t_parity VALUES (1, 's1')");
             exec(conn, "SAVEPOINT sp");
@@ -196,12 +250,22 @@ class OgDmlParityIT {
      */
     @Test
     void midColumnUpdateFullIdentityParityAndZeroTruncationCounters() throws Exception {
+        midColumnUpdateScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 1e 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void midColumnUpdateFullIdentityParityAndZeroTruncationCountersACompat() throws Exception {
+        midColumnUpdateScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void midColumnUpdateScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, flag bool, val numeric,"
                         + " d date, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        ParityRun run = runParity("中段列 UPDATE", "dml5", ddl, new String[]{"parity.t_parity"},
+        ParityRun run = runParity(compatMode, "中段列 UPDATE", "dml5", ddl, new String[]{"parity.t_parity"},
                 1, 1, 0, conn -> {
                     conn.setAutoCommit(false);
                     exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'alice', true, 12.345, '2026-10-07')");
@@ -222,6 +286,16 @@ class OgDmlParityIT {
      */
     @Test
     void copyBatchMultiInsertParityRealEntryGeometry() throws Exception {
+        copyBatchScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 1f 的 A 档全量复验形态（M3 T5——CSV 空串 NULL 语义双档一致）。 */
+    @Test
+    void copyBatchMultiInsertParityRealEntryGeometryACompat() throws Exception {
+        copyBatchScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void copyBatchScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_copy (id int4 NOT NULL, name text, v numeric, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_copy REPLICA IDENTITY FULL",
@@ -233,9 +307,9 @@ class OgDmlParityIT {
             String val = (i % 4 == 0) ? "" : i + ".25";
             csv.append(i).append(',').append(name).append(',').append(val).append('\n');
         }
-        List<OgBlock> blocks = runParity("COPY 批量", "dml6", ddl, new String[]{"parity.t_copy"},
+        List<OgBlock> blocks = runParity(compatMode, "COPY 批量", "dml6", ddl, new String[]{"parity.t_copy"},
                 1, 1, 0, conn -> {
-                    copyInM2pg("COPY parity.t_copy FROM STDIN WITH (FORMAT csv)", csv.toString());
+                    copyIn(compatMode, "COPY parity.t_copy FROM STDIN WITH (FORMAT csv)", csv.toString());
                 }).capture().blocks();
         assertEquals(1, blocks.size(), "COPY 单事务应恰一个块");
         assertEquals(100, blocks.get(0).rows().size(), "100 行 COPY 应逐 entry 全解出:\n"
@@ -257,6 +331,19 @@ class OgDmlParityIT {
      */
     @Test
     void typeMatrixBoundaryRowsParityAcrossPaths() throws Exception {
+        typeMatrixScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /**
+     * 场景 2 的 A 档全量复验形态（M3 T5）：date 列的基准路方言后缀归一化见
+     * {@link OgParityBaseline} 类 javadoc；{@code ''} 空串 A 档入库即 NULL（两路同见）。
+     */
+    @Test
+    void typeMatrixBoundaryRowsParityAcrossPathsACompat() throws Exception {
+        typeMatrixScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void typeMatrixScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_types (id int4 NOT NULL,"
                         + " c_bool bool, c_int2 int2, c_int8 int8,"
@@ -267,7 +354,7 @@ class OgDmlParityIT {
                         + " PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_types REPLICA IDENTITY FULL",
         };
-        runParity("类型矩阵边界值", "typ1", ddl, new String[]{"parity.t_types"}, 1, 1, 0, conn -> {
+        runParity(compatMode, "类型矩阵边界值", "typ1", ddl, new String[]{"parity.t_types"}, 1, 1, 0, conn -> {
             conn.setAutoCommit(false);
             exec(conn,
                     "INSERT INTO parity.t_types VALUES (1, true, -32768, -9223372036854775808,"
@@ -311,11 +398,21 @@ class OgDmlParityIT {
      */
     @Test
     void toastThreeStorageFormsWideValuesParityAcrossPaths() throws Exception {
+        toastThreeStorageScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 3a 的 A 档全量复验形态（M3 T5——TOAST 引擎与兼容档正交，双档同阈值）。 */
+    @Test
+    void toastThreeStorageFormsWideValuesParityAcrossPathsACompat() throws Exception {
+        toastThreeStorageScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void toastThreeStorageScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity_toast (id int4, w text)",
                 "ALTER TABLE parity.t_parity_toast REPLICA IDENTITY FULL",
         };
-        List<OgBlock> blocks = runParity("TOAST 三形态", "tst1", ddl, new String[]{"parity.t_parity_toast"},
+        List<OgBlock> blocks = runParity(compatMode, "TOAST 三形态", "tst1", ddl, new String[]{"parity.t_parity_toast"},
                 1, 1, 0, conn -> {
                     conn.setAutoCommit(false);
                     exec(conn, "INSERT INTO parity.t_parity_toast VALUES (1,"
@@ -358,22 +455,32 @@ class OgDmlParityIT {
      */
     @Test
     void restartUpdateUnchangedWideColumnRendersUnchangedToastParity() throws Exception {
+        restartUpdateUnchangedScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 3b 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void restartUpdateUnchangedWideColumnRendersUnchangedToastParityACompat() throws Exception {
+        restartUpdateUnchangedScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void restartUpdateUnchangedScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity_toast (id int4, w text)",
                 "ALTER TABLE parity.t_parity_toast REPLICA IDENTITY FULL",
         };
-        resetScenario(ddl);
-        slots("tst2");
-        OgParityBaseline.createLogicalSlot(logicalSlot);
+        resetScenario(ddl, compatMode);
+        slots("tst2", compatMode);
+        OgParityBaseline.createLogicalSlot(logicalSlot, compatMode);
         OgParityBaseline.WalCapture capture = new OgParityBaseline.WalCapture();
         wal = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_parity_toast"},
-                toastStateDir.toString()), capture);
+                toastStateDir.toString(), compatMode), capture);
         WalSource wal2 = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_parity_toast"},
-                toastStateDir.toString()), capture);
+                toastStateDir.toString(), compatMode), capture);
         boolean resumed = false;
         try {
             wal.start();
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 exec(conn, "INSERT INTO parity.t_parity_toast VALUES (1,"
                         + " (SELECT string_agg(md5(i::text),'') FROM generate_series(1,220) i))");
             }
@@ -384,7 +491,7 @@ class OgDmlParityIT {
             wal = wal2;
             wal2.start();
             resumed = wal2.resumedFromState();
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 exec(conn, "UPDATE parity.t_parity_toast SET id = 101 WHERE id = 1");
             }
             await(() -> wal2.dmlEmittedBuckets() >= 1,
@@ -394,7 +501,7 @@ class OgDmlParityIT {
             wal2.close();
         }
         assertTrue(resumed, "段二应自检查点续传（段一 close 落盘有效检查点）");
-        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 2, CAPTURE_MS);
+        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 2, CAPTURE_MS, compatMode);
         OgParityBaseline.assertParity(baseline, capture.blocks(), "TOAST 重启续传", 0);
 
         String wide = md5Chain(220);
@@ -435,19 +542,29 @@ class OgDmlParityIT {
      */
     @Test
     void inTxnAddColumnAsOfRenderingParity() throws Exception {
+        inTxnAddColumnScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 4 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void inTxnAddColumnAsOfRenderingParityACompat() throws Exception {
+        inTxnAddColumnScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void inTxnAddColumnScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_ddlin (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_ddlin REPLICA IDENTITY FULL",
         };
-        resetScenario(ddl);
-        slots("ddl1");
-        OgParityBaseline.createLogicalSlot(logicalSlot);
+        resetScenario(ddl, compatMode);
+        slots("ddl1", compatMode);
+        OgParityBaseline.createLogicalSlot(logicalSlot, compatMode);
         OgParityBaseline.WalCapture capture = new OgParityBaseline.WalCapture();
-        wal = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_ddlin"}, null), capture);
+        wal = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_ddlin"}, null, compatMode), capture);
         try {
             wal.start();
             assertTrue(wal.dmlEnabled(), "事务内 ADD COLUMN as-of: wal 直解路 DML 面应装配");
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 conn.setAutoCommit(true);
                 exec(conn, "BEGIN");
                 exec(conn, "INSERT INTO parity.t_ddlin VALUES (1, 'before-ddl')");
@@ -466,7 +583,7 @@ class OgDmlParityIT {
         } finally {
             wal.close();
         }
-        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 2, CAPTURE_MS);
+        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 2, CAPTURE_MS, compatMode);
         List<OgBlock> walBlocks = capture.blocks();
         assertEquals(2, walBlocks.size(), "wal 路应恰两块（DDL 事务 + 控制事务）:\n" + walBlocks);
         List<String> ddlTxnRows = walBlocks.get(0).rows();
@@ -476,7 +593,7 @@ class OgDmlParityIT {
         assertEquals("INSERT parity.t_ddlin BEFORE=- AFTER=[id=2, name=after-ddl, extra=new-col]",
                 ddlTxnRows.get(1), "DDL 后段行应按三列词典渲染");
         assertEquals("UPDATE parity.t_ddlin BEFORE=[id=1, name=before-ddl, extra=NULL]"
-                + " AFTER=[id=1, name=before-ddl-upd, extra=filled]", ddlTxnRows.get(2),
+                        + " AFTER=[id=1, name=before-ddl-upd, extra=filled]", ddlTxnRows.get(2),
                 "UPDATE 前像三列词典缺席新列渲 NULL、后像三列（v2 as-of 语义同 vanilla）");
         assertEquals(1, baseline.get(0).rows().size(),
                 "基准路 DDL 事务块恰一行——OG 逻辑解码对事务内 DDL 后续行静默丢弃（og-plan 实测锚，"
@@ -502,11 +619,21 @@ class OgDmlParityIT {
      */
     @Test
     void twoPhaseSuspendDiscardAndCommitPreparedParity() throws Exception {
+        twoPhaseSuspendScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 5a 的 A 档全量复验形态（M3 T5——PREPARE TRANSACTION 是集群级能力，与档位正交）。 */
+    @Test
+    void twoPhaseSuspendDiscardAndCommitPreparedParityACompat() throws Exception {
+        twoPhaseSuspendScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void twoPhaseSuspendScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        ParityRun run = runParity("2PC 挂起/弃桶/COMMIT PREPARED", "tp1", ddl,
+        ParityRun run = runParity(compatMode, "2PC 挂起/弃桶/COMMIT PREPARED", "tp1", ddl,
                 new String[]{"parity.t_parity"}, 1, 1, 0, conn -> {
                     conn.setAutoCommit(true);
                     exec(conn, "BEGIN");
@@ -549,22 +676,32 @@ class OgDmlParityIT {
      */
     @Test
     void twoPhasePreparedPendingSurvivesRestartResumeParity() throws Exception {
+        twoPhasePreparedPendingScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 5b 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void twoPhasePreparedPendingSurvivesRestartResumeParityACompat() throws Exception {
+        twoPhasePreparedPendingScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void twoPhasePreparedPendingScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        resetScenario(ddl);
-        slots("tp2");
-        OgParityBaseline.createLogicalSlot(logicalSlot);
+        resetScenario(ddl, compatMode);
+        slots("tp2", compatMode);
+        OgParityBaseline.createLogicalSlot(logicalSlot, compatMode);
         OgParityBaseline.WalCapture capture = new OgParityBaseline.WalCapture();
         wal = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_parity"},
-                tpStateDir.toString()), capture);
+                tpStateDir.toString(), compatMode), capture);
         WalSource wal2 = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_parity"},
-                tpStateDir.toString()), capture);
+                tpStateDir.toString(), compatMode), capture);
         boolean resumed = false;
         try {
             wal.start();
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 conn.setAutoCommit(true);
                 exec(conn, "BEGIN");
                 exec(conn, "INSERT INTO parity.t_parity VALUES (10, 'gtx-pending')");
@@ -578,7 +715,7 @@ class OgDmlParityIT {
             wal = wal2;
             wal2.start();
             resumed = wal2.resumedFromState();
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 exec(conn, "COMMIT PREPARED 'gtx'");
             }
             await(() -> wal2.dmlEmittedBuckets() >= 2,
@@ -588,7 +725,7 @@ class OgDmlParityIT {
             wal2.close();
         }
         assertTrue(resumed, "段二应自检查点续传（段一 close 落盘有效检查点）");
-        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 2, CAPTURE_MS);
+        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 2, CAPTURE_MS, compatMode);
         OgParityBaseline.assertParity(baseline, capture.blocks(), "2PC 重启续传", 0);
 
         ChangeOutputListener.BatchBegin gtxBegin = capture.begins().stream()
@@ -614,22 +751,32 @@ class OgDmlParityIT {
      */
     @Test
     void midStreamStopResumePlainDmlParityAcrossPaths() throws Exception {
+        midStreamStopResumeScenario(OgTestEnv.CompatMode.PG);
+    }
+
+    /** 场景 6 的 A 档全量复验形态（M3 T5）。 */
+    @Test
+    void midStreamStopResumePlainDmlParityAcrossPathsACompat() throws Exception {
+        midStreamStopResumeScenario(OgTestEnv.CompatMode.A);
+    }
+
+    private void midStreamStopResumeScenario(OgTestEnv.CompatMode compatMode) throws Exception {
         String[] ddl = {
                 "CREATE TABLE parity.t_parity (id int4 NOT NULL, name text, PRIMARY KEY (id))",
                 "ALTER TABLE parity.t_parity REPLICA IDENTITY FULL",
         };
-        resetScenario(ddl);
-        slots("lf1");
-        OgParityBaseline.createLogicalSlot(logicalSlot);
+        resetScenario(ddl, compatMode);
+        slots("lf1", compatMode);
+        OgParityBaseline.createLogicalSlot(logicalSlot, compatMode);
         OgParityBaseline.WalCapture capture = new OgParityBaseline.WalCapture();
         wal = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_parity"},
-                lifecycleStateDir.toString()), capture);
+                lifecycleStateDir.toString(), compatMode), capture);
         WalSource wal2 = new WalSource(walSourceConfig(physicalSlot, new String[]{"parity.t_parity"},
-                lifecycleStateDir.toString()), capture);
+                lifecycleStateDir.toString(), compatMode), capture);
         boolean resumed = false;
         try {
             wal.start();
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 exec(conn, "INSERT INTO parity.t_parity VALUES (1, 'seg1-a')");
                 exec(conn, "INSERT INTO parity.t_parity VALUES (2, 'seg1-b')");
             }
@@ -640,7 +787,7 @@ class OgDmlParityIT {
             wal = wal2;
             wal2.start();
             resumed = wal2.resumedFromState();
-            try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+            try (Connection conn = OgTestEnv.newSqlConnection(compatMode.database())) {
                 exec(conn, "ALTER TABLE parity.t_parity ADD COLUMN extra text");
                 conn.setAutoCommit(false);
                 exec(conn, "INSERT INTO parity.t_parity VALUES (3, 'seg2-c', 'seg2-new')");
@@ -655,7 +802,7 @@ class OgDmlParityIT {
             wal2.close();
         }
         assertTrue(resumed, "段二应自检查点续传（段一 close 落盘有效检查点）");
-        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 4, CAPTURE_MS);
+        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, 4, CAPTURE_MS, compatMode);
         OgParityBaseline.assertParity(baseline, capture.blocks(), "生命周期停续", 0);
 
         // 专项：wal 两段会话并集覆盖基准路全部行事务 xid（空块 xid 属 wal 侧零发射面，天然缺席）
@@ -677,9 +824,9 @@ class OgDmlParityIT {
     }
 
     /**
-     * 单场景对拍骨架（无 state.dir 档）：重置场景 → 建逻辑槽 → 起 wal 直解路（direct
-     * 通道 + opengauss-jdbc 前缀 + 白名单钉场景表）→ DML → await 桶数 → 基准路
-     * capture → close → assertParity，返回对拍结局快照。
+     * 单场景对拍骨架（无 state.dir 档，PG 档缺省形态——M2 既有签名，OgDmlOgSpecificIT
+     * 消费面）：委派 {@link #runParity(OgTestEnv.CompatMode, String, String[], String[], long, long, long, SqlConsumer)}
+     * 的 {@code CompatMode.PG} 形态。
      *
      * @param scenario      场景名（断言消息上下文）
      * @param slotSuffix    槽名后缀（前缀 m2par_logic_/m2par_wal_ 固定）
@@ -694,35 +841,73 @@ class OgDmlParityIT {
      */
     ParityRun runParity(String scenario, String slotSuffix, String[] tableDdl, String[] whitelist,
             long walTxns, long baselineTxns, long walAborted, SqlConsumer<Connection> dml) throws Exception {
-        resetScenario(tableDdl);
-        slots(slotSuffix);
-        OgParityBaseline.createLogicalSlot(logicalSlot);
+        return runParity(OgTestEnv.CompatMode.PG, scenario, slotSuffix, tableDdl, whitelist,
+                walTxns, baselineTxns, walAborted, dml);
+    }
+
+    /**
+     * 单场景对拍骨架的兼容档参数化形态（M3 T5——场景体零复制的承载面）：重置场景 →
+     * 建逻辑槽（按档取库）→ 起 wal 直解路（direct 通道 + opengauss-jdbc 前缀 + 白名单
+     * 钉场景表 + 库名按档）→ DML → await 桶数 → 基准路 capture（按档取库）→ close →
+     * assertParity，返回对拍结局快照。槽名 A 档带 {@code _a} 后缀（物理槽是集群级对象，
+     * 跨库重名互踩清理面）。
+     *
+     * @param mode          兼容档（取场景库与槽名后缀）
+     * @param scenario      场景名（断言消息上下文）
+     * @param slotSuffix    槽名后缀（前缀 m2par_logic_/m2par_wal_ 固定，A 档再附 _a）
+     * @param tableDdl      场景建表语句（parity schema 内）
+     * @param whitelist     DML 白名单表全名集
+     * @param walTxns       wal 路追平目标（发射桶数）
+     * @param baselineTxns  基准路 capture 的 C 帧计数目标（含 DDL 空块——OG 分叉记档）
+     * @param walAborted    场景内被回滚的子事务行数（wal 记账与实付的期望差）
+     * @param dml           DML 执行器
+     * @return 对拍结局快照（已关闭 WalSource + 捕获器）
+     * @throws Exception 连接/启动/等待路径的底层异常
+     */
+    ParityRun runParity(OgTestEnv.CompatMode mode, String scenario, String slotSuffix, String[] tableDdl,
+            String[] whitelist, long walTxns, long baselineTxns, long walAborted,
+            SqlConsumer<Connection> dml) throws Exception {
+        resetScenario(tableDdl, mode);
+        slots(slotSuffix, mode);
+        OgParityBaseline.createLogicalSlot(logicalSlot, mode);
         OgParityBaseline.WalCapture capture = new OgParityBaseline.WalCapture();
-        wal = new WalSource(walSourceConfig(physicalSlot, whitelist, null), capture);
+        wal = new WalSource(walSourceConfig(physicalSlot, whitelist, null, mode), capture);
         wal.start();
         assertTrue(wal.dmlEnabled(), scenario + ": wal 直解路 DML 面应装配");
-        try (Connection conn = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+        try (Connection conn = OgTestEnv.newSqlConnection(mode.database())) {
             dml.accept(conn);
         }
         await(() -> wal.dmlEmittedBuckets() >= walTxns,
                 scenario + ": wal 路未发射 " + walTxns + " 个桶（buckets=" + wal.dmlEmittedBuckets()
                         + ", terminal=" + wal.receiverTerminalFailure() + "）");
-        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, baselineTxns, CAPTURE_MS);
+        List<OgBlock> baseline = OgParityBaseline.capture(logicalSlot, PUBLICATION, baselineTxns, CAPTURE_MS, mode);
         wal.close();
         OgParityBaseline.assertParity(baseline, capture.blocks(), scenario, walAborted);
         return new ParityRun(wal, capture);
     }
 
     /**
-     * 场景重置：两路槽位前置清理由调用方（{@link #slots}）承担；schema CASCADE 整体
-     * 清场 + 场景建表 + publication 重建（FOR ALL TABLES——m2pg 专用库）。DDL 先于
-     * 建槽/引导（spike 坑 2 的时序契约）。
+     * 场景重置（PG 档缺省形态——OgDmlOgSpecificIT 消费面）：委派
+     * {@link #resetScenario(String[], OgTestEnv.CompatMode)} 的 PG 形态。
      *
      * @param tableDdl 场景建表语句
      * @throws SQLException DDL 失败
      */
     static void resetScenario(String[] tableDdl) throws SQLException {
-        try (Connection c = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG); Statement st = c.createStatement()) {
+        resetScenario(tableDdl, OgTestEnv.CompatMode.PG);
+    }
+
+    /**
+     * 场景重置的兼容档参数化形态（M3 T5）：两路槽位前置清理由调用方（{@link #slots}）
+     * 承担；目标库内 schema CASCADE 整体清场 + 场景建表 + publication 重建（FOR ALL
+     * TABLES——m2pg/m2a 专用库）。DDL 先于建槽/引导（spike 坑 2 的时序契约）。
+     *
+     * @param tableDdl 场景建表语句
+     * @param mode     兼容档（取目标库）
+     * @throws SQLException DDL 失败
+     */
+    static void resetScenario(String[] tableDdl, OgTestEnv.CompatMode mode) throws SQLException {
+        try (Connection c = OgTestEnv.newSqlConnection(mode.database()); Statement st = c.createStatement()) {
             st.execute("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
             st.execute("CREATE SCHEMA " + SCHEMA);
             for (String ddl : tableDdl) {
@@ -734,15 +919,28 @@ class OgDmlParityIT {
     }
 
     /**
-     * 设定当前用例的两路槽名并前置清理残留。
+     * 设定当前用例的兼容档与两路槽名并前置清理残留（A 档槽名附 {@code _a} 后缀——
+     * 物理槽是集群级对象，与 PG 档同名互踩）。
+     *
+     * @param suffix 后缀（槽名 = m2par_logic_/m2par_wal_ + suffix [+ _a]）
+     * @param mode   兼容档
+     */
+    void slots(String suffix, OgTestEnv.CompatMode mode) {
+        this.mode = mode;
+        String tagged = suffix + (mode == OgTestEnv.CompatMode.A ? "_a" : "");
+        logicalSlot = "m2par_logic_" + tagged;
+        physicalSlot = "m2par_wal_" + tagged;
+        OgParityBaseline.dropLogicalSlotQuietly(logicalSlot, mode);
+        OgTestEnv.dropPhysicalSlotQuietly(physicalSlot);
+    }
+
+    /**
+     * 设定当前用例的两路槽名并前置清理残留（PG 档缺省——M2 既有签名保留）。
      *
      * @param suffix 后缀（槽名 = m2par_logic_/m2par_wal_ + suffix）
      */
     void slots(String suffix) {
-        logicalSlot = "m2par_logic_" + suffix;
-        physicalSlot = "m2par_wal_" + suffix;
-        OgParityBaseline.dropLogicalSlotQuietly(logicalSlot);
-        OgTestEnv.dropPhysicalSlotQuietly(physicalSlot);
+        slots(suffix, OgTestEnv.CompatMode.PG);
     }
 
     /**
@@ -755,9 +953,9 @@ class OgDmlParityIT {
     }
 
     /**
-     * wal 直解路门面配置：六键指向 m2pg（PG 兼容档——DML 护栏放行前提）+ direct 通道
-     * + opengauss-jdbc SQL 会话前缀（OG 档 sha256）+ DML 白名单；stateDir 非 null 时
-     * 启用检查点（续传场景）。
+     * wal 直解路门面配置（PG 档缺省形态——M2 既有签名）：六键指向 m2pg（PG 兼容档——
+     * DML 护栏放行前提）+ direct 通道 + opengauss-jdbc SQL 会话前缀（OG 档 sha256）+
+     * DML 白名单；stateDir 非 null 时启用检查点（续传场景）。
      *
      * @param physicalSlot 物理槽名
      * @param whitelist    DML 白名单表全名集
@@ -765,10 +963,26 @@ class OgDmlParityIT {
      * @return WalSource 构造入参配置
      */
     static Properties walSourceConfig(String physicalSlot, String[] whitelist, String stateDir) {
+        return walSourceConfig(physicalSlot, whitelist, stateDir, OgTestEnv.CompatMode.PG);
+    }
+
+    /**
+     * wal 直解路门面配置的兼容档参数化形态（M3 T5）：库名按档取（m2pg/m2a），其余六键
+     * 与 PG 档同构——direct 通道 + opengauss-jdbc SQL 会话前缀（OG 档 sha256）+ DML
+     * 白名单；stateDir 非 null 时启用检查点（续传场景）。
+     *
+     * @param physicalSlot 物理槽名
+     * @param whitelist    DML 白名单表全名集
+     * @param stateDir     检查点目录（null = 禁用）
+     * @param mode         兼容档（取库名）
+     * @return WalSource 构造入参配置
+     */
+    static Properties walSourceConfig(String physicalSlot, String[] whitelist, String stateDir,
+            OgTestEnv.CompatMode mode) {
         Properties cfg = new Properties();
         cfg.setProperty(WalSource.KEY_HOST, OgTestEnv.host());
         cfg.setProperty(WalSource.KEY_PORT, String.valueOf(OgTestEnv.port()));
-        cfg.setProperty(WalSource.KEY_DB, OgTestEnv.DATABASE_M2PG);
+        cfg.setProperty(WalSource.KEY_DB, mode.database());
         cfg.setProperty(WalSource.KEY_USER, OgTestEnv.USER);
         cfg.setProperty(WalSource.KEY_PASS, OgTestEnv.PASSWORD);
         cfg.setProperty(WalSource.KEY_SLOT, physicalSlot);
@@ -782,16 +996,18 @@ class OgDmlParityIT {
     }
 
     /**
-     * 客户端侧 COPY FROM STDIN（m2pg 库——{@code OgTestEnv.copyIn} 的库名参数化形态，
-     * 供本 IT 的 MULTI_INSERT 场景）：服务端侧 COPY 文件被 OG 安全策略禁止（M1 实测锚）。
+     * 客户端侧 COPY FROM STDIN（兼容档参数化——按档取库；{@code OgTestEnv.copyIn} 的
+     * 库名参数化形态，供本 IT 的 MULTI_INSERT 场景）：服务端侧 COPY 文件被 OG 安全
+     * 策略禁止（M1 实测锚）。
      *
-     * @param sql COPY 命令
-     * @param csv 装载文本
+     * @param mode 兼容档（取目标库）
+     * @param sql  COPY 命令
+     * @param csv  装载文本
      * @return 装载行数
      * @throws SQLException COPY 失败
      */
-    private static long copyInM2pg(String sql, String csv) throws SQLException {
-        try (Connection c = OgTestEnv.newSqlConnection(OgTestEnv.DATABASE_M2PG)) {
+    private static long copyIn(OgTestEnv.CompatMode mode, String sql, String csv) throws SQLException {
+        try (Connection c = OgTestEnv.newSqlConnection(mode.database())) {
             CopyManager cp = new CopyManager(c.unwrap(BaseConnection.class));
             return cp.copyIn(sql, new StringReader(csv));
         } catch (IOException e) {
@@ -801,7 +1017,7 @@ class OgDmlParityIT {
 
     /**
      * 兜底清理：关 WalSource（幂等）→ 删两路槽（异常路径保险；槽名带 m2par 前缀，
-     * 不触碰 M1 物理槽清理面）。
+     * 不触碰 M1 物理槽清理面；删逻辑槽按当前用例的兼容档取库）。
      */
     @AfterEach
     void cleanupSlots() {
@@ -809,7 +1025,7 @@ class OgDmlParityIT {
             wal.close();
         }
         if (logicalSlot != null) {
-            OgParityBaseline.dropLogicalSlotQuietly(logicalSlot);
+            OgParityBaseline.dropLogicalSlotQuietly(logicalSlot, mode);
         }
         if (physicalSlot != null) {
             OgTestEnv.dropPhysicalSlotQuietly(physicalSlot);
