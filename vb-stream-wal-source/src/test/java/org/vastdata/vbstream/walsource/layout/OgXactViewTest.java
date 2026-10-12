@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -305,7 +306,7 @@ class OgXactViewTest {
         // gid 无 NUL 拒面：200B 定长区填满非零
         byte[] mainNoNul = new byte[272];
         put32(mainNoNul, 0, 0x57F94534L);
-        java.util.Arrays.fill(mainNoNul, 53, 53 + 200, (byte) 'g');
+        Arrays.fill(mainNoNul, 53, 53 + 200, (byte) 'g');
         IllegalStateException eNul = assertThrows(IllegalStateException.class,
                 () -> OgXactView.parsePrepare(parse(ogXact(HeapOps.XLOG_XACT_PREPARE, 1, mainNoNul))));
         assertTrue(eNul.getMessage().contains("无 NUL"), eNul.getMessage());

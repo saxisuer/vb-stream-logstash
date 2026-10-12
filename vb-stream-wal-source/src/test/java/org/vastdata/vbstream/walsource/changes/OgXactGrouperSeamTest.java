@@ -10,6 +10,7 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.layout.WalRecordParser;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -250,7 +251,7 @@ class OgXactGrouperSeamTest {
             put64(m, 8, xid);
             put64(m, 24, 1_000_000L);
             put32(m, 36, 0);
-            byte[] gidBytes = gid.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] gidBytes = gid.getBytes(StandardCharsets.UTF_8);
             System.arraycopy(gidBytes, 0, m, 53, gidBytes.length);
             feed(xact(HeapOps.XLOG_XACT_PREPARE, xid, m));
         }
