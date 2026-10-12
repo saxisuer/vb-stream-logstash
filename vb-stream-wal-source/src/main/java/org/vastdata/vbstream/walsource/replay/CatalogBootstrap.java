@@ -271,10 +271,11 @@ public final class CatalogBootstrap {
     /**
      * pg_class 全行种子：ctid 折键 + ClassRow 落 classRows（不限 relkind——toast/index
      * 行也在跟踪面，INPLACE 对象与 tracked toast 依赖它们；v2 增投影 relkind）。
-     * <b>OG 档（Task 7）</b>：按显式列单投影取位，且逐行施加<b>存储引擎护栏</b>
-     * （reldeltarelid/relcudescrelid/parttype/reloptions/relbucket 五判别列，与
-     * CatalogReplay 流内护栏同谓词）——库内已存在列存/分区/段页式/bucket/UStore
-     * 表时种子期即 ISE（消息含 relname/oid）。
+     * <b>OG 档（Task 7；M2 T7 修复 B 放宽）</b>：按显式列单投影取位，且逐行施加
+     * <b>存储引擎护栏</b>（reldeltarelid/relcudescrelid/parttype/reloptions/
+     * relbucket 五判别列，与 CatalogReplay 流内护栏同谓词）——库内已存在列存/
+     * 段页式/bucket/UStore 表时种子期即 ISE（消息含 relname/oid）；分区母表
+     * （parttype='p'）放行入字典（M2 语义"不砖 + fail-safe 跳过"，与流内护栏同放宽）。
      *
      * @param stores 状态容器
      * @return 灌入行数

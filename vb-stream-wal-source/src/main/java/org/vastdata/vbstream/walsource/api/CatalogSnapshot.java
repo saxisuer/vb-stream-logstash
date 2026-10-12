@@ -80,8 +80,9 @@ public interface CatalogSnapshot {
      *
      * <p>M2 T5 前置接缝：{@code TableFilter} 的 OG 档判别消费本方法。缺省 empty =
      * "不可判"——V17/V18 无该列（快照实现不覆写），openGauss 档生产快照当前亦未
-     * 供数（M1 三表字典无该列投影，且 M1 存储护栏使 parttype≠'n' 行在种子/流内
-     * 双面 ISE——护栏放松后接线）；消费方（TableFilter OG 分支）对 empty 按
+     * 供数（ClassRow/CatalogStores 无该列投影——M2 T7 存储护栏已对 parttype='p'
+     * 放行入字典，但 parttype 值面仍不随字典携带；供数接线与 pg_partition 第四
+     * 字典一并归 M3）；消费方（TableFilter OG 分支）对 empty 按
      * fail-open 放行，与 V17/V18 无此闸的行为面一致。</p>
      *
      * @param relOid 关系 oid

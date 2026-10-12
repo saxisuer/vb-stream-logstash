@@ -35,10 +35,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>pg_class INS 解码：9.2 式元组头 oid（虚拟前导槽）注入值行槽 0，ClassRow
  *       投影（relfilenode 槽 6/reltoastrelid 槽 11/relkind 槽 20 + 值行位移）与
  *       int1 列（relcmprs）消耗正确；</li>
- *   <li>存储引擎护栏：列存（relcudescrelid/reldeltarelid≠0）、分区（parttype≠'n'）、
- *       段页式/bucket（relbucket≠null≠0）、UStore（reloptions 含
- *       storage_type=ustore）的 class 行到达即 ISE（消息含 relname/oid）——
- *       og-plan 实测判别面；</li>
+ *   <li>存储引擎护栏：列存（relcudescrelid/reldeltarelid≠0）、段页式/bucket
+ *       （relbucket≠null≠0）、UStore（reloptions 含 storage_type=ustore）的
+ *       class 行到达即 ISE（消息含 relname/oid）——og-plan 实测判别面；分区母表
+ *       （parttype='p'）<b>放行入字典</b>（M2 T7 修复 B——不砖 + fail-safe 跳过
+ *       语义，完整分区捕获归 M3 的 pg_partition 第四字典）；</li>
  *   <li>pg_attribute OG 词典（attnum 槽 5）与 pg_namespace OG 七数据列（oid 头槽）
  *       的 INS 解码；</li>
  *   <li>INPLACE 数据区直读（OG 偏移 84/116）与 UPDATE 老结构字段位（行位移动 +
@@ -104,15 +105,13 @@ class OgCatalogReplayTest {
     }
 
     /**
-     * 用例 ②b：分区/段页式 bucket/UStore 三护栏——parttype='p'（分区父表 relkind 仍
-     * 'r'）、relbucket=2（段页式实测值）、reloptions 含 storage_type=ustore
-     * （UStore 仅经 reloptions 可判，relam 恒 0）分别命中各自 ISE 判别串。
+     * 用例 ②b（M2 T7 修复 B 反转）：段页式 bucket/UStore 两护栏仍 ISE；分区母表
+     * （parttype='p'，relkind 仍 'r'）<b>放行入字典</b>——M2 分区语义 = "不砖 +
+     * fail-safe 有痕跳过"：母表行入字典无害（路由实测母表不承载行——T5 锚），分区
+     * DML 行落 pg_partition relfilenode 的字典 miss 跳过（完整捕获归 M3 第四字典）。
      */
     @Test
-    void partitionBucketAndUstoreRowsTripStorageEngineGuard() {
-        // parttype='p'（分区父表）
-        assertGuardMessage(ogClassTuple(16410L, "og_t_part", 5001L, 0L, 0L, 0L, 'p', null, null),
-                "og_t_part", "16410", "parttype=p");
+    void partitionMotherAdmittedWhileBucketAndUstoreRowsTripStorageEngineGuard() {
         // relbucket=2（段页式表 SEGMENT=ON 实测）
         assertGuardMessage(ogClassTuple(16411L, "og_t_seg", 5002L, 0L, 0L, 0L, 'n', 2L, null),
                 "og_t_seg", "16411", "relbucket=2");
@@ -120,6 +119,16 @@ class OgCatalogReplayTest {
         assertGuardMessage(ogClassTuple(16412L, "og_t_ustore", 5003L, 0L, 0L, 0L, 'n', null,
                         "{orientation=row,storage_type=ustore,compression=no}"),
                 "og_t_ustore", "16412", "storage_type=ustore");
+        // parttype='p' 分区母表：入字典不抛（原 ISE 断言按 T5 R1 裁定反转）
+        CatalogStores stores = freshStores();
+        WalRecord rec = rec(ogRecord(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, 1,
+                CLASS_RELNODE, 0, ogClassTuple(16410L, "og_t_part", 5001L, 0L, 0L, 0L, 'p', null, null).payload())
+                .mainData(insertMain(1, false)).build());
+        assertDoesNotThrow(() -> replay.applyCatalogRecord(rec, stores),
+                "parttype='p' 分区母表行应放行入字典（M2 T7 修复 B）");
+        assertEquals(new CatalogRow.ClassRow(16410L, "og_t_part", 11L, 12L, 0L, 10L, 0L, 5001L, 0L, "r"),
+                stores.classRows().get(CatalogReplay.ctidKey(0, 1)),
+                "分区母表行应按普通投影落字典（relkind 'r'、filenode 取新值）");
     }
 
     /**

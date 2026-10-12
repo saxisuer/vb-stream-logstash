@@ -195,10 +195,13 @@ public final class CatalogReplay {
     }
 
     /**
-     * 存储引擎护栏（Task 7 OG 适配）：判别一条 pg_class 值行是否落在 M1 不支持的
-     * openGauss 存储形态上——列存（relcudescrelid/reldeltarelid≠0）、分区表
-     * （parttype≠'n'）、段页式/bucket（relbucket 非 null 且 ≠0，段页式实测=2）、
-     * UStore/段页式（reloptions 含 storage_type=ustore / segment=on）。
+     * 存储引擎护栏（Task 7 OG 适配，M2 T7 修复 B 放宽）：判别一条 pg_class 值行是否落在
+     * 不支持的 openGauss 存储形态上——列存（relcudescrelid/reldeltarelid≠0）、段页式/
+     * bucket（relbucket 非 null 且 ≠0，段页式实测=2）、UStore/段页式（reloptions 含
+     * storage_type=ustore / segment=on）。<b>分区母表（parttype='p'）放行入字典</b>
+     * （M2 T7，T5 R1 裁定）：母表不承载行（路由实测——分区 DML 落 pg_partition
+     * relfilenode），入字典无行流副作用；分区 DML 行的字典 miss 是 M2 fail-safe
+     * 有痕跳过语义，完整捕获归 M3 的 pg_partition 第四字典。
      *
      * <p>关键步骤：五判别槽位经 layout 访问器取（V17/V18 全 -1 即护栏整体不激活，
      * 零回归）；值行槽位 = 物理词典槽位 + classValsSlotDelta()；null 列（relbucket
@@ -235,13 +238,16 @@ public final class CatalogReplay {
     }
 
     /**
-     * 存储形态判别的共享谓词（值行与 JDBC 种子两侧同源，Task 7）：输入五判别列的
-     * 收敛值（null = 列缺席/NULL/NUL 字符不可判），返回违例描述或 null。
+     * 存储形态判别的共享谓词（值行与 JDBC 种子两侧同源，Task 7；M2 T7 修复 B 放宽
+     * parttype）：输入五判别列的收敛值（null = 列缺席/NULL/NUL 字符不可判），返回
+     * 违例描述或 null。
      *
      * <p>判别依据（og-plan 容器实测，2026-10-12）：列存表 relcudescrelid=16447 /
-     * reldeltarelid=16441；分区父表 parttype='p'；段页式表（SEGMENT=ON）
-     * relbucket=2 且 reloptions 含 segment=on；UStore 表 reloptions 含
-     * storage_type=ustore（relam 恒 0 无分叉）。线程约束：纯函数。</p>
+     * reldeltarelid=16441；分区母表 parttype='p'（M2 T7 起<b>放行入字典</b>——
+     * 与 {@code TableFilter.isAdmittedOgParttype} 的 {'n','p'} 放行集对齐，其余
+     * 非空非 NUL 值维持违例——实测值域恰 {'n','p'}，未转录值的防御面）；段页式表
+     * （SEGMENT=ON）relbucket=2 且 reloptions 含 segment=on；UStore 表 reloptions
+     * 含 storage_type=ustore（relam 恒 0 无分叉）。线程约束：纯函数。</p>
      *
      * @param reldelta     reldeltarelid（null=缺席/NULL）
      * @param relcudesc    relcudescrelid（null=缺席/NULL）
@@ -260,7 +266,7 @@ public final class CatalogReplay {
             return "column store delta table (reldeltarelid=" + reldelta + ")";
         }
         if (parttype != null && !parttype.isEmpty() && parttype.charAt(0) != 'n'
-                && parttype.charAt(0) != '\0') {
+                && parttype.charAt(0) != 'p' && parttype.charAt(0) != '\0') {
             return "partitioned table (parttype=" + parttype.charAt(0) + ")";
         }
         if (relbucket != null && relbucket != 0) {
