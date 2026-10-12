@@ -2,6 +2,7 @@ package org.vastdata.vbstream.walsource.api;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.layout.WalLayouts;
 import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
 import org.vastdata.vbstream.walsource.receive.PhysicalSlotManager;
@@ -15,6 +16,8 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.Driver;
+import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -68,6 +71,10 @@ class OgWalSourceConfigTest {
     /** 检查点目录（startOg 续传路径用例的落盘面）。 */
     @TempDir
     Path stateDir;
+
+    /** OG external file 通道的落盘目录（全装配门面用例的字节源 tail 面——空目录即纯等待）。 */
+    @TempDir
+    Path walDir;
 
     /** 词典外补充键的最小配置载体（其余键走默认）。 */
     private static Properties props(String key, String value) {
@@ -264,6 +271,80 @@ class OgWalSourceConfigTest {
         assertTrue(source.stopped, "stop() 须连带停源");
         assertFalse(jdbc.executed.contains("SELECT pg_current_xlog_location()"),
                 "P₀ 来自存量槽 restart_lsn——不触位点函数");
+    }
+
+    // ---- ⑤ OG 档全装配门面的 DML listener 降级（终审 I-1 代码修） ----
+
+    /**
+     * README/Main 形态的 OG 档全装配<strong>不得 ISE</strong>：冒烟 {@code Main} 固定以
+     * 双参构造注入 {@code OutputRenderer}（listener 非 null）且 {@code vb.wal.dml}
+     * 缺省 true——原形态 {@code startOpenGauss} 即抛"请 -Dvb.wal.dml=false"（spec §4
+     * 的请求即 ISE），照 README 快速开始命令逐字执行必失败。终审 I-1 修后语义：
+     * listener 在场且 dml 开着时 <strong>WARN 降级 catalog-only</strong>（DML 面不装配、
+     * 零事件交付，与 -Dvb.wal.dml=false 的运行形态完全等价——M1 OG 本就无 DML 能力，
+     * ISE 不保护正确性面只挡文档默认路径），{@code dmlEnabled()} 归 false（Main 周期
+     * 行的 {@code dml=[...]} 段随之不追加）。
+     *
+     * <p>关键步骤：伪 Driver 顶替 DriverManager 里的真 pgjdbc（临时注销/恢复——只影响
+     * 本用例执行窗）驱动 {@code WalSource.start()} 全路径（版本判别 → OG 装配 →
+     * external file 通道空目录 tail）；state 预置 pgVersion=5 检查点走续传（绕开引导
+     * 的 OG 内部 SQL 适配）。断言：start 正常返回（不抛 ISE）+ dmlEnabled()==false。</p>
+     */
+    @Test
+    void ogStartWithMainShapedDmlListenerDegradesToCatalogOnlyInsteadOfIse() throws Exception {
+        long storedLsn = 0x10028L;
+        new StateStore(stateDir, 5).checkpoint(new CatalogStores(), storedLsn);
+        FakeJdbc jdbc = FakeJdbc.scripted()
+                .rows("SELECT current_setting('server_version_num')", new Object[] {"90204"})
+                .rows("SELECT version()", new Object[] {"(openGauss 5.0.0 build abc) compiled at 2023"})
+                .rows("SELECT current_setting('server_version_num')::int", new Object[] {"90204"})
+                .rows(SLOT_QUERY, new Object[] {"0/10000"})
+                .build();
+        Driver real = DriverManager.getDriver("jdbc:postgresql://localhost:5432/postgres");
+        Driver fake = proxyDriver(jdbc);
+        DriverManager.deregisterDriver(real);
+        DriverManager.registerDriver(fake);
+        Properties cfg = new Properties();
+        cfg.setProperty(WalSource.KEY_OG_RX_MODE, "external");
+        cfg.setProperty(WalSource.KEY_OG_RX_DIR, walDir.toString());
+        cfg.setProperty(WalSource.KEY_STATE_DIR, stateDir.toString());
+        ChangeOutputListener noop = new ChangeOutputListener() {
+            @Override public void onBegin(ChangeOutputListener.BatchBegin begin) { }
+            @Override public void onRow(ChangeOutputListener.RowChange row) { }
+            @Override public void onEnd(ChangeOutputListener.BatchEnd end) { }
+            @Override public void onAborted(ChangeOutputListener.BatchAborted aborted) { }
+        };
+        WalSource source = new WalSource(cfg, noop);
+        try {
+            source.start();
+            assertFalse(source.dmlEnabled(),
+                    "OG 档 M1 降级 catalog-only 后 dmlEnabled 须归 false（DML 观测段随之不追加）");
+        } finally {
+            source.close();
+            DriverManager.deregisterDriver(fake);
+            DriverManager.registerDriver(real);
+        }
+    }
+
+    /**
+     * 伪 JDBC Driver（顶替 DriverManager 里的真 pgjdbc 驱动 {@code WalSource.start()} 的
+     * 建连面）：只认 {@code jdbc:postgresql:} 前缀 URL，connect 返回 {@link FakeJdbc}
+     * 的脚本化连接代理；未脚本化方法面按 Driver 接口惯例值兜底（jdbcCompliant/
+     * getParentLogger 不进断言面）。
+     *
+     * @param jdbc 脚本化伪会话
+     * @return Driver 代理
+     */
+    private static Driver proxyDriver(FakeJdbc jdbc) {
+        return (Driver) Proxy.newProxyInstance(OgWalSourceConfigTest.class.getClassLoader(),
+                new Class<?>[] {Driver.class}, (p, method, args) -> switch (method.getName()) {
+                    case "acceptsURL" -> ((String) args[0]).startsWith("jdbc:postgresql:");
+                    case "connect" -> ((String) args[0]).startsWith("jdbc:postgresql:")
+                            ? jdbc.connection() : null;
+                    case "jdbcCompliant" -> Boolean.FALSE;
+                    case "getParentLogger" -> java.util.logging.Logger.getGlobal();
+                    default -> null;
+                });
     }
 
     /**

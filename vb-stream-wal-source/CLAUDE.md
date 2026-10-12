@@ -239,7 +239,10 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 ## openGauss 5.0.0 档（M1 catalog 面，2026-10-11 spec / 2026-10-12 落地）
 
 **范围**：v1 catalog 同步面（引导 + 重放 + 检查点/槽推进）+ WAL 接收双通道；**DML 面
-不装配（M2 范围，请求即 ISE）**。存储引擎只做 ASTORE；版本只做 5.0.0（90204 撞号经
+不装配（M2 范围——listener 在场且 dml 开着时 WARN 降级 catalog-only：`dmlEnabled()`
+归 false、零事件交付，与 `-Dvb.wal.dml=false` 运行形态等价；终审 I-1 修，原"请求即
+ISE"形态废除——其只挡冒烟 Main/README 快速开始默认路径、不保护正确性面）**。存储引擎
+只做 ASTORE；版本只做 5.0.0（90204 撞号经
 `forServer(int, String)` 的 version() 文本判别）。调研全文见
 `docs/wal-source-opengauss-adaptation-research.md`（文首有 M1 落地状态与勘误回填）。
 
@@ -370,7 +373,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**342 用例 = 离线 295 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
+**343 用例 = 离线 296 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
@@ -392,7 +395,9 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 7 /
   PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
   库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；`api` WalSourceConfigTest
-  5 / OgWalSourceConfigTest 13（OG 五键解析/缺省值/IAE 面）；ModuleBuildTest 1。
+  5 / OgWalSourceConfigTest 14（OG 五键解析/缺省值/IAE 面 + 全装配门面 README/Main
+  形态 DML listener WARN 降级锚[伪 Driver 顶替 DriverManager 驱动 start() 全路径，
+  终审 I-1]）；ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
   `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
   REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 19（v2 双路对拍——engine

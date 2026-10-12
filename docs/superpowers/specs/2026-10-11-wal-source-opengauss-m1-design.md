@@ -99,6 +99,15 @@ UStore/列存（relcudescrelid≠0）/段页式/bucket 表拒绝；流中块引�
 连续失败走 `receiverTerminalFailure` 终态契约；File managed 子进程死→退避重拉 + WARN；
 external 无新数据仅等待（观测行见停滞前沿）；解析 ISE 终态死亡（现有契约）。
 
+> **DML 门控形态勘误（2026-10-12 终审 I-1 修，随合并回写）**：实施期把"OG 档 M1 无
+> DML 面"落成"listener 在场且 `vb.wal.dml` 开着即启动期 ISE"（宁拒不错）——但冒烟
+> `Main` 固定注入 `OutputRenderer`，照 README OG 快速开始命令逐字执行必然启动期 ISE，
+> 且该文档路径无 IT 覆盖未被暴露。终审裁定改 **WARN 降级 catalog-only**：
+> `WalSource.startOpenGauss` 置 `ogCatalogOnly` 降级位，`dmlEnabled()` 归 false、
+> DML 面不装配、零事件交付——与 `-Dvb.wal.dml=false` 的运行形态完全等价（M1 OG 本就
+> 无 DML 能力，ISE 不保护正确性面只挡文档默认路径）；WARN 一行保持降级可观测，
+> README 快速开始命令原样可跑。
+
 **已知限制（文档化承诺）**：OG 物理槽 restart_lsn 保留窗口行为未实测完（T6）；
 write 位点起流在极端写入停顿下的表现；OG PRUNE 格式是唯一未字节实测的记录族（T4）；
 挂了 replconninfo 的 HA 形态实例不在支持面（"build walsender 自杀"雷区，文档标注）。

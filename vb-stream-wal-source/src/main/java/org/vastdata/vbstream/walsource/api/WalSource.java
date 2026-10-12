@@ -44,7 +44,8 @@ import java.util.function.LongSupplier;
  * 同步形态）。<strong>openGauss 5.0.0 档（M1 Task 6）</strong>：判别命中
  * {@code WalLayoutVOpenGauss} 时转 {@code startOpenGauss}——槽走 ensureSlotOg（dummy_
  * standby 建槽 + xlog 位点函数）、收流按 {@code vb.wal.og.source} 走 WalByteSource
- * 双通道（file=sidecar tail / direct=裸 v3 直连）、DML 面不装配（M2 范围，请求即 ISE）；
+ * 双通道（file=sidecar tail / direct=裸 v3 直连）、DML 面不装配（M2 范围——listener
+ * 在场且 dml 开着时 WARN 降级 catalog-only，终审 I-1 修，原"请求即 ISE"形态废除）；
  * 观测面（consumedLsn/metrics/terminalFailure/检查点/槽推进）经同步器同源透传。</p>
  *
  * <p>配置面：构造入参 {@link Properties} 读 {@code vb.wal.host/port/db/user/pass/slot}
@@ -306,6 +307,14 @@ public final class WalSource implements AutoCloseable {
     private Boolean dmlOff;
 
     /**
+     * OG 档 M1 的 catalog-only 降级位（终审 I-1 修，volatile——start 装配线程写、
+     * {@link #dmlEnabled()} 任意线程读）：listener 在场且 dml 开着时 startOpenGauss
+     * WARN 降级置 true——DML 面不装配（与 -Dvb.wal.dml=false 运行形态等价），原
+     * "请求即 ISE" 形态废除（README 快速开始默认路径照抄可跑）。
+     */
+    private volatile boolean ogCatalogOnly;
+
+    /**
      * 白名单文本解析：逗号切分 + 逐项 trim + 空项跳过（"public.a, public.b,," 形态）。
      *
      * @param text 配置原文（null 安全按空串）
@@ -326,13 +335,15 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * DML 输出面是否装配（构造期裁定）：listener 缺席（v1 单参构造）或
-     * {@code vb.wal.dml=false} 时 false。
+     * DML 输出面是否装配（构造期裁定 + OG 档 M1 启动期降级）：listener 缺席（v1 单参
+     * 构造）或 {@code vb.wal.dml=false} 时 false；<strong>OG 档 M1 下 listener 在场且
+     * dml 开着时 startOpenGauss WARN 降级 catalog-only</strong>（终审 I-1）——本方法此后
+     * 归 false（DML 观测段/惰性 ChangeStream 均不装配，与 -Dvb.wal.dml=false 等价）。
      *
      * @return true = start 后 sink 串接 ChangeStream
      */
     public boolean dmlEnabled() {
-        return dmlOut != null && dmlOff == null;
+        return dmlOut != null && dmlOff == null && !ogCatalogOnly;
     }
 
     /**
@@ -448,9 +459,12 @@ public final class WalSource implements AutoCloseable {
      * 字节源装配）。
      *
      * <p>关键步骤：DML 面门控——M1 范围裁定（spec §0）OG 档仅 catalog 同步面，DML/
-     * changes 面属 M2，listener 在场且 dml 开着即启动期 ISE fail-fast（宁拒不错，优于
-     * 静默装配一个未验收的输出面）；字节源按 {@code vb.wal.og.source} 由
-     * {@link #buildOgByteSource} 构造（工厂形态——流起点由同步器的续传/引导决策给出，
+     * changes 面属 M2；listener 在场且 dml 开着时 <strong>WARN 降级 catalog-only</strong>
+     * （终审 I-1 修：降级置 {@code ogCatalogOnly}——DML 面不装配、{@link #dmlEnabled()}
+     * 归 false、零事件交付，与 {@code -Dvb.wal.dml=false} 的运行形态完全等价；M1 OG 本就
+     * 无 DML 能力，原"请求即 ISE"形态只挡了冒烟 Main/README 快速开始的默认路径、不保护
+     * 任何正确性面，故废除——WARN 一行保持降级可观测）；字节源按 {@code vb.wal.og.source}
+     * 由 {@link #buildOgByteSource} 构造（工厂形态——流起点由同步器的续传/引导决策给出，
      * 构造需在此之后）。边界与异常语义：SQLException/ISE 原样上抛（已建资源由本类持有、
      * 调用方 close 释放）；bootstrap 的 OG 内部适配（列单/LSN 函数）归 Task 7——真 OG
      * 服务端全新引导路径在 bootstrap 处失败属 M1 预期形态，本任务的验收面是配置/槽/装配
@@ -458,12 +472,13 @@ public final class WalSource implements AutoCloseable {
      *
      * @param layout 判别出的 openGauss 布局描述符
      * @throws SQLException 槽管理/引导查询失败
-     * @throws IllegalStateException DML 面在 OG 档请求装配（M2 范围）
      */
     private void startOpenGauss(WalLayout layout) throws SQLException {
         if (dmlEnabled()) {
-            throw new IllegalStateException("openGauss 档 M1 仅 catalog 同步面——DML 输出面属 M2"
-                    + "（spec 2026-10-11 §0）；请 -Dvb.wal.dml=false（或无 listener 的单参构造）后重试");
+            ogCatalogOnly = true;
+            LOG.warn("openGauss 档 M1 仅 catalog 同步面——DML 输出面属 M2（spec 2026-10-11 §0）："
+                    + "listener 在场且 vb.wal.dml 缺省 true，已降级 catalog-only（DML 面不装配、"
+                    + "零事件交付）；显式 -Dvb.wal.dml=false 可声明该形态并消本告警");
         }
         sync = CatalogSynchronizer.startOg(sqlConnection, slotName, layout, state, 0L,
                 startLsn -> buildOgByteSource(layout, startLsn));

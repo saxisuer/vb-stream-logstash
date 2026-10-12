@@ -33,6 +33,8 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 
 M1 范围 = catalog 同步 + WAL 接收（**不含 DML 输出**，M2 范围）；存储引擎只做
 ASTORE（UStore/列存/段页式/bucket 表识别即启动期 ISE），仅单机/无 replconninfo 形态。
+Main 冒烟默认注入的 DML 输出面在 OG 档**自动降级 catalog-only**（启动 WARN 一行——
+`vb.wal.dml` 无须显式置 false；M2 落地 DML 面后自动恢复）。
 起容器与运行：
 
 ```bash

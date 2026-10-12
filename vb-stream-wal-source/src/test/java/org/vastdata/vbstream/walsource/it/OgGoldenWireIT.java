@@ -101,6 +101,9 @@ class OgGoldenWireIT {
                 "黄金对拍会话不得有终态失败: " + source.terminalFailure());
         assertTrue(source.isTerminated(), "停机后工作线程须终止");
 
+        // 终审 I-2 修：快照前先 close（join 泵线程建立 happens-before）——与 CaptureProxy
+        // javadoc 契约对齐；此前依赖"source 停机后泵经 EOF 异步终止"的时序，join 边不存在
+        proxy.close();
         byte[] captured = proxy.clientToServerBytes();
         ServerSideFrames server = proxy.serverFrames();
         assertWireEquivalence(fixture, captured);
@@ -458,6 +461,9 @@ class OgGoldenWireIT {
         /** close 对泵线程的 join 上限（毫秒）——socket 关闭使阻塞读立即返回，常理毫秒级。 */
         private static final long PUMP_JOIN_TIMEOUT_MS = 3_000;
 
+        /** 幂等位：主用例快照前先行 close（终审 I-2），@AfterAll 的 close 二连为 no-op。 */
+        private boolean closed;
+
         private CaptureProxy(ServerSocket listen) {
             this.listen = listen;
         }
@@ -593,12 +599,18 @@ class OgGoldenWireIT {
         }
 
         /**
-         * 幂等收尾：关三 socket → join 泵线程（上限 {@value #PUMP_JOIN_TIMEOUT_MS}ms）
-         * ——快照静默握手：join 建立 happens-before，此后 {@link #clientToServerBytes()}
-         * /{@link #serverFrames()} 读到的 tee 必是泵的完整产出（不会截在帧中）；
-         * 超时则守护位兜底退出，截断尾帧由解析面的防御分支兜住。
+         * 幂等收尾（closed 位守卫——主用例快照前先行 close[终审 I-2 修]，@AfterAll 的
+         * close 二连为 no-op）：关三 socket → join 泵线程（上限
+         * {@value #PUMP_JOIN_TIMEOUT_MS}ms）——快照静默握手：join 建立 happens-before，
+         * 此后 {@link #clientToServerBytes()}/{@link #serverFrames()} 读到的 tee 必是
+         * 泵的完整产出（不会截在帧中）；超时则守护位兜底退出，截断尾帧由解析面的防御
+         * 分支兜住。
          */
         void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
             closeQuietly(client);
             closeQuietly(server);
             closeQuietly(listen);
