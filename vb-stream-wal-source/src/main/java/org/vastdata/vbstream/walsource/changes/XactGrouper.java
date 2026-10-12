@@ -7,6 +7,7 @@ import org.vastdata.vbstream.walsource.layout.BlockRef;
 import org.vastdata.vbstream.walsource.layout.DecodeKinds;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
 import org.vastdata.vbstream.walsource.layout.HeapViews;
+import org.vastdata.vbstream.walsource.layout.OgXactView;
 import org.vastdata.vbstream.walsource.layout.PageImages;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.TruncatedUpdateSplice;
@@ -16,6 +17,7 @@ import org.vastdata.vbstream.walsource.layout.WalRecord;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -67,6 +69,23 @@ import java.util.Set;
  * 4+12n / stats 4+16n / invals 4+16n / twophase xid u32 + gid NUL 结尾）；PREPARE main =
  * 72B 两阶段状态文件头（xid u32@8、prepared_at i64@16、gidlen u16@54、gid@72 按
  * gidlen 截取，<b>非 NUL 结尾</b>——twophase.c PrepareRedoAdd 的 strncpy 同面）。</p>
+ *
+ * <p><b>openGauss 档 XACT 接缝（M2 T2）</b>：{@code layout.openGaussDialect()} 时
+ * XACT 记录经 {@link OgXactView}（layout 包）按 OG v5.0.0 布局转录（TransactionId
+ * u64 / commit 平铺计数结构 / 两阶段确认 u64 前缀 / PREPARE 272B 文件头 gid@53），
+ * 消费面仍走本类既有发射/弃桶/挂起状态机——PG 17/18 路径字节零变化。<b>子事务归并
+ * 差异</b>：OG 流无 vanilla 的 252 TOPLEVEL_XID 标记（xlog_basic.h 的块 id 仅
+ * 253-255），归并通道剩 ASSIGNMENT 单路（top 未记过 WAL 时子赋值即发射，xact.cpp
+ * AssignTransactionId log_unknown_top）——top 先写 WAL 的常见形态下 ASSIGNMENT
+ * 缺席，子行落到<b>以子 xid 为键的独立桶</b>。修复面（本类 OG 分派内的合并接缝，
+ * 状态机对 vanilla 语义零扰动）：终态记录（COMMIT/ABORT 族/PREPARE）的 main 携带
+ * subxacts 数组，发射/弃桶前 {@link #mergeSubBuckets} 把子桶行并入顶层桶——子行
+ * 保真到达，行序经 {@link RowEntry#recLsn} 的稳定排序恢复 WAL 真序（vanilla 桶内
+ * 行本就 lsn 有序，排序为恒等操作）。子回滚（ABORT_WITH_XID，记录头 xid 即子 xid）
+ * 在归并映射缺位时按"子桶整弃 + onAborted"处理（数据面等价：子行恰独占其桶）、
+ * 映射在场时按 vanilla 的 abortedSubxids 过滤面处理。xid 键一致性：main 内 u64 xid
+ * 在本接缝一律截低 32 位（记录头 xl_xid 的既有读面即低 u32——两口径在现实 xid
+ * （&lt;2^32）下恒等）。</p>
  *
  * <p><b>TableMeta 缓存</b>（控制器裁定，Task 4 提醒）：{@link TableFilter#resolve}
  * 每行 7 趟线性扫——本层按 relfilenode 缓存解析结果；失效策略取最简可靠形态：
@@ -246,11 +265,16 @@ public final class XactGrouper {
     }
 
     /**
-     * XACT 记录六态分发（opcode 见类 javadoc 布局钉）。
+     * XACT 记录六态分发（opcode 见类 javadoc 布局钉）——openGauss 档先走
+     * {@link #dispatchXactOg}（布局差异 + 子桶合并接缝，见类 javadoc OG 节）。
      *
      * @param rec XACT 记录
      */
     private void dispatchXact(WalRecord rec) {
+        if (layout.openGaussDialect()) {
+            dispatchXactOg(rec);
+            return;
+        }
         int op = rec.info() & HeapOps.XLOG_XACT_OPMASK;
         switch (op) {
             case HeapOps.XLOG_XACT_COMMIT -> onCommit(rec, false);
@@ -260,6 +284,32 @@ public final class XactGrouper {
             case HeapOps.XLOG_XACT_ABORT_PREPARED -> onAbortPrepared(rec);
             case HeapOps.XLOG_XACT_ASSIGNMENT -> onAssignment(rec);
             default -> { /* INVALIDATIONS(0x60) 等与事务组装无关 */ }
+        }
+    }
+
+    /**
+     * openGauss 档 XACT 分发（M2 T2 接缝）：七 opcode 映射到与 vanilla 同源的
+     * 发射/弃桶/挂起动作，main 解析经 {@link OgXactView}（OG 布局）。
+     *
+     * <p>关键步骤：COMMIT 族（含 OG 独有 COMMIT_COMPACT 0x60——logical 档不出现，
+     * 分派兜底）走 {@link #onCommit}（其内 {@link #parseCommitMain} 经 OG 分派 +
+     * 子桶合并）；ABORT 族（含 OG 独有 ABORT_WITH_XID 0x70——logical 档回滚恒为此
+     * 形态）走 {@link #onAbort}（内嵌 OG 分支）；两阶段确认经各自 OG 分支（归属键 =
+     * main 的 u64 前缀 xid）；PREPARE/ASSIGNMENT 经原方法内的 OG 解析分支。线程
+     * 约束：单写者（与 {@link #dispatchXact} 同缝）。</p>
+     *
+     * @param rec XACT 记录
+     */
+    private void dispatchXactOg(WalRecord rec) {
+        int op = rec.info() & HeapOps.XLOG_XACT_OPMASK;
+        switch (op) {
+            case HeapOps.XLOG_XACT_COMMIT, HeapOps.OG_XLOG_XACT_COMMIT_COMPACT -> onCommit(rec, false);
+            case HeapOps.XLOG_XACT_COMMIT_PREPARED -> onCommit(rec, true);
+            case HeapOps.XLOG_XACT_ABORT, HeapOps.OG_XLOG_XACT_ABORT_WITH_XID -> onAbort(rec);
+            case HeapOps.XLOG_XACT_ABORT_PREPARED -> onAbortPrepared(rec);
+            case HeapOps.XLOG_XACT_PREPARE -> onPrepare(rec);
+            case HeapOps.XLOG_XACT_ASSIGNMENT -> onAssignment(rec);
+            default -> { /* 未知 opcode 静默忽略（vanilla INVALIDATIONS 同面） */ }
         }
     }
 
@@ -278,6 +328,11 @@ public final class XactGrouper {
     private void onCommit(WalRecord rec, boolean twoPhase) {
         CommitView c = parseCommitMain(rec);
         long xid = c.twophaseXid() != 0 ? c.twophaseXid() : rec.xid() & 0xFFFFFFFFL;
+        if (c.ogSubxacts() != null) {
+            // OG 接缝：main 的 subxacts 数组先于发射把子桶行并入顶层桶（OG 流无
+            // 252 TOPLEVEL 标记，top 先写形态下子行落独立子桶——见类 javadoc OG 节）
+            mergeSubBuckets(xid, c.ogSubxacts());
+        }
         Bucket b = removeBucket(xid);
         if (b != null) {
             String gid = c.gid() != null ? c.gid() : b.gid;
@@ -299,11 +354,48 @@ public final class XactGrouper {
      */
     private void onAbort(WalRecord rec) {
         long xid = rec.xid() & 0xFFFFFFFFL;
+        if (layout.openGaussDialect()) {
+            onAbortOg(rec, xid);
+            return;
+        }
         long top = effectiveTop(rec, xid);
         if (top != xid) {
             Bucket b = buckets.get(top);
             if (b != null) {
                 b.abortedSubxids.add(xid);
+            }
+            return;
+        }
+        Bucket b = removeBucket(xid);
+        if (b != null) {
+            out.onAborted(new ChangeOutputListener.BatchAborted(xid));
+        }
+        terminalCleanup(xid);
+    }
+
+    /**
+     * openGauss 档的回滚处理（M2 T2 接缝）——子桶合并 + 双形态子回滚语义。
+     *
+     * <p>关键步骤：先解析 OG 回滚 main 取 subxacts（一并回滚的子树）；①归并映射
+     * 在场（ASSIGNMENT 已建立 sub→top）：把子树桶行并入顶层桶后把子 xid 记入
+     * abortedSubxids——与 vanilla 子回滚同面（发射期过滤、无 onAborted 事件）；②
+     * 映射缺位（top 先写形态——子行独立成桶）：子树桶行合并后整弃 + onAborted，
+     * 数据面等价（子行恰独占其桶）。顶层回滚两形态同路：合并子桶 → 整弃 →
+     * terminalCleanup。线程约束：单写者。</p>
+     *
+     * @param rec 回滚记录（ABORT / ABORT_WITH_XID）
+     * @param xid 记录头 xid（中止（子）事务 id——两形态恒等，见 OgXactView javadoc）
+     */
+    private void onAbortOg(WalRecord rec, long xid) {
+        OgXactView.OgAbort a = OgXactView.parseAbort(rec);
+        long[] subs = a.subxacts();
+        long top = effectiveTop(rec, xid);
+        mergeSubBuckets(xid, subs);
+        if (top != xid) {
+            mergeBucketInto(xid, top);
+            Bucket topBucket = buckets.get(top);
+            if (topBucket != null) {
+                topBucket.abortedSubxids.add(xid);
             }
             return;
         }
@@ -326,26 +418,40 @@ public final class XactGrouper {
      * @param rec 准备记录
      */
     private void onPrepare(WalRecord rec) {
-        byte[] raw = rec.raw();
-        int off = rec.mainOff();
-        if (rec.mainLen() < SIZE_OF_XACT_PREPARE) {
-            throw new IllegalStateException("xl_xact_prepare main too short: " + rec.mainLen()
-                    + " < " + SIZE_OF_XACT_PREPARE);
+        long xid;
+        String gid;
+        long[] ogSubs;
+        if (layout.openGaussDialect()) {
+            // OG 接缝：main 是两阶段状态文件头（272B 新形/264B 老形，magic 分派），
+            // gid 在定长区 [53,253) 内 NUL 结尾（区别于 vanilla 的 gidlen 计数截取）
+            OgXactView.OgPrepare p = OgXactView.parsePrepare(rec);
+            xid = p.xid() & 0xFFFFFFFFL;
+            gid = p.gid();
+            ogSubs = p.subxacts();
+        } else {
+            byte[] raw = rec.raw();
+            int off = rec.mainOff();
+            if (rec.mainLen() < SIZE_OF_XACT_PREPARE) {
+                throw new IllegalStateException("xl_xact_prepare main too short: " + rec.mainLen()
+                        + " < " + SIZE_OF_XACT_PREPARE);
+            }
+            xid = u32(raw, off + 8);
+            int gidlen = u16(raw, off + 54);
+            if (SIZE_OF_XACT_PREPARE + gidlen > rec.mainLen()) {
+                throw new IllegalStateException("prepare gid 越界: gidlen=" + gidlen
+                        + ", mainLen=" + rec.mainLen());
+            }
+            // 真实 gidlen = strlen+1 含尾 NUL（twophase.c SaveTransactionState 的
+            // hdr->gidlen = strlen(gid) + 1）——剥尾 NUL 才得原 gid；无 NUL 形态（gidlen 即
+            // strlen 的手造/异源字节）不受影响
+            int gidStrLen = gidlen;
+            if (gidStrLen > 0 && raw[off + SIZE_OF_XACT_PREPARE + gidStrLen - 1] == 0) {
+                gidStrLen--;
+            }
+            gid = new String(raw, off + SIZE_OF_XACT_PREPARE, gidStrLen, StandardCharsets.UTF_8);
+            ogSubs = null;
         }
-        long xid = u32(raw, off + 8);
-        int gidlen = u16(raw, off + 54);
-        if (SIZE_OF_XACT_PREPARE + gidlen > rec.mainLen()) {
-            throw new IllegalStateException("prepare gid 越界: gidlen=" + gidlen
-                    + ", mainLen=" + rec.mainLen());
-        }
-        // 真实 gidlen = strlen+1 含尾 NUL（twophase.c SaveTransactionState 的
-        // hdr->gidlen = strlen(gid) + 1）——剥尾 NUL 才得原 gid；无 NUL 形态（gidlen 即
-        // strlen 的手造/异源字节）不受影响
-        int gidStrLen = gidlen;
-        if (gidStrLen > 0 && raw[off + SIZE_OF_XACT_PREPARE + gidStrLen - 1] == 0) {
-            gidStrLen--;
-        }
-        String gid = new String(raw, off + SIZE_OF_XACT_PREPARE, gidStrLen, StandardCharsets.UTF_8);
+        mergeSubBuckets(xid, ogSubs);
         Bucket b = buckets.get(xid);
         if (b != null) {
             b.gid = gid;
@@ -363,13 +469,17 @@ public final class XactGrouper {
 
     /**
      * ABORT_PREPARED：弃挂起桶（onAborted 单事件）——归属键同 COMMIT_PREPARED
-     * （main 的 twophase chunk xid 优先）。
+     * （main 的 twophase xid 优先：vanilla 的 twophase chunk / OG 的 u64 前缀）。
+     * OG 档先经 subxacts 合并子桶（M2 T2 接缝）。
      *
      * @param rec 两阶段回滚记录
      */
     private void onAbortPrepared(WalRecord rec) {
         CommitView c = parseCommitMain(rec);
         long xid = c.twophaseXid() != 0 ? c.twophaseXid() : rec.xid() & 0xFFFFFFFFL;
+        if (c.ogSubxacts() != null) {
+            mergeSubBuckets(xid, c.ogSubxacts());
+        }
         Bucket b = removeBucket(xid);
         if (b != null) {
             out.onAborted(new ChangeOutputListener.BatchAborted(xid));
@@ -396,12 +506,97 @@ public final class XactGrouper {
     }
 
     /**
+     * OG 子桶合并的批量面（M2 T2 接缝）：把 subxacts 数组逐项经
+     * {@link #mergeBucketInto} 并入顶层桶——null 数组（vanilla 路径 / 无子形态）
+     * no-op；u64 xid 截低 32 位（键一致性，见类 javadoc OG 节）。
+     *
+     * @param top  顶层事务 id（目标桶键）
+     * @param subs 终态记录 main 携带的子事务数组（可为 null）
+     */
+    private void mergeSubBuckets(long top, long[] subs) {
+        if (subs == null) {
+            return;
+        }
+        for (long sub : subs) {
+            mergeBucketInto(sub & 0xFFFFFFFFL, top);
+        }
+    }
+
+    /**
+     * 单桶搬移：from 桶的行并入 to 桶——to 桶缺位时把 from 桶提升为 to 键（顶层
+     * 自身无行、行全在子事务的形态；firstLsn 取两者较小，pendingFloorLsn 语义保真）。
+     *
+     * <p>行序保真：并入行携带各自 recLsn，发射期稳定排序恢复 WAL 真序（见
+     * {@link #emitBucket}）。abortedSubxids 一并搬移（子回滚后到达终态的窄序形态）。
+     * 边界与异常语义：from==to 或 from 无桶 no-op。线程约束：单写者（与终态处理
+     * 同缝）。</p>
+     *
+     * @param from 源桶键（子事务 xid）
+     * @param to   目标桶键（顶层事务 xid）
+     */
+    private void mergeBucketInto(long from, long to) {
+        if (from == to) {
+            return;
+        }
+        Bucket src = buckets.remove(from);
+        if (src == null) {
+            return;
+        }
+        Bucket dst = buckets.get(to);
+        if (dst == null) {
+            Bucket promoted = new Bucket(to, src.firstLsn);
+            promoted.rows.addAll(src.rows);
+            promoted.abortedSubxids.addAll(src.abortedSubxids);
+            promoted.gid = src.gid;
+            buckets.put(to, promoted);
+            return;
+        }
+        dst.rows.addAll(src.rows);
+        dst.abortedSubxids.addAll(src.abortedSubxids);
+        if (src.gid != null && dst.gid == null) {
+            dst.gid = src.gid;
+        }
+        if (src.firstLsn < dst.firstLsn) {
+            dst.firstLsn = src.firstLsn;
+        }
+    }
+
+    /**
+     * OG 接缝的 xid 键归一：main 内 u64 xid 截低 32 位——记录头 xl_xid 的既有读面
+     * 即低 u32（{@code WalRecordParser} u32 读 + 本类 {@code & 0xFFFFFFFFL} 口径），
+     * 两口径在现实 xid（&lt;2^32）下恒等，归一防高位位带来的桶键分叉。
+     *
+     * @param subs u64 子事务数组
+     * @return 低 32 位归一后的数组（原数组为零长时原样返回）
+     */
+    private static long[] maskToXid32(long[] subs) {
+        if (subs.length == 0) {
+            return subs;
+        }
+        long[] out = new long[subs.length];
+        for (int i = 0; i < subs.length; i++) {
+            out[i] = subs[i] & 0xFFFFFFFFL;
+        }
+        return out;
+    }
+
+    /**
      * ASSIGNMENT：子 xid → 顶层 xid 映射兜底（TOPLEVEL_XID 标记缺位时的归并通道，
      * spike 发现 25）——main = xtop u32@0 / nsubxacts i32@4 / subxacts u32[]@8。
      *
      * @param rec 归并记录
      */
     private void onAssignment(WalRecord rec) {
+        if (layout.openGaussDialect()) {
+            // OG 接缝：xtop/subxacts 均 u64（TransactionId 8B 宽）——截低 32 位入映射
+            // 与记录头 xid 口径对齐（见类 javadoc OG 节的键一致性注记）
+            OgXactView.OgAssignment a = OgXactView.parseAssignment(rec);
+            long top = a.xtop() & 0xFFFFFFFFL;
+            for (long sub : a.subxacts()) {
+                subToTop.put(sub & 0xFFFFFFFFL, top);
+            }
+            return;
+        }
         if (rec.mainLen() < 8) {
             throw new IllegalStateException("xl_xact_assignment main too short: " + rec.mainLen());
         }
@@ -813,7 +1008,7 @@ public final class XactGrouper {
             b = new Bucket(top, recLsn);
             buckets.put(top, b);
         }
-        b.rows.add(new RowEntry(origin, new ChangeOutputListener.RowChange(meta, dml, beforeMap, afterMap)));
+        b.rows.add(new RowEntry(origin, recLsn, new ChangeOutputListener.RowChange(meta, dml, beforeMap, afterMap)));
     }
 
     /**
@@ -881,6 +1076,10 @@ public final class XactGrouper {
      */
     private void emitBucket(Bucket b, boolean twoPhase, String gid, long commitLsn, long endLsn, Instant commitTs) {
         long expected = b.rows.size();
+        // OG 子桶合并后的行序保真（M2 T2）：按行所在记录 lsn 稳定排序——vanilla 桶内
+        // 行本就按 WAL 到达序（= lsn 序）追加，稳定排序为恒等操作（行为零变化）；
+        // OG 合并进来的子行按真序归位
+        b.rows.sort(Comparator.comparingLong(RowEntry::recLsn));
         out.onBegin(new ChangeOutputListener.BatchBegin(b.xid, twoPhase, gid, commitLsn, endLsn, commitTs, expected));
         long emitted = 0;
         for (RowEntry e : b.rows) {
@@ -990,6 +1189,20 @@ public final class XactGrouper {
      * @return 解析面（commitTs / twophaseXid[无=0] / gid[无=null]）
      */
     private CommitView parseCommitMain(WalRecord rec) {
+        if (layout.openGaussDialect()) {
+            // OG 接缝：COMMIT 族走 OgXactView（平铺计数结构 + u64 xid）；ABORT_PREPARED
+            // 也经本入口（vanilla 同面——onAbortPrepared 只消费归属键）→ 映射为同形
+            // CommitView（gid 恒 null：OG 两阶段确认 main 无 gid，gid 由 PREPARE 记桶）
+            int op = rec.info() & HeapOps.XLOG_XACT_OPMASK;
+            if (op == HeapOps.XLOG_XACT_ABORT_PREPARED) {
+                OgXactView.OgAbort a = OgXactView.parseAbort(rec);
+                return new CommitView(a.abortTs(), a.twophaseXid() & 0xFFFFFFFFL, null,
+                        maskToXid32(a.subxacts()));
+            }
+            OgXactView.OgCommit c = OgXactView.parseCommit(rec);
+            return new CommitView(c.commitTs(), c.twophaseXid() & 0xFFFFFFFFL, null,
+                    maskToXid32(c.subxacts()));
+        }
         if (rec.mainLen() < 8) {
             throw new IllegalStateException("xact commit/abort main too short: " + rec.mainLen());
         }
@@ -1026,7 +1239,7 @@ public final class XactGrouper {
                 gid = nulTerminated(raw, cur);
             }
         }
-        return new CommitView(commitTs, twophaseXid, gid);
+        return new CommitView(commitTs, twophaseXid, gid, null);
     }
 
     /**
@@ -1137,10 +1350,12 @@ public final class XactGrouper {
      * commit/abort 记录 main 的解析面。
      *
      * @param commitTs    提交/中止时间戳（xact_time@0）
-     * @param twophaseXid 两阶段归属 xid（twophase chunk；无块为 0）
-     * @param gid         两阶段全局事务名（NUL 结尾；无块为 null）
+     * @param twophaseXid 两阶段归属 xid（vanilla 的 twophase chunk / OG 的 u64 前缀；无块为 0）
+     * @param gid         两阶段全局事务名（vanilla NUL 结尾；OG 恒 null——gid 由 PREPARE 记桶）
+     * @param ogSubxacts  OG 接缝：main 携带的 subxacts 数组（终态前子桶合并源）；
+     *                   vanilla 路径恒 null
      */
-    private record CommitView(Instant commitTs, long twophaseXid, String gid) {
+    private record CommitView(Instant commitTs, long twophaseXid, String gid, long[] ogSubxacts) {
     }
 
     /**
@@ -1156,11 +1371,12 @@ public final class XactGrouper {
     /**
      * 待决事务桶：行到达期累积（RowEntry 携带来源 xid 供 aborted 过滤），终态记录
      * 发射/弃。挂起（PREPARE）= 桶留存 + gid 悬置。firstLsn = 首行记录 lsn
-     * （{@link XactGrouper#pendingFloorLsn()} 的重放下界源——Task 11）。
+     * （{@link XactGrouper#pendingFloorLsn()} 的重放下界源——Task 11；OG 子桶合并
+     * （M2 T2）取两桶较小值，重放窗口语义保真，故非 final）。
      */
     private static final class Bucket {
         final long xid;
-        final long firstLsn;
+        long firstLsn;
         final List<RowEntry> rows = new ArrayList<>();
         final Set<Long> abortedSubxids = new HashSet<>();
         String gid;
@@ -1179,11 +1395,13 @@ public final class XactGrouper {
 
     /**
      * 桶内行条目：RowChange + 来源 xid（记录头 xid——子事务行即子 xid，aborted
-     * 过滤的私有记账键，不泄漏进输出契约——预检 #5 裁定）。
+     * 过滤的私有记账键，不泄漏进输出契约——预检 #5 裁定）+ 行所在记录 lsn
+     * （{@link #emitBucket} 稳定排序的键——OG 子桶合并后的行序保真，M2 T2）。
      *
      * @param originXid 行来源事务 id
+     * @param recLsn    行所在记录的 lsn
      * @param row       行变更事件
      */
-    private record RowEntry(long originXid, ChangeOutputListener.RowChange row) {
+    private record RowEntry(long originXid, long recLsn, ChangeOutputListener.RowChange row) {
     }
 }

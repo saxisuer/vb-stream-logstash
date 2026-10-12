@@ -1,0 +1,76 @@
+openGauss 5.0.0 XACT 记录族语料锚（2026-10-12 采集，og-plan 容器 opengauss/opengauss:5.0.0，
+m2pg 库[DBCOMPATIBILITY 'PG']，wal_level=logical，段 pg_xlog/000000010000000000000002）
+================================================================
+
+写入序列（窗口 A = [0x2926000,0x2928000) 页对齐 8KB，xact-a.bin）:
+  drop table if exists t_xact_corpus;                         -- DDL 事务 xid=13878
+  create table t_xact_corpus(id int primary key, v text);
+  alter table t_xact_corpus replica identity full;
+  ① 普通提交:   begin; insert (1,'b'x100); commit;             -- xid=13879
+  ② 整体回滚:   begin; insert (2,'x'x64); rollback;            -- xid=13880（ABORT_WITH_XID）
+  ③ SAVEPOINT 子回滚: begin; insert (3,'a'x50)[top=13881];
+       savepoint s1; insert (4,'c'x60)[sub=13882]; rollback to s1; commit;
+       -- 子回滚 ABORT_WITH_XID xid=13882（记录头 xid 即子 xid）+ 顶层 COMMIT xid=13881
+       --   （nsubxacts=0——已回滚子事务不入 commit 子列表，main=56B 自洽）
+  ④ 子先赋值（savepoint 先于任何 top 写入）: begin; savepoint s2;
+       insert (5)[sub=13884]; release savepoint s2; insert (6)[top=13883]; commit;
+       -- ASSIGNMENT 记录（xact.cpp AssignTransactionId log_unknown_top：top 未记过
+       --   WAL 时子 xid 赋值即发射，记录头 xid=被赋值子 xid 13884，main xtop=13883）
+       -- + COMMIT xid=13883 nsubxacts=1 subxacts=[13884]
+  ⑤ top 先写:   begin; insert (7)[top=13885]; savepoint s3; insert (8)[sub=13886]; commit;
+       -- 无 ASSIGNMENT（top 已随 heap 记录记过 WAL），COMMIT nsubxacts=1 subxacts=[13886]
+  ⑥ 2PC 提交:   begin; insert (9); prepare transaction 'og_t2_g1';   -- xid=13887
+       commit prepared 'og_t2_g1';                              -- COMMIT_PREPARED（记录头 xid=0）
+  ⑦ 2PC 回滚:   begin; insert (10); prepare transaction 'og_t2_g2';  -- xid=13888
+       rollback prepared 'og_t2_g2';                            -- ABORT_PREPARED（记录头 xid=0）
+
+窗口 B = [0x292A000,0x292C000) 页对齐 8KB，xact-b.bin）:
+  drop table t_xact_corpus2; create table t_xact_corpus2(id int); drop table t_xact_corpus2;
+  begin; insert (11); savepoint a; insert (12); savepoint b; insert (13); commit;
+       -- 多子事务提交：COMMIT nsubxacts=2 subxacts=[13892,13893]（嵌套 savepoint 归并）
+
+锚记录（LSN 为记录起始；全部 info 带 XLR_REL_COMPRESS 0x04 位——PREPARE/ASSIGNMENT 除外）:
+  0x2926150  COMMIT           xid=13878 main=120B（DDL：nrels=0 nmsgs=4 inval 16B/条 + RecentXmin u64 尾）
+  0x29263B8  COMMIT           xid=13879 main=56B  = MinSizeOfXactCommit 48 + RecentXmin 8
+  0x2926508  ABORT_WITH_XID   xid=13880 main=28B  = xl_xact_abort 20 + curId u64（== 记录头 xid）
+  0x2926718  ABORT_WITH_XID   xid=13882 main=28B  （子回滚——记录头 xid 即子 xid）
+  0x2926798  COMMIT           xid=13881 main=56B  （③的顶层提交，nsub=0）
+  0x29267F8  ASSIGNMENT       xid=13884 main=24B  = xtop u64@0=13883 + n i32@8=1 + sub u64@16=13884
+  0x2926A38  COMMIT           xid=13883 main=64B  = 48 + subxacts u64[1] + RecentXmin 8
+  0x2926CB0  COMMIT           xid=13885 main=64B  = 48 + subxacts u64[1]=13886 + RecentXmin 8
+  0x2926E00  PREPARE          xid=13887 main=464B = TwoPhaseFileHeaderNew 272（magic=0x57F94534
+              TWOPHASE_MAGIC_COMPRESSION：xid u64@8/prepared_at i64@24/gid@53 NUL 结尾
+              'og_t2_g1'/ncommitlibrarys@256/nabortlibrarys@260/ncommitrels_temp@264/nabortrels_temp@268）
+              + 192B 两阶段状态记录链
+  0x29270E8  PREPARE          xid=13888 gid='og_t2_g2'（同构）
+  0x29272E0  COMMIT_PREPARED  记录头 xid=0 main=64B = 2pc_xid u64@0=13887 + xl_xact_commit@8
+              （xact_time@8/csn@16/xinfo@24/nrels@32/.../xnodes@56）+ RecentXmin 8
+  0x2927348  ABORT_PREPARED   记录头 xid=0 main=28B = 2pc_xid u64@0=13888 + xl_xact_abort@8
+              （xact_time@8/nrels@16/nsubxacts@20/nlibrary@24/xnodes@28）
+  0x292A2B8  COMMIT           xid=13890 main=464B nrels=1（compress 位 → xnodes 每项 24B
+              ColFileNode：spc=1663/db=24581/rel=32816/bucket int2+opt uint2/forknum i32/ownerid u32；
+              48+24+0+24×16(inval)+8(RecentXmin)=464 自洽——20B 假设下 456≠464，24B 锚死）
+  0x292A710  COMMIT           xid=13891 main=72B  = 48 + subxacts u64[2]=[13892,13893] + RecentXmin 8
+
+字段布局钉（OG v5.0.0 src/include/access/xact.h + 实测）:
+  xl_xact_commit      : xact_time i64@0 / csn u64@8 / xinfo u64@16 / nrels i32@24 /
+                        nsubxacts i32@28 / nmsgs i32@32 / dbId u32@36 / tsId u32@40 /
+                        nlibrary i32@44 / xnodes@48（ColFileNodeRel 20B，info 带
+                        XLR_REL_COMPRESS 0x04 时 ColFileNode 24B）/ subxacts u64[] 殿后 /
+                        invalmsgs 16B×nmsgs / RecentXmin u64 尾（单机构建恒在）
+  xl_xact_commit_compact（opcode 0x60）: xact_time@0 / csn@8 / nsubxacts@16 / subxacts u64[]@24
+                        ——wal_level=logical 恒走全量形态（xact.cpp RecordTransactionCommit
+                        分派条件），语料窗口未见（未锚，源码推导）
+  xl_xact_abort       : xact_time@0 / nrels@8 / nsubxacts@12 / nlibrary@16 / xnodes@20 /
+                        subxacts u64[] 殿后 / [ABORT_WITH_XID(0x70) 再随 curId u64]
+  xl_xact_commit_prepared: 2pc xid u64@0 + xl_xact_commit 整体 +8（xnodes@56）
+  xl_xact_abort_prepared : 2pc xid u64@0 + xl_xact_abort  整体 +8（xnodes@28）
+  xl_xact_assignment  : xtop u64@0 / nsubxacts i32@8 / subxacts u64[]@16
+  PREPARE main        = 两阶段状态文件头（5.0.0 新装为 TwoPhaseFileHeaderNew 272B，
+                        magic=0x57F94534；gid 定长区 [53,253) NUL 结尾，strncpy_s 同面）
+  TransactionId 为 u64（c.h L450）——subxacts/2pc xid/xtop 均按 8B 读
+  RM_XACT_ID=1（rmgrlist.h 0-based 序，同 vanilla）；XLR_REL_COMPRESS=0x04（xlogrecord.h L41）
+
+SHA-256:
+  xact-a.bin 100db6baa8f03542ba1adc9ba80b279fd2eb676d68bd06a1988a17bb2fff5057
+  xact-b.bin 09c0481dfd0bfd4adb26d2f2cd2f8248f0664f3b44da59960134031ddb5a7e71

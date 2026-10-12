@@ -71,6 +71,29 @@ public final class HeapOps {
      * xinfo u32 与块链；commit/abort/两阶段确认记录共用）。 */
     public static final int XLOG_XACT_HAS_INFO = 0x80;
 
+    /** openGauss v5.0.0 xact.h L127：XLOG_XACT_COMMIT_COMPACT（opcode 位段 0x60——
+     *  无 rels/invals 的紧凑提交形态；wal_level=logical 下 RecordTransactionCommit 恒走
+     *  全量 COMMIT 形态，本 opcode 不出现——xact.cpp 分派条件 XLogLogicalInfoActive）。
+     *  与 vanilla PG 15+ 的 XLOG_XACT_INVALIDATIONS(0x60) 数值撞号，分派须经
+     *  layout 门控不可仅凭 opcode。语料窗口未锚（og-plan logical 档恒全量），源码推导。 */
+    public static final int OG_XLOG_XACT_COMMIT_COMPACT = 0x60;
+
+    /** openGauss v5.0.0 xact.h L128：XLOG_XACT_ABORT_WITH_XID（opcode 位段 0x70——
+     *  子 xid 被记入 WAL 后的逻辑日志形态回滚，main 在 subxacts 后追加 curId u64；
+     *  xact.cpp RecordTransactionAbort：workingVersionNum ≥ DECODE_ABORT_VERSION_NUM
+     *  且 XLogLogicalInfoActive() 时恒走本形态，og-plan 语料实测 logical 档全部回滚
+     *  记录均为此 opcode[lsn=0x2926508 顶层回滚 / 0x2926718 子回滚]。curId 恒等于
+     *  记录头 xid（XLogInsert 的 xl_xid = GetCurrentTransactionIdIfAny，RecordTransactionAbort
+     *  调用点即中止事务自身），解析面不消费。 */
+    public static final int OG_XLOG_XACT_ABORT_WITH_XID = 0x70;
+
+    /** openGauss v5.0.0 xlogrecord.h L41：XLR_REL_COMPRESS（info 低位 0x04——
+     *  commit/abort 记录的 xnodes 数组走 ColFileNode（24B，含 bucket int2 + opt uint2）
+     *  而非 ColFileNodeRel（20B）。被 opcode 掩码 0x70 天然忽略，仅影响 xnodes 步进宽。
+     *  og-plan 语料锚：lsn=0x292A2B8 COMMIT nrels=1 带 0x04 位，main=464B 恰在
+     *  24B/项假设下收口（20B 假设 456≠464）。 */
+    public static final int OG_XLR_REL_COMPRESS = 0x04;
+
     /** heapam_xlog.h：xl_heap_update 含旧 tuple 全行或旧键（CONTAINS_OLD_TUPLE|OLD_KEY = 0x04|0x08）。 */
     public static final int XLH_UPDATE_CONTAINS_OLD = 0x04 | 0x08;
 
