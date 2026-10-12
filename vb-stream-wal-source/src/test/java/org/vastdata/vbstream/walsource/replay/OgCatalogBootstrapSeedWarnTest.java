@@ -241,6 +241,12 @@ class OgCatalogBootstrapSeedWarnTest {
                     + " FROM pg_attribute WHERE attnum > 0", List.of());
             scripted.put(CatalogBootstrap.classSeedSql(layout), classRows);
             scripted.put("SELECT ctid::text, oid, nspname FROM pg_namespace", List.of());
+            // openGauss M3 Task 1 第四表种子（OG 档新增调用足迹——空 pg_partition 即可）
+            if (layout.openGaussDialect()) {
+                scripted.put("SELECT pg_relation_filenode('pg_partition'::regclass)",
+                        List.<Object[]>of(new Object[] {14318L}));
+                scripted.put(CatalogBootstrap.partitionSeedSql(layout), List.of());
+            }
         }
 
         /**

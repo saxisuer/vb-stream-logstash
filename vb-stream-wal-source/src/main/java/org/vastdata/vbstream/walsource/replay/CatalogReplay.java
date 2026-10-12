@@ -109,6 +109,13 @@ public final class CatalogReplay {
      */
     private String[] classDecodeKinds;
 
+    /**
+     * pg_partition 腿的解码词典（惰性缓存，openGauss M3 Task 1）：即
+     * {@link CatalogRow.PartitionRow#kinds()}（33 项含虚拟头 oid 槽——OG 专属表，
+     * 词典自持无版本分派）。构造后只读，线程安全。
+     */
+    private String[] partitionDecodeKinds;
+
     /** 截断自愈校验器（null = 禁用：未知 oldCtid 保留 skip + 计数行为）。 */
     private final SelfHealer healer;
 
@@ -119,10 +126,12 @@ public final class CatalogReplay {
     private static final int ADOPT_SKIP_STALE_THRESHOLD = 3;
 
     /**
-     * watched 目录判别（PRUNE 施加面的三向分派）：tracked 双 ctid 跟随仅 pg_class
+     * watched 目录判别（PRUNE 施加面的四向分派）：tracked 双 ctid 跟随仅 pg_class
      * （行位语义）；redirect 缺行的精确采纳物化仅 ATTR/CLASS 两面（有 probe 面），
-     * NSP 面无 ctid 探测通道（v2 限制）、缺行放弃物化并计
-     * {@link CatalogStores.CatalogMetrics#NSP_REDIRECT_MISSES}（行留待后续链事件/对拍暴露）。
+     * NSP 面（v2）与 PARTITION 面（openGauss M3 扩链）无 ctid 探测通道、缺行放弃
+     * 物化并计各自 miss 计数（{@link CatalogStores.CatalogMetrics#NSP_REDIRECT_MISSES}
+     * / {@link CatalogStores.CatalogMetrics#PARTITION_REDIRECT_MISSES}——行留待后续
+     * 链事件/对拍暴露）。
      */
     private enum WatchedLeg {
         /** pg_attribute 面（attr 精确采纳可用）。 */
@@ -130,7 +139,9 @@ public final class CatalogReplay {
         /** pg_class 面（tracked 跟随 + class 精确采纳可用）。 */
         CLASS,
         /** pg_namespace 面（v2 扩链，无采纳面）。 */
-        NSP
+        NSP,
+        /** pg_partition 面（openGauss M3 扩链第四腿，无采纳面）。 */
+        PARTITION
     }
 
     /**
@@ -192,6 +203,23 @@ public final class CatalogReplay {
             }
         }
         return classDecodeKinds;
+    }
+
+    /**
+     * pg_partition 腿的解码词典（openGauss M3 Task 1）：透传
+     * {@link CatalogRow.PartitionRow#kinds()}（OG 专属表，33 项含虚拟头 oid 槽——
+     * 值行槽 0 = 元组头 oid，attnum n 的值行槽位恰为 n）。
+     *
+     * <p>边界与异常语义：产物缓存复用（构造后只读数组，调用方不得改写）。
+     * 线程约束：惰性初始化竞态无害（幂等赋值、数组内容恒定）。</p>
+     *
+     * @return pg_partition 解码词典（33 项 = 虚拟头 oid 槽 + 32 数据列）
+     */
+    private String[] partitionDecodeKinds() {
+        if (partitionDecodeKinds == null) {
+            partitionDecodeKinds = CatalogRow.PartitionRow.kinds();
+        }
+        return partitionDecodeKinds;
     }
 
     /**
@@ -401,16 +429,16 @@ public final class CatalogReplay {
     public List<HeapEvent> heapEvents(WalRecord r, long watchedRelfilenode, String[] kinds,
             Map<Long, ?> rawTailStore, LongFunction<CatalogRow.ClassRow> classRowLookup,
             CatalogStores.CatalogMetrics metrics, CatalogStores healStores) {
-        return heapEvents(r, watchedRelfilenode, kinds, rawTailStore, classRowLookup, null, metrics, healStores);
+        return heapEvents(r, watchedRelfilenode, kinds, rawTailStore, classRowLookup, null, null, metrics, healStores);
     }
 
     /**
-     * 提取 heap 级行事件（私有全参核，v2 增 pg_namespace 腿）——七参公开档之上增加
-     * {@code nspRowLookup}（pg_namespace 行字典查找，值编码重建的旧行面；<strong>
-     * 非 null 即约定 kinds 为 {@link CatalogRow.NspRow#kinds()}</strong>，同时作为
-     * "本调用非 pg_attribute 面"的判据——attr 精确采纳仅在 classRowLookup 与
-     * nspRowLookup 双空时触发，防止第三表的截断 skip 误采 pg_attribute 行）。
-     * 语义与七参档一致，见其 javadoc。
+     * 提取 heap 级行事件（私有全参核，v2 增 pg_namespace 腿，openGauss M3 增
+     * pg_partition 腿）——七参公开档之上增加 {@code nspRowLookup} 与
+     * {@code partRowLookup}（行字典查找，值编码重建的旧行面；<strong>非 null 即约定
+     * kinds 为对应词典</strong>，同时作为"本调用非 pg_attribute 面"的判据——attr
+     * 精确采纳仅在三个 lookup 全空时触发，防止第三/四表的截断 skip 误采
+     * pg_attribute 行）。语义与七参档一致，见其 javadoc。
      *
      * @param r                 走读完成的记录
      * @param watchedRelfilenode watched 关系 relfilenode（0 恒不匹配）
@@ -419,13 +447,15 @@ public final class CatalogReplay {
      * @param classRowLookup    pg_class 行字典查找（null 则截断不走 class 值编码）
      * @param nspRowLookup      pg_namespace 行字典查找（null 则截断不走 nsp 值编码，
      *                          且不参与 attr 采纳判据——见方法 javadoc）
+     * @param partRowLookup     pg_partition 行字典查找（null 则截断不走 partition 值
+     *                          编码，且不参与 attr 采纳判据）
      * @param metrics           指标容器（skip 计数；null 不计）
      * @param healStores        自愈状态容器（仅 pg_class 腿非 null）
      * @return 事件列表
      */
     private List<HeapEvent> heapEvents(WalRecord r, long watchedRelfilenode, String[] kinds,
             Map<Long, ?> rawTailStore, LongFunction<CatalogRow.ClassRow> classRowLookup,
-            LongFunction<CatalogRow.NspRow> nspRowLookup,
+            LongFunction<CatalogRow.NspRow> nspRowLookup, LongFunction<CatalogRow.PartitionRow> partRowLookup,
             CatalogStores.CatalogMetrics metrics, CatalogStores healStores) {
         List<HeapEvent> out = new ArrayList<>();
         if (r.rmid() != HeapOps.RM_HEAP_ID && r.rmid() != HeapOps.RM_HEAP2_ID) {
@@ -469,7 +499,8 @@ public final class CatalogReplay {
                 byte[] tail;
                 if ((view.flags() & HeapOps.XLH_UPDATE_TRUNCATION) != 0) {
                     Reconstruction rc = reconstructTruncatedUpdate(
-                            r, b0, oldCtid, newCtid, kinds, tails, classRowLookup, nspRowLookup, metrics, healStores);
+                            r, b0, oldCtid, newCtid, kinds, tails, classRowLookup, nspRowLookup, partRowLookup,
+                            metrics, healStores);
                     if (rc == null) {
                         return out;    // 旧行值与 raw tail 皆无：窗口外噪声，skip 不抛
                     }
@@ -529,15 +560,15 @@ public final class CatalogReplay {
     /**
      * 施加一条 heap2 页清理记录（vanilla：三种 prune opcode 等价，发现 18；
      * openGauss：XLOG_HEAP2_CLEAN 单 opcode——两族 opcode 撞号，门按
-     * layout.legacyHeap2Clean() 分派）到三目录的 ctid 键控状态：redirected 段
+     * layout.legacyHeap2Clean() 分派）到四目录的 ctid 键控状态：redirected 段
      * 重定位行/tail 并跟随 tracked，nowdead/nowunused 段移除行/tail——不重放
      * PRUNE 会在 autovacuum 压实页后丢失 tracked 行位（spike S6 实证）。
      *
      * <p>关键步骤：rmid/opcode 筛（OG 档只放行 0x10 CLEAN——0x30 CLEANUP_INFO
      * 与 vanilla PRUNE_VACUUM_CLEANUP 撞号，须在解析前拦下 no-op）→ PruneView
      * 解析（vanilla：freeze 段已在视图层跳过；OG：段计数取自 main、unused 余长
-     * 推导）→ 对 pg_attribute / pg_class / pg_namespace 各自按 relNode 匹配块后
-     * 逐段施加。tracked 命中 dead/unused 打 WARN（行位丢失是异常态：该行已被
+     * 推导）→ 对 pg_attribute / pg_class / pg_namespace / pg_partition 各自按
+     * relNode 匹配块后逐段施加。tracked 命中 dead/unused 打 WARN（行位丢失是异常态：该行已被
      * 物理删除）。边界与异常语义：非页清理记录 no-op；记录块不属任一 watched
      * 目录 no-op；段字节越界由上游走读不变量排除（裸抛）。线程约束：单写者
      * （stores 生命周期内仅重放线程）。</p>
@@ -563,17 +594,23 @@ public final class CatalogReplay {
         pruneCatalog(view, stores.pgAttrRelfilenode(), stores.attrRows(), stores.rawAttrTails(), stores, WatchedLeg.ATTR);
         pruneCatalog(view, stores.pgClassRelfilenode(), stores.classRows(), stores.rawClassTails(), stores, WatchedLeg.CLASS);
         pruneCatalog(view, stores.pgNspRelnode(), stores.nspRows(), stores.rawNspTails(), stores, WatchedLeg.NSP);
+        pruneCatalog(view, stores.pgPartitionRelfilenode(), stores.partitionRows(), stores.rawPartitionTails(),
+                stores, WatchedLeg.PARTITION);
     }
 
     /**
      * 施加 XLOG_HEAP_INPLACE 到 tracked pg_class 行（TRUNCATE/ANALYZE 路径，
      * 发现 17/19：PG 18 原地改写新 relfilenode——ctid 不动、块 data 是自 t_hoff 起
-     * 的新数据区、头/位图不动，列数据区偏移定宽故 88/112 直读）。
+     * 的新数据区、头/位图不动，列数据区偏移定宽故 88/112 直读），及 pg_partition
+     * 行（openGauss M3 第四腿——T0 锚④：ADD PARTITION 收尾对母表 'r' 行的统计面
+     * INPLACE；分区列 7-12 与 pg_class OG 列 7-12 同宽对齐使 relfilenode@84/
+     * reltoastrelid@116 恰同偏移，直接复用 layout 访问器）。
      *
      * <p>关键步骤：rmid/opcode 筛 → 按 pgClassRelfilenode 匹配块且须有 data →
      * offnum 定 ctid 键 → 行字典命中（未跟踪行 no-op）→ 按布局偏移读新
      * relfilenode/reltoastrelid 重建 ClassRow（其余字段不动）→ raw tail 置失效
-     * （删除：改写后的 tail 已陈旧，后续截断重建走值编码）→ 指标计数。
+     * （删除：改写后的 tail 已陈旧，后续截断重建走值编码）→ 指标计数；随后对
+     * pg_partition 腿重复同构流程（{@link #applyPartitionInplace}）。
      * 边界与异常语义：非 inplace/块不属 pg_class/行未跟踪均 no-op；线程约束：
      * 单写者。</p>
      *
@@ -585,6 +622,17 @@ public final class CatalogReplay {
                 || (r.info() & HeapOps.XLOG_XACT_OPMASK) != HeapOps.XLOG_HEAP_INPLACE) {
             return;
         }
+        applyClassInplace(r, stores);
+        applyPartitionInplace(r, stores);
+    }
+
+    /**
+     * XLOG_HEAP_INPLACE 的 pg_class 面（原 applyInplace 主体，见其 javadoc）。
+     *
+     * @param r      走读完成的记录（调用方已筛 rmid/opcode）
+     * @param stores 重放状态容器
+     */
+    private void applyClassInplace(WalRecord r, CatalogStores stores) {
         BlockRef b0 = findHeapBlock(r, stores.pgClassRelfilenode());
         if (b0 == null || !b0.hasData()) {
             return;
@@ -606,9 +654,47 @@ public final class CatalogReplay {
     }
 
     /**
+     * XLOG_HEAP_INPLACE 的 pg_partition 面（openGauss M3 Task 1 第四腿）——按
+     * {@code pgPartitionRelfilenode} 匹配块，数据区直读 relfilenode@84/
+     * reltoastrelid@116（T0 锚④：ADD PARTITION 收尾对 pg_partition 母表行的
+     * 统计面 INPLACE——投影列不经统计面变化，直读两字段是防御口径：INPLACE 改写
+     * 整个数据区，末态采纳即安全；与 pg_class OG 偏移恰同值见
+     * {@link #applyInplace} javadoc）重建 {@link CatalogRow.PartitionRow}（其余
+     * 字段不动）并置 raw tail 失效。
+     *
+     * <p>关键步骤与边界语义同 {@link #applyClassInplace}（块不属 pg_partition/
+     * 行未跟踪均 no-op）；线程约束：单写者。</p>
+     *
+     * @param r      走读完成的记录（调用方已筛 rmid/opcode）
+     * @param stores 重放状态容器
+     */
+    private void applyPartitionInplace(WalRecord r, CatalogStores stores) {
+        BlockRef b0 = findHeapBlock(r, stores.pgPartitionRelfilenode());
+        if (b0 == null || !b0.hasData()) {
+            return;
+        }
+        HeapViews.HeapInplaceView view = HeapViews.HeapInplaceView.parse(r, layout);
+        long key = ctidKey(b0.blockNo(), view.offnum());
+        CatalogRow.PartitionRow pr = stores.partitionRows().get(key);
+        if (pr == null) {
+            return;    // 未跟踪行：no-op
+        }
+        long newFileno = u32(r.raw(), b0.dataOff() + layout.pgClassRelfilenodeDataOffset()) & 0xFFFFFFFFL;
+        long newToast = u32(r.raw(), b0.dataOff() + layout.pgClassReltoastrelidDataOffset()) & 0xFFFFFFFFL;
+        stores.partitionRows().put(key, new CatalogRow.PartitionRow(pr.partOid(), pr.relname(), pr.parttype(),
+                pr.parentid(), newFileno, newToast));
+        stores.rawPartitionTails().remove(key);    // tail 已陈旧：置失效
+        stores.metrics().inc(CatalogStores.CatalogMetrics.INPLACE_UPDATES);
+        LOG.debug("pg_partition INPLACE oid={} relfilenode {} -> {} reltoastrelid {} -> {}",
+                pr.partOid(), pr.relfilenode(), newFileno, pr.reltoastrelid(), newToast);
+    }
+
+    /**
      * 单记录全量重放入口（spike {@code replayCatalogs} 移植）——施加次序固定：
-     * PRUNE → INPLACE → pg_attribute 行事件 → pg_class 行事件（含 tracked 跟随
-     * 与 toast 收养）→ pg_namespace 行事件（v2 扩链第三腿，schema 名解析源）。
+     * PRUNE → INPLACE（pg_class + pg_partition 面）→ pg_attribute 行事件 →
+     * pg_class 行事件（含 tracked 跟随与 toast 收养）→ pg_namespace 行事件
+     * （v2 扩链第三腿，schema 名解析源）→ pg_partition 行事件（openGauss M3
+     * 扩链第四腿，分区路由字典——vanilla 档 inert）。
      * Task 11 的 synchronizer.apply 直接委托本方法。
      *
      * <p>关键步骤（pg_class 事件施加）：DEL 删行；INS/UPD 落新键行模型（UPD 先删
@@ -695,7 +781,7 @@ public final class CatalogReplay {
         // 判据——截断 skip 不触发 attr 精确采纳（误采 pg_attribute 行产垃圾 NspRow）。
         // 词典版本感知（Task 7）：OG 七数据列 + 虚拟头 oid 槽
         List<HeapEvent> nspEvents = heapEvents(r, stores.pgNspRelnode(), CatalogRow.NspRow.kinds(layout),
-                stores.rawNspTails(), null, stores.nspRows()::get, stores.metrics(), null);
+                stores.rawNspTails(), null, stores.nspRows()::get, null, stores.metrics(), null);
         for (HeapEvent ev : nspEvents) {
             if (ev.op() == HeapEvent.DEL) {
                 stores.nspRows().remove(ev.oldCtid());
@@ -704,6 +790,24 @@ public final class CatalogReplay {
                     stores.nspRows().remove(ev.oldCtid());
                 }
                 stores.nspRows().put(ev.newCtid(), CatalogRow.NspRow.fromDecoded(ev.row()));
+            }
+            stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
+        }
+        // openGauss M3 Task 1 扩链第四腿：pg_partition 行事件——施加次序在 nsp 之后
+        // （固定，四腿字典互不依赖）。partRowLookup 非 null 兼作"非 attr 面"判据
+        // ——截断 skip 不触发 attr 精确采纳（误采 pg_attribute 行产垃圾 PartitionRow）；
+        // 且启用 partition 值编码重建（读区 120）。vanilla 档 pgPartitionRelfilenode
+        // 恒 0，本腿天然 inert。
+        List<HeapEvent> partEvents = heapEvents(r, stores.pgPartitionRelfilenode(), partitionDecodeKinds(),
+                stores.rawPartitionTails(), null, null, stores.partitionRows()::get, stores.metrics(), null);
+        for (HeapEvent ev : partEvents) {
+            if (ev.op() == HeapEvent.DEL) {
+                stores.partitionRows().remove(ev.oldCtid());
+            } else {
+                if (ev.op() == HeapEvent.UPD) {
+                    stores.partitionRows().remove(ev.oldCtid());
+                }
+                stores.partitionRows().put(ev.newCtid(), CatalogRow.PartitionRow.fromDecoded(ev.row()));
             }
             stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
         }
@@ -842,6 +946,67 @@ public final class CatalogReplay {
     }
 
     /**
+     * pg_partition 截断更新的值编码重建（openGauss M3 Task 1 第四腿，
+     * {@link #reconstructNspTruncated} 的 partition 面同构）——prefix 落在读区
+     * （OG 恒 {@link CatalogRow.PartitionRow#READ_REGION_LEN}=120）时由已知旧行
+     * {@link CatalogRow.PartitionRow#encodeReadRegion()} 重编码前缀，中段取自记录；
+     * 后缀零填充仅在读区之外合法，与读区的重叠段按旧行读区字节回填（语义同
+     * class/nsp 面：典型形态是 MERGE 改名/EXCHANGE 换段号——prefix 落 relname/
+     * parttype 区、suffix 起点越入读区）。
+     *
+     * <p>关键步骤与边界语义同 {@link #reconstructNspTruncated}（读区末尾 = 120
+     * 恒定、词典 = {@link #partitionDecodeKinds()} 无版本分派）；
+     * 返回 null 表示 prefix 越过读区（落 rawTail splice）；线程约束：纯函数。</p>
+     *
+     * @param r      走读完成的 UPDATE 记录
+     * @param b0     新页块引用（须携带 data）
+     * @param oldRow 旧行值模型（来自 partition 行字典）
+     * @return 重建产物；prefix &gt; 读区长为 null
+     */
+    private Reconstruction reconstructPartitionTruncated(WalRecord r, BlockRef b0, CatalogRow.PartitionRow oldRow) {
+        int[] p = truncParams(r, b0);
+        int prefix = p[0];
+        int suffix = p[1];
+        int cur = p[2];
+        int readEnd = CatalogRow.PartitionRow.READ_REGION_LEN;
+        if (prefix > readEnd) {
+            return null;
+        }
+        byte[] raw = r.raw();
+        int infomask2 = u16(raw, cur);
+        int infomask = u16(raw, cur + 2);
+        int tHoff = raw[cur + 4] & 0xFF;
+        cur += 5;
+        int bitmapLen = tHoff - TUPLE_BITS_OFFSET;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        if (prefix == 0) {
+            out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 整段（仅截后缀）
+        } else {
+            out.write(raw, cur, bitmapLen);    // 位图 + 垫齐
+            cur += bitmapLen;
+            out.write(oldRow.encodeReadRegion(), 0, prefix);
+            out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 中段
+        }
+        out.write(new byte[suffix], 0, suffix);    // 后缀零填充占位（读区重叠段下方回填）
+        byte[] assembled = out.toByteArray();
+        // 读区回填（语义同 class/nsp 面）：零填充仅在读区之外合法——suffix 起点 <
+        // 读区末尾时，重叠段从旧行读区编码取精确值
+        int dataLen = assembled.length - bitmapLen;
+        int zeroStart = dataLen - suffix;
+        if (zeroStart < 0) {
+            return null;    // 防御：suffix 超数据区长（畸形记录）——落 tail/skip 兜底
+        }
+        if (zeroStart < readEnd) {
+            byte[] readRegion = oldRow.encodeReadRegion();
+            int backfillEnd = Math.min(dataLen, readEnd);
+            for (int i = zeroStart; i < backfillEnd; i++) {
+                assembled[bitmapLen + i] = readRegion[i];
+            }
+        }
+        return finishReconstruction(assembled, tHoff, infomask, infomask2, partitionDecodeKinds());
+    }
+
+    /**
      * 通用截断更新的 rawTail splice 重建（spike {@code reconstructTruncated} 移植）
      * ——chunk 布局（heapam.c）：[prefix u16?][suffix u16?][xl_heap_header 5B]，随后
      * prefix=0 时 [整 tail 减后缀]、否则 [位图+垫 (t_hoff-23)B][数据区自
@@ -884,18 +1049,21 @@ public final class CatalogReplay {
 
     /**
      * 截断 UPDATE 的重建决策（spec §6 三级：值编码 → rawTail splice → 自愈/skip；
-     * v2 增 nsp 值编码一级）。
+     * v2 增 nsp 值编码一级，openGauss M3 增 partition 值编码一级）。
      *
      * <p>关键步骤：值编码优先——classRowLookup 非空且 prefix ≤ 88 时查旧行，命中
      * 即走 {@link #reconstructClassTruncated}（prefix 越界防御性再判一次）；
      * nspRowLookup 非空且 prefix ≤ {@link CatalogRow.NspRow#READ_REGION_LEN} 时查
-     * 旧行走 {@link #reconstructNspTruncated}（同语义的 nsp 面）；未命中或未配
-     * lookup 则取 rawTailStore 的旧 tail 走 splice；两者皆无时若 healer 与
+     * 旧行走 {@link #reconstructNspTruncated}（同语义的 nsp 面）；
+     * partRowLookup 非空且 prefix ≤
+     * {@link CatalogRow.PartitionRow#READ_REGION_LEN} 时查旧行走
+     * {@link #reconstructPartitionTruncated}（同语义的 partition 面）；未命中或
+     * 未配 lookup 则取 rawTailStore 的旧 tail 走 splice；两者皆无时若 healer 与
      * healStores 均可用（pg_class 面）走 {@code selfHealTruncated} ctid 寻址精确
      * 采纳（spec §6② 的收敛形态——末态回填而非历史重建），classRowLookup 与
-     * nspRowLookup <strong>双空</strong>时按 pg_attribute 面走 attr 精确采纳
-     * （Task 13 同判——nsp 腿以非空 nspRowLookup 自排除，防误采），仍无则返回
-     * null（调用方 skip）并对 metrics 计数
+     * nspRowLookup 与 partRowLookup <strong>三空</strong>时按 pg_attribute 面走
+     * attr 精确采纳（Task 13 同判——nsp/partition 腿以非空各自 lookup 自排除，
+     * 防误采），仍无则返回 null（调用方 skip）并对 metrics 计数
      * skippedTruncated（spike 差异①：页读兜底已删）。边界与异常语义：tail/lookup
      * 任一非 null 即重建；自愈判否不抛（连续失败只计数/标 stale）；线程约束：单写者。</p>
      *
@@ -908,13 +1076,15 @@ public final class CatalogReplay {
      * @param classRowLookup  pg_class 行字典查找（可为 null；非 null 约定 kinds 为 pg_class 词典）
      * @param nspRowLookup    pg_namespace 行字典查找（可为 null；非 null 约定 kinds 为
      *                        nsp 词典，且本调用不触发 attr 精确采纳）
+     * @param partRowLookup   pg_partition 行字典查找（可为 null；非 null 约定 kinds 为
+     *                        partition 词典，且本调用不触发 attr 精确采纳）
      * @param metrics         指标容器（可为 null）
      * @param healStores      自愈状态容器（可为 null；非 null 约定为 pg_class 面）
      * @return 重建产物；skip 为 null
      */
     private Reconstruction reconstructTruncatedUpdate(WalRecord r, BlockRef b0, long oldCtid, long newCtid,
             String[] kinds, Map<Long, byte[]> tails, LongFunction<CatalogRow.ClassRow> classRowLookup,
-            LongFunction<CatalogRow.NspRow> nspRowLookup,
+            LongFunction<CatalogRow.NspRow> nspRowLookup, LongFunction<CatalogRow.PartitionRow> partRowLookup,
             CatalogStores.CatalogMetrics metrics, CatalogStores healStores) {
         if (classRowLookup != null) {
             CatalogRow.ClassRow oldRow = classRowLookup.apply(oldCtid);
@@ -934,6 +1104,15 @@ public final class CatalogReplay {
                 }
             }
         }
+        if (partRowLookup != null) {
+            CatalogRow.PartitionRow oldPart = partRowLookup.apply(oldCtid);
+            if (oldPart != null) {
+                Reconstruction rc = reconstructPartitionTruncated(r, b0, oldPart);
+                if (rc != null) {
+                    return rc;
+                }
+            }
+        }
         byte[] oldTail = tails == null ? null : tails.get(oldCtid);
         if (oldTail == null) {
             if (healer != null && healer.enabled()) {
@@ -943,10 +1122,10 @@ public final class CatalogReplay {
                     if (healed != null) {
                         return healed;
                     }
-                } else if (classRowLookup == null && nspRowLookup == null) {
+                } else if (classRowLookup == null && nspRowLookup == null && partRowLookup == null) {
                     // pg_attribute 面（Task 13）：ctid 寻址精确采纳——更新必移行位，
                     // "末态仍居记录 new 位"的行即该记录施加后的精确状态，整行采纳
-                    // （双 lookup 空 = attr 腿判据；nsp 腿经非空 nspRowLookup 自排除）
+                    // （三 lookup 空 = attr 腿判据；nsp/partition 腿经非空各自 lookup 自排除）
                     Reconstruction adopted = attrExactAdopt(r, newCtid, metrics);
                     if (adopted != null) {
                         return adopted;
@@ -1232,8 +1411,8 @@ public final class CatalogReplay {
      * nowunused 移除。tracked 跟随（redirect）与 tracked 链断 WARN（dead/unused）
      * <strong>仅 pg_class 分支</strong>（{@link WatchedLeg#CLASS}）——tracked 双
      * ctid 是 pg_class 行位，而 ctidKey 无关系判别、各目录块号键空间完全重叠，
-     * attr/nsp 分支数值命中 tracked 时不得搬移/告警（spike remapCtid 的 attr 分支
-     * 同判，nsp 面同扩）。
+     * attr/nsp/partition 分支数值命中 tracked 时不得搬移/告警（spike remapCtid
+     * 的 attr 分支同判，nsp/partition 面同扩）。
      *
      * <p>关键步骤：按 relNode 匹配块（不属则 no-op）→ redirected 段逐对 (from,to)
      * 折键重定位（行命中计 pruneRedirects；<strong>from 位无行且 healer 可用时按
@@ -1299,8 +1478,9 @@ public final class CatalogReplay {
      * {@link #attrExactAdopt}——attr 采纳行 attnum &le; 0（系统列，字典面契约外）
      * 丢弃不落。边界与异常语义：探测无行（to 位也被再迁移/复用）返回 null（本
      * redirect 放弃物化，行留待后续链事件/对拍暴露）；拒绝记账仅 class 面（与
-     * 截断更新采纳同规则）；NSP 面 DEBUG + 专用计数后返回 null（观测面见
-     * {@code WatchedLeg.NSP} 注记）。线程约束：单写者（重放线程，probe 复用 healer
+     * 截断更新采纳同规则）；NSP/PARTITION 面 DEBUG + 各自专用计数后返回 null
+     * （观测面见 {@code WatchedLeg.NSP}/{@code WatchedLeg.PARTITION} 注记）。
+     * 线程约束：单写者（重放线程，probe 复用 healer
      * 会话）。</p>
      *
      * @param r       走读完成的 PRUNE 记录（LSN 定位日志面）
@@ -1326,6 +1506,14 @@ public final class CatalogReplay {
             LOG.debug("NSP redirect 缺行放弃物化（v2 限制，行留待后续链事件/对拍暴露）: to=0x{}",
                     Long.toHexString(to));
             stores.metrics().inc(CatalogStores.CatalogMetrics.NSP_REDIRECT_MISSES);
+            return null;
+        }
+        if (leg == WatchedLeg.PARTITION) {
+            // partition 面同 nsp 无 ctid 探测通道（openGauss M3 第四腿）：缺行放弃物化
+            // ——DEBUG 一行 + 专用计数（partitionRedirectMisses），分区字典链断的观测面
+            LOG.debug("PARTITION redirect 缺行放弃物化（行留待后续链事件/对拍暴露）: to=0x{}",
+                    Long.toHexString(to));
+            stores.metrics().inc(CatalogStores.CatalogMetrics.PARTITION_REDIRECT_MISSES);
             return null;
         }
         Reconstruction rc = attrExactAdopt(r, to, stores.metrics());

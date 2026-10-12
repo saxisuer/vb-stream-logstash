@@ -8,9 +8,10 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * 系统目录重放的行模型——pg_attribute / pg_class / pg_namespace 三张 watched 目录
- * 各自的最小列投影（as-of 字典查询与 relfilenode/toast 跟踪所需字段），按物理 ctid
- * 键控存于 {@link CatalogStores}。三 record 以嵌套类型收拢进本文件（仓库嵌套类型惯例，
- * 参照 layout 包 HeapViews 的视图收纳方式）。
+ * （v1/v2）+ openGauss M3 扩链的第四张 pg_partition 各自的最小列投影（as-of 字典
+ * 查询与 relfilenode/toast 跟踪所需字段），按物理 ctid 键控存于 {@link CatalogStores}。
+ * 各 record 以嵌套类型收拢进本文件（仓库嵌套类型惯例，参照 layout 包 HeapViews 的
+ * 视图收纳方式）。
  *
  * <p>pg_attribute / pg_class 两 record 提供 {@code fromDecoded(Object[], WalLayout)}
  * 静态工厂：把 {@code TupleDecoder} 的解码值行投影为行模型。词典槽位与数据区偏移
@@ -428,6 +429,180 @@ public final class CatalogRow {
             }
             out.write(new byte[4], 0, 4);   // nspowner@64：0 占位（不投影）
             out.write(new byte[8], 0, 8);   // [68,80)：4B 垫 + nsptimeline@72 0 占位
+            return out.toByteArray();
+        }
+    }
+
+    /**
+     * 一条重放中的 pg_partition 行（按物理 ctid 键控，openGauss M3 Task 1 扩链
+     * <b>第四 watched 目录</b>）——OG 原生分区路由字典的最小投影：分区 relfilenode
+     * （heap 记录路由锚）→ parttype/parentid → 母表 pg_class oid 的映射链源
+     * （spike 锚②：`PARTITION_NAME=mother`——wal 路表名解析须经本链归一到母表），
+     * 加 reltoastrelid（spike 锚③：分区自有 toast 挂 'p' 行、母表面恒 0——
+     * ToastAssembler 的 chunk 归属反查源）。
+     *
+     * <p><b>openGauss 5.0.0 专属表</b>（vanilla PG 无 pg_partition——第四腿仅在
+     * OG 档激活）：32 数据列 + oid 在 9.2 式元组头（T0 锚①，og-plan live
+     * pg_attribute 实查 2026-10-13：attnum 1-32 见 {@link #KINDS} 列序注）；行身份
+     * 双面——parttype 'r'=母表行（relfilenode/reltoastrelid 恒 0）与 'p'=分区行。
+     * 词典自持于 {@link #kinds()}（首位虚拟头 oid 槽使投影槽位与值行对齐），
+     * 不经 layout。<b>无伴生结构</b>（OG 5.0.0 不存在 pg_partition_fn/
+     * pg_partition_enum，T0 锚①），watched 面单表。</p>
+     *
+     * @param partOid     行自身 oid（元组头 oid 虚拟槽；分区行 INSERT 时与 relfilenode
+     *                    同值，EXCHANGE 后换源表段号——以重放末态为准，T0 坑 3）
+     * @param relname     分区/母表名（定宽 64B name）
+     * @param parttype    行身份（'r'=母表行 / 'p'=分区行——与 pg_class.parttype
+     *                    值域不同语义：这里区分行身份，投影恒裸字符）
+     * @param parentid    母表 pg_class oid（母表行=自 oid）
+     * @param relfilenode 分区物理段号（数据区偏移 84；路由锚——heap 记录落此段号）
+     * @param reltoastrelid 分区自有 toast 关系 oid（数据区偏移 116；'r' 行恒 0）
+     */
+    public record PartitionRow(long partOid, String relname, String parttype,
+                               long parentid, long relfilenode, long reltoastrelid) {
+
+        /**
+         * 值编码<strong>读区</strong>长度（数据区偏移，自 t_hoff 起）：[0,120) 定宽段
+         * = relname 64B@0 + parttype 1B@64 + 垫 3 + parentid u32@68 + rangenum@72 +
+         * intervalnum@76 + partstrategy@80 + 垫 3 + relfilenode u32@84 +
+         * reltablespace@88（0 占位——不投影）+ 垫 4 + relpages float8@96（0 占位）+
+         * reltuples float8@104（0 占位）+ relallvisible@112（0 占位）+
+         * reltoastrelid u32@116——截断更新值编码重建的合法 prefix 上界与后缀读区
+         * 回填的读区末尾（语义同 {@link ClassRow}/{@link NspRow} 读区；T0 锚①
+         * 数据区偏移 84/116 实测锚，与 pg_class OG 列 7-12 同宽对齐恰同值）。
+         * 变长段 @156 起不可值编码，prefix 越过 120 落 rawTail splice。
+         */
+        public static final int READ_REGION_LEN = 120;
+
+        /** 词典索引：元组头 oid（虚拟槽 0——9.2 式 [t_hoff-4,t_hoff) 垫区）。 */
+        private static final int IX_PARTOID = 0;
+
+        /** 词典索引：relname（attnum 1，数据区 @0）。 */
+        private static final int IX_RELNAME = 1;
+
+        /** 词典索引：parttype（attnum 2，数据区 @64）。 */
+        private static final int IX_PARTTYPE = 2;
+
+        /** 词典索引：parentid（attnum 3，数据区 @68）。 */
+        private static final int IX_PARENTID = 3;
+
+        /** 词典索引：relfilenode（attnum 7，数据区 @84——虚拟槽使值行槽位 = attnum）。 */
+        private static final int IX_RELFILENODE = 7;
+
+        /** 词典索引：reltoastrelid（attnum 12，数据区 @116）。 */
+        private static final int IX_RELTOASTRELID = 12;
+
+        /**
+         * pg_partition 列解码词典（33 项 = 虚拟头 oid 槽 + 32 数据列），逐行转录自
+         * live opengauss:5.0.0 服务端 pg_attribute 于 pg_partition 的行（attnum
+         * 升序，2026-10-13 og-plan 容器实查，T0 锚①同源 SQL）：
+         * relname name@1 / parttype char@2 / parentid oid@3 / rangenum int4@4 /
+         * intervalnum int4@5 / partstrategy char@6 / relfilenode oid@7 /
+         * reltablespace oid@8 / relpages float8@9 / reltuples float8@10 /
+         * relallvisible int4@11 / reltoastrelid oid@12 / reltoastidxid oid@13 /
+         * indextblid oid@14 / indisusable bool@15 / reldeltarelid oid@16 /
+         * reldeltaidx oid@17 / relcudescrelid oid@18 / relcudescidx oid@19 /
+         * relfrozenxid xid32@20 / intspnum int4@21 / partkey int2vector@22 /
+         * intervaltablespace oidvector@23 / interval _text@24 / boundaries _text@25 /
+         * transit _text@26 / reloptions _text@27 / relfrozenxid64 xid@28 /
+         * relminmxid xid@29 / partkeyexpr text@30 / partitionno int4@31 /
+         * subpartitionno int4@32。变长段 22-27/30 路由面不消费记 "skip"；
+         * xid32/xid 沿 pg_class 词典的 int4/int8 口径（M1 Task 7 先例）。
+         */
+        private static final String[] KINDS = {
+                TupleDecoder.OIDHDR_KIND,   // 元组头 oid（虚拟槽）
+                "name",    // relname
+                "char",    // parttype（'r'/'p' 行身份）
+                "oid",     // parentid
+                "int4",    // rangenum
+                "int4",    // intervalnum
+                "char",    // partstrategy（'r'/'l'）
+                "oid",     // relfilenode          <-- 槽 7（数据区 84）
+                "oid",     // reltablespace
+                "float8",  // relpages（float8——与 pg_class OG 同形加宽）
+                "float8",  // reltuples
+                "int4",    // relallvisible
+                "oid",     // reltoastrelid        <-- 槽 12（数据区 116）
+                "oid",     // reltoastidxid
+                "oid",     // indextblid
+                "bool",    // indisusable
+                "oid",     // reldeltarelid
+                "oid",     // reldeltaidx
+                "oid",     // relcudescrelid
+                "oid",     // relcudescidx
+                "int4",    // relfrozenxid（xid32 4B）
+                "int4",    // intspnum
+                "skip",    // partkey int2vector
+                "skip",    // intervaltablespace oidvector
+                "skip",    // interval _text
+                "skip",    // boundaries _text
+                "skip",    // transit _text
+                "skip",    // reloptions _text
+                "int8",    // relfrozenxid64（xid 8B）
+                "int8",    // relminmxid（xid 8B）
+                "skip",    // partkeyexpr text
+                "int4",    // partitionno
+                "int4",    // subpartitionno
+        };
+
+        /**
+         * pg_partition 列解码词典（防御副本——调用方改写不污染静态词典）。OG 专属表
+         * 无 vanilla 档变体：第四腿仅在 OG 引导回填 pgPartitionRelfilenode 后激活
+         * （vanilla 恒 0 不匹配，词典不被消费）。
+         *
+         * @return 列 kind 数组（33 项含虚拟头 oid 槽）
+         */
+        public static String[] kinds() {
+            return KINDS.clone();
+        }
+
+        /**
+         * 把 pg_partition 解码值行投影为行模型。
+         *
+         * <p>关键步骤与异常语义同 {@link AttrRow#fromDecoded(Object[], WalLayout)}
+         * （虚拟头 oid 前导槽使 attnum n 的值行槽位恰为 n；parttype 词典 kind 为
+         * "char"——解码为左引号单字符（{@code 'p}），投影经
+         * {@link ClassRow#stripCharQuotes} 剥引号收敛为裸字符，与 JDBC/引导种子的
+         * {@code getString} 形态一致，record equals 两侧同锚）。线程约束：静态纯
+         * 函数，并发安全。</p>
+         *
+         * @param vals 解码值行（与 {@link #kinds()} 同长）
+         * @return 行模型
+         */
+        public static PartitionRow fromDecoded(Object[] vals) {
+            return new PartitionRow(
+                    ((Number) vals[IX_PARTOID]).longValue(),
+                    (String) vals[IX_RELNAME],
+                    ClassRow.stripCharQuotes(vals[IX_PARTTYPE]),
+                    ((Number) vals[IX_PARENTID]).longValue(),
+                    ((Number) vals[IX_RELFILENODE]).longValue(),
+                    ((Number) vals[IX_RELTOASTRELID]).longValue());
+        }
+
+        /**
+         * 编码<strong>读区</strong>的数据区字节（值编码——语义同
+         * {@link ClassRow#encodeReadRegion(WalLayout)} 的 partition 面，布局见
+         * {@link #READ_REGION_LEN} javadoc）。消费面：截断更新的 prefix 重编码与
+         * 后缀读区回填。边界与异常语义：relname 超 63B 截断不抛（防御）；
+         * 不投影的定宽列（reltablespace/relpages/reltuples/relallvisible）以 0
+         * 占位——仅重建几何需要；线程约束：纯函数，并发安全。
+         *
+         * @return {@value #READ_REGION_LEN} 字节数据区读区编码
+         */
+        public byte[] encodeReadRegion() {
+            ByteArrayOutputStream out = new ByteArrayOutputStream(READ_REGION_LEN);
+            byte[] n = relname.getBytes(StandardCharsets.UTF_8);
+            out.write(n, 0, Math.min(63, n.length));
+            for (int i = Math.min(63, n.length); i < 64; i++) {
+                out.write(0);   // NUL 尾垫
+            }
+            out.write(parttype == null || parttype.isEmpty() ? 0 : (byte) parttype.charAt(0));   // parttype@64
+            out.write(new byte[3], 0, 3);   // [65,68) 垫
+            ClassRow.writeU32(out, parentid);        // parentid@68
+            out.write(new byte[12], 0, 12); // [72,84) rangenum/intervalnum/partstrategy/垫：0 占位（不投影）
+            ClassRow.writeU32(out, relfilenode);     // relfilenode@84
+            out.write(new byte[28], 0, 28); // [88,116) 垫 4 + relpages/reltuples float8 + relallvisible：0 占位
+            ClassRow.writeU32(out, reltoastrelid);   // reltoastrelid@116
             return out.toByteArray();
         }
     }

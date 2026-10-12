@@ -16,9 +16,11 @@ import java.util.List;
 
 /**
  * JDBC 一致性引导（spec §6①）——把 pg_attribute / pg_class / pg_namespace 三张
- * watched 目录的全行快照（含物理 ctid）灌入 {@link CatalogStores}，回填三目录
- * relfilenode，并按 interest oid 定位 tracked 双 ctid（v2 扩第三目录 pg_namespace
- * ——schema 名解析的字典源）。
+ * watched 目录（v1/v2）+ openGauss M3 扩链的第四张 pg_partition 的全行快照
+ * （含物理 ctid）灌入 {@link CatalogStores}，回填各目录 relfilenode，并按
+ * interest oid 定位 tracked 双 ctid（v2 扩第三目录 pg_namespace——schema 名解析
+ * 的字典源；M3 扩第四目录 pg_partition——OG 原生分区路由字典，<b>OG 档独占</b>，
+ * vanilla 无该表）。
  *
  * <p><strong>openGauss 档差异（Task 7）</strong>：位点函数
  * {@code pg_current_xlog_location()}（9.2 系命名，无 flush 档）；pg_class 种子按
@@ -95,6 +97,16 @@ public final class CatalogBootstrap {
     private static final String NSP_SEED_SQL =
             "SELECT ctid::text, oid, nspname FROM pg_namespace";
 
+    /**
+     * pg_partition 全行种子查询（openGauss M3 扩链第四 watched 目录，分区路由字典）
+     * ——投影 = T0 锚①"喂 T1"的最少列集：ctid（键）+ oid（元组头 oid 的 JDBC 面）+
+     * relname/parttype/parentid/relfilenode/reltoastrelid（映射链五字段）；
+     * parttype 带 ::text 转换（char 输出裸单字符，与 pg_class 种子的 relkind 同口径）。
+     */
+    private static final String PARTITION_SEED_SQL =
+            "SELECT ctid::text, oid, relname, parttype::text, parentid, relfilenode,"
+                    + " reltoastrelid FROM pg_partition";
+
     /** interest 关系的 pg_class 行定位（tracked 表行位 + toast oid 顺取）。 */
     private static final String INTEREST_CLASS_SQL =
             "SELECT ctid::text, reltoastrelid FROM pg_class WHERE oid = ?";
@@ -156,14 +168,26 @@ public final class CatalogBootstrap {
             int attrCount = seedAttrRows(stores);
             int classCount = seedClassRows(stores);
             int nspCount = seedNspRows(stores);
+            int partCount = seedPartitionRows(stores);
             locateTracked(stores);
             connection.commit();
-            LOG.info("catalog 引导完成 (layout PG{}): pg_attribute {} 行 / pg_class {} 行 / pg_namespace {} 行,"
-                            + " pgAttrRelnode={}, pgClassRelnode={}, pgNspRelnode={},"
-                            + " trackedTable={}, trackedToast={}, 首句 flush LSN={}（≤ 种子快照时点）",
-                    layout.majorVersion(), attrCount, classCount, nspCount,
-                    stores.pgAttrRelfilenode(), stores.pgClassRelfilenode(), stores.pgNspRelnode(),
-                    stores.trackedTableCtid(), stores.trackedToastCtid(), Lsn.format(flushLsn));
+            if (layout.openGaussDialect()) {
+                LOG.info("catalog 引导完成 (layout PG{}): pg_attribute {} 行 / pg_class {} 行 / pg_namespace {} 行"
+                                + " / pg_partition {} 行, pgAttrRelnode={}, pgClassRelnode={}, pgNspRelnode={},"
+                                + " pgPartitionRelnode={}, trackedTable={}, trackedToast={},"
+                                + " 首句 flush LSN={}（≤ 种子快照时点）",
+                        layout.majorVersion(), attrCount, classCount, nspCount, partCount,
+                        stores.pgAttrRelfilenode(), stores.pgClassRelfilenode(), stores.pgNspRelnode(),
+                        stores.pgPartitionRelfilenode(), stores.trackedTableCtid(), stores.trackedToastCtid(),
+                        Lsn.format(flushLsn));
+            } else {
+                LOG.info("catalog 引导完成 (layout PG{}): pg_attribute {} 行 / pg_class {} 行 / pg_namespace {} 行,"
+                                + " pgAttrRelnode={}, pgClassRelnode={}, pgNspRelnode={},"
+                                + " trackedTable={}, trackedToast={}, 首句 flush LSN={}（≤ 种子快照时点）",
+                        layout.majorVersion(), attrCount, classCount, nspCount,
+                        stores.pgAttrRelfilenode(), stores.pgClassRelfilenode(), stores.pgNspRelnode(),
+                        stores.trackedTableCtid(), stores.trackedToastCtid(), Lsn.format(flushLsn));
+            }
             return flushLsn;
         } catch (SQLException e) {
             connection.rollback();
@@ -207,6 +231,11 @@ public final class CatalogBootstrap {
             stores.pgAttrRelfilenode(queryLong(st, "SELECT pg_relation_filenode('pg_attribute'::regclass)"));
             stores.pgClassRelfilenode(queryLong(st, "SELECT pg_relation_filenode('pg_class'::regclass)"));
             stores.pgNspRelnode(queryLong(st, "SELECT pg_relation_filenode('pg_namespace'::regclass)"));
+            if (layout.openGaussDialect()) {
+                // 第四 watched 目录（openGauss M3）：vanilla 无 pg_partition 表，查询即
+                // SQLException——档位门控是硬前提；段号≠oid（T0 坑 2：14318 ≠ 9016）
+                stores.pgPartitionRelfilenode(queryLong(st, "SELECT pg_relation_filenode('pg_partition'::regclass)"));
+            }
         }
     }
 
@@ -354,6 +383,50 @@ public final class CatalogBootstrap {
             while (rs.next()) {
                 stores.nspRows().put(parseCtidKey(rs.getString(1)),
                         new CatalogRow.NspRow(rs.getLong(2), rs.getString(3)));
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * pg_partition 种子 SQL（openGauss M3 Task 1 第四表）：OG 档返回
+     * {@link #PARTITION_SEED_SQL}；vanilla 档返回 <b>null = 不种子</b>（vanilla 无
+     * pg_partition 表，查询即 SQLException——档位门控是硬前提，第四腿在 vanilla
+     * 天然 inert）。
+     *
+     * <p>线程约束：纯函数（SQL 文本），并发安全。</p>
+     *
+     * @param layout 版本布局描述符（openGaussDialect 决定是否种子）
+     * @return 种子查询 SQL；vanilla 为 null
+     */
+    static String partitionSeedSql(WalLayout layout) {
+        return layout.openGaussDialect() ? PARTITION_SEED_SQL : null;
+    }
+
+    /**
+     * pg_partition 全行种子（openGauss M3 扩链第四腿，OG 档独占）：ctid 折键 +
+     * {@link CatalogRow.PartitionRow} 落 partitionRows——OG 原生分区路由字典的
+     * 引导快照（分区 relfilenode → parentid → 母表 oid 映射链 + reltoastrelid
+     * 分区自有 toast 挂靠，T0 锚①/锚③）；母表行（'r'）与分区行（'p'）双面全收
+     * （行身份双面，母表面 relfilenode/toast 恒 0）。vanilla 档不调用（返回 0）。
+     *
+     * @param stores 状态容器
+     * @return 灌入行数（vanilla 为 0）
+     * @throws SQLException 查询失败
+     */
+    private int seedPartitionRows(CatalogStores stores) throws SQLException {
+        String sql = partitionSeedSql(layout);
+        if (sql == null) {
+            return 0;    // vanilla 无 pg_partition：不种子（第四腿 inert 的前提）
+        }
+        int count = 0;
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                stores.partitionRows().put(parseCtidKey(rs.getString(1)), new CatalogRow.PartitionRow(
+                        rs.getLong(2), rs.getString(3), rs.getString(4), rs.getLong(5),
+                        rs.getLong(6), rs.getLong(7)));
                 count++;
             }
         }

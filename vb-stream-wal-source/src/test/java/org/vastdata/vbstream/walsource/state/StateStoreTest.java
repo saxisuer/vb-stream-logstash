@@ -5,6 +5,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.AttrRow;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.ClassRow;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.NspRow;
+import org.vastdata.vbstream.walsource.replay.CatalogRow.PartitionRow;
 import org.vastdata.vbstream.walsource.replay.CatalogStores;
 
 import java.io.IOException;
@@ -267,6 +268,56 @@ class StateStoreTest {
 
         new StateStore(dir, 18).checkpoint(filledStores(), LSN);
         assertTrue(new StateStore(dir, 5).load().isEmpty(), "18 写出的检查点用 OG(5) 存储器 load 应拒载 empty");
+    }
+
+    /**
+     * 用例 ⑪（openGauss M3 Task 1 / formatVersion 4 扩链）：第四 watched 字典
+     * pg_partition 面的 roundtrip——partition 行字典（'p' 分区行 + 'r' 母表行两形态）、
+     * partition tail 存储、pgPartitionRelfilenode 标量 checkpoint→load 逐面全等，
+     * 并经 restoreInto 灌回新 stores 复核。
+     */
+    @Test
+    void partitionDictionaryRoundtripsAndRestoresIntoFreshStores() throws IOException {
+        StateStore store = new StateStore(dir, 5);
+        CatalogStores stores = new CatalogStores();
+        stores.partitionRows().put(30L, new PartitionRow(32900L, "p1", "p", 32896L, 32900L, 32902L));
+        stores.partitionRows().put(31L, new PartitionRow(32896L, "t_m3_range", "r", 32896L, 0L, 0L));
+        stores.rawPartitionTails().put(30L, new byte[] {3, 3});
+        stores.pgPartitionRelfilenode(14318);
+        store.checkpoint(stores, LSN);
+
+        Optional<StoredState> loaded = store.load();
+        assertTrue(loaded.isPresent(), "v4 合法检查点应可 load");
+        StoredState s = loaded.orElseThrow();
+        assertEquals(stores.partitionRows(), s.partitionRows(), "partition 行字典应 roundtrip 全等");
+        assertTailsEqual(stores.rawPartitionTails(), s.rawPartitionTails());
+        assertEquals(14318L, s.pgPartitionRelfilenode(), "pgPartitionRelfilenode 应 roundtrip 全等");
+
+        CatalogStores restored = new CatalogStores();
+        s.restoreInto(restored);
+        assertEquals(stores.partitionRows(), restored.partitionRows(), "restoreInto 应回填 partition 行字典");
+        assertTailsEqual(stores.rawPartitionTails(), restored.rawPartitionTails());
+        assertEquals(14318L, restored.pgPartitionRelfilenode());
+    }
+
+    /**
+     * 用例 ⑫（formatVersion 4 拒载 v3，沿 v1/v2 先例）：把 v4 检查点的 header
+     * formatVersion 字段改写回 3 并<strong>同步修正 header CRC 与全文件 CRC</strong>
+     * （隔离 CRC 拒载路径——唯一残差是版本号本身）→ load 必须 empty（v3 状态文件缺
+     * partition 表段，语义不完整，不迁移不回退兼容解读，拒载回落全新引导）。
+     */
+    @Test
+    void v3FormatCheckpointIsRejectedEvenWithConsistentCrcs() throws IOException {
+        StateStore store = new StateStore(dir, 18);
+        store.checkpoint(filledStores(), LSN);
+        Path file = dir.resolve(FILE_NAME);
+        byte[] bytes = Files.readAllBytes(file);
+        bytes[4] = 0;
+        bytes[5] = 3;    // formatVersion 4 → 3
+        patchCrc(bytes, 0, 20, 20);
+        patchCrc(bytes, 0, bytes.length - 4, bytes.length - 4);
+        Files.write(file, bytes);
+        assertTrue(store.load().isEmpty(), "v3（formatVersion=3）检查点应拒载 empty——回落全新引导");
     }
 
     /**

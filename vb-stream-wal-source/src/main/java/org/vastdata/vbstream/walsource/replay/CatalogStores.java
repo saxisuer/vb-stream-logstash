@@ -28,9 +28,11 @@ public final class CatalogStores {
     private final Map<Long, CatalogRow.AttrRow> attrRows = new ConcurrentHashMap<>();
     private final Map<Long, CatalogRow.ClassRow> classRows = new ConcurrentHashMap<>();
     private final Map<Long, CatalogRow.NspRow> nspRows = new ConcurrentHashMap<>();
+    private final Map<Long, CatalogRow.PartitionRow> partitionRows = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawAttrTails = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawClassTails = new ConcurrentHashMap<>();
     private final Map<Long, byte[]> rawNspTails = new ConcurrentHashMap<>();
+    private final Map<Long, byte[]> rawPartitionTails = new ConcurrentHashMap<>();
     // interest 集 CHM：重放线程的 ctid 寻址精确采纳与消费方的中途登记（新关系出现时）并发——弱一致不抛 CME
     private final Set<Long> interestRelOids = ConcurrentHashMap.newKeySet();
     private final Set<Long> staleOids = new HashSet<>();
@@ -40,6 +42,7 @@ public final class CatalogStores {
     private long pgAttrRelfilenode;
     private long pgClassRelfilenode;
     private long pgNspRelnode;
+    private long pgPartitionRelfilenode;
 
     /**
      * pg_attribute 行字典（ctid 键 → 行模型）——活引用，重放引擎与引导直接读写。
@@ -97,6 +100,28 @@ public final class CatalogStores {
      */
     public Map<Long, byte[]> rawNspTails() {
         return rawNspTails;
+    }
+
+    /**
+     * pg_partition 行字典（ctid 键 → 行模型，openGauss M3 扩链第四 watched 目录）
+     * ——OG 原生分区路由字典（分区 relfilenode → parentid → 母表 oid 映射链源）；
+     * 活引用。vanilla 档恒空（引导不回填 {@link #pgPartitionRelfilenode()}，第四腿
+     * 不激活）。
+     *
+     * @return 键控字典（非拷贝）
+     */
+    public Map<Long, CatalogRow.PartitionRow> partitionRows() {
+        return partitionRows;
+    }
+
+    /**
+     * pg_partition 的 raw tail 存储——语义同 {@link #rawAttrTails()}（截断更新
+     * splice 重建的旧值面；INPLACE 后置失效）；活引用。
+     *
+     * @return 键控字典（非拷贝）
+     */
+    public Map<Long, byte[]> rawPartitionTails() {
+        return rawPartitionTails;
     }
 
     /**
@@ -206,6 +231,26 @@ public final class CatalogStores {
     }
 
     /**
+     * pg_partition 的 relfilenode（块匹配面，引导回填，openGauss M3 扩链）——<b>须按
+     * 物理段号注册</b>（T0 坑 2：pg_partition 自身 relfilenode=14318 ≠ oid 9016，
+     * 与 M2 T7 修复 C 的映射目录段号直认机制同源注意）。
+     *
+     * @return relfilenode（未引导/vanilla 档为 0——重放引擎按 0 不匹配处理，第四腿不激活）
+     */
+    public long pgPartitionRelfilenode() {
+        return pgPartitionRelfilenode;
+    }
+
+    /**
+     * 回填 pg_partition relfilenode（仅 OG 档引导调用）。
+     *
+     * @param relfilenode 引导查询值（{@code pg_relation_filenode('pg_partition'::regclass)}）
+     */
+    public void pgPartitionRelfilenode(long relfilenode) {
+        this.pgPartitionRelfilenode = relfilenode;
+    }
+
+    /**
      * 兴趣关系 oid 登记（caller 指定需要列字典/toast 映射的关系）——活引用；
      * 引导据此裁剪查询、快照据此取列、ctid 寻址精确采纳据此圈定 oid 域。
      *
@@ -270,6 +315,11 @@ public final class CatalogStores {
         /** 计数键：pg_namespace 面 PRUNE redirect 缺行放弃物化的次数（v2 无 nsp 探测
          *  通道的观测面——非零提示 nsp 链断，schema 字典可能静默缺表）。 */
         public static final String NSP_REDIRECT_MISSES = "nspRedirectMisses";
+
+        /** 计数键：pg_partition 面 PRUNE redirect 缺行放弃物化的次数（openGauss M3
+         *  扩链第四腿——无 ctid 探测通道的观测面，语义同 nspRedirectMisses：非零
+         *  提示分区字典链断，分区路由可能静默缺行）。 */
+        public static final String PARTITION_REDIRECT_MISSES = "partitionRedirectMisses";
 
         private final Map<String, Long> counters = new ConcurrentHashMap<>();
 

@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.AttrRow;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.ClassRow;
 import org.vastdata.vbstream.walsource.replay.CatalogRow.NspRow;
+import org.vastdata.vbstream.walsource.replay.CatalogRow.PartitionRow;
 import org.vastdata.vbstream.walsource.replay.CatalogStores;
 
 import java.io.ByteArrayInputStream;
@@ -35,9 +36,11 @@ import java.util.zip.CheckedOutputStream;
  * {@code .part→rename} publish 范式同一语义：目录里无 {@code .part} 后缀的
  * {@value #FILE_NAME} 即完整检查点）。
  *
- * <p><strong>文件布局（formatVersion=3，大端，DataOutputStream 原生序；v2 增
+ * <p><strong>文件布局（formatVersion=4，大端，DataOutputStream 原生序；v2 增
  * pg_namespace 面——nsp 表/nsp tail 表/pgNspRelnode 标量，class 行增 relkind；
- * v3 增 dmlFloorLsn u64——待决桶重放下界，Task 11 挂起桶跨检查点修复）</strong>：
+ * v3 增 dmlFloorLsn u64——待决桶重放下界，Task 11 挂起桶跨检查点修复；v4 增
+ * pg_partition 面——partition 表/partition tail 表/pgPartitionRelfilenode 标量，
+ * openGauss M3 第四 watched 字典）</strong>：
  * <pre>
  * header 24B: magic "VBWS" 4B + formatVersion u16 + pgVersion u16（大版本，与构造
  *             入参 layout.majorVersion() 同源——17 写 17、18 写 18；openGauss 档写
@@ -49,9 +52,13 @@ import java.util.zip.CheckedOutputStream;
  *           → class 表（rowCount u32 + 行[ctid u64 + 8 个 long 字段 + relname UTF
  *               + relkind UTF]×n）
  *           → nsp 表（rowCount u32 + 行[ctid u64 + nspOid u64 + nspname UTF]×n）
+ *           → partition 表（v4 增：rowCount u32 + 行[ctid u64 + partOid u64
+ *               + parentid u64 + relfilenode u64 + reltoastrelid u64 + relname UTF
+ *               + parttype UTF]×n）
  *           → attr tail 表（count u32 + 条目[ctid u64 + len u32 + bytes]×n）
- *           → class tail 表（同上）→ nsp tail 表（同上）
- *           → tracked 双 ctid u64×2 + pgAttr/pgClass/pgNsp relfilenode u64×3
+ *           → class tail 表（同上）→ nsp tail 表（同上）→ partition tail 表（同上）
+ *           → tracked 双 ctid u64×2 + pgAttr/pgClass/pgNsp/pgPartition relfilenode
+ *               u64×4
  *           → staleOids（count u32 + oid u64×n）+ interestRelOids（同上）
  *           → dmlFloorLsn u64（v3 增——DML 待决桶重放下界，0 = 无待决桶）
  * footer 12B: lsn u64（header 复述双验）+ fileCrc32 u32（[0, len-4) 全文件）
@@ -60,9 +67,9 @@ import java.util.zip.CheckedOutputStream;
  * <p><strong>拒载语义</strong>：任一校验不符（magic / formatVersion / pgVersion /
  * headerLen / header CRC / 全文件 CRC / lsn 双验 / 尾部余量）或解析期
  * EOF——{@link #load()} 一律 {@code Optional.empty()} + ERROR 日志，回落重引导
- * 由 caller 决定；<strong>v1/v2（formatVersion&lt;3）检查点一律拒载</strong>（扩链
- * 裁定沿 v1→v2 先例：旧版缺段语义不完整，不迁移——拒载回落全新引导是安全侧）；
- * {@code .part} 残留永不 load（{@link #exists()} 亦只认正名文件）。
+ * 由 caller 决定；<strong>v1/v2/v3（formatVersion&lt;4）检查点一律拒载</strong>
+ * （扩链裁定沿 v1→v2 先例：旧版缺段语义不完整，不迁移——拒载回落全新引导是
+ * 安全侧）；{@code .part} 残留永不 load（{@link #exists()} 亦只认正名文件）。
  * 持久化面 = 完整 CatalogStores 可重建态除 metrics 外全部字段（裁定见
  * {@link StoredState}）。<strong>契约（Med-3）：一个目录同一时刻仅一个活实例写
  * 检查点</strong>——两实例共用目录时后停机者以陈旧状态覆盖新检查点（文件锁后续）。
@@ -82,10 +89,12 @@ public final class StateStore {
     /**
      * 格式版本（header u16——不符拒载，不回退兼容解读）。v2（Task 4 扩链）：增
      * pg_namespace 面（nsp 表/nsp tail/pgNspRelnode）+ class 行 relkind 字段；
-     * v3（Task 11）：body 尾增 dmlFloorLsn u64（DML 待决桶重放下界）；v1/v2 文件
-     * 拒载回落全新引导（裁定不迁移，沿 v1→v2 先例）。
+     * v3（Task 11）：body 尾增 dmlFloorLsn u64（DML 待决桶重放下界）；v4
+     * （openGauss M3 Task 1）：增 pg_partition 面（partition 表/partition tail/
+     * pgPartitionRelfilenode——第四 watched 字典）；v1/v2/v3 文件拒载回落全新
+     * 引导（裁定不迁移，沿 v1→v2 先例）。
      */
-    private static final int FORMAT_VERSION = 3;
+    private static final int FORMAT_VERSION = 4;
 
     /** header 定长 24B（4+2+2+8+4+4——版本演进的前向兼容跳读锚）。 */
     private static final int HEADER_LEN = 24;
@@ -166,9 +175,9 @@ public final class StateStore {
             LOG.warn("文件系统不支持 ATOMIC_MOVE，检查点换名回落非原子 move: {}", target, e);
             Files.move(part, target, StandardCopyOption.REPLACE_EXISTING);
         }
-        LOG.info("StateStore 检查点落盘: {} lsn={} attr={} class={} nsp={} stale={}（原子换名完成）",
+        LOG.info("StateStore 检查点落盘: {} lsn={} attr={} class={} nsp={} partition={} stale={}（原子换名完成）",
                 target, lsn, stores.attrRows().size(), stores.classRows().size(),
-                stores.nspRows().size(), stores.staleOids().size());
+                stores.nspRows().size(), stores.partitionRows().size(), stores.staleOids().size());
     }
 
     /**
@@ -255,7 +264,7 @@ public final class StateStore {
     }
 
     /**
-     * 写 body 段（六表 + 标量 + 两 oid 集，布局见类 javadoc）。
+     * 写 body 段（七表 + 标量 + 两 oid 集，布局见类 javadoc）。
      *
      * @param out    目标流（已处全文件 CRC 计数面）
      * @param stores 数据源
@@ -294,14 +303,27 @@ public final class StateStore {
             out.writeLong(r.nspOid());
             out.writeUTF(r.nspname());
         }
+        out.writeInt(stores.partitionRows().size());
+        for (Map.Entry<Long, PartitionRow> e : stores.partitionRows().entrySet()) {
+            PartitionRow r = e.getValue();
+            out.writeLong(e.getKey());
+            out.writeLong(r.partOid());
+            out.writeLong(r.parentid());
+            out.writeLong(r.relfilenode());
+            out.writeLong(r.reltoastrelid());
+            out.writeUTF(r.relname());
+            out.writeUTF(r.parttype() == null ? "" : r.parttype());
+        }
         writeTails(out, stores.rawAttrTails());
         writeTails(out, stores.rawClassTails());
         writeTails(out, stores.rawNspTails());
+        writeTails(out, stores.rawPartitionTails());
         out.writeLong(stores.trackedTableCtid());
         out.writeLong(stores.trackedToastCtid());
         out.writeLong(stores.pgAttrRelfilenode());
         out.writeLong(stores.pgClassRelfilenode());
         out.writeLong(stores.pgNspRelnode());
+        out.writeLong(stores.pgPartitionRelfilenode());
         writeOids(out, stores.staleOids());
         writeOids(out, stores.interestRelOids());
     }
@@ -387,14 +409,17 @@ public final class StateStore {
         Map<Long, AttrRow> attrs = readAttrTable(in, bytes.length);
         Map<Long, ClassRow> classes = readClassTable(in, bytes.length);
         Map<Long, NspRow> nspRows = readNspTable(in, bytes.length);
+        Map<Long, PartitionRow> partitionRows = readPartitionTable(in, bytes.length);
         Map<Long, byte[]> rawAttrTails = readTails(in, bytes.length);
         Map<Long, byte[]> rawClassTails = readTails(in, bytes.length);
         Map<Long, byte[]> rawNspTails = readTails(in, bytes.length);
+        Map<Long, byte[]> rawPartitionTails = readTails(in, bytes.length);
         long trackedTableCtid = in.readLong();
         long trackedToastCtid = in.readLong();
         long pgAttrRelfilenode = in.readLong();
         long pgClassRelfilenode = in.readLong();
         long pgNspRelnode = in.readLong();
+        long pgPartitionRelfilenode = in.readLong();
         Set<Long> staleOids = readOids(in, bytes.length);
         Set<Long> interestRelOids = readOids(in, bytes.length);
         long dmlFloorLsn = in.readLong();    // v3 段：DML 待决桶重放下界（0 = 无待决桶）
@@ -406,8 +431,10 @@ public final class StateStore {
         if (in.available() != 4) {
             throw new IOException("尾部余量不符: " + in.available() + "B（应恰余全文件 CRC 4B）");
         }
-        return new StoredState(lsn, attrs, classes, nspRows, rawAttrTails, rawClassTails, rawNspTails,
-                trackedTableCtid, trackedToastCtid, pgAttrRelfilenode, pgClassRelfilenode, pgNspRelnode,
+        return new StoredState(lsn, attrs, classes, nspRows, partitionRows,
+                rawAttrTails, rawClassTails, rawNspTails, rawPartitionTails,
+                trackedTableCtid, trackedToastCtid, pgAttrRelfilenode, pgClassRelfilenode,
+                pgNspRelnode, pgPartitionRelfilenode,
                 interestRelOids, staleOids, dmlFloorLsn);
     }
 
@@ -494,6 +521,37 @@ public final class StateStore {
             nspRows.put(ctid, new NspRow(nspOid, nspname));
         }
         return nspRows;
+    }
+
+    /**
+     * 读 partition 行表（v4 扩链段，openGauss M3 第四 watched 字典；计数防线同
+     * {@link #readAttrTable}——每行至少 44B：ctid u64=8 + partOid/parentid/
+     * relfilenode/reltoastrelid 四 u64=32 + relname/parttype 两个 UTF 空串前缀
+     * 各 u16=2）。
+     *
+     * @param in      输入流（已处 nsp 表之后）
+     * @param fileLen 文件实长（计数防线锚）
+     * @return ctid 键控行字典（保持落盘序）
+     * @throws IOException 解析失败/截断
+     */
+    private static Map<Long, PartitionRow> readPartitionTable(DataInputStream in, int fileLen) throws IOException {
+        int rowCount = in.readInt();
+        if (rowCount < 0 || (long) rowCount * 44 > fileLen) {
+            throw new IOException("partition 表计数损坏: " + rowCount);
+        }
+        Map<Long, PartitionRow> partitionRows = new LinkedHashMap<>(Math.max(16, rowCount));
+        for (int i = 0; i < rowCount; i++) {
+            long ctid = in.readLong();
+            long partOid = in.readLong();
+            long parentid = in.readLong();
+            long relfilenode = in.readLong();
+            long reltoastrelid = in.readLong();
+            String relname = in.readUTF();    // 写序最后（u16 前缀 UTF）
+            String parttype = in.readUTF();   // 裸单字符；防御空串容忍
+            partitionRows.put(ctid, new PartitionRow(partOid, relname, parttype, parentid,
+                    relfilenode, reltoastrelid));
+        }
+        return partitionRows;
     }
 
     /**
