@@ -68,13 +68,13 @@ MSG#6 len=26 type=C  hex: 43 00 00 00 00 00 02 90 c8 e8 00 00 00 00 02 90 c9 48 
 
 | 帧 | 布局 |
 |---|---|
-| B (25B) | `'B'` + finalLsn Int64 + commitTs Int64 + **xid Int64**（vanilla 为 Int32，B 帧 21B——**唯一帧长差异**；高 4 字节恒 0，`txid_current()` 对锚验证 xid=末 8 字节） |
+| B (25B) | `'B'` + finalLsn Int64 + commitTs Int64 + **xid Int64**（vanilla 为 Int32，B 帧 21B——**两处帧级差异之一**；高 4 字节恒 0，`txid_current()` 对锚验证 xid=末 8 字节） |
 | R | `'R'` + relId Int32 + ns cstring + relname cstring + replica-identity 字节（'d'）+ Int16 ncols + 每列 {flags Int8（1=复制身份列）+ name cstring + typeId Int32 + typmod Int32}——**与 vanilla 逐字段等同**（int4=23/text=25/numeric=1700 实测） |
 | I | `'I'` + relId + `'N'` + TupleData |
 | U | `'U'` + relId + `'K'` + TupleData(old-key) + `'N'` + TupleData(new-tuple)（replica identity default 下 old-key 只含 PK 列，其余列以 'n' 占位） |
 | D | `'D'` + relId + `'K'` + TupleData(old-key) |
 | C (26B) | `'C'` + flags Int8(0) + commitLsn Int64 + endLsn Int64 + ts Int64——与 vanilla 等同 |
-| **TupleData（I/U/D 内）** | **Int16 ncols 前缀** + 每列 kind：`'t'`+Int32 len+文本字节 / `'n'`=NULL / `'u'`=unchanged-TOAST 哨兵。**vanilla 无 ncols 前缀**（列读到消息尾）——解码器差异点之二 |
+| **TupleData（I/U/D 内）** | **Int16 ncols 前缀** + 每列 kind：`'t'`+Int32 len+文本字节 / `'n'`=NULL / `'u'`=unchanged-TOAST 哨兵。**vanilla 无 ncols 前缀**（列读到消息尾）——两处帧级差异之二 |
 
 值一律 text 形态（length-prefixed UTF-8），与 engine text 模式可直接对拍。
 
@@ -99,7 +99,7 @@ MSG#6 len=26 type=C  hex: 43 00 00 00 00 00 02 90 c8 e8 00 00 00 00 02 90 c9 48 
 2. **publication 必须先于被解码事务存在**（历史快照语义，vanilla 同）：槽/流建在 publication 之前 → 解码旧事务时 `FATAL: publication "m2pub" does not exist` 杀流。IT 时序固定：建 publication → 建槽 → 写 DML → 起流
 3. **`publication_names` 必传**：缺省即 `FATAL: publication_names parameter missing`（startup callback 拒绝）——与 vanilla 一致，`proto_version` 仅验过 `"1"`
 4. **B 帧 xid 为 Int64、TupleData 带 Int16 ncols 前缀**：不能直接复用 engine 的 `PgOutputDecoder`（帧长两处差异）；归一化器按 §2 布局新写，勿共享解码路径
-5. `stream.close()` 恒抛 EOF 竞态（吞掉）；`readPending()` 不暴露断流（需活性护栏）
+5. `stream.close()` 恒抛 EOF 竞态（吞掉）；`readPending()` 不暴露断流（需活性护栏）——**实证依据含一次 1.7s 空闲流被服务端关闭的孤例**（无错误日志、现象仅见 walsender shutdown；两次对照组——45s 10s-interval 含 20s 空闲段 / 45s 1s-interval 纯空闲——均未复现，未定因）：T6 活性护栏以防御位处理，不以"流恒存活"为前提
 6. pg_recvlogical 逐帧追加 `\n` + stderr 污染（仅路①；选型路② 无此问题）
 7. gsql 输出 "total time" 页脚会污染 hex 采样（grep 纯行，沿用调研期经验）
 8. vanilla pgjdbc 对 OG 逻辑流首读即 FATAL（勿在 OG 面上尝试 vanilla 驱动）
