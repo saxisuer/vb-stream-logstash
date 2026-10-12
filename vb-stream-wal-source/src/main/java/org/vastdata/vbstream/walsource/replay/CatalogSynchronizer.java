@@ -127,6 +127,15 @@ public final class CatalogSynchronizer {
     private volatile long appliedLsn;
 
     /**
+     * 槽推进 SQL 的 lsn 参数后缀（缺省 {@code "::pg_lsn"}——PG 17/18 档既有形态；
+     * openGauss 档空串：OG 无 {@code pg_lsn} 类型[9.2 系血统，实测锚]而
+     * {@code pg_replication_slot_advance(name, text)} 参数本就是 text——无 cast 直传。
+     * startOg 装配期覆写；PG 档 SQL 逐字节不变。Task 9 实测项（Task 6 concern 4 收口：
+     * cast 形态在 OG 上每检查点一次 "type pg_lsn does not exist" WARN，推进恒失败）。
+     */
+    private String advanceLsnCast = "::pg_lsn";
+
+    /**
      * DML 待决桶重放下界供应者（Task 11 挂起桶跨检查点修复）：检查点把它与 lsn 一并
      * 落盘（StateStore {@code dmlFloorLsn}）、槽推进按它封顶（WAL 保留覆盖重放窗口）、
      * 续传流起点按它回退（重放段重建待决桶）。缺省恒 0（无 DML 面 / 无待决桶）。
@@ -423,6 +432,8 @@ public final class CatalogSynchronizer {
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout), new SelfHealer(new JdbcProbeImpl(sql))),
                 null, slotName, state, stateStore, stateStore == null ? null : sql);
+        // OG 档槽推进 SQL 去 pg_lsn cast（见字段注记——PG 档缺省形态不变）
+        sync.advanceLsnCast = "";
         // 前沿种子化（与 startInternal 同式）：续传/forced = 决策起点严格过滤；全新引导 =
         // 页对齐流起点（流交付重叠段重放消化，终审 C1 两级语义的 OG 面）
         sync.appliedLsn = resumed || forced ? start
@@ -741,7 +752,8 @@ public final class CatalogSynchronizer {
     /**
      * 推进物理槽 restart_lsn 到检查点 lsn（SQL：{@code pg_replication_slot_advance}）。
      *
-     * <p>关键步骤：参数绑定槽名与 lsn 文本（{@code ?::pg_lsn} 服务端转换）；成功记
+     * <p>关键步骤：参数绑定槽名与 lsn 文本（PG 档 {@code ?::pg_lsn} 服务端转换；OG 档
+     * 无 cast 直传 text——{@link #advanceLsnCast}）；成功记
      * {@link #lastSlotAdvanceLsn}。边界与异常语义：槽不存在/参数错等 SQLException 一律
      * WARN 不中断（推进是保留窗口的优化而非正确性前提——WAL 保留兜底由
      * {@code max_slot_wal_keep_size} 承担）；会话失效同样 WARN（下次检查点重试）。
@@ -755,7 +767,8 @@ public final class CatalogSynchronizer {
         if (c == null || slot == null) {
             return;
         }
-        try (PreparedStatement ps = c.prepareStatement("SELECT pg_replication_slot_advance(?, ?::pg_lsn)")) {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT pg_replication_slot_advance(?, ?" + advanceLsnCast + ")")) {
             ps.setString(1, slot);
             ps.setString(2, Lsn.format(lsn));
             ps.executeQuery();

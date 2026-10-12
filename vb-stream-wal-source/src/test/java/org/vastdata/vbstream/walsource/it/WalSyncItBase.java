@@ -50,9 +50,23 @@ abstract class WalSyncItBase {
     /** 对拍等待接收前沿的超时（毫秒）。 */
     private static final long POLL_TIMEOUT_MS = 30_000;
 
-    /** 本基类布局（构造期按 {@link #serverVersion()} 解析——默认干扰容器 PG 18 → V18，
-     * 17 矩阵子类覆写指向 Wal17TestEnv）——子类起同步器共用。 */
-    protected final WalLayout layout = WalLayouts.forServerVersion(serverVersion());
+    /** 本基类布局（构造期经 {@link #resolveLayout()} 解析——默认按 {@link #serverVersion()}
+     * 分发（干扰容器 PG 18 → V18，17 矩阵子类覆写 serverVersion 指向 Wal17TestEnv，
+     * openGauss 子类覆写 resolveLayout 直取 OG 单例——90204 撞号判别需版本文本，不走
+     * forServerVersion 数值分发）——子类起同步器共用。 */
+    protected final WalLayout layout = resolveLayout();
+
+    /**
+     * 布局描述符解析钩子（子类覆写位）：默认按 {@link #serverVersion()} 数值分发；
+     * openGauss 档子类覆写直取 {@code WalLayoutVOpenGauss.INSTANCE}（90204 与 vanilla
+     * 9.2 撞号，判别面是版本文本而非数值，{@code WalLayouts#forServerVersion} 数值
+     * 分发不适用）。构造器/字段初始化期调用，覆写实现不得依赖子类自有字段。
+     *
+     * @return 本测试环境的布局描述符
+     */
+    protected WalLayout resolveLayout() {
+        return WalLayouts.forServerVersion(serverVersion());
+    }
 
     /**
      * 本测试环境的服务端版本号（布局分发输入）——实例方法钩子，子类可覆写指向
@@ -470,7 +484,7 @@ abstract class WalSyncItBase {
      * @return 首列字符串值
      * @throws SQLException 查询失败
      */
-    private static String queryString(Connection c, String sql) throws SQLException {
+    protected static String queryString(Connection c, String sql) throws SQLException {
         try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             rs.next();
             return rs.getString(1);

@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.BindMode;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.output.OutputFrame;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 
 import java.io.IOException;
@@ -15,10 +16,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -84,7 +88,8 @@ public final class OgTestEnv {
             .withExposedPorts(5432)
             .withEnv("GS_PASSWORD", PASSWORD)
             .withFileSystemBind(HOST_WAL_DIR.toString(), CONTAINER_WAL_DIR, BindMode.READ_WRITE)
-            .withStartupTimeout(Duration.ofMinutes(2));
+            .withStartupTimeout(Duration.ofMinutes(2))
+            .withLogConsumer(OgTestEnv::appendContainerLogFrame);
 
     static {
         OG.start();   // GenericContainer 无 wait 策略——就绪由 JDBC 重试承担
@@ -306,6 +311,84 @@ public final class OgTestEnv {
      */
     public static Path hostWalDir() {
         return HOST_WAL_DIR;
+    }
+
+    /**
+     * 容器 stdout/stderr 的有界滚动缓冲（{@code withLogConsumer} 回调线程单写者、
+     * 快照读方 synchronized 同步）——实例存活红线 IT 的 {@code Gaussdb exit} 检查面：
+     * gaussdb 由 entrypoint 前台拉起，postmaster 死亡的退出痕迹会打到容器日志。
+     *
+     * <p>上界 {@value #CONTAINER_LOG_MAX_CHARS} 字符，超限删前半——5 轮存活 IT 的
+     * 检查窗远小于上界，截断不侵检查面（截断只移除更早内容，标记一旦出现即在
+     * 窗口内持续可见）。回调发生在容器启动期（早于本类其余静态字段就绪），故
+     * 本面<strong>不得触碰 LOG 等静态字段</strong>——只用自持有缓冲。</p>
+     */
+    private static final StringBuilder CONTAINER_LOG = new StringBuilder();
+
+    /** 容器日志滚动缓冲上界（字符）。 */
+    private static final int CONTAINER_LOG_MAX_CHARS = 512 * 1024;
+
+    /**
+     * 容器日志帧追加（log consumer 回调——容器日志线程调用，见 {@link #CONTAINER_LOG}
+     * 的线程与初始化约束）：有界滚动，超限删前半防长跑膨胀。
+     *
+     * @param frame 日志帧（stdout/stderr 增量）
+     */
+    private static synchronized void appendContainerLogFrame(OutputFrame frame) {
+        CONTAINER_LOG.append(frame.getUtf8String());
+        if (CONTAINER_LOG.length() > CONTAINER_LOG_MAX_CHARS) {
+            CONTAINER_LOG.delete(0, CONTAINER_LOG_MAX_CHARS / 2);
+        }
+    }
+
+    /**
+     * 容器日志快照（截至当前的滚动缓冲拷贝——实例存活红线 IT 的断言输入）。
+     *
+     * @return 日志文本（至多最近 {@value #CONTAINER_LOG_MAX_CHARS} 字符）
+     */
+    public static synchronized String containerLogSnapshot() {
+        return CONTAINER_LOG.toString();
+    }
+
+    /**
+     * 静默删除物理槽（先杀本端 walsender 再删；Task 8 concern 1 移交的 IT 间槽残留
+     * 清理面）。<strong>OG 实测锚</strong>：{@code pg_replication_slots} 无
+     * {@code active_pid} 列（列为 {@code active} 布尔）——活跃连接的 pid 只能从
+     * {@code pg_stat_replication} 按应用名取；walsender 名带前缀包裹
+     * （{@code "WalSender to Standby[vb-wal-source]"}），按 LIKE 匹配。pid 先物化再
+     * 按值 terminate（避免视图谓词下推自杀面）。槽不存在等情况仅 WARN——测试清理
+     * 路径不得掩盖断言失败。
+     *
+     * @param slotName 槽名
+     */
+    public static void dropPhysicalSlotQuietly(String slotName) {
+        try (Connection c = newSqlConnection()) {
+            List<Long> pids = new ArrayList<>();
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT pid FROM pg_stat_replication WHERE application_name LIKE '%vb-wal-source%'")) {
+                while (rs.next()) {
+                    pids.add(rs.getLong(1));
+                }
+            }
+            for (long pid : pids) {
+                try (Statement st = c.createStatement()) {
+                    st.execute("SELECT pg_terminate_backend(" + pid + ")");
+                }
+            }
+            Thread.sleep(200);
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT pg_drop_replication_slot(?)")) {
+                ps.setString(1, slotName);
+                ps.executeQuery();
+            }
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("does not exist")) {
+                LOG.debug("OG 物理槽 {} 不存在——前置清理空转", slotName);
+            } else {
+                LOG.warn("清理 OG 物理槽 {} 失败: {}", slotName, e.getMessage());
+            }
+        }
     }
 
     /**
