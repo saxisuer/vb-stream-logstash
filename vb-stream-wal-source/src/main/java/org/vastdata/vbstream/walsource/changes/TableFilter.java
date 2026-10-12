@@ -30,11 +30,13 @@ import java.util.concurrent.atomic.LongAdder;
  * {@link CatalogSnapshot#parttypeOf} 不可判（empty）fail-open 放行（与 V17/V18
  * 无此闸的行为面一致）。</p>
  *
- * <p><b>openGauss 档分区身份链（M3 T2，T0 锚②语义重排）</b>：OG 原生分区的 heap
- * 记录路由到<b>分区自己的 relfilenode</b>（pg_partition 'p' 行——不在 pg_class
- * 三表字典，og-plan m2pg 四锚实测）；三表解析 miss 且 OG 档时走第四步分区链：
- * {@link CatalogSnapshot#partitionOf} 反查分区行 → parentid 母表链 → 按<b>母表
- * 身份</b>放行与组装（TableMeta = schema.母表名 + 母表 pg_class oid + 母表列集
+ * <p><b>openGauss 档分区身份链（M3 T2，T0 锚②语义重排；T5 属主优先修复）</b>：
+ * OG 原生分区的 heap 记录路由到<b>分区自己的 relfilenode</b>（pg_partition 'p'
+ * 行——不在 pg_class 三表字典，og-plan m2pg 四锚实测）；OG 档 resolve 先过第四
+ * 字典属主判定——{@link CatalogSnapshot#partitionOf} 命中即走母表身份链（T5 前
+ * 是"三表 miss 后第四步"，EXCHANGE 换绑段号与普通表 oid 碰撞的误属主实测后升为
+ * 属主优先、命中不回退三表面）：反查分区行 → parentid 母表链 → 按<b>母表身份</b>
+ * 放行与组装（TableMeta = schema.母表名 + 母表 pg_class oid + 母表列集
  * ——列挂母表 oid，M2 T5 事实；基准路 pgoutput R/I 帧同形，锚②
  * {@code PARTITION_NAME=mother}：wal 路渲分区名对拍必 diff）。<b>白名单基准形态
  * = 母表名匹配</b>（写母表名即覆盖其全部分区）；<b>分区名条目 = 兼容增强</b>——
@@ -111,13 +113,15 @@ public final class TableFilter {
      * relfilenode），miss 再按 oid 直认（元数据形态）；三道闸（relkind[OG 档含
      * parttype]/系统模式/白名单）全过返回组装好的 {@link TableMeta}。
      *
-     * <p>关键步骤：①{@link CatalogSnapshot#relOidOf(long)} 双入口归一到关系 oid，
-     * 字典无行（未引导/已删除/未登记）即 empty；②relkind（OG 档再叠 parttype）/
-     * 系统模式/白名单逐闸过滤；③组装 TableMeta（schema/table/列序投影）。OG 档
-     * 的三表 miss 不即终：分区 relfilenode（不在 pg_class——路由落 pg_partition
-     * 'p' 行）转 {@link #resolvePartitionAnchored} 第四步身份链（M3 T2，见类
-     * javadoc）；vanilla 档三表 miss 即终（零变化锚）。边界与异常语义：任一闸不过
-     * 或字典缺行返回 empty（不抛——miss 是常态而非异常；分区链断除外：WARN 一次 +
+     * <p>关键步骤：①OG 档先过<b>第四字典属主判定</b>——{@code partitionOf} 命中即走
+     * {@link #resolvePartitionAnchored} 母表身份链（<b>不回退三表面</b>：第四字典
+     * 'p' 行是分区段号的权威属主，而 EXCHANGE PARTITION 换绑后段号数值可与某普通表
+     * oid 碰撞[OG 建表 relfilenode==oid、换绑双向对调段号]，三表的 oid 直认兜底在该
+     * 面必产出错误属主——M3 T5 修复，OgPartitionIT 实测 + TableFilterTest ⑯ 锚；
+     * 链断 fail-safe 跳过同样不回退——段号属主已定）；②未命中第四字典走三表解析
+     * （{@link CatalogSnapshot#relOidOf(long)} 双入口归一 + 三道闸）；vanilla 档
+     * 无第四字典面（ogDialect 门控——零变化锚）。边界与异常语义：任一闸不过或字典
+     * 缺行返回 empty（不抛——miss 是常态而非异常；分区链断除外：WARN 一次 +
      * 计数的有痕面）；relnamespace 无对应 nsp 行（字典半损）视同 miss。线程约束：
      * 并发安全（见类 javadoc）。</p>
      *
@@ -125,11 +129,14 @@ public final class TableFilter {
      * @return 表身份 + 列序；miss 为 empty
      */
     public Optional<TableMeta> resolve(long relNodeOrOid) {
-        Optional<TableMeta> resolved = resolveThreeTable(relNodeOrOid);
-        if (resolved.isPresent() || !ogDialect) {
-            return resolved;
+        if (!ogDialect) {
+            return resolveThreeTable(relNodeOrOid);
         }
-        return resolvePartitionAnchored(relNodeOrOid);
+        Optional<CatalogSnapshot.PartitionIdentity> part = snapshot.partitionOf(relNodeOrOid);
+        if (part.isPresent()) {
+            return resolvePartitionAnchored(part.get(), relNodeOrOid);
+        }
+        return resolveThreeTable(relNodeOrOid);
     }
 
     /**
@@ -178,29 +185,27 @@ public final class TableFilter {
     }
 
     /**
-     * OG 档分区身份链（M3 T2 第四步，T0 锚②）：分区 relfilenode 经第四字典反查
-     * 分区行 → parentid 母表链 → 按<b>母表身份</b>过闸与组装。
+     * OG 档分区身份链（M3 T2 第四步，T0 锚②；T5 起由 {@link #resolve} 的第四字典
+     * 属主判定先行调用）：分区身份（第四字典反查所得）→ parentid 母表链 → 按<b>母表
+     * 身份</b>过闸与组装。
      *
-     * <p>关键步骤：①{@link CatalogSnapshot#partitionOf} 反查（'p' 行路由锚）——
-     * 无行即正常 miss（未知关系/未引导，零痕迹）；②母表闸——relkindOf(parentid)
-     * 缺行 = <b>链断</b>（parentid 悬空——WARN 一次 + 计数）；形态闸不过（非用户
-     * 表 kind）为正常 miss；③schema 解析缺行（nsp 半损）= 链断、系统模式为正常
-     * miss；nameOf 缺行 = 链断；④白名单<b>双匹配</b>（母表全名 OR 分区全名——
-     * schema 取母表解析值；母表名 = 基准形态，分区名 = 兼容增强）；⑤TableMeta =
-     * 母表 oid/母表名/母表列集（columnsOf(parentid)）。边界与异常语义：链断与
-     * 正常 miss 同返 empty（fail-safe 跳过不抛——差面只在内嵌痕迹/计数）；列集
-     * 空（母表无 attr 行的字典半损）照常组装（空列的 TableMeta 由解码层自然
-     * 兜住，与三表面同口径）。线程约束：并发安全（计数/WARN 节流原子面）。</p>
+     * <p>关键步骤：①母表闸——relkindOf(parentid) 缺行 = <b>链断</b>（parentid
+     * 悬空——WARN 一次 + 计数）；形态闸不过（非用户表 kind）为正常 miss；②schema
+     * 解析缺行（nsp 半损）= 链断、系统模式为正常 miss；nameOf 缺行 = 链断；③白名单
+     * <b>双匹配</b>（母表全名 OR 分区全名——schema 取母表解析值；母表名 = 基准
+     * 形态，分区名 = 兼容增强）；④TableMeta = 母表 oid/母表名/母表列集
+     * （columnsOf(parentid)）。边界与异常语义：链断与正常 miss 同返 empty
+     * （fail-safe 跳过不抛——差面只在内嵌痕迹/计数；<b>调用方不再回退三表解析</b>，
+     * 段号属主已由第四字典判定，见 {@link #resolve} 的 oid 碰撞锚）；列集空（母表
+     * 无 attr 行的字典半损）照常组装（空列的 TableMeta 由解码层自然兜住，与三表面
+     * 同口径）。线程约束：并发安全（计数/WARN 节流原子面）。</p>
      *
-     * @param partitionRelfilenode 分区物理段号（heap 记录路由锚）
+     * @param identity             第四字典命中的分区身份（'p' 行——relname/parentid）
+     * @param partitionRelfilenode 分区物理段号（heap 记录路由锚——链断痕迹面）
      * @return <b>母表身份</b>的表身份 + 母表列序；miss/链断为 empty
      */
-    private Optional<TableMeta> resolvePartitionAnchored(long partitionRelfilenode) {
-        Optional<CatalogSnapshot.PartitionIdentity> part = snapshot.partitionOf(partitionRelfilenode);
-        if (part.isEmpty()) {
-            return Optional.empty();   // 第四字典无行：正常 miss（未知段号/未引导）
-        }
-        CatalogSnapshot.PartitionIdentity identity = part.get();
+    private Optional<TableMeta> resolvePartitionAnchored(CatalogSnapshot.PartitionIdentity identity,
+            long partitionRelfilenode) {
         long parentOid = identity.parentid();
 
         Optional<String> relkind = snapshot.relkindOf(parentOid);

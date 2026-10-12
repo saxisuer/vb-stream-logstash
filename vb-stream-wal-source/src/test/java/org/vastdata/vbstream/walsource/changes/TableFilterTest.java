@@ -525,4 +525,37 @@ class TableFilterTest {
         assertTrue(filter.resolve(39001).isEmpty(),
                 "V17/V18 档不消费第四字典——分区 relfilenode 仍 miss（零变化锚）");
     }
+
+    /**
+     * 用例 ⑯（M3 T5 修复：EXCHANGE 段号换绑的 oid 碰撞面，OgPartitionIT 实测红转绿）：
+     * {@code EXCHANGE PARTITION} 后分区 'p' 行换绑到普通表旧段号——OG 建表
+     * relfilenode==oid，故该段号数值 == 普通表 oid，而普通表 pg_class 行的 relfilenode
+     * 已同步改走原分区段号：三表的 relfilenode 反查 miss 但 <b>oid 直认兜底</b>会误命中
+     * 普通表（IT 实测形态：换绑后母表路由行被渲成普通表名）。修复语义：第四字典 'p' 行
+     * 是分区段号的<b>权威属主</b>——OG 档 resolve 先过第四字典（partitionOf 命中即走
+     * 母表身份链，链断也不回退三表面——段号属主已定，oid 碰撞的兜底答案必错）；普通表
+     * 换绑后的新段号（原分区段号）不在第四字典，经三表 relfilenode 反查照常解析。
+     */
+    @Test
+    void ogExchangeSwappedSegmentResolvesPartitionOwnerOverOidFallback() {
+        WalLayout og = WalLayoutVOpenGauss.INSTANCE;
+        FakeSnapshot s = new FakeSnapshot();
+        s.relation(2001, 2001, "t_mom", 2200, "public", "r");
+        s.parttype(2001, "p");
+        s.column(2001, new CatalogSnapshot.Column(1, "id", 23, false));
+        s.column(2001, new CatalogSnapshot.Column(2, "v", 25, false));
+        // EXCHANGE 后的 t_swap：oid 2078 不变，relfilenode 已改走原分区段号 39005
+        s.relation(2078, 39005, "t_swap", 2200, "public", "r");
+        s.parttype(2078, "n");
+        // 分区 q1 换绑到 t_swap 旧段号 2078（数值 == t_swap oid——碰撞面）
+        s.partition(2078, "q1", 2001);
+        TableFilter filter = new TableFilter(s, Set.of("public.t_mom", "public.t_swap"), og);
+
+        TableMeta swapped = filter.resolve(2078).orElseThrow();
+        assertEquals("t_mom", swapped.table(),
+                "换绑后分区段号 2078 的行应归母表（第四字典权威属主优先于三表 oid 直认兜底）");
+        TableMeta plain = filter.resolve(39005).orElseThrow();
+        assertEquals("t_swap", plain.table(),
+                "普通表换绑后的新段号（原分区段号，不在第四字典）经 relfilenode 反查照常解析");
+    }
 }
