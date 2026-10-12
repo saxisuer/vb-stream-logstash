@@ -65,6 +65,27 @@ public final class OgTestEnv {
     /** 库名（镜像缺省 postgres 库）。 */
     public static final String DATABASE = "postgres";
 
+    /**
+     * M2 双路对拍库（PG 兼容档）：DML 面的兼容模式护栏只放行本档（postgres 缺省库是
+     * 'A' 档会 ISE——wal 直解路必须跑在本库，T1 护栏的测试面依赖）。
+     */
+    public static final String DATABASE_M2PG = "m2pg";
+
+    /** M2 预留库（'A' 档 = Oracle 风格，M3 范围——建库面先行，测试面随 M3 落）。 */
+    public static final String DATABASE_M2A = "m2a";
+
+    /** M2 预留库（'B' 档 = MySQL 风格，M4 范围——建库面先行，测试面随 M4 落）。 */
+    public static final String DATABASE_M2B = "m2b";
+
+    /**
+     * M2 对拍基准路的专用复制角色（码 11 混合挑战是 opengauss-jdbc 的实锚死角——角色 +
+     * hba sha256 行绕开，见 {@link #ensureParityBaselineRole}）。
+     */
+    public static final String PARITY_ROLE = "m2par_base";
+
+    /** 基准路复制角色口令（sha256 存储——经 hba sha256 行走码 10 RFC5802 挑战）。 */
+    public static final String PARITY_ROLE_PASSWORD = "M2Base#2026";
+
     /** 容器内数据目录（pg_hba.conf 所在，镜像固定路径）。 */
     private static final String PG_DATA = "/var/lib/opengauss/data";
 
@@ -96,8 +117,10 @@ public final class OgTestEnv {
         awaitSqlReady();
         ensureReplicationHba();
         prepareWalCopyDir();
-        LOG.info("openGauss 测试容器就绪: {} 密码认证面=码11(md5 hba+sha256 存储) 段bind={}",
-                sqlJdbcUrl(), HOST_WAL_DIR);
+        ensureM2Databases();
+        ensureParityBaselineRole();
+        LOG.info("openGauss 测试容器就绪: {} 密码认证面=码11(md5 hba+sha256 存储) 段bind={} M2三库=[{},{},{}]",
+                sqlJdbcUrl(), HOST_WAL_DIR, DATABASE_M2PG, DATABASE_M2A, DATABASE_M2B);
     }
 
     /** 私有构造器：静态单例环境，不可实例。 */
@@ -163,6 +186,88 @@ public final class OgTestEnv {
     }
 
     /**
+     * 幂等建 M2 三兼容档库（m2pg='PG' / m2a='A' / m2b='B'——M2 Task 6 扩展，og-plan
+     * 容器 2026-10-12 实测三档 DBCOMPATIBILITY 均可建）。
+     *
+     * <p>关键步骤：逐库查 {@code pg_database.datname}（存在即跳过——幂等），缺席则
+     * {@code CREATE DATABASE <db> DBCOMPATIBILITY '<档>'}（CREATE DATABASE 不进事务，
+     * Statement.execute 独立自动提交满足）。失败抛 ISE——M2 对拍面的硬前提（m2pg 缺席
+     * = DML 面护栏全红），容器初始化期 fail-fast 优于逐用例报错。m2a/m2b 是 M3/M4
+     * 的预留面（本任务只建库不消费）。</p>
+     */
+    private static void ensureM2Databases() {
+        createDatabaseIfAbsent(DATABASE_M2PG, "PG");
+        createDatabaseIfAbsent(DATABASE_M2A, "A");
+        createDatabaseIfAbsent(DATABASE_M2B, "B");
+    }
+
+    /**
+     * 单库的幂等建库：存在即跳过，缺席按兼容档建。
+     *
+     * @param database 库名
+     * @param compat   DBCOMPATIBILITY 档位值（'PG'/'A'/'B'）
+     */
+    private static void createDatabaseIfAbsent(String database, String compat) {
+        try (Connection c = newSqlConnection()) {
+            boolean exists;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT 1 FROM pg_database WHERE datname = ?")) {
+                ps.setString(1, database);
+                try (ResultSet rs = ps.executeQuery()) {
+                    exists = rs.next();
+                }
+            }
+            if (!exists) {
+                try (Statement st = c.createStatement()) {
+                    st.execute("CREATE DATABASE " + database + " DBCOMPATIBILITY '" + compat + "'");
+                }
+                LOG.info("M2 兼容档库已建: {} DBCOMPATIBILITY '{}'", database, compat);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("M2 库 " + database + "（DBCOMPATIBILITY '" + compat
+                    + "'）创建/检查失败——M2 对拍面硬前提", e);
+        }
+    }
+
+    /**
+     * M2 对拍基准路的专用复制角色 + hba 面（T6 实测锚，og 容器 2026-10-12 三段试探）：
+     * <b>openGauss 的复制连接在 pg_hba 只匹配 {@code replication} 关键字行</b>（库
+     * {@code all}/名字行均不匹配——"no pg_hba.conf entry for replication connection"），
+     * 命中镜像缺省的 {@code host replication gaussdb ... md5} 行 + sha256 存储验证器时
+     * 服务端发码 11（AUTH_REQ_MD5_SHA256）混合挑战——<b>opengauss-jdbc 的码 11 应答
+     * 缺 ITERATION_STRING 尾缀且用 2048 旧迭代数，对真服务端恒被拒</b>（M1 OgAuth 同源
+     * 实锚）。解法：建 {@link #PARITY_ROLE} 专用角色并在 hba 文件首插
+     * {@code host replication <role> all sha256} 行——码 10 RFC5802 挑战驱动可正确应答
+     * （真容器实证连接 + 逻辑流起流全通）。gaussdb 连接不经该行（角色限定），M1 的
+     * DirectWalSource 码 11 验证面不变。
+     */
+    private static void ensureParityBaselineRole() {
+        try (Connection c = newSqlConnection()) {
+            boolean exists;
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT 1 FROM pg_roles WHERE rolname = '" + PARITY_ROLE + "'")) {
+                exists = rs.next();
+            }
+            if (!exists) {
+                try (Statement st = c.createStatement()) {
+                    st.execute("CREATE ROLE " + PARITY_ROLE + " LOGIN REPLICATION PASSWORD '"
+                            + PARITY_ROLE_PASSWORD + "'");
+                }
+                LOG.info("M2 对拍基准路复制角色已建: {}", PARITY_ROLE);
+            }
+            // 行插到 hba 文件首（先于 replication md5 行命中；角色限定使 gaussdb 连接不匹配）
+            OG.execInContainer("bash", "-c",
+                    "grep -q 'host replication " + PARITY_ROLE + "' " + PG_DATA + "/pg_hba.conf"
+                            + " || sed -i '1i host    replication    " + PARITY_ROLE
+                            + "    all    sha256' " + PG_DATA + "/pg_hba.conf");
+            execSql("SELECT pg_reload_conf()");
+        } catch (Exception e) {
+            throw new IllegalStateException("M2 对拍基准路角色/hba 面施加失败", e);
+        }
+    }
+
+    /**
      * 段落盘 bind 卷的就绪准备：root exec chmod 777。
      *
      * <p>bind 目录容器侧属主 root，而 pg_receivexlog 以 opengauss（uid 1000）用户写段
@@ -182,7 +287,17 @@ public final class OgTestEnv {
      * @return 形如 {@code jdbc:opengauss://host:mappedPort/postgres}
      */
     public static String sqlJdbcUrl() {
-        return "jdbc:opengauss://" + host() + ":" + port() + "/" + DATABASE;
+        return sqlJdbcUrl(DATABASE);
+    }
+
+    /**
+     * 库名参数化的 SQL 会话 JDBC URL（M2 起对拍/护栏面需直连 m2pg/m2a/m2b 库）。
+     *
+     * @param database 目标库名（如 {@link #DATABASE_M2PG}）
+     * @return 形如 {@code jdbc:opengauss://host:mappedPort/<database>}
+     */
+    public static String sqlJdbcUrl(String database) {
+        return "jdbc:opengauss://" + host() + ":" + port() + "/" + database;
     }
 
     /**
@@ -194,7 +309,22 @@ public final class OgTestEnv {
      * @throws SQLException 连接失败
      */
     public static Connection newSqlConnection() throws SQLException {
-        return DriverManager.getConnection(sqlJdbcUrl(), USER, PASSWORD);
+        return newSqlConnection(DATABASE);
+    }
+
+    /**
+     * 库名参数化的普通 SQL 会话连接（M2 对拍面：wal 直解路 / 逻辑基准路 / DML 写入
+     * 各自按库名开连接——缺省 postgres 库是 'A' 档，DML 面的护栏会拒）。
+     *
+     * <p>调用方负责关闭；复制连接不经本方法（基准路的逻辑复制连接由
+     * {@code OgParityBaseline} 自建，带 replication 参数形态）。</p>
+     *
+     * @param database 目标库名
+     * @return 已认证的 JDBC 连接
+     * @throws SQLException 连接失败
+     */
+    public static Connection newSqlConnection(String database) throws SQLException {
+        return DriverManager.getConnection(sqlJdbcUrl(database), USER, PASSWORD);
     }
 
     /** @return 容器映射主机名 */
