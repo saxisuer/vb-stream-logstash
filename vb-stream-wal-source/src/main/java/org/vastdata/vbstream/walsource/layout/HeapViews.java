@@ -25,7 +25,9 @@ import java.util.List;
  *   <li>xl_heap_inplace：offnum u16@0 + 后续 16B 头（dbId/tsId/nmsgs）与 msgs[]
  *       柔性数组，本视图不消费</li>
  *   <li>xl_heap_multi_insert：flags u8@0 + C padding@1 + ntuples u16@2 +
- *       offsets u16[]@4（INIT_PAGE 时省略，spike 发现 3）</li>
+ *       offsets u16[]@4（INIT_PAGE 时省略，spike 发现 3）；openGauss 档同形差异：
+ *       第二字节是 isCompressed bool（≠0 即 ISE——页字典压缩区 M2 范围外）、
+ *       INIT_PAGE 前置 pd_xid_base u64、LogCSN u64 殿后（M2 Task 3 语料锚定）</li>
  *   <li>xl_heap_prune：main 区 reason u8@0 + flags u8@1（+冲突水位 4B 可选），
  *       块0 data 区按 XLHP_* 位序分段（freeze/redirected/nowdead/nowunused，
  *       spike 发现 18）；openGauss 档同视图走 XLOG_HEAP2_CLEAN 老格式分支
@@ -242,32 +244,75 @@ public final class HeapViews {
          * 解析一条 heap2 MULTI_INSERT 记录。
          *
          * <p>关键步骤：校验 rmid==RM_HEAP2_ID 且 opcode==XLOG_HEAP2_MULTI_INSERT；
-         * main 区须至少 4 字节（flags + padding + ntuples）；ntuples 读 main@2（u16）；
-         * 按 info 的 XLOG_HEAP_INIT_PAGE 位决定 offsets 形态——置位时 offsetsOff=-1
-         * （offnum 隐含为 i+1），否则 mainOff+4。边界与异常语义：错配/main 过短 ISE；
+         * <b>vanilla</b>：main 区须至少 4 字节（flags + padding + ntuples）、ntuples
+         * 读 main@2（u16）、按 info 的 XLOG_HEAP_INIT_PAGE 位决定 offsets 形态——置位
+         * 时 offsetsOff=-1（offnum 隐含为 i+1），否则 mainOff+4；<b>openGauss
+         * （layout.openGaussDialect()）走 {@link #parseOg} 老结构分支</b>（M2 Task 3
+         * 语料锚定后放开，此前 M1 恒 ISE）。边界与异常语义：错配/main 过短 ISE；
          * 线程约束：静态纯函数 + 持只读记录引用，并发安全。</p>
          *
          * @param r      走读完成的记录（main 区即 xl_heap_multi_insert 头）
-         * @param layout 版本布局描述符（本视图结构为版本稳定小结构，暂不取值；签名统一）
+         * @param layout 版本布局描述符（openGaussDialect 决定 OG 老结构分派）
          * @return 视图（ntuples + offsetsOff + 源记录引用）
-         * @throws IllegalStateException rmid/opcode 错配或 main 过短
+         * @throws IllegalStateException rmid/opcode 错配、main 过短或 OG 拒面（见 parseOg）
          */
         public static MultiInsertView parse(WalRecord r, WalLayout layout) {
             requireOp(r, HeapOps.RM_HEAP2_ID, HeapOps.XLOG_HEAP2_MULTI_INSERT);
             if (layout.openGaussDialect()) {
-                // OG 的 xl_heap_multi_insert main 布局（9.2 系 {int ntuples; offsets[]}
-                // + LogCSN 形态）未经语料锚定：og-plan 32KB 窗口（283 条，含 CREATE
-                // TABLE 的 pg_attribute 逐行单条 INSERT）零 multi_insert 记录——盲解
-                // 错读 ntuples/offsets 即静默错位，M1 fail-fast（Task 8 语料补锚后放开）
-                throw new IllegalStateException(String.format(
-                        "openGauss MULTI_INSERT main layout not anchored yet (M1 limitation), lsn=%d info=0x%02x",
-                        r.lsn(), r.info()));
+                return parseOg(r);
             }
             requireMainLen(r, 4, "xl_heap_multi_insert");
             int ntuples = u16(r.raw(), r.mainOff() + 2);
             boolean initPage = (r.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0;
             int offsetsOff = initPage ? -1 : r.mainOff() + 4;
             return new MultiInsertView(ntuples, offsetsOff, r);
+        }
+
+        /**
+         * openGauss 老结构解析路径（v5.0.0，M2 Task 3 语料锚定）。
+         *
+         * <p>关键步骤：INIT_PAGE（info 的 0x80 位）时 main 前置 pd_xid_base u64
+         * （heapam.cpp heap_multi_insert 的首个 XLogRegisterData——与 heap_insert
+         * 同构，字段整体 +8）；main 布局 = [pd_xid_base 8B?]flags u8@0 +
+         * isCompressed bool@1（og v5.0.0 htup.h L847-854——vanilla 此位是 C padding）
+         * + ntuples u16@2 + offsets u16[]@4（INIT_PAGE 省略）+ LogCSN u64 殿后
+         * （logical 档恒在场，值不消费）。isCompressed≠0 时 offsets 之后、tuple 流
+         * 之前有页字典压缩区（int16 size + meta，heapam.cpp L4201-4212）——M2 范围
+         * 外，ISE fail-fast（盲解会把压缩区当 offsets 静默错位）。INIT_PAGE 形态
+         * offsetsOff=-1（offnum 隐含 i+1）；否则 offsetsOff=mainOff+shift+4，且
+         * offsets 数组须整体落在 main 区内（越出即 ISE——ntuples 读位错位的兜底
+         * 防线）。边界与异常语义：main 过短（常态 &lt;4 / INIT_PAGE &lt;12）ISE；
+         * 线程约束：静态纯函数，并发安全。语料锚：ogcorpus/mi-anchor.txt——INIT_PAGE
+         * main=20B 恰收口（lsn=0x2935DC8 等 7 条）、非 INIT main=4+2n+8 恰收口
+         * （lsn=0x2939E00 offsets=[61,62,63] / 0x294BF00 offsets=[2..11]）。</p>
+         *
+         * @param r 走读完成的记录（main 区即 OG xl_heap_multi_insert 头）
+         * @return 视图（ntuples + offsetsOff + 源记录引用）
+         * @throws IllegalStateException main 过短、isCompressed≠0 或 offsets 越出 main
+         */
+        private static MultiInsertView parseOg(WalRecord r) {
+            boolean initPage = (r.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0;
+            int shift = initPage ? 8 : 0;   // pd_xid_base u64 前缀
+            requireMainLen(r, shift + 4, "xl_heap_multi_insert(og)");
+            byte[] raw = r.raw();
+            int off = r.mainOff() + shift;
+            if ((raw[off + 1] & 0xFF) != 0) {
+                throw new IllegalStateException(String.format(
+                        "openGauss multi_insert page-dictionary compression not supported "
+                                + "(isCompressed!=0), lsn=%d info=0x%02x",
+                        r.lsn(), r.info()));
+            }
+            int ntuples = u16(raw, off + 2);
+            if (initPage) {
+                return new MultiInsertView(ntuples, -1, r);
+            }
+            int offsetsEnd = off + 4 + 2 * ntuples;
+            if (offsetsEnd > r.mainOff() + r.mainLen()) {
+                throw new IllegalStateException(String.format(
+                        "xl_heap_multi_insert(og) offsets array exceeds main: ntuples=%d mainLen=%d lsn=%d",
+                        ntuples, r.mainLen(), r.lsn()));
+            }
+            return new MultiInsertView(ntuples, off + 4, r);
         }
 
         /**

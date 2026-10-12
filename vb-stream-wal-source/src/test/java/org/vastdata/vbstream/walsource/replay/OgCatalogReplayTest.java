@@ -6,6 +6,7 @@ import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.layout.HeapOps;
+import org.vastdata.vbstream.walsource.layout.HeapViews;
 import org.vastdata.vbstream.walsource.layout.TupleBytes;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
@@ -238,15 +239,39 @@ class OgCatalogReplayTest {
     }
 
     /**
-     * 用例 ⑦（M1 已知限制锚）：OG 档 MULTI_INSERT 记录解析即 ISE——main 布局未语料
-     * 锚定（og-plan 32KB 窗口 283 条零 multi_insert），fail-fast 优于盲解错位。
+     * 用例 ⑦（M2 Task 3 反转）：OG MULTI_INSERT main 布局已语料锚定（ogcorpus/
+     * mi-anchor.txt——[pd_xid_base 8B?]flags u8 + isCompressed u8 + ntuples u16 +
+     * offsets u16[] + LogCSN 8B），M1 的 fail-fast ISE 位解除——well-formed 记录经
+     * 视图解析（ntuples/offsets）与 {@link CatalogReplay#applyCatalogRecord} 走通
+     * pg_attribute 行落位（data 路径 entry = [datalen u16][xl_heap_header 5B][tail]，
+     * datalen 只计 tail 字节，walk 与 vanilla 同几何）。
      */
     @Test
-    void ogMultiInsertIsFailFastUntilLayoutAnchored() {
+    void ogMultiInsertReplaysAttrRowAfterLayoutAnchored() {
         CatalogStores stores = freshStores();
+        // 单 entry 块 data：datalen u16 只计 tail（payload = [xl_heap_header 5B][tail]）
+        TupleBytes tuple = ogAttrTuple(2);
+        byte[] payload = tuple.payload();
+        ByteArrayOutputStream data = new ByteArrayOutputStream();
+        put16(data, payload.length - 5);
+        data.writeBytes(payload);
+        // main：flags + isCompressed=0 + ntuples=1 + offsets[0]=5 + LogCSN（值不消费）
+        ByteArrayOutputStream main = new ByteArrayOutputStream();
+        main.write(0x10);
+        main.write(0);
+        put16(main, 1);
+        put16(main, 5);
+        main.write(new byte[8], 0, 8);
         WalRecord rec = rec(ogRecord(HeapOps.RM_HEAP2_ID, HeapOps.XLOG_HEAP2_MULTI_INSERT, 1,
-                ATTR_RELNODE, 0, new byte[]{0, 0}).mainData(new byte[]{0, 0, 2, 0}).build());
-        assertThrows(IllegalStateException.class, () -> replay.applyCatalogRecord(rec, stores));
+                ATTR_RELNODE, 3, data.toByteArray()).mainData(main.toByteArray()).build());
+
+        HeapViews.MultiInsertView v = HeapViews.MultiInsertView.parse(rec, og);
+        assertEquals(1, v.ntuples());
+        assertEquals(5, v.offsetAt(0));
+        replay.applyCatalogRecord(rec, stores);
+        assertEquals(new CatalogRow.AttrRow(16389L, "v", 26L, 2, false),
+                stores.attrRows().get(CatalogReplay.ctidKey(3, 5)),
+                "MULTI_INSERT 行须按 offsets[0] 落位（原 M1 ISE 位已解除）");
     }
 
     /**

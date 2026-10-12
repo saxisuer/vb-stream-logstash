@@ -1,0 +1,57 @@
+openGauss 5.0.0 MULTI_INSERT 语料锚（2026-10-12 采集，og-plan 容器 m2pg 库[PG 兼容档]，
+M2 Task 3——重采版：M1 Task 8 的 COPY 200 行语料已随段滚动，本窗口为独立新采）
+================================================================
+
+段文件   : pg_xlog/000000010000000000000002（同段续写；LSN 口径 = 页头 xlp_pageaddr + 页内全偏移）
+写入序列（单机，wal_level=logical，gsql 客户端 \copy FROM STDIN——客户端侧 COPY 走
+           COPY FROM STDIN 协议，与 JDBC CopyManager STDIN 同触发面；服务端文件 COPY 被
+           OG 安全策略禁止[M1 Task 8 实测锚]）:
+           DROP TABLE IF EXISTS t_mi; CREATE TABLE t_mi(id int, v text);   -- relfilenode=32793
+           COPY t_mi FROM STDIN;   -- 短行 800 条（id 1..800, v='miA'||id）  xid=13895
+           COPY t_mi FROM STDIN;   -- 宽行 40 条（id 1001..1040, v='W'*1800） xid=13896
+           COPY t_mi FROM STDIN;   -- 短行 10 条（id 2001..2010, v='miT'||id） xid=13897
+           （三批各自独立事务，COMMIT 记录 rmid=1 info=0x04 紧随各批末记录）
+
+资源     : mi-a.bin（40KB @ 0x2934000，7 条 MULTI_INSERT + 2 条 COMMIT）
+           mi-b.bin（12KB @ 0x294A000，2 条 MULTI_INSERT + 2 条 COMMIT）
+
+main 布局（og 档，源码 src/include/access/htup.h L847-854 + gausskernel/storage/access/
+heap/heapam.cpp heap_multi_insert 注册序 L4161-4290，逐字节实测收口）:
+           [INIT_PAGE 时 pd_xid_base u64 前置] + flags u8@0 + isCompressed bool@1 +
+           ntuples u16@2 + offsets u16[]@4（INIT_PAGE 省略）+ LogCSN u64 殿后
+           （logical 档恒在场，heapam.cpp LogCSN() L2887）——INIT_PAGE main=20B 恰收口、
+           非 INIT main=4+2n+8 恰收口（全部 9 条记录实测）。
+           与 vanilla 同构差异：@1 是 isCompressed（vanilla 为 C padding）；
+           isCompressed!=0 时 header 与 offsets 之后、tuple 流之前有页字典压缩区
+           （int16 size + meta 字节，heapam.cpp L4201-4212）——M2 不支持，解析面 ISE。
+块 0 data（tuple 流，与 vanilla 几何一致）: 逐 entry 2 对齐起点
+           [datalen u16][t_infomask2 u16][t_infomask u16][t_hoff u8][tail datalen 字节]，
+           步进 SHORTALIGN(7+datalen)，datalen = t_len - offsetof(t_bits)（只计 tail）。
+
+锚记录（LSN 为记录起始；entries 列 = 块 0 data 按 2 对齐 7+datalen 步进实测走读）:
+  0x2935dc8  info=0xd0(0x50|INIT_PAGE) xid=13895 tot=3585  main=20B ntuples=185 blkno=0
+             offsets 省略（offsetAt(i)=i+1 实测 1..185 连续） entries=185 ids 1..185
+             （短行首记录：新表页 0 整页重初始化；datalen 只计 tail=t_len-23，随 v 长度
+              变化——'miA1' 首行 10B=24+4+5-23，'miA741' 段 12B；t_hoff=24 无位图）
+  0x2936be8 / 0x2937ab0 / 0x2938990  info=0xd0 同形 ntuples=185/185/185
+             ids 186..370 / 371..555 / 556..740（blkno=1/2/3，跨页批次逐页一记录）
+  0x2939858  info=0xd0 xid=13895 tot=1283 main=20B ntuples=60 blkno=4 ids 741..800
+             （短行批末记录；xlrec.flags=0x90=LAST_IN_MULTI|CONTAINS_NEW_TUPLE——
+              短行批中间记录 flags=0x10 仅 CONTAINS_NEW_TUPLE）
+  0x2939e00  info=0x50（非 INIT_PAGE）xid=13896 tot=5530 main=18B=4+2*3+8 ntuples=3
+             offsets=[61,62,63] blkno=4 ids 1001..1003
+             （跨批续写几何锚：页 4 已有 60 短行 → 宽行批首记录从 offnum 61 续起，
+              offsets 数组在场形态）
+  0x293b3b8  info=0xd0 xid=13896 tot=7348 main=20B ntuples=4 blkno=5 ids 1004..1007
+             （宽行 INIT_PAGE：~1809B datalen/entry，一记录 4 entry；同形续页记录
+              0x293d088..0x2949a20 共 9 条 blkno=5..13——0x293d088 起在 mi-a 窗口外）
+  0x294b6f0  info=0xd0 xid=13896 tot=1900 main=20B ntuples=1 blkno=14 id=1040
+             （宽行批末记录，flags=0x90 LAST_IN_MULTI）
+  0x294bf00  info=0x50 xid=13897 tot=296 main=32B=4+2*10+8 ntuples=10
+             offsets=[2..11] blkno=14 ids 2001..2010
+             （页 14 仅 1 宽行 → 尾批从 offnum 2 续起；非 INIT_PAGE + offsets 第二锚）
+  COMMIT     0x2935888(xid=13894, DDL) / 0x2939da0(13895) / 0x294bea0(13896) /
+             0x294c080(13897)——info=0x04（XACT 面归 T2 OgXactView，此处仅记档定位）
+
+SHA-256: mi-a.bin b7cf5225c1d62e5518559226c0bf25a0335ec3668065ab37fc43a0128f3ff5f9
+         mi-b.bin 8bc910e583ae32e652021dc0bd9b2835fc9c367ed7b81aebeed5d38dbb02bb6e
