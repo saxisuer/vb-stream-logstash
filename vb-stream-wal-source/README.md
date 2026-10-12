@@ -34,17 +34,21 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 `org.vastdata.vbstream.walsource.cdc`；Ctrl-C 优雅退出含最终 best-effort 检查点 + 槽
 推进；启动失败 exit 1。）
 
-## openGauss 5.0.0 快速开始（M1 catalog 面）
+## openGauss 5.0.0 快速开始（M2 DML 面开门）
 
-M1 范围 = catalog 同步 + WAL 接收（**不含 DML 输出**，M2 范围）；存储引擎只做
-ASTORE（UStore/列存/段页式/bucket 表识别即启动期 ISE），仅单机/无 replconninfo 形态。
-Main 冒烟默认注入的 DML 输出面在 OG 档**自动降级 catalog-only**（启动 WARN 一行——
-`vb.wal.dml` 无须显式置 false；M2 落地 DML 面后自动恢复）。
+catalog 同步 + WAL 接收（M1 面）+ **DML 输出面（M2 起——`vb.wal.dml` 缺省 true 即装配，
+兼容模式护栏先探测）**；存储引擎只做 ASTORE（UStore/列存/段页式/bucket 表识别即启动期
+ISE），仅单机/无 replconninfo 形态。**DML 面仅支持 PG 兼容模式库**（`DBCOMPATIBILITY
+'PG'`）：Main 冒烟默认注入 DML 输出面，在非 PG 档库（如镜像缺省 postgres 库是 'A' 档
+Oracle 风格）上启动期 ISE 附档位与 M3/M4 指引；仅需 catalog 同步面可显式
+`-Dvb.wal.dml=false`（catalog 面与兼容模式无关，任何档位可用）。
 起容器与运行（配置文件形态——零 `-D`；Windows 宿主机无 pg_receivexlog，模板已选
 `direct` 通道）：
 
 ```bash
 docker run -d --name og-m1 -e GS_PASSWORD=openGauss@123 -p 15700:5432 opengauss/opengauss:5.0.0   # 等就绪 ~60s
+docker exec og-m1 su - opengauss -c '/usr/local/opengauss/bin/gsql -d postgres -p 5432 \
+     -c "CREATE DATABASE vbpg DBCOMPATIBILITY '\''PG'\''"'   # PG 兼容档库（DML 面前提）
 mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 cp src/docker/walconfig-og.properties ./walconfig.properties
 java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/cp.txt)" \
@@ -56,7 +60,7 @@ java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/
 
 ```bash
 java -cp "vb-stream-wal-source/target/classes:$(cat vb-stream-wal-source/target/cp.txt)" \
-     -Dvb.wal.port=15700 -Dvb.wal.user=gaussdb -Dvb.wal.pass=openGauss@123 \
+     -Dvb.wal.port=15700 -Dvb.wal.db=vbpg -Dvb.wal.user=gaussdb -Dvb.wal.pass=openGauss@123 \
      -Dvb.wal.og.jdbc.prefix=jdbc:opengauss: \
      -Dvb.wal.state.dir=/tmp/wal-source-state \
      org.vastdata.vbstream.walsource.Main

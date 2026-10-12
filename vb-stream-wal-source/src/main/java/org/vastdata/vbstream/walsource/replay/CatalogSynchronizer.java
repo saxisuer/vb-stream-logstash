@@ -400,10 +400,42 @@ public final class CatalogSynchronizer {
      * @return 已运行的同步器（apply 消费面 + snapshot 查询面 + 字节源观测面）
      * @throws SQLException 槽管理或引导查询失败
      * @throws IllegalStateException 布局与连接端 server_version_num 错配（跨版本注入）
+     * @see #startOg(Connection, String, WalLayout, StateConfig, long, LongFunction, Consumer,
+     * LongSupplier, long...) DML 面接缝档（M2 Task 1）——本档等价其 postApply/pendingFloor
+     * 双 null 形态（纯 catalog，M1 调用面）
      */
     public static CatalogSynchronizer startOg(Connection sql, String slotName, WalLayout layout,
             StateConfig state, long forcedStartLsn, LongFunction<WalByteSource> sourceFactory,
             long... interestRelOid) throws SQLException {
+        return startOg(sql, slotName, layout, state, forcedStartLsn, sourceFactory, null, null,
+                interestRelOid);
+    }
+
+    /**
+     * startOg 的 DML 面接缝档（M2 Task 1，与 {@code startInternal} 的 postApply/
+     * pendingFloor 语义同构）：sink 第二消费者激活——字节源每记录先
+     * {@code applyRecord}（catalog 施加）再 {@code postApply}（ChangeStream 组装），
+     * 检查点在 postApply 之后（floor 须含本记录新建的待决桶）；续传时 DML 待决桶下界
+     * （检查点携带的 dmlFloorLsn）低于 stored lsn 则字节源工厂起点回退到 floor
+     * （重放段重建待决桶，catalog 过滤线仍 = stored lsn 不二次施加字典）。
+     * 两参传 null 时与六参档行为逐字节等价（M1 调用面零回归）。
+     *
+     * @param sql             引导用 SQL 会话（probe 与槽推进复用，归同步器独占）
+     * @param slotName        物理槽名
+     * @param layout          版本布局描述符（openGauss 档经 {@code WalLayouts.forServer} 分发）
+     * @param state           检查点配置（null 或 dir=null = 禁用）
+     * @param forcedStartLsn  显式流起点（0 = 按决策；&gt;0 = 覆盖，诊断接缝）
+     * @param sourceFactory   字节源工厂——入参 = 决策出的流起点（floor 回退后）
+     * @param postApply       apply 之后的第二消费者（null = 纯 catalog 形态）
+     * @param pendingFloor    DML 待决桶重放下界供应者（null = 恒 0）
+     * @param interestRelOid  tracked 面 oid（v1 注册 0 个）
+     * @return 已运行的同步器
+     * @throws SQLException 槽管理或引导查询失败
+     */
+    public static CatalogSynchronizer startOg(Connection sql, String slotName, WalLayout layout,
+            StateConfig state, long forcedStartLsn, LongFunction<WalByteSource> sourceFactory,
+            Consumer<WalRecord> postApply, LongSupplier pendingFloor, long... interestRelOid)
+            throws SQLException {
         // 版本交叉校验（与 startInternal 同面）：错配的常量会让页遍历/记录解析整体错位
         int serverVersionNum = queryServerVersionNum(sql);
         if (!layout.supports(serverVersionNum)) {
@@ -420,6 +452,7 @@ public final class CatalogSynchronizer {
         StateStore stateStore = decision.stateStore();
         long start = decision.start();
         boolean resumed = decision.resumed();
+        long storedFloor = decision.storedFloor();
         boolean forced = false;
         if (forcedStartLsn > 0) {
             if (forcedStartLsn < start) {
@@ -434,6 +467,8 @@ public final class CatalogSynchronizer {
                 null, slotName, state, stateStore, stateStore == null ? null : sql);
         // OG 档槽推进 SQL 去 pg_lsn cast（见字段注记——PG 档缺省形态不变）
         sync.advanceLsnCast = "";
+        // DML 待决桶下界供应者（M2 Task 1 接缝档；null = 恒 0，与六参档等价）
+        sync.pendingFloor = pendingFloor == null ? () -> 0L : pendingFloor;
         // 前沿种子化（与 startInternal 同式）：续传/forced = 决策起点严格过滤；全新引导 =
         // 页对齐流起点（流交付重叠段重放消化，终审 C1 两级语义的 OG 面）
         sync.appliedLsn = resumed || forced ? start
@@ -443,10 +478,29 @@ public final class CatalogSynchronizer {
             sync.lastCheckpointWallMs = System.currentTimeMillis();
             sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
         }
-        // 收流组装（spec §3）：walker 计数自有实例（receiver==null 档的 streamMetrics 来源）
+        // 流起点（Task 11 挂起桶跨检查点修复的 OG 面，与 startInternal 同构）：续传时 DML
+        // 待决桶下界低于 stored lsn 则回退到 floor 起流（字节源各自段/页对齐下取整）——
+        // 重放段把待决桶的行记录重新喂给 postApply 面重建桶；catalog 过滤线仍 =
+        // stored lsn（appliedLsn 种子不变），重放段不二次施加字典
+        long streamStart = start;
+        if (resumed && storedFloor > 0 && storedFloor < start) {
+            streamStart = storedFloor;
+            LOG.info("续传流起点按 DML 待决桶下界回退（openGauss 档）: floor {} < stored {}"
+                            + "（重放段重建待决桶，catalog 过滤线不动）",
+                    Lsn.format(storedFloor), Lsn.format(start));
+        }
+        // 收流组装（spec §3）：walker 计数自有实例（receiver==null 档的 streamMetrics 来源）；
+        // sink 组合（M2 Task 1 接缝档）与 startInternal 同构——postApply 在场时每记录
+        // 先施加字典（变更面读到施加后的 as-of 快照）再组装、检查点随后（floor 含新开桶）
         WalStreamMetrics metrics = new WalStreamMetrics();
-        WalStreamWalker walker = new WalStreamWalker(layout, metrics, sync::apply);
-        WalByteSource source = sourceFactory.apply(start);
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, postApply == null
+                ? sync::apply
+                : rec -> {
+                    sync.applyRecord(rec);
+                    postApply.accept(rec);
+                    sync.maybeCheckpoint();
+                });
+        WalByteSource source = sourceFactory.apply(streamStart);
         sync.byteSource = source;
         sync.externalMetrics = metrics;
         sync.externalConsumedLsn = sync.appliedLsn;   // 种子化：首块前即报告页对齐起点（与接收器路同形）

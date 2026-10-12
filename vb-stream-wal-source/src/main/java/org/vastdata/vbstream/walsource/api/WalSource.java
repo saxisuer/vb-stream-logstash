@@ -41,11 +41,15 @@ import java.util.function.LongSupplier;
  * 补充 version() 文本）分发布局——错配版本启动期 ISE fail-fast（绝不近似回退）；
  * ③ 带凭据档 + 检查点配置起同步器（自愈接线；state.dir 有有效检查点 → 续传跳过引导，
  * 否则全新引导——决策见同步器 javadoc）。v1 门面无 tracked 面（interest 0 个，纯字典
- * 同步形态）。<strong>openGauss 5.0.0 档（M1 Task 6）</strong>：判别命中
+ * 同步形态）。<strong>openGauss 5.0.0 档（M1 Task 6 + M2 Task 1）</strong>：判别命中
  * {@code WalLayoutVOpenGauss} 时转 {@code startOpenGauss}——槽走 ensureSlotOg（dummy_
  * standby 建槽 + xlog 位点函数）、收流按 {@code vb.wal.og.source} 走 WalByteSource
- * 双通道（file=sidecar tail / direct=裸 v3 直连）、DML 面不装配（M2 范围——listener
- * 在场且 dml 开着时 WARN 降级 catalog-only，终审 I-1 修，原"请求即 ISE"形态废除）；
+ * 双通道（file=sidecar tail / direct=裸 v3 直连）、DML 面与 PG 17/18 路同构装配
+ * （M2 Task 1 撤销 M1 的 WARN 降级——{@code ogCatalogOnly} 位退役；listener 在场且
+ * dml 开着时 postApply/pendingFloor 经 startOg 注入 sink 惰性串接 ChangeStream）+
+ * <strong>库级兼容模式护栏</strong>（DML 面请求在场时探测 {@code pg_database.
+ * datcompatibility}，可判定的非 PG 档启动期 ISE 附档位与 M3/M4 指引；探测不可判定
+ * WARN 放行——catalog 面与兼容模式无关，M1 OG IT 即在 'A' 档缺省库全绿）；
  * 观测面（consumedLsn/metrics/terminalFailure/检查点/槽推进）经同步器同源透传。</p>
  *
  * <p>配置面：构造入参 {@link Properties} 读 {@code vb.wal.host/port/db/user/pass/slot}
@@ -307,14 +311,6 @@ public final class WalSource implements AutoCloseable {
     private Boolean dmlOff;
 
     /**
-     * OG 档 M1 的 catalog-only 降级位（终审 I-1 修，volatile——start 装配线程写、
-     * {@link #dmlEnabled()} 任意线程读）：listener 在场且 dml 开着时 startOpenGauss
-     * WARN 降级置 true——DML 面不装配（与 -Dvb.wal.dml=false 运行形态等价），原
-     * "请求即 ISE" 形态废除（README 快速开始默认路径照抄可跑）。
-     */
-    private volatile boolean ogCatalogOnly;
-
-    /**
      * 白名单文本解析：逗号切分 + 逐项 trim + 空项跳过（"public.a, public.b,," 形态）。
      *
      * @param text 配置原文（null 安全按空串）
@@ -335,15 +331,16 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * DML 输出面是否装配（构造期裁定 + OG 档 M1 启动期降级）：listener 缺席（v1 单参
-     * 构造）或 {@code vb.wal.dml=false} 时 false；<strong>OG 档 M1 下 listener 在场且
-     * dml 开着时 startOpenGauss WARN 降级 catalog-only</strong>（终审 I-1）——本方法此后
-     * 归 false（DML 观测段/惰性 ChangeStream 均不装配，与 -Dvb.wal.dml=false 等价）。
+     * DML 输出面是否装配（构造期裁定，三档统一语义——M2 T1 起 OG 档不再降级）：
+     * listener 缺席（v1 单参构造）或 {@code vb.wal.dml=false} 时 false；否则 true——
+     * OG 档与 PG 17/18 档同构装配（postApply/pendingFloor 接缝 + 惰性 ChangeStream），
+     * M1 的 {@code ogCatalogOnly} WARN 降级位已退役（spec 2026-10-12 §1 变化①）；OG
+     * 档 DML 面另有库级兼容模式护栏（{@link #startOpenGauss}——非 PG 档启动期 ISE）。
      *
      * @return true = start 后 sink 串接 ChangeStream
      */
     public boolean dmlEnabled() {
-        return dmlOut != null && dmlOff == null && !ogCatalogOnly;
+        return dmlOut != null && dmlOff == null;
     }
 
     /**
@@ -453,39 +450,57 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * openGauss 5.0.0 档装配分支（M1 Task 6，spec §3 启动次序）：判别命中 OG 布局后由
-     * {@link #start()} 转入——SQL 会话已建（URL 前缀按 {@code vb.wal.og.jdbc.prefix} 分流），
-     * 此后委派 {@link CatalogSynchronizer#startOg}（槽 OG 变体 → state 决策 → bootstrap →
+     * openGauss 5.0.0 档装配分支（M1 Task 6 落地，M2 Task 1 增 DML 面装配 + 兼容模式
+     * 护栏，spec 2026-10-12 §1）：判别命中 OG 布局后由 {@link #start()} 转入——SQL 会话
+     * 已建（URL 前缀按 {@code vb.wal.og.jdbc.prefix} 分流），此后委派
+     * {@link CatalogSynchronizer#startOg}（槽 OG 变体 → state 决策 → bootstrap →
      * 字节源装配）。
      *
-     * <p>关键步骤：DML 面门控——M1 范围裁定（spec §0）OG 档仅 catalog 同步面，DML/
-     * changes 面属 M2；listener 在场且 dml 开着时 <strong>WARN 降级 catalog-only</strong>
-     * （终审 I-1 修：降级置 {@code ogCatalogOnly}——DML 面不装配、{@link #dmlEnabled()}
-     * 归 false、零事件交付，与 {@code -Dvb.wal.dml=false} 的运行形态完全等价；M1 OG 本就
-     * 无 DML 能力，原"请求即 ISE"形态只挡了冒烟 Main/README 快速开始的默认路径、不保护
-     * 任何正确性面，故废除——WARN 一行保持降级可观测）；字节源按 {@code vb.wal.og.source}
-     * 由 {@link #buildOgByteSource} 构造（工厂形态——流起点由同步器的续传/引导决策给出，
-     * 构造需在此之后）。边界与异常语义：SQLException/ISE 原样上抛（已建资源由本类持有、
-     * 调用方 close 释放）；bootstrap 的 OG 内部适配（列单/LSN 函数）归 Task 7——真 OG
-     * 服务端全新引导路径在 bootstrap 处失败属 M1 预期形态，本任务的验收面是配置/槽/装配
-     * 缝正确。线程约束：装配线程（start 调用线程）单次执行。</p>
+     * <p>关键步骤：①<strong>兼容模式护栏（M2 Task 1）</strong>——DML 面请求在场
+     * （{@link #dmlEnabled()}：listener + vb.wal.dml=true）时先探测库级
+     * {@code pg_database.datcompatibility}（{@link #queryDbCompatMode}），可判定的非
+     * PG 档启动期 ISE（附档位值与 M3/M4 里程碑指引）；不可判定（无行/空白值/探测
+     * SQLException）WARN 放行。护栏只在 DML 面请求时探测的依据：不兼容面是 DML 解码
+     * 语义（三档分区表实现不同，spec §0），catalog 同步面与兼容模式无关——M1 全部
+     * OG IT 即跑在 'A' 档的 postgres 缺省库上全绿（og-plan 实测 datcompatibility 值：
+     * postgres='A'、DBCOMPATIBILITY 'PG' 库='PG'）；显式 {@code -Dvb.wal.dml=false}
+     * 等价声明 catalog-only 意图，不 ISE。②DML 面与 PG 17/18 路同构装配（M1 的
+     * WARN 降级形态已废）：{@code dmlEnabled()} 时 postApply（惰性 ChangeStream 的
+     * onRecord）与 pendingFloor（待决桶下界供应者）经 startOg 注入 sink——先施加
+     * 字典后解码行，as-of 次序与 PG 档同源。③字节源按 {@code vb.wal.og.source} 由
+     * {@link #buildOgByteSource} 构造（工厂形态——流起点由同步器的续传/引导决策给出，
+     * 构造需在此之后）。边界与异常语义：SQLException/ISE（含护栏）原样上抛（已建资源
+     * 由本类持有、调用方 close 释放），护栏先于槽副作用。线程约束：装配线程（start
+     * 调用线程）单次执行。</p>
      *
      * @param layout 判别出的 openGauss 布局描述符
      * @throws SQLException 槽管理/引导查询失败
+     * @throws IllegalStateException DML 面请求在场且库级兼容模式可判定为非 PG 档
      */
     private void startOpenGauss(WalLayout layout) throws SQLException {
         if (dmlEnabled()) {
-            ogCatalogOnly = true;
-            LOG.warn("openGauss 档 M1 仅 catalog 同步面——DML 输出面属 M2（spec 2026-10-11 §0）："
-                    + "listener 在场且 vb.wal.dml 缺省 true，已降级 catalog-only（DML 面不装配、"
-                    + "零事件交付）；显式 -Dvb.wal.dml=false 可声明该形态并消本告警");
+            String compat = queryDbCompatMode(sqlConnection);
+            if (compat != null && !OG_PG_COMPAT_MODE.equals(compat)) {
+                throw new IllegalStateException("openGauss 档 DML 面仅支持 PG 兼容模式库: 当前库 "
+                        + "datcompatibility=" + compat
+                        + "（A 档=Oracle 风格支持属 M3、B 档=MySQL 风格属 M4、C 档为 PG 兼容"
+                        + "历史别名但未在 M2 验证面——请以 DBCOMPATIBILITY 'PG' 建库；仅需 "
+                        + "catalog 同步面可 -Dvb.wal.dml=false 显式声明，catalog 面与兼容模式无关）");
+            }
+            if (compat == null) {
+                LOG.warn("openGauss 库级兼容模式探测不可判定（无行/空值/探测失败）——护栏按放行处理"
+                        + "（非 PG 档 ISE 仅对可判定档位生效）");
+            }
         }
+        Consumer<WalRecord> postApply = dmlEnabled() ? rec -> changeStreamOrInit(layout).onRecord(rec) : null;
+        LongSupplier pendingFloor = dmlEnabled() ? this::dmlPendingFloorLsn : null;
         sync = CatalogSynchronizer.startOg(sqlConnection, slotName, layout, state, 0L,
-                startLsn -> buildOgByteSource(layout, startLsn));
+                startLsn -> buildOgByteSource(layout, startLsn), postApply, pendingFloor);
         started = true;
-        LOG.info("WalSource 启动（openGauss 档）: slot={} source={} mode={} dir={} bin={} jdbcPrefix={} state={} 续传起点 {}",
+        LOG.info("WalSource 启动（openGauss 档）: slot={} source={} mode={} dir={} bin={} jdbcPrefix={} "
+                        + "state={} dml={} 续传起点 {}",
                 slotName, ogSource, ogRxMode, ogRxDir, ogRxBin, ogJdbcPrefix,
-                state.enabled() ? state.dir() : "禁用", Lsn.format(sync.consumedLsn()));
+                state.enabled() ? state.dir() : "禁用", dmlEnabled(), Lsn.format(sync.consumedLsn()));
     }
 
     /**
@@ -739,6 +754,57 @@ public final class WalSource implements AutoCloseable {
         }
         LOG.info("WalSource 已关闭: slot={} 消费前沿 {}（检查点 {} / 槽推进 {}）", slotName,
                 Lsn.format(consumedLsn()), Lsn.format(lastCheckpointLsn()), Lsn.format(lastSlotAdvanceLsn()));
+    }
+
+    /**
+     * openGauss 兼容模式 PG 档白名单值（M2 Task 1，og-plan 容器 2026-10-12 实测钉死）：
+     * {@code CREATE DATABASE ... DBCOMPATIBILITY 'PG'} 库的 {@code pg_database.
+     * datcompatibility} 列恰回 {@code "PG"} 单值；'A'=Oracle 风格（postgres 缺省库
+     * 即此档）、'B'=MySQL 风格、'C'=PG 兼容历史别名（5.0.0 仍接受建库且存储值与
+     * 'PG' 相异，未在 M2 验证面）。
+     */
+    static final String OG_PG_COMPAT_MODE = "PG";
+
+    /**
+     * 查当前库的 openGauss 兼容模式档位（护栏的探测面，M2 Task 1）。
+     *
+     * <p>关键步骤：单行查询 {@code pg_database.datcompatibility}（探测 SQL 以 og-plan
+     * 实测钉死——见 {@link #OG_PG_COMPAT_MODE} javadoc 的档位值域）；无行、null 或
+     * 空白值归一化为 null（不可判定面——OG 对各档的表示形态已实测，空/NULL 不是
+     * PG 档表示）；SQLException 捕获后 WARN 并归 null（护栏是兼容性预检不是正确性
+     * 锚，探测瞬断静默砖死启动不如放行可观测）。边界：连接须已建立（start 装配线程
+     * 内调用）；返回值仅作护栏判定，不缓存。</p>
+     *
+     * @param connection 已建立的 SQL 会话
+     * @return 档位值（如 "PG"/"A"/"B"/"C"）；不可判定为 null
+     */
+    @SuppressWarnings("SqlResolve")
+    static String queryDbCompatMode(Connection connection) {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT datcompatibility FROM pg_database WHERE datname = current_database()")) {
+            if (!rs.next()) {
+                return null;
+            }
+            String mode = rs.getString(1);
+            return mode == null || mode.isBlank() ? null : mode.trim();
+        } catch (SQLException e) {
+            LOG.warn("openGauss 兼容模式探测查询失败（归不可判定处理）: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 当前库是否 PG 兼容档（{@link #queryDbCompatMode} 的判定面，供护栏与离线测试）：
+     * 'PG' 白名单放行；可判定的其他档位（'A'/'B'/'C'）false；不可判定（探测失败/空值）
+     * true——fail-open 语义，与 startOpenGauss 护栏分支一致。
+     *
+     * @param connection 已建立的 SQL 会话
+     * @return true = PG 档或不可判定（放行）；false = 可判定的非 PG 档
+     */
+    static boolean isPgCompatMode(Connection connection) {
+        String mode = queryDbCompatMode(connection);
+        return mode == null || OG_PG_COMPAT_MODE.equals(mode);
     }
 
     /**

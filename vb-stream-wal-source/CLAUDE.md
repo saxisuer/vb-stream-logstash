@@ -11,10 +11,13 @@ relfilenode、toast 映射、dropped 占位语义）与 **B. WAL 接收**（物�
 CREATE SCHEMA）证明两路 CDC 输出逐字节等价；**openGauss 5.0.0 适配 M1（2026-10-11
 spec，2026-10-12 落地）**在 v1 catalog 面上增第三布局档——判别（90204 撞号经
 version() 文本消解）→ OG 布局描述符 → 双通道收流（sidecar 文件 tail / 裸 v3 直连）
-→ catalog 引导/重放 OG 适配（见"openGauss 5.0.0 档"节；DML 面是 M2 范围）。设计全文见
+→ catalog 引导/重放 OG 适配（见"openGauss 5.0.0 档"节；**M2（2026-10-12 spec）起 DML 面
+开门装配**——T1 已落兼容模式护栏 + 撤销 M1 WARN 降级，XACT/MULTI_INSERT/列压缩/分区
+等 OG 差异接缝按 T2-T7 分期落地）。设计全文见
 `docs/superpowers/specs/2026-10-05-wal-source-module-design.md`、
 `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` 与
-`docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md`（先导实验
+`docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md` 与
+`docs/superpowers/specs/2026-10-12-wal-source-opengauss-m2-design.md`（先导实验
 `docs/wal-direct-decode-spike.md` + OG 调研
 `docs/wal-source-opengauss-adaptation-research.md`）。
 
@@ -239,9 +242,14 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 ## openGauss 5.0.0 档（M1 catalog 面，2026-10-11 spec / 2026-10-12 落地）
 
 **范围**：v1 catalog 同步面（引导 + 重放 + 检查点/槽推进）+ WAL 接收双通道；**DML 面
-不装配（M2 范围——listener 在场且 dml 开着时 WARN 降级 catalog-only：`dmlEnabled()`
-归 false、零事件交付，与 `-Dvb.wal.dml=false` 运行形态等价；终审 I-1 修，原"请求即
-ISE"形态废除——其只挡冒烟 Main/README 快速开始默认路径、不保护正确性面）**。存储引擎
+M2 起（2026-10-12 M2 T1）开门装配——`ogCatalogOnly` WARN 降级位退役，listener 在场且
+dml 开着时 postApply/pendingFloor 经 `startOg` 接缝档与 PG 17/18 路同构注入（惰性
+ChangeStream）+ 库级兼容模式护栏：探测 `pg_database.datcompatibility`（og-plan 实测：
+postgres 缺省库='A'、DBCOMPATIBILITY 'PG' 库='PG'、'C' 为 PG 兼容历史别名[5.0.0 仍接受
+建库且存储值与 'PG' 相异，未在 M2 验证面]），可判定的非 PG 档（A/B/C）启动期 ISE 附
+档位与 M3/M4 指引、探测不可判定（无行/空值/SQLException）WARN 放行；**护栏只在 DML
+面请求在场时探测**——catalog 同步面与兼容模式无关（M1 全部 OG IT 即跑在 'A' 档缺省库
+上全绿），显式 `-Dvb.wal.dml=false` 等价声明 catalog-only 意图不 ISE**。存储引擎
 只做 ASTORE；版本只做 5.0.0（90204 撞号经
 `forServer(int, String)` 的 version() 文本判别）。调研全文见
 `docs/wal-source-opengauss-adaptation-research.md`（文首有 M1 落地状态与勘误回填）。
@@ -310,6 +318,12 @@ storage_type=ustore/segment=on）——护栏读区越界零填充段按不可�
 
 ## 已知限制
 
+- **对拍 IT 满负载偶发（非回归，2026-10-12 M2 T1 记档）**：`mvn test` 全量（PG 17/18 +
+  OG 容器并发满载）下偶发单用例红——`DualPathParityIT` TOAST 重发场景（wal 侧重发行渲
+  `<toast-unchanged>` vs engine 真值，即下文"交错清窗/重发渲染末态"已知分叉面的窄缝形
+  态；改动前基线复现同形）与 `OgDualChannelParityIT`（boundary 越界 +160B / 中窗记录数
+  差 ≤25@16k+），二者单跑/组跑稳定全绿且与 M2 T1 改动零代码路径交叠——负载相关竞态，
+  根因待查。
 - **接收器终态死亡进程面**：接收器 5 次重连失败/解析 ISE 后线程自行退出（ERROR），
   冒烟 `Main` 周期行经 `WalSource.receiverTerminalFailure()` 检测到终态 → ERROR 一行 +
   `System.exit(1)`（对齐引擎 fail-fast，终审 I2）；库形态宿主须自行轮询该面。
@@ -381,7 +395,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**350 用例 = 离线 303 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
+**353 用例 = 离线 306 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
@@ -404,8 +418,10 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
   库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；`api` WalSourceConfigTest
   5 / OgWalSourceConfigTest 14（OG 五键解析/缺省值/IAE 面 + 全装配门面 README/Main
-  形态 DML listener WARN 降级锚[伪 Driver 顶替 DriverManager 驱动 start() 全路径，
-  终审 I-1]）；顶层 WalConfigFileTest 7（2026-10-12 配置文件层——白名单过滤/空串
+  形态 DML listener 装配锚[伪 Driver 顶替 DriverManager 驱动 start() 全路径，M2 T1
+  反转 M1 的 WARN 降级断言——PG 档库 dmlEnabled 保持 true]）/ OgCompatModeGuardTest 3
+  （兼容模式护栏：档位判定面 PG/A/B/C + 不可判定 fail-open + 全路径 'A' 档 ISE 先于
+  槽副作用）；顶层 WalConfigFileTest 7（2026-10-12 配置文件层——白名单过滤/空串
   未设/缺文件空集与 vb.config fail-fast/保留键不入 props/Main 三层合并次序）；
   ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
