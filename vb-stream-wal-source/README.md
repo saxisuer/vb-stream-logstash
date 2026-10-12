@@ -29,7 +29,42 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 `org.vastdata.vbstream.walsource.cdc`；Ctrl-C 优雅退出含最终 best-effort 检查点 + 槽
 推进；启动失败 exit 1。）
 
-配置键全表（`-Dvb.wal.*` 十一键，默认值即下表；单一来源 `WalSource`/`StateConfig`）：
+## openGauss 5.0.0 快速开始（M1 catalog 面）
+
+M1 范围 = catalog 同步 + WAL 接收（**不含 DML 输出**，M2 范围）；存储引擎只做
+ASTORE（UStore/列存/段页式/bucket 表识别即启动期 ISE），仅单机/无 replconninfo 形态。
+起容器与运行：
+
+```bash
+docker run -d --name og-m1 -e GS_PASSWORD=openGauss@123 -p 15700:5432 opengauss/opengauss:5.0.0   # 等就绪 ~60s
+mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java -cp "vb-stream-wal-source/target/classes:$(cat vb-stream-wal-source/target/cp.txt)" \
+     -Dvb.wal.port=15700 -Dvb.wal.user=gaussdb -Dvb.wal.pass=openGauss@123 \
+     -Dvb.wal.og.jdbc.prefix=jdbc:opengauss: \
+     -Dvb.wal.state.dir=/tmp/wal-source-state \
+     org.vastdata.vbstream.walsource.Main
+```
+
+**认证二选一**（`vb.wal.og.jdbc.prefix` 键，缺省 `jdbc:postgresql:`——是否 OG 档在建连
+后才知道，缺省换前缀会反噬 PG 档）：`jdbc:opengauss:` = opengauss-jdbc 走 sha256（镜像
+默认 `password_encryption_type=2`，**OG 部署推荐、零服务端改动**）；`jdbc:postgresql:` =
+vanilla pgjdbc 走 md5，须服务端预埋 `password_encryption_type=1` + 重设密码 + pg_hba
+md5 行（运维自担）。
+
+**pg_hba replication 行是硬前提**：openGauss pg_hba 的 `all` 不匹配 replication 伪库，
+replication 用户必须显式一行（缺省镜像恰已含同形行；自建部署须自查）：
+
+```
+host replication gaussdb 0.0.0.0/0 md5
+```
+
+槽自动建/复用（OG 变体 `pg_create_physical_replication_slot(slot, false)`——第二参是
+dummy_standby 非 immediately_reserve）；收流通道 `-Dvb.wal.og.source=file|direct`
+（缺省 file=sidecar pg_receivexlog 落目录 tail；direct=裸 v3 协议直连，两通道 IT 对拍
+记录序列全等）。OG 五键全表见模块 `CLAUDE.md` 配置面节。
+
+配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键，默认值即下表；单一来源
+`WalSource`/`StateConfig`）：
 
 | 键 | 默认 | 语义 |
 |---|---|---|
@@ -44,6 +79,11 @@ census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观
 | `vb.wal.state.events` | `1000` | catalog 行事件数阈值（与间隔先到为准） |
 | `vb.wal.tables` | 缺省/空 = 全放行 | DML 输出面表白名单（逗号分隔 `schema.table`，relkind 'r'/'p' 持久用户表） |
 | `vb.wal.dml` | `true` | DML 输出开关（false 回纯 v1 catalog 形态；非 true/false 启动期 fail-fast） |
+| `vb.wal.og.source` | `file` | **OG 档**收流通道：file=sidecar 落目录 tail / direct=裸 v3 直连（仅 OG 档读本键） |
+| `vb.wal.og.rx.mode` | `managed` | OG file 通道 sidecar：managed=自拉起 pg_receivexlog / external=只读既有目录 |
+| `vb.wal.og.rx.dir` | `wal-og-queue` | OG file 通道落盘目录（managed 亦作 `-D` 参数） |
+| `vb.wal.og.rx.bin` | `pg_receivexlog` | OG managed 模式可执行文件（走 PATH） |
+| `vb.wal.og.jdbc.prefix` | `jdbc:postgresql:` | OG 档 SQL 会话驱动前缀（`jdbc:opengauss:`=sha256 推荐；缺省保 pgjdbc 防 PG 档反噬，见上文认证二选一） |
 
 ## 架构
 
@@ -74,8 +114,14 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   engine Main 装配）与 wal 直解路各自独立槽位捕获输出，按 xid 交集**逐行 diff 为空**；
   六场景（基础 DML 六形态 / 17 类型边界值 / TOAST 三形态 + 重启 unchanged / DDL-in-txn
   as-of / 2PC 四形态 / 中途停续）+ CREATE SCHEMA + 干扰矩阵。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（253 用例 = 离线 213 + Testcontainers
-  IT 40，后者需本机 Docker）。
+- **openGauss 档（M1）**：`opengauss/opengauss:5.0.0` Testcontainers 五组 IT——catalog
+  末态对拍（65 轮干扰 + 宽 DDL，断言面 vanilla 同源逐行全等）+ 生命周期（检查点续传/
+  损坏回落/门面全装配）+ 实例存活红线（5 轮双 kill 向量：服务端 walsender 终止 +
+  客户端裸 socket 关闭，每轮 SELECT 1 + 日志无 gaussdb exit）+ 黄金 wire 对拍（真流上
+  'k' 恰 33B / 65B 'r' 反馈 peer_role=3/peer_state=7 私有帧形）+ 双通道对拍（file vs
+  direct 同窗口记录序列全等）。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（342 用例 = 离线 295 + Testcontainers
+  IT 47——PG 40 + openGauss 7，后者需本机 Docker）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
 
@@ -85,6 +131,10 @@ pglz 与 lz4 解压/行内压缩/未变列 `<toast-unchanged>`/重启回查）�
 as-of、RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重发、PG 17+18
 双版本。
 
+**✅ 支持（openGauss 5.0.0 档，M1 catalog 面）**：catalog 同步（引导 + ctid 重放 + 末态
+对拍全等）、双通道收流（file/direct 对拍一致）、检查点续传与槽推进、实例存活红线。
+DML 输出是 M2 范围。
+
 **❌ 不支持（触发时的行为）**：
 - **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，
   **DML 面需 `wal_level=logical`**
@@ -92,6 +142,9 @@ as-of、RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-on
 - **矩阵外类型**（enum/jsonb/域等）→ `0x` 十六进制降级 + WARN，流不断
 - **VACUUM FULL/CLUSTER** → 字典跟踪但 DML 语义未承诺
 - **dropped 列** → wal `∅` vs engine 不发——已知分叉面
+- **openGauss 档**：UStore/列存/段页式/bucket 表 → 启动期/流内 ISE（只做 ASTORE）；
+  OG MULTI_INSERT → 解析即 ISE（main 布局未语料锚定，M2 补）；MultiXactId 变体 → 未锚
+  （到达即错位 ISE）；挂 replconninfo 的 HA 形态 → 不在支持面
 
 ## 已知限制（详版见模块 CLAUDE.md）
 

@@ -1,5 +1,26 @@
 # wal-source 适配 PG 9.2 / openGauss 调研报告（2026-10-11）
 
+> **M1 已落地（2026-10-12）**：openGauss 5.0.0 catalog 面适配按
+> `docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md` 完成十任务
+> （判别/布局/双通道收流/槽生命周期/catalog 引导重放/五组 IT——存活红线 5/5、65 轮干扰
+> 对拍全等）；调研期 P0 阻塞（"物理流启动致实例退出"）经 Task 5 化解——DirectWalSource
+> 按 §2.3 终局机理走 **`replication=true` 纯物理形态**（正确路由 XLogSendPhysical，
+> 非 pgjdbc 系 replication=database 的逻辑路由死路），单机形态三认证面直连收流成功、
+> 5 轮双 kill 向量实例存活。**下表勘误**为实施期字节实测对本文若干推导值的修正（原段
+> 落保留作历史，以表为准）：
+
+| 调研期推导 | 实测裁定 | 依据 |
+|---|---|---|
+| 块引用定位器 16B（疑带 bucketNode） | **14B**（RelFileNodeOld 12B + extra_flag u16；16B 仅 bucket 变体、0x80 扩展位 fail-fast） | 32KB 窗口 283 条记录全量走读不变量锚——实测裁定见 task-2 报告 |
+| pg_class 41 列 | **40 列**（catalog 元组 oid 在 9.2 式元组头非数据列，数据区首列即 relname） | og-plan 元组字节直读 + infomask2 natts=40——实测裁定见 task-1 报告 |
+| relfilenode@88 / reltoastrelid@108 / relkind@135（沿 V17 推导） | **84 / 116 / 143**（oid 进元组头少 4B；relpages/reltuples float8 加宽净 8B；五个 oid 列） | 元组字节逐位实测自洽——实测裁定见 task-1 报告 |
+| heap 前缀 16/8/2 系（按现代结构推） | **sizeOfHeap 13/11/2**（老结构 5/3/2 + LogCSN u64；INPLACE 无 CSN） | 语料锚 0x2359908/0x2359AD8/0x23587D8——实测裁定见 task-2 报告 |
+| 65B 'r' 反馈字段 | 同长，但 **peer_role=3 / peer_state=7** 两 OG 尾缀经真流闭环钉死 | 黄金 wire 对拍——实测裁定见 task-5/8 报告 |
+| 记录头 term 恒 `0x80000001` | **单机恒 0x1**（0x80000001 是 HA 段号域形态） | 段页链式走读——实测裁定见 task-1 报告 |
+| 'k' keepalive 帧长（未实测） | **恰 33B**（walprotocol.h） | 真流黄金对拍——实测裁定见 task-8 报告 |
+| 段文件"完成段恒 16MB 零垫尾" | **pg_receivexlog 预分配 16MB 全零 `.partial`**（文件长度≠接收进度——tail 面须前向扫描最后非零字节） | strace + 对拍实证（旧逻辑静默丢 ~760 条尾记录）——实测裁定见 task-8 报告 |
+| `?::pg_lsn` cast（沿 vanilla SQL） | **OG 无 pg_lsn 类型**——cast 每检查点一条 ERROR、槽推进恒失败，须档位化去 cast | pg_type 实查 + 修复后 restart_lsn 真实持久推进——实测裁定见 task-9 报告 |
+
 调研目标：评估 `vb-stream-wal-source`（现支持 PG 17/18）适配 **PG 9.2（openGauss 内核基线）**
 的工作量与可行性。方法：①vanilla PG 9.2 与 openGauss 5.0.0 双 Docker 容器实测（协议面/SQL 面/
 WAL 字节面）；②REL9_2_STABLE 与 openGauss v5.0.0 源码头文件核对；③pgjdbc 42.7.13 与

@@ -18,6 +18,14 @@ catalog 维护对拍全绿；M2 = DML/changes 面（另立 spec）。
   `jdbc:opengauss:` URL）；vanilla pgjdbc + md5 亦可（`jdbc:postgresql:`，运维自担）。
   DriverManager 按 URL 前缀分流，代码零分支。
 
+  > **勘误注记（2026-10-12 Task 6 实施裁定，Task 10 回写）**：上述"OG 档默认
+  > opengauss-jdbc"与实施形态不符——**SQL 会话先于版本判别建立**（判别依赖会话内
+  > `current_setting('server_version_num')` 查询），建连时无法得知是否 OG 档；若缺省
+  > URL 前缀是 `jdbc:opengauss:`，PG 17/18 档会在零配置变化下改走 opengauss-jdbc，
+  > 违反"PG 档零回归"硬约束。实施形态：新增 `vb.wal.og.jdbc.prefix` 键（缺省
+  > `jdbc:postgresql:` 保 PG 档零感知），**openGauss 部署显式设 `jdbc:opengauss:`**
+  > 选 sha256 驱动。§7 配置键清单相应增第五键。
+
 ## 1. 架构总览
 
 ```

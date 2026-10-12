@@ -8,13 +8,20 @@ relfilenode、toast 映射、dropped 占位语义）与 **B. WAL 接收**（物�
 位点管理、检查点持久化）；**v2（2026-10-06 spec）在其上完成用户表 DML 解码与事务
 组装**（changes 包——XactGrouper 事务组装 / TOAST external 重组 / engine 格式复刻
 输出），并以**双路对拍 IT**（engine 逻辑解码路 vs wal 直解路，六场景 + 干扰矩阵 +
-CREATE SCHEMA）证明两路 CDC 输出逐字节等价。设计全文见
-`docs/superpowers/specs/2026-10-05-wal-source-module-design.md` 与
-`docs/superpowers/specs/2026-10-06-wal-source-v2-design.md`（先导实验
-`docs/wal-direct-decode-spike.md` + `spike/wal-parse` throwaway）。
+CREATE SCHEMA）证明两路 CDC 输出逐字节等价；**openGauss 5.0.0 适配 M1（2026-10-11
+spec，2026-10-12 落地）**在 v1 catalog 面上增第三布局档——判别（90204 撞号经
+version() 文本消解）→ OG 布局描述符 → 双通道收流（sidecar 文件 tail / 裸 v3 直连）
+→ catalog 引导/重放 OG 适配（见"openGauss 5.0.0 档"节；DML 面是 M2 范围）。设计全文见
+`docs/superpowers/specs/2026-10-05-wal-source-module-design.md`、
+`docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` 与
+`docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md`（先导实验
+`docs/wal-direct-decode-spike.md` + OG 调研
+`docs/wal-source-opengauss-adaptation-research.md`）。
 
 **依赖方向刻意收窄**：运行依赖 pgjdbc + slf4j-api + lz4-java（TOAST lz4 压缩值解压，
-2026-10-07 lz4 支持落地引入）+ logback-classic（**runtime** 绑定 + `src/main/resources/`
+2026-10-07 lz4 支持落地引入）+ **opengauss-jdbc（runtime，openGauss 档 SQL 会话——sha256
+认证兼容；包名 `org.opengauss.jdbc` 系与 vanilla pgjdbc 同 classpath 共存，DriverManager
+按 URL 前缀分流，M1 Task 6）** + logback-classic（**runtime** 绑定 + `src/main/resources/`
 logback.xml，2026-10-09 自 test-scope 提升——此前 main 面直接跑冒烟 Main 因 slf4j 无绑定
 NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配置时以其 classpath 为准），
 零 engine/Chronicle 依赖——将来是 engine（或连接器）依赖本模块，不是反过来（v2 裁定：两模块是**平级的
@@ -26,12 +33,13 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 
 | 组件 | 位置 | 职责要点 |
 |---|---|---|
-| `WalLayout`/`WalLayouts` | `layout` | 版本化布局常量（`WalLayoutV17`/`WalLayoutV18`，逐常量标注 REL_STABLE 出处）；`forServerVersion` 按 `server_version_num` 分发，未注册版本/显式错配布局启动期 ISE fail-fast |
-| `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**）；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立） |
+| `WalLayout`/`WalLayouts` | `layout` | 版本化布局常量（`WalLayoutV17`/`WalLayoutV18`/`WalLayoutVOpenGauss`，逐常量标注 REL_STABLE/og-plan 实测出处）；`forServerVersion` 按 `server_version_num` 分发，未注册版本/显式错配布局启动期 ISE fail-fast；OG 档 90204 与 vanilla 9.2 撞号，经 `forServer(int, String)` 以 version() 文本判别 |
+| `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**）；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立；OG 变体 `ensureSlotOg`：第二参 dummy_standby） |
+| `WalByteSource` + `FileWalSource`/`ReceivexlogProcess`/`DirectWalSource`（+ direct 子包 `V3ProtocolChannel`/`OgAuth`） | `receive` | **OG 档双通道字节源（M1，详见"openGauss 5.0.0 档"节）**——推模式字节源接口（`start(LongConsumer, BiConsumer<Long,byte[]>)`）；file 通道=sidecar pg_receivexlog 落目录 + FileWalSource tail（managed 自管子进程 / external 只读既有目录）；direct 通道=裸 v3 协议客户端直连收流 |
 | `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码） |
 | `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件 |
 | `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验；formatVersion 3 增 `dmlFloorLsn`——DML 待决桶重放下界，Task 11），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
-| `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面 |
+| `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面；**OG 档（M1）**判别命中 `WalLayoutVOpenGauss` 时转 `startOpenGauss`（`vb.wal.og.*` 五键——见"openGauss 5.0.0 档"节） |
 | `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`Lz4`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/lz4/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger |
 
 单线程直通执行模型（接收 → 解析 → 重放/解码 → 周期落盘全在 wal-receiver 线程，sink
@@ -228,6 +236,75 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 - **wal_compression=off 是运维前提**：PageImages 不解压压缩 FPW——CHECKPOINT 后首写
   必带页镜像，压缩 FPW 记录会 ISE（v1 非目标）。
 
+## openGauss 5.0.0 档（M1 catalog 面，2026-10-11 spec / 2026-10-12 落地）
+
+**范围**：v1 catalog 同步面（引导 + 重放 + 检查点/槽推进）+ WAL 接收双通道；**DML 面
+不装配（M2 范围，请求即 ISE）**。存储引擎只做 ASTORE；版本只做 5.0.0（90204 撞号经
+`forServer(int, String)` 的 version() 文本判别）。调研全文见
+`docs/wal-source-opengauss-adaptation-research.md`（文首有 M1 落地状态与勘误回填）。
+
+**判别与布局差异要点**（`WalLayoutVOpenGauss`，逐常量标注 og-plan 容器实测锚）：
+页魔数 0xD074 / 短页头 24B 含私有 `xlp_total_len@20` / **记录头 32B**（term u32@4
+前置——单机实测恒 0x1，xid@8/info@24/rmid@25/bucket_id@26）/ 块引用消费序 =
+定位器 14B（RelFileNodeOld 12B + extra_flag u16）+ blkno u32 + last_lsn u64、镜像头
+仅 4B 洞字段（无压缩面）/ heap main 老结构 + LogCSN（sizeOfHeap **13/11/2**）/ catalog
+元组 oid 在 9.2 式元组头（[t_hoff-4,t_hoff)，`TupleDecoder` 虚拟 "oidhdr" 槽注入）/ 
+**pg_class 词典 40 列**（非 41——oid 不占数据列）、relfilenode@**84**/reltoastrelid@**116**
+（relpages/reltuples float8 加宽净 8B）/relkind@**143**、全槽位较 vanilla 前移一位 /
+pg_attribute 词典 24 项（attstattarget 回 attnum 4、attnum 槽 5）/ PRUNE 是 9.2 系
+XLOG_HEAP2_CLEAN 单 opcode 与 vanilla 撞号——经 `legacyHeap2Clean()` 门控分派 /
+块 id 高位扩展位（0x80 bucket/段页式、0x40 TDE）启动期 ISE fail-fast / walker 容忍
+整零页（`tolerateAllZeroPages()`——pg_receivexlog 落盘段对跳过页/段尾零区零填充补位）。
+
+**收流双通道（`vb.wal.og.source`）**：
+- **file（缺省）**：sidecar `pg_receivexlog`（`ReceivexlogProcess`——managed 自拉起
+  子进程[stop×拉起竞态锁内互斥、监督线程守护化] / external 只读既有目录）落盘
+  `rx.dir` + `FileWalSource` 目录 tail。**坑**：pg_receivexlog 预分配 16MB 全零
+  `.partial`（文件长度 ≠ 接收进度）——交付上限 = 最后非零字节 +1 前向扫描（旧逻辑
+  静默丢 ~760 条尾记录，对拍实证）。
+- **direct**：`DirectWalSource` 裸 v3 协议客户端（`V3ProtocolChannel`/`OgAuth`）——
+  startup packet **`replication=true`** 形态（非 pgjdbc 的 replication=database；两驱动
+  的复制 API 只会 database 形态故不可用）→ 认证（OG sha256 挑战[码 11，应答含 iteration
+  尾缀] + md5 + 码 10-3.0 签名三面）→ IDENTIFY_SYSTEM → START_REPLICATION（可带 SLOT）→
+  'w'/'k' 解析。**OG 私有帧形**：'k' keepalive 恰 **33B**（walprotocol.h，真流闭环锚）；
+  反馈 'r' standby status 恒 **65B**（多 peer_role u32=3 / peer_state u32=7 两 OG 尾缀）；
+  块锚 = dataStart + 载荷长（非 walEnd）。断线重连面：CopyDone / 畸形 'k' 帧归可重试
+  IOException。心跳线程周期 = statusInterval 之半。
+- **部署硬前提**：openGauss pg_hba 的 `all` 不匹配 replication 伪库——replication 用户需
+  显式 `host replication <user> 0.0.0.0/0 md5` 行（测试环境幂等追加 + reload 兜底）。
+
+**catalog 引导/重放 OG 适配**（Task 7）：LSN 函数无 flush 档（`pg_current_xlog_location()`
+write 位点，B 取值面同 C1 语义）；种子 SQL 的 OG 列单投影（41 列 SQL 面 vs 40 列 WAL 面
+口径差已 javadoc）；**槽推进 cast 门控**——OG 无 `pg_lsn` 类型（`?::pg_lsn` 每检查点一条
+ERROR、槽恒不推），`CatalogSynchronizer.advanceLsnCast` 缺省 `"::pg_lsn"` 保 PG 档字节
+等价、`startOg` 装配期覆写空串（text 直传即通）；**存储引擎护栏**（种子面 + 流内
+INS/UPD 双面，识别即 ISE 含 relname/oid）：列存（relcudescrelid/reldeltarelid≠0）、
+分区（parttype≠'n'）、段页式/bucket（relbucket≠null≠0）、UStore（reloptions 含
+storage_type=ustore/segment=on）——护栏读区越界零填充段按不可判跳过（防假阳性）；
+系统列 attnum 诊断下界经 layout 取（vanilla -6 / OG -8——tableoid/xc_node_id 是 -7/-8，
+2026-10-12 实修防误报"词典错位"WARN）。
+
+**验收**（OG IT 5 类，`opengauss/opengauss:5.0.0` Testcontainers `OgTestEnv`）：
+`OgCatalogSyncIT`（65 轮干扰 + 宽 DDL 对拍，断言面 vanilla 同源逐行全等）、`OgLifecycleIT`
+三用例（检查点续传/损坏回落/门面全装配 og.source=direct 两轮启停）、`OgInstanceSurvivalIT`
+（存活红线 5/5 双 kill 向量——服务端 walsender 终止 + 客户端裸 socket 关闭，每轮 SELECT 1 +
+日志无 gaussdb exit）、`OgGoldenWireIT`（黄金 wire 对拍——'k'=33/'r'=65 私有帧形）、
+`OgDualChannelParityIT`（双通道对拍——file vs direct 同窗口记录序列全等
+  [lsn/totLen/rmid/info]，窗口按两路覆盖较小者归一）。
+
+**已知限制（OG 档增量，详版记档见各任务报告）**：
+- **MULTI_INSERT 解析即 ISE**：OG 档 main 布局未语料锚定（og-plan 32KB 窗口 283 条零
+  multi_insert；候选锚 rmid=9 info 0x30 已造）——fail-fast 优于盲解错位，M2 补。
+- **MultiXactId 变体未锚**：xmax 为 MultiXactId 时 UPDATE/DELETE 走全量 SizeOfHeap
+  （u64 xmax 布局，前缀漂移）——常量锚常态逻辑日志形态，变体到达即偏移错位 ISE。
+- **挂 replconninfo 的 HA 形态不在支持面**（"build walsender 自杀"雷区）——仅单机/
+  无 replconninfo 实例验证。
+- **write 位点起流语义**：OG 无 flush 位点函数，对拍目标前沿取 write 位点——write ≥
+  flush 使引导窗口 S ≥ B(write) 更窄（物理流自 flushed 起发，重发窗口两检查点 IT 闭环
+  无丢失）；槽推进对 write 档 restart_lsn 的观察面已验（推进成功才断言落位）。
+- **`advanceLsnCast` 直写字段**（唯一写点 startOg）：未来新增非 startOg 的 OG 装配路径
+  会静默回落失败 cast——新装配路径须同步覆写（Task 9 记档）。
+
 ## 已知限制
 
 - **接收器终态死亡进程面**：接收器 5 次重连失败/解析 ISE 后线程自行退出（ERROR），
@@ -260,7 +337,7 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
   stored，不二次施加字典）——重放段重建桶后终态补发；对拍验收
   `DualPathParityIT` 2PC 四形态（挂起零输出/弃桶/COMMIT PREPARED/挂起重启续传）。
 
-## 配置面（`vb.wal.*` 十一键，`WalSource`/`StateConfig` 单一来源）
+## 配置面（`vb.wal.*` 十一基础键 + openGauss 档五键，`WalSource`/`StateConfig` 单一来源）
 
 | 键 | 默认 | 语义 |
 |---|---|---|
@@ -275,6 +352,11 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 | `vb.wal.state.events` | `1000` | catalog 行事件数阈值（与间隔先到为准；≤0 IAE） |
 | `vb.wal.tables` | 缺省/空 = 全放行 | DML 输出面表白名单（逗号分隔 `schema.table`；relkind 'r'/'p' 持久用户表） |
 | `vb.wal.dml` | `true` | DML 输出开关（false 回纯 v1 catalog 形态——ChangeStream 不装配；非 true/false 构造期 IAE） |
+| `vb.wal.og.source` | `file` | **OG 档**收流通道：`file`=sidecar pg_receivexlog 落目录 + FileWalSource tail；`direct`=DirectWalSource 裸 v3 直连。非法值构造期 IAE；PG 17/18 档不读本键 |
+| `vb.wal.og.rx.mode` | `managed` | OG file 通道 sidecar 管理：`managed`=自拉起 pg_receivexlog 子进程；`external`=只读既有落盘目录（进程运维自担）。非法值 IAE |
+| `vb.wal.og.rx.dir` | `wal-og-queue` | OG file 通道落盘目录（managed 的 `-D` 参数值；相对工作目录）。显式空白构造期 IAE |
+| `vb.wal.og.rx.bin` | `pg_receivexlog` | OG managed 模式的 pg_receivexlog 可执行文件（走 PATH）。显式空白构造期 IAE |
+| `vb.wal.og.jdbc.prefix` | `jdbc:postgresql:` | OG 档 SQL 会话驱动 URL 前缀：`jdbc:opengauss:`=opengauss-jdbc（sha256，OG 部署**显式设置**）；缺省保 `jdbc:postgresql:`=vanilla pgjdbc（+md5，须 pg_hba 预埋 md5 行）——**缺省不换前缀的理由**：是否 OG 档在建连后才知道，默认换前缀会让 PG 17/18 档零配置变化下改走 opengauss-jdbc（违反 PG 档零回归）。非法值 IAE |
 
 冒烟 Main 周期行（10s，logger `org.vastdata.vbstream.walsource.Main`）：
 `smoke: lsn=… records=N resyncs=N reconnects=N censusTop3=[rmid/XX=count,…]`，state
@@ -288,20 +370,29 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**253 用例 = 离线 213 + Testcontainers IT 40（需本机 Docker）**。
+**342 用例 = 离线 295 + Testcontainers IT 47（PG 40 + openGauss 7；需本机 Docker）**。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
-  "两版 toast 偏移差恰 4B"自检锚）；`receive` WalStreamWalkerTest 12（锚定协议含
-  mid-stream 漂移免疫）；`replay` CatalogReplayTest 15 / CatalogSynchronizerTest 9（含
-  引导前沿种子过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚）/ SelfHealerTest
-  4；`state` StateStoreTest 9（往返/CRC 拒载/版本拒载/pgVersion 参数化错配拒载——
-  17 写 17、18 写 18，终审 I1；formatVersion 3 dmlFloorLsn 往返）/ StateConfigTest
-  5；`changes`（v2 DML 面：DiskValueRendererTest 18 / XactGrouperTest 20 /
-  ToastAssemblerTest 13（含 lz4 双形态解压往返与未知方法码 ISE）/ OutputRendererTest 7 /
-  TableFilterTest 7 / PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：
-  手造黄金字节 + 库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；
-  `api` WalSourceConfigTest 5；ModuleBuildTest 1。
+  "两版 toast 偏移差恰 4B"自检锚；**OG 档**：OgWalRecordParserTest 4（真实语料 283 条
+  全窗走读 + 四锚记录 + prev 链自洽）/ OgPruneViewTest 6（9.2 系 CLEAN 老格式 + 撞号
+  门控）/ WalLayoutVOpenGaussTest 5 / WalLayoutsOgDiscriminatorTest 5（90204 撞号
+  文本判别））；`receive` WalStreamWalkerTest 14（锚定协议含 mid-stream 漂移免疫 +
+  OG 整零页容忍）/ FileWalSourceTest 10（目录 tail + .partial 预分配全零的前向扫描
+  交付上限）/ direct 子包（**M1 裸 v3 客户端**：V3ProtocolChannelTest 6 / OgAuthTest 6
+  （sha256 码 11/码 10-3.0 签名/md5 三认证面）/ DirectWalSourceStreamTest 6 /
+  DirectWalSourceFeedbackTest 2（65B 'r' 反馈 + 心跳））；`replay` CatalogReplayTest
+  16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 9（含引导前沿种子
+  过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚）/ SelfHealerTest 4 / **OG 档**：
+  OgCatalogReplayTest 11（头 oid/护栏/OG 词典/attnum -7/-8 合法下界）/ 
+  OgCatalogBootstrapSqlTest 4；`state` StateStoreTest 10（往返/CRC 拒载/版本拒载/
+  pgVersion 参数化错配拒载——17 写 17、18 写 18，终审 I1；formatVersion 3 dmlFloorLsn
+  往返 + OG 档 majorVersion=5）/ StateConfigTest 5；`changes`（v2 DML 面：
+  DiskValueRendererTest 18 / XactGrouperTest 20 / ToastAssemblerTest 13（含 lz4 双形态
+  解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 7 /
+  PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
+  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7）；`api` WalSourceConfigTest
+  5 / OgWalSourceConfigTest 13（OG 五键解析/缺省值/IAE 面）；ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
   `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
   REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 19（v2 双路对拍——engine
@@ -317,4 +408,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   风暴/随机 CHECKPOINT 干扰下 DDL 全场景对拍，@RepeatedTest(2) + RENAME 最小复现）、
   `WalLifecycleIT` 5（检查点续传/损坏回落全新引导/丢页末态追平 resyncs==0/门面全装配/
   引导窗口并发 DDL 不丢行）、`Wal17SyncIT` 7（17 对抗精简版 + 生命周期 + 跨版本分发
-  拒绝与 V18 注入 fail-fast 零副作用）。
+  拒绝与 V18 注入 fail-fast 零副作用）；**openGauss 档 7 用例**（`opengauss/opengauss:5.0.0`
+  `OgTestEnv` 单例，详见"openGauss 5.0.0 档"节验收段）：`OgCatalogSyncIT` 1 /
+  `OgLifecycleIT` 3 / `OgInstanceSurvivalIT` 1 / `OgGoldenWireIT` 1 /
+  `OgDualChannelParityIT` 1。
