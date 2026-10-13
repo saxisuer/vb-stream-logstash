@@ -111,8 +111,8 @@ public final class CatalogReplay {
 
     /**
      * pg_partition 腿的解码词典（惰性缓存，openGauss M3 Task 1）：即
-     * {@link CatalogRow.PartitionRow#kinds()}（33 项含虚拟头 oid 槽——OG 专属表，
-     * 词典自持无版本分派）。构造后只读，线程安全。
+     * {@link CatalogRow.PartitionRow#kinds(WalLayout)}（33 项含虚拟头 oid 槽——OG
+     * 专属表，经版本感知分派：VastBase 档返回 name128 变体）。构造后只读，线程安全。
      */
     private String[] partitionDecodeKinds;
 

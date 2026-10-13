@@ -21,7 +21,7 @@ import java.nio.charset.StandardCharsets;
  * 的版本化访问器（{@code attrDroppedIndex()} / {@code classToastRelidIndex()} /
  * {@code classRelkindIndex()}）取值，禁止跨版本硬编码；其余投影槽位（词典前段）
  * V17/V18 同序。pg_namespace 列序两版无漂移（oid/nspname/nspowner/nspacl 四列），
- * 词典自持于 {@link NspRow#kinds()}，不经 layout。</p>
+ * 词典经 {@link NspRow#kinds(WalLayout)} 版本感知分派（vanilla 档自持 4 项）。</p>
  */
 public final class CatalogRow {
 

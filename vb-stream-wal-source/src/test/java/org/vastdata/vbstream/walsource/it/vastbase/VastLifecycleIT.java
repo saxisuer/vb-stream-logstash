@@ -61,7 +61,7 @@ class VastLifecycleIT {
 
     private static final Logger LOG = LoggerFactory.getLogger(VastLifecycleIT.class);
 
-    /** VastBase 档布局单例（记录层与 OG 5.0.0 同构，词典几何 name128——判别在门面探测）。 */
+    /** VastBase 档布局单例（记录头与 OG 5.0.0 同构，heap UPDATE/DELETE 前缀 21/19 除外，词典几何 name128——判别在门面探测）。 */
     private static final WalLayout LAYOUT = WalLayoutVVastbase.INSTANCE;
 
     /** direct 通道反馈心跳的 statusInterval（毫秒）——对齐 OG 侧同步 IT 的 5s 档。 */

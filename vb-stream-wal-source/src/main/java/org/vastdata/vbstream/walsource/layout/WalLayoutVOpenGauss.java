@@ -46,9 +46,10 @@ package org.vastdata.vbstream.walsource.layout;
  * 15 条记录 MAXALIGN 步进下 prev 链逐条自洽（pageaddr+off 对齐）。</p>
  *
  * <p><b>可继承声明（vastbase 适配 Task 2 起）</b>：VastBase G100 第四布局档
- * {@link WalLayoutVVastbase} 继承本类——记录层与 OG 5.0 全同构（132019 条真实 WAL
- * 记录零 resync 实证，vastbase spec §0.2），仅 catalog 词典几何分叉（NAMEDATALEN
- * 128 等，Task 3 落地）。<b>本类的读区偏移常量（84/116/143）与两词典数组均为
+ * {@link WalLayoutVVastbase} 继承本类——记录头/块引用层与 OG 5.0 全同构（132019 条
+ * 真实 WAL 记录零 resync 实证，vastbase spec §0.2），另有 heap UPDATE/DELETE main
+ * 前缀 xid u64 殿后分叉（子类覆写 21/19，T6 真库实测锚）+ catalog 词典几何分叉
+ * （NAMEDATALEN 128 等，Task 3 落地）。<b>本类的读区偏移常量（84/116/143）与两词典数组均为
  * OG 64B name 几何</b>——VastBase 档覆写为 148/180/207 与自含 oidhdr 的
  * name128 词典（见其类注释的槽位口径段），防误读：本类各偏移 javadoc 不再逐条
  * 标注 VastBase 对照值。本类自身无状态、行为零变化；{@code WalSource} 等消费面

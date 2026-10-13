@@ -49,7 +49,7 @@ public final class WalLayouts {
      * 9 万段同落拒绝面（判别信息缺失不得静默猜测）。其余版本号 ISE 附版本号与文本。
      * 线程约束：静态纯函数，并发安全。vastbase T4 起委派三参重载
      * {@link #forServer(int, String, int)}（探测值传 -1——无探测面时 VastBase 分支
-     * 不可达，行为与旧实现逐字节一致，离线测试锚不破）。</p>
+     * 不可达，分发语义与旧实现一致(仅 vanilla 9.2 拒绝消息文案附探测值后缀)，离线测试锚不破）。</p>
      *
      * @param pgVersionNum 服务端版本号（如 90204/180000）
      * @param versionText  服务端 {@code version()} 返回文本（判别 openGauss 的唯一面）

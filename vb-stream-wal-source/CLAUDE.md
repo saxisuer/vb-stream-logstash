@@ -17,8 +17,9 @@ DML 面收官**——兼容模式护栏 + XACT/MULTI_INSERT/列压缩/分区四�
 开门 + 分区捕获**——白名单放宽 {'PG','A'} + pg_partition 第四 watched 字典（分区行
 正常捕获、母表身份输出）+ 白名单双匹配 + StateStore v4 + A 档全量复验与分区专项
 对拍，见"openGauss 5.0.0 档 M3"节；**VastBase G100 V3.0 适配（2026-10-13 spec，同日
-T0-T7 收官）第四布局档 `WalLayoutVVastbase`**——OG 6.0.0 内核发行版，记录层与 OG 同构
-+ name128 词典几何 + relname 探测判别 + heap 前缀 21/19 与 oradate 重映射两接缝 + 手动档
+T0-T7 收官）第四布局档 `WalLayoutVVastbase`**——OG 6.0.0 内核发行版，记录头与 OG 同构
+(heap UPDATE/DELETE 前缀 21/19 分叉) + name128 词典几何 + relname 探测判别 + heap 前缀
+21/19 与 oradate 重映射两接缝 + 手动档
 真库 IT 三组（catalog 对拍/DML 对拍/生命周期），见"VastBase G100 档"节）。设计全文见
 `docs/superpowers/specs/2026-10-05-wal-source-module-design.md`、
 `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` 与
@@ -674,7 +675,7 @@ VastBase 手动档真库 IT 20（`it/vastbase` 包——常规跑全 skip，`@En
 （2026-10-13 M3 收口 surefire 逐类对账口径；2026-10-13 vastbase T7 收口同口径重对——
 离线 377→396 净增 19：vastbase 线 18[TupleDecoder +2 name128 / TableFilter +1 /
 WalLayoutsOgDiscriminator +1 三参 / WalLayoutVVastbase 10 / VastProbeDiscriminator 2 /
-OgXactGrouperSeam +2] + OgPartitionDictionary 9→10 的 M3 期漏记 1 一并校准）+ 手动档 20）。
+OgXactGrouperSeam +2] + OgPartitionDictionary 9→10 的 M3 期漏记 1 一并校准 + 手动档 20）。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 17
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
