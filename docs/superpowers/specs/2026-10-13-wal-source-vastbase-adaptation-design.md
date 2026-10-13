@@ -1,7 +1,7 @@
 # vb-stream-wal-source VastBase G100 适配设计(第四布局档)
 
 - **日期**:2026-10-13
-- **状态**:设计定稿(用户已批准方案 A 与七节设计)
+- **状态**:设计定稿(用户已批准方案 A 与七节设计);**T0-T7 已收官(同日)——执行偏差回填见 §9**
 - **前置**:M1/M2/M3 已收官(OG 5.0.0 档 catalog + DML 面 + A 档 + 分区捕获);本 spec 为独立适配线,不占用 OG M 系列编号(M4 仍指 B/'C' 档)
 - **实测基础**:2026-10-13 对真实 VastBase G100 V3.0(Build 9,OG 6.0.0 内核,172.16.107.133:55433/test_a)的探测与全装配试跑,锚定数据见附录 A
 
@@ -208,6 +208,41 @@ M2 的双路对拍基准路 = opengauss-jdbc `logical()` in-process 逻辑流 + 
 - **真库干扰**:手动档 IT 在用户测试库上跑,须避开业务表(orders 等既有表不触碰);槽/表 vb_wal_ 前缀 + 用例级清理
 - **name128 的溢出语义**:VastBase 标识符最长 128B(实测 attlen),渲染剥离尾零即可;>128B 形态不存在于 name 定宽存储
 - **判别探测的假阳性面**:真 vanilla 9.2(64B name)不受影响;未来其他 NAMEDATALEN≠64 的发行版会被误认 VastBase——可接受(探测值 128 当前唯 VastBase),消息附探测值可诊断
+
+---
+
+## §9 执行偏差回填(T0-T7 收官,2026-10-13)
+
+实施期对设计的四处修正/补充(逐项经审查裁定正当,原章节保留作历史):
+
+1. **§0.2/§5 "记录层(heap 载荷)零改动"修正为"记录头全兼容,heap 载荷 xid 宽度分叉"**
+   (T6 真库对拍首轮 9 红逼出的真差异,设计期 132019 条 census 实证只覆盖记录头/块引用面):
+   VastBase 的 heap UPDATE/DELETE main 前缀较 OG 各 **+8(xid u64 殿后,无条件在场——OG 仅
+   INIT_PAGE 变体带前置 pd_xid_base)**——`sizeOfHeapUpdate()=21`/`sizeOfHeapDelete()=19`
+   覆写 + `XactGrouper` 旧行元组偏移补 `ogInitShift`(rec)(兼修 OG 档 INIT_PAGE 变体的
+   同型潜在错位)。vastdump 探针锚:UPDATE info=0x40 main `[old u16][new u16][flags u8]
+   [CSN u64][xid u64]`、DELETE info=0x10 同构;INSERT 常态 offnum@0 与 OG 等同不受影响、
+   INIT_PAGE 变体 +8 前缀原样成立(离线双档锚:`OgXactGrouperSeamTest` 场景⑥⑦)。
+2. **第二主代码接缝:`WalLayout#remapDmlTypeOid`(缺省恒等,VastBase 覆写
+   9040[oradate]→1114[timestamp])**(T6):A 档 DDL 关键字 `date` 落私有类型 oradate
+   (oid 9040,typlen=8)——**非 OG A 档的 1114**(M3 结论在 VastBase 反转);磁盘表示与
+   timestamp 同构(8B epoch-2000 微秒),`TableFilter.assembleMeta` 经接缝归一后
+   DecodeKinds/渲染零改动;catalog 面 atttypid 保持 9040 原值(catalog 对拍不受扰)。
+3. **§2 "词典宿主统一上移(接口新增 pgPartitionKinds/pgNamespaceKinds)"执行为
+   CatalogRow 版本感知分派**(T2 执行裁定):沿 M2/M3 已有的 `CatalogRow` kinds 分派先例
+   (`NspRow#kinds(WalLayout)`/`PartitionRow.KINDS` 按布局实例判别)而非字面上移接口——
+   接口面零新增方法,vanilla/OG 词典内容零变化(离线零回归锚);`nameDatumWidth()` 是
+   唯一新增的布局接缝(name128 kind 定宽由其驱动)。
+4. **§3.1 补充:护栏槽位三覆写**(T3,spec 词典差异表未列):relhassecids 插入使分叉点后
+   槽位整体 +1——`classParttypeIndex()` 31→**32**、`classReloptionsIndex()` 34→**35**、
+   `classRelbucketIndex()` 37→**38**(存储引擎护栏三判别列的物理槽位;消费面经继承的
+   `classValsSlotDelta()`=1 落回 attnum 值行槽位,与 OG 同式桥接)。
+
+另两项验收期裁定记档(非偏差,spec §8 风险面的实测落点):**uuid_out RAW 风格(32 位大写
+hex 无连字符)+ numeric_out 剥小数尾零(Oracle NUMBER 语义)**——同一字节值的两种合法文本
+形态,对拍矩阵避开 + javadoc 记档(沿 OG M2 float 先例),方言渲染分支归后续任务;
+**逻辑解码器 DDL-in-txn 不丢弃后续行**(与 OG 的静默丢弃裁定反转,与 vanilla 同形)——
+场景 4 改双块全量 parity,断言强度升不降。
 
 ---
 

@@ -422,6 +422,9 @@ class VastCatalogSyncIT {
     /**
      * 对拍主断言（{@code WalSyncItBase#assertCatalogMatchesJdbc} 的语义复刻 + VastBase
      * 第四字典两面）：停流后的快照四字典 vs JDBC REPEATABLE READ 单事务实查。
+     * <b>包内共享面（vastbase T7）</b>：{@code VastLifecycleIT} 的续传/回落两用例复用
+     * 本断言（传 {@code droppedP2Filenode=0} 跳过分区归空面）——对拍器单源，防两份
+     * 复刻漂移。
      *
      * <p>关键步骤：① 两侧各自按基表 oid 收集 pg_class 行并发现 toast oid（并集为对拍
      * 范围——两侧行模型本身含 reltoastrelid，单侧陈旧由 pg_class 行对拍暴露）；② JDBC
@@ -440,7 +443,7 @@ class VastCatalogSyncIT {
      * @param relOids           对拍关系 oid 集（基表，toast 自动并入）
      * @throws SQLException JDBC 实查失败
      */
-    private void assertVastCatalogMatchesJdbc(CatalogSynchronizer sync, Connection probe,
+    static void assertVastCatalogMatchesJdbc(CatalogSynchronizer sync, Connection probe,
             long trackedOid, long droppedP2Filenode, long... relOids) throws SQLException {
         TreeSet<Long> baseOids = new TreeSet<>();
         for (long oid : relOids) {

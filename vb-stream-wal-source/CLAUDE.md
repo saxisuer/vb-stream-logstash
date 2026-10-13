@@ -16,12 +16,16 @@ DML 面收官**——兼容模式护栏 + XACT/MULTI_INSERT/列压缩/分区四�
 全量验收，见"openGauss 5.0.0 档 M2"节；**M3（2026-10-13 spec，同日落地）A 兼容模式
 开门 + 分区捕获**——白名单放宽 {'PG','A'} + pg_partition 第四 watched 字典（分区行
 正常捕获、母表身份输出）+ 白名单双匹配 + StateStore v4 + A 档全量复验与分区专项
-对拍，见"openGauss 5.0.0 档 M3"节）。设计全文见
+对拍，见"openGauss 5.0.0 档 M3"节；**VastBase G100 V3.0 适配（2026-10-13 spec，同日
+T0-T7 收官）第四布局档 `WalLayoutVVastbase`**——OG 6.0.0 内核发行版，记录层与 OG 同构
++ name128 词典几何 + relname 探测判别 + heap 前缀 21/19 与 oradate 重映射两接缝 + 手动档
+真库 IT 三组（catalog 对拍/DML 对拍/生命周期），见"VastBase G100 档"节）。设计全文见
 `docs/superpowers/specs/2026-10-05-wal-source-module-design.md`、
 `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` 与
 `docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md` 与
 `docs/superpowers/specs/2026-10-12-wal-source-opengauss-m2-design.md` 与
-`docs/superpowers/specs/2026-10-13-wal-source-opengauss-m3-design.md`（M2 DML 面已收官，
+`docs/superpowers/specs/2026-10-13-wal-source-opengauss-m3-design.md` 与
+`docs/superpowers/specs/2026-10-13-wal-source-vastbase-adaptation-design.md`（M2 DML 面已收官，
 2026-10-12 同日落地——兼容模式护栏[PG 档 only，A/B 档启动期 ISE 附 M3/M4 指引] +
 XACT/MULTI_INSERT/列压缩/分区四接缝 + v2 六场景双路对拍[基准路=OG 逻辑解码]全量验收，
 见"openGauss 5.0.0 档 M2"节；M3 已收官 2026-10-13——A 档开门 + 分区捕获，见
@@ -44,13 +48,13 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 
 | 组件 | 位置 | 职责要点 |
 |---|---|---|
-| `WalLayout`/`WalLayouts` | `layout` | 版本化布局常量（`WalLayoutV17`/`WalLayoutV18`/`WalLayoutVOpenGauss`，逐常量标注 REL_STABLE/og-plan 实测出处）；`forServerVersion` 按 `server_version_num` 分发，未注册版本/显式错配布局启动期 ISE fail-fast；OG 档 90204 与 vanilla 9.2 撞号，经 `forServer(int, String)` 以 version() 文本判别 |
+| `WalLayout`/`WalLayouts` | `layout` | 版本化布局常量（`WalLayoutV17`/`WalLayoutV18`/`WalLayoutVOpenGauss`/`WalLayoutVVastbase`，逐常量标注 REL_STABLE/og-plan/真库实测出处）；`forServerVersion` 按 `server_version_num` 分发，未注册版本/显式错配布局启动期 ISE fail-fast；OG 档 90204 与 vanilla 9.2 撞号，经 `forServer(int, String)` 以 version() 文本判别；VastBase 档再撞号（无 branding），经 `forServer(int, String, int)` 三参版以 relname attlen 探测判别（见"VastBase G100 档"节） |
 | `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**）；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立；OG 变体 `ensureSlotOg`：第二参 dummy_standby） |
 | `WalByteSource` + `FileWalSource`/`ReceivexlogProcess`/`DirectWalSource`（+ direct 子包 `V3ProtocolChannel`/`OgAuth`） | `receive` | **OG 档双通道字节源（M1，详见"openGauss 5.0.0 档"节）**——推模式字节源接口（`start(LongConsumer, BiConsumer<Long,byte[]>)`）；file 通道=sidecar pg_receivexlog 落目录 + FileWalSource tail（managed 自管子进程 / external 只读既有目录）；direct 通道=裸 v3 协议客户端直连收流 |
 | `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码） |
 | `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件 |
 | `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验；formatVersion 3 增 `dmlFloorLsn`——DML 待决桶重放下界，Task 11），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
-| `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面；**OG 档（M1）**判别命中 `WalLayoutVOpenGauss` 时转 `startOpenGauss`（`vb.wal.og.*` 五键——见"openGauss 5.0.0 档"节） |
+| `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面；**OG 档（M1）**判别命中 `instanceof WalLayoutVOpenGauss`（VastBase 子类同命中，vastbase T4）时转 `startOpenGauss`（`vb.wal.og.*` 五键——见"openGauss 5.0.0 档"节） |
 | `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`Lz4`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/lz4/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger |
 
 单线程直通执行模型（接收 → 解析 → 重放/解码 → 周期落盘全在 wal-receiver 线程，sink
@@ -518,7 +522,64 @@ CU 族 WAL 是独立大项，除非呈报）；跨分区 UPDATE 迁移 = DELETE+
 自然，专项 IT 已钉）；"链断不回退三表"语义收紧后的真实链断 + oid 碰撞叠加形态极窄，
 记档不另设 IT。
 
-## 已知限制
+## VastBase G100 档（第四布局档，2026-10-13 spec / 同日 T0-T7 收官）
+
+**范围**：VastBase G100 **V3.0（Build 9，OG 6.0.0 内核，2026-03-31）** 的 catalog 同步面
++ DML 面——与 OG 档同构的完整能力（四字典 / 检查点续传 / direct 通道[真库实测，file 通道
+形态同 OG 未专项验] / DML 输出 / 分区捕获[第四字典沿用 M3] / A 档[真库恒 A 档，M3 白名单
+内]）。设计 `docs/superpowers/specs/2026-10-13-wal-source-vastbase-adaptation-design.md`
++ spike `docs/wal-source-vastbase-adaptation-spike.md` + 实施计划
+`docs/superpowers/plans/2026-10-13-vastbase-adaptation.md`。**仅认 V3.0**：判别命中
+（relname attlen=128）但版本面不认的其他 OG 系发行版仍拒（64B name 的无 branding 发行版
+走 vanilla 9.2 ISE 不变）。
+
+**判别（第二面 = relname 探测）**：`version()` 报 `PostgreSQL 9.2.4 ...` **无任何
+openGauss/VastBase branding**（branding 只在 `v$version` 视图）且 `server_version_num=90204`
+——与 vanilla 9.2 / OG 三方撞号。`WalLayouts.forServer(int, String, int)` 三参重载：9 万段
++ 含 "openGauss" 文本 → OG 档（两参版语义不变）；9 万段 + 无 branding + **经已建 SQL 会话
+探测 `pg_class.relname` attlen** → 128 = VastBase 档 / 64 或探测失败 = vanilla 9.2 ISE 不变
+（消息附探测值）。探测在建槽**之前**（M2 护栏纪律：ISE 先于槽副作用）、只跑一次（9 万段
+无 branding 才触发，17/18 档零触碰）。OG 装配分支门控 `instanceof WalLayoutVOpenGauss` 化
+（子类命中同一 `startOpenGauss`——OG 变体建槽/bootstrap OG 种子/direct 通道全沿用）。
+
+**词典几何差异表**（`WalLayoutVVastbase extends WalLayoutVOpenGauss`，全部列序/attlen
+2026-10-13 真库实查锚——spec 附录 A）：
+
+| 面 | OG 5.0.0 | VastBase G100 | 形态 |
+|---|---|---|---|
+| NAMEDATALEN（name kind） | 64（`name`） | **128（`name128`，T1 新 kind——128B 定宽/对齐 'c'/剥尾零）** | 四词典含 name 列者全加宽 |
+| pg_class 词典 | oidhdr + 40 = 41 | **oidhdr + 42 = 43**（槽 24 插 `relhassecids`；尾增 `relminmxid`/`relrewrite`） | 读区偏移统一 +64B |
+| pg_attribute 词典 | 24 | **29**（槽 19/20 插 `attalias`(name128)/`attisquoted`；尾增 `attidentity`/`attextraopt`/`attdroppedname`） | 投影槽位（attnum@5/dropped@14 等）全在分叉点前——AttrRow 零改动 |
+| pg_partition / pg_namespace 词典 | 32+oidhdr / 7+oidhdr | **列集零分叉，仅 name → name128**（读区偏移同 +64） | M3 第四字典沿用 |
+| pg_class 读区偏移 | relfilenode@84 / reltoastrelid@116 / relkind@143 | **148 / 180 / 207**（name 128 + oid×5；自检锚"与 OG 差恰 64B"） | INPLACE 直读/截断重建读区 |
+| heap UPDATE/DELETE main 前缀 | 13 / 11（老结构 + LogCSN） | **21 / 19**（再 + **xid u64 殿后**，无条件在场——T6 真库实测锚；INIT_PAGE 变体仍 +8 前缀 pd_xid_base，`XactGrouper.ogInitShift` 同型适用） | 记录层唯一分叉（spec §0.2 "记录层全兼容"修正为"记录头全兼容，heap 载荷 xid 宽度分叉"） |
+| DML 类型 oid | — | **9040（oradate，A 档 `date` 关键字私有类型）→ 1114（timestamp）**：`WalLayout#remapDmlTypeOid` 接缝（缺省恒等，VastBase 覆写；`TableFilter.assembleMeta` 经接缝归一——catalog 面 atttypid 保持 9040 原值不受扰） | 磁盘表示与 timestamp 同构（8B epoch-2000 微秒），DecodeKinds/渲染零改动 |
+| 检查点档位 | majorVersion=5 | **majorVersion=6**（v5 检查点在本档拒载回落全新引导——判别落点的排他证据） | StateStore 档位隔离 |
+
+**验收（手动档 IT，`-Dvb.it.vastbase=true`，连真库 172.16.107.133:55433/test_a——非
+Testcontainers 长活共享环境；常规 `mvn test` 全 skip）**：`VastCatalogSyncIT` 2（干扰 + 全
+DDL 场景四字典 vs JDBC REPEATABLE READ 逐行全等——对拍器包内自持复刻 `WalSyncItBase` 语义
++ pg_partition 行级/身份链两面 + 门面判别链 v6 检查点排他锚）、`VastDmlParityIT` 15（v2
+六场景 + A 档 date 专形 + **COPY 批量 MULTI_INSERT 真几何[T7 补]**——基准路 = opengauss-jdbc
+逻辑流 + `OgParityBaseline` 复用[T0 spike 裁定"同形"：认证 md5 码 5 一次过、B 帧 xid Int64/
+TupleData Int16 ncols 前缀两处帧级差异原样成立]、DDL-in-txn 双块全量 parity[VastBase 解码器
+不丢弃 DDL 后续行——与 OG 的静默丢弃裁定反转]、2PC/中途停续 state.dir 两轮）、`VastLifecycleIT`
+3（检查点续传两轮启停对拍 / state 截断回落全新引导 / 门面全装配 direct 通道两轮启停——对拍
+断言复用 `VastCatalogSyncIT.assertVastCatalogMatchesJdbc` 包内共享面）。环境/连接参数经
+`-Dvb.it.vastbase.{host,port,db,user,pass}` 可覆盖（缺省真库实测值，`VastTestEnv` 单一来源）。
+
+**已知限制（VastBase 档增量）**：①**仅 V3.0（Build 9）**——其他版本线不承诺，64B name 无
+branding 发行版仍拒（探测假阳性面：未来 NAMEDATALEN=128 的其他发行版会被误认——spec §8
+记档可接受）；②**uuid/numeric 输出函数方言**（值面裁定，沿 OG float 先例避开 + 记档）：
+`uuid_out` 渲 RAW 风格（32 位大写 hex 无连字符）vs wal 路 `DiskValueRenderer` PG 风格（小写
+带连字符）——同一 16B 值的两种合法文本形态，对拍矩阵不收 uuid 列（离线渲染测试覆盖）；
+`numeric_out` 剥小数尾零（Oracle NUMBER 语义，`.1234567890` → `.123456789`）——矩阵取无尾零
+scale 值避开；方言渲染分支（wal 路按档切文本风格）记档归后续任务；③INIT_PAGE + CONTAINS_OLD
+的 UPDATE/DELETE 前像偏移是**离线手造字节锚**（OgXactGrouperSeamTest 双档用例——真库该
+角落未独立构造，推导形态与 OG INSERT INIT_PAGE 探针同型）；④file 通道（pg_receivexlog
+sidecar）未在 VastBase 专项验证（direct 通道真库全链验证）。
+
+
 
 - **~~对拍 IT 满负载偶发（非回归，2026-10-12 M2 T1 记档）~~ 已修（2026-10-13 双 flake
   根因修复，均实测复现钉）**：①`DualPathParityIT` TOAST 重发场景——根因是**重启续传
@@ -604,16 +665,23 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**476 用例 = 离线 377 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）**
+**515 用例 = 离线 396 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+VastBase 手动档真库 IT 20（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
+计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
+6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
+超时]——pg_receivexlog 文件通道族在 Windows 的已知限制，非回归）**
 （2026-10-13 双 flake 根因修复 +3：ToastAssemblerTest INSERT 视图空面回查三用例）
-（2026-10-13 M3 收口 surefire 逐类对账口径）。
+（2026-10-13 M3 收口 surefire 逐类对账口径；2026-10-13 vastbase T7 收口同口径重对——
+离线 377→396 净增 19：vastbase 线 18[TupleDecoder +2 name128 / TableFilter +1 /
+WalLayoutsOgDiscriminator +1 三参 / WalLayoutVVastbase 10 / VastProbeDiscriminator 2 /
+OgXactGrouperSeam +2] + OgPartitionDictionary 9→10 的 M3 期漏记 1 一并校准）+ 手动档 20）。
 
-- **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
+- **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 17
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
   "两版 toast 偏移差恰 4B"自检锚；**OG 档**：OgWalRecordParserTest 4（真实语料 283 条
   全窗走读 + 四锚记录 + prev 链自洽）/ OgPruneViewTest 6（9.2 系 CLEAN 老格式 + 撞号
-  门控）/ WalLayoutVOpenGaussTest 5 / WalLayoutsOgDiscriminatorTest 5（90204 撞号
-  文本判别）/ **OgXactViewTest 6（M2 T2：XACT 四记录族手造 + 语料锚——含无 252
+  门控）/ WalLayoutVOpenGaussTest 5 / WalLayoutsOgDiscriminatorTest 6（90204 撞号
+  文本判别 + vastbase T4 三参探测）/ **OgXactViewTest 6（M2 T2：XACT 四记录族手造 + 语料锚——含无 252
   TOPLEVEL_XID 的终态 subxacts 归并面）/ OgMultiInsertViewTest 4（M2 T3：九条真 COPY
   语料收口 + 手造变体）**）；`receive` WalStreamWalkerTest 14（锚定协议含 mid-stream 漂移免疫 +
   OG 整零页容忍）/ FileWalSourceTest 10（目录 tail + .partial 预分配全零的前向扫描
@@ -627,7 +695,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   反转为 parttype='p' 放行断言）/ OgCatalogBootstrapSqlTest 4 / OgCatalogBootstrapSeedWarnTest
   3（M3 T2 连动：捕获语义下分区母表 seed **零 WARN**——'p' 行入字典锚 + vanilla 零
   WARN 锚；M2 终审 I1 的节流 WARN 断言随语义退役更新，强度等）/ **OgPartitionDictionaryTest
-  9（M3 T1 第四字典：kinds 词典镜像 og-plan pg_attribute 实查/INS·UPD·DEL·PRUNE·INPLACE
+  10（M3 T1 第四字典：kinds 词典镜像 og-plan pg_attribute 实查/INS·UPD·DEL·PRUNE·INPLACE
   五形态投影[含 EXCHANGE 跨页换段号与截断重建读区回填]/bootstrap 种子 SQL/vanilla 未回填
   段号第四腿 inert 零回归锚）**；`state` StateStoreTest 12
   （往返/CRC 拒载/版本拒载/
@@ -636,14 +704,17 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   拒载回落全新引导**）/ StateConfigTest 5；`changes`（v2 DML 面：
   DiskValueRendererTest 18 / XactGrouperTest 22（含 M2 T7 修复 A 的 MULTI_INSERT
   SHORTALIGN 真几何锚）/ ToastAssemblerTest 16（含 lz4 双形态
-  解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 16（M2 T5 OG 档
+  解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 17（M2 T5 OG 档
   parttype 判别闸——V17/V18 用例零改动零回归；**M3：分区身份链四用例[母表身份/白名单
   双匹配含分区名不外溢负例/链断 WARN 恰一次+计数/vanilla 无视分区链] + EXCHANGE 换绑
   段号 oid 碰撞属主优先双向锚，T5 修复**）/
   PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
   库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7；**OG 档（M2）**：
-  OgXactGrouperSeamTest 5（OG XACT 接缝——终态 subxacts 归并/COMMIT_COMPACT/2PC 面，
-  T2）/ OgColumnCompressionTest 21（四算法黄金向量 + meta 走读 + 失败负例，T4）；
+  OgXactGrouperSeamTest 7（OG XACT 接缝——终态 subxacts 归并/COMMIT_COMPACT/2PC 面，
+  T2；**+2 INIT_PAGE + CONTAINS_OLD 的 UPDATE/DELETE 旧元组偏移角落——OG 13/11+8 与
+  VastBase 21/19 常态 + INIT_PAGE 29/27 双档，`ogInitShift` 的 +8 面（vastbase T7 补钉，
+  Fixture 布局参数化）**）/ OgColumnCompressionTest 21（四算法黄金向量 + meta 走读 + 失败
+  负例，T4）；
   **OgPartitionIdentityTest 5（M3 T2：OG 布局手造记录喂真 XactGrouper——分区行母表
   身份发射/第四字典 heap 记录全清缓存/分区自有 toast chunk 重组[ToastAssembler 零改动
   锚]/链断 fail-safe/partitionOf 缺省 empty[vanilla no-op 锚]）**）；
@@ -680,4 +751,10 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   **M3（2026-10-13）**：`OgParitySmokeIT` 增至 2（+分区冒烟）/ `OgDmlParityIT` 增至
   27（13 场景参数化 PG/A 双库 + A 专形 date）/ `OgCompatGuardIT` 增至 3（+A 档列存表
   ISE）/ 新增 `OgPartitionIT` 16（分区专项 PG+A 双档——详见"openGauss 5.0.0 档 M3"
-  节验收段））。
+  节验收段））；**VastBase 手动档 20 用例（2026-10-13 vastbase T5-T7，`it/vastbase` 包
+  `VastTestEnv` 真库静态单例——非 Testcontainers，`-Dvb.it.vastbase=true` 才跑，常规
+  `mvn test` 全 skip）**：`VastCatalogSyncIT` 2（T5：干扰 DDL 四字典对拍 + 门面判别链
+  v6 排他锚——对拍器包内自持复刻 `WalSyncItBase` 语义）、`VastDmlParityIT` 15（T6 六
+  场景 + A 档 date 专形 + T7 补 COPY 批量 MULTI_INSERT 真几何——基准路复用
+  `OgParityBaseline`）、`VastLifecycleIT` 3（T7：检查点续传两轮启停对拍 / state 截断
+  回落全新引导 / 门面全装配 direct 通道两轮启停——详见"VastBase G100 档"节验收段）。

@@ -54,6 +54,25 @@
 | A 档 Oracle 系类型 WAL 存储面差异未验（M3 spec 风险注记②，按排障修预案） | 唯一值面分叉 = `date`：A 档 DDL 关键字 `date` 映射 **atttypid=1114（底层 timestamp，8B 存时段；Oracle DATE 整秒粒度——微秒输入服务端截断）**；wal 路按列 typeOid 走 timestamp 渲染、基准路 timestamp_out 同形——**时段零真值损失、双路天然逐字节一致，无需归一化**（首版"date 输出方言"归一化前提被证伪，死分支移除）；其余 16 类型双档逐字面全等；`pg_catalog.date` 直引（1082）A 档渲 PG 同形（探针记档） | T5 fix round 1 探针（m2probe_a vs m2pg）——task-5 报告 |
 | EXCHANGE PARTITION = 字典换绑段号（spike 锚④ 记档，未预见碰撞面） | EXCHANGE 换绑段号存在 **oid 碰撞**——OG 建表 relfilenode==oid、换绑双向对调段号使分区 'p' 行新段号恰等于交换对方普通表的 oid，三表反查 miss 后 oid 直认兜底误命中普通表；修复 = OG 档 resolve **第四字典属主优先且不回退**（"链断不回退三表"语义收紧） | T5 实测红转绿（commit `9d98f38`）——task-5 报告 |
 
+> **VastBase G100 档已落地（2026-10-13，vastbase T0-T7）**：VastBase G100 V3.0（Build 9，
+> **OG 6.0.0 内核**，海量数据发行版）第四布局档 `WalLayoutVVastbase` 按
+> `docs/superpowers/specs/2026-10-13-wal-source-vastbase-adaptation-design.md` 完成——
+> 判别第二面（relname attlen=128 探测）/ name128 词典几何（四词典 + 读区偏移 +64B）/
+> heap 前缀 21/19 与 oradate(9040)→1114 两主代码接缝 / 手动档真库 IT 三组（catalog 对拍
+> 2 + DML 对拍 15 + 生命周期 3）。**下表**为 VastBase 适配期（T0-T7）实测发现回填——
+> 本文调研对象是 OG 5.0.0，VastBase 是 OG 6.0.0 内核系发行版，多数结论可迁移、四处实测
+> 反转/增量的记档如下（原段落保留作历史，以表为准）：
+
+| 面 | OG 5.0.0 结论（本文） | VastBase G100 V3.0 实测裁定（2026-10-13） | 依据 |
+|---|---|---|---|
+| 版本判别 | `version()` 含 "openGauss" 文本即可判别（§2.2） | **version() 无任何 branding**（报 `PostgreSQL 9.2.4 ...`，branding 只在 `v$version` 视图：`Vastbase G100 V3.0 ... openGauss version:6.0.0`）——三方撞号（vanilla 9.2/OG/VastBase 同报 90204），判别须第二探测面：`pg_class.relname` attlen（**128 = VastBase**[NAMEDATALEN 加宽签名]，64/失败 = vanilla 9.2 ISE 不变），探测在建槽之前、只跑一次 | spec 附录 A 实查 + T4 判别落地 |
+| 词典几何 | pg_class 40 列 / pg_attribute 24 列 / relfilenode@84 / reltoastrelid@116（M1 勘误表） | **pg_class 42 列**（槽 24 插 relhassecids、尾增 relminmxid/relrewrite）/ **pg_attribute 29 列**（槽 19/20 插 attalias/attisquoted、尾增 attidentity/attextraopt/attdroppedname）/ **NAMEDATALEN 64→128**——name 列四词典全加宽，读区偏移统一 +64B（relfilenode@148/reltoastrelid@180/relkind@207）；pg_partition/pg_namespace 列集零分叉仅 name 加宽；投影槽位全在分叉点前（AttrRow/changes 包零改动） | spec 附录 A 真库实查 + T3 词典机械对拍 |
+| heap 记录 main 前缀 | sizeOfHeap 13/11（老结构 + LogCSN；§2.1/勘误表） | **UPDATE/DELETE = 21/19**——再 + **xid u64 殿后**（无条件在场，非 OG 的仅 INIT_PAGE 变体 +8 前缀形态）；INSERT 常态 offnum@0 与 OG 等同、INIT_PAGE 变体 +8 前缀原样成立（ogInitShift 同型适用，离线双档锚）；spec §0.2 "记录层全兼容"由此修正为"记录头全兼容，heap 载荷 xid 宽度分叉"——对拍首轮 9 红的根因（按 13/11 读旧行元组落进 xid 尾，natts 解出 731/658 等垃圾值恰为 xid 低位） | T6 真库字节探针（vastdump UPDATE info=0x40 / DELETE info=0x10）|
+| 认证死角（逻辑流基准路） | gaussdb 走复制流撞码 11 混合挑战（M2 勘误表——须专用角色 + sha256 行） | **md5 码 5 一次通过**（test 用户直连，无码 11 死角、无专用角色/pg_hba 改动）——`OgParityBaseline` 基座零复制复用（spike 裁定"同形"：pgoutput 帧 B 帧 xid Int64 / TupleData Int16 ncols 前缀两处差异原样成立） | T0 spike §1 + T6 15 场景 |
+| 逻辑解码器 DDL-in-txn 行为 | OG 解码器对事务内 DDL 的后续行**静默丢弃**（M2 勘误表） | **VastBase 不丢弃**——DDL 事务块三行与 wal 路逐字面全等（与 vanilla 同形），DDL-in-txn 场景改双块全量 parity（断言强度升不降） | T6 场景 4 首轮红 → 实测反转 |
+| A 档 date 值面 | A 档 `date` 关键字 → atttypid=1114 timestamp（M3 勘误表） | **A 档 `date` 落私有类型 oradate（oid 9040，typlen=8）**——非 1114；磁盘表示与 timestamp 同构（8B epoch-2000 微秒，整秒粒度），DML 面经 `remapDmlTypeOid` 归一 1114 渲染、基准路 oradate_out 同形（时段零损失）；catalog 面 atttypid 保持 9040（对拍不受扰） | T6 vastkind 探针 + 主代码接缝 |
+| 输出函数方言 | float (0,1) 前导零省略 + TOAST 未变列恒发重写值（M2 值面分叉两处） | 再增两处：**uuid_out 渲 RAW 风格**（32 位大写 hex 无连字符，vs vanilla 小写带连字符）+ **numeric_out 剥小数尾零**（Oracle NUMBER 语义）——同一字节值的两种合法文本形态，对拍矩阵避开 + javadoc 记档（解码正确性无争议，方言渲染分支归后续任务） | T6 场景 2 首轮红 → 裁定记档 |
+
 调研目标：评估 `vb-stream-wal-source`（现支持 PG 17/18）适配 **PG 9.2（openGauss 内核基线）**
 的工作量与可行性。方法：①vanilla PG 9.2 与 openGauss 5.0.0 双 Docker 容器实测（协议面/SQL 面/
 WAL 字节面）；②REL9_2_STABLE 与 openGauss v5.0.0 源码头文件核对；③pgjdbc 42.7.13 与

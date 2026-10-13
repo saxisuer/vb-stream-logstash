@@ -111,6 +111,38 @@ dummy_standby 非 immediately_reserve）；收流通道 `-Dvb.wal.og.source=file
   DBCOMPATIBILITY 'PG'/'A' 库）；MultiXactId 变体未锚（到达即错位 ISE）；页字典压缩表
   （MULTI_INSERT isCompressed≠0）ISE。
 
+## VastBase G100 快速开始（V3.0 / OG 6.0.0 内核——第四布局档）
+
+VastBase G100 V3.0 报 `server_version_num=90204` 且 `version()` **无 openGauss/VastBase
+branding**——判别走第二探测面（`pg_class.relname` attlen=128，`NAMEDATALEN 64→128` 是
+VastBase 词典几何的签名）。**前置**：①`wal_level=logical`（DML 面前提，catalog 面可
+`-Dvb.wal.dml=false` 放宽到 replica 档）；②连接用户有 REPLICATION 权限（rolreplication=t）
+且 pg_hba 含 replication 放行行；③**`vb.wal.og.jdbc.prefix=jdbc:opengauss:`**（VastBase 档
+装配走 OG 分支，opengauss-jdbc 前缀对 md5/sha256 认证兼容——真库实测 md5 码 5 一次过，无
+OG 容器的码 11 死角）；④收流推荐 `-Dvb.wal.og.source=direct`（裸 v3 直连，无 sidecar 依赖
+——真库全链验证形态）。
+
+```bash
+mvn -q -pl vb-stream-wal-source compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/cp.txt)" \
+     -Dvb.wal.host=<vastbase-host> -Dvb.wal.port=<port> -Dvb.wal.db=test_a \
+     -Dvb.wal.user=test -Dvb.wal.pass=<password> \
+     -Dvb.wal.slot=vb_wal_source \
+     -Dvb.wal.og.source=direct -Dvb.wal.og.jdbc.prefix=jdbc:opengauss: \
+     -Dvb.wal.state.dir=./vast-wal-state \
+     org.vastdata.vbstream.walsource.Main
+# （Windows classpath 分隔符 ';'，macOS/Linux 为 ':'；能力/限制与词典几何差异详见模块
+#  CLAUDE.md "VastBase G100 档"节——A 档 date→oradate 已归一渲染，uuid/numeric 输出
+#  方言是记档差异面）
+```
+
+手动档真库 IT（`VastCatalogSyncIT`/`VastDmlParityIT`/`VastLifecycleIT`，常规 `mvn test`
+全 skip；连接参数 `-Dvb.it.vastbase.{host,port,db,user,pass}` 可覆盖）：
+
+```bash
+mvn test -pl vb-stream-wal-source -Dtest='Vast*IT' -Dvb.it.vastbase=true
+```
+
 配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键，默认值即下表；单一来源
 `WalSource`/`StateConfig`）：
 
@@ -177,8 +209,16 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   码 11 的认证死角绕开）** + **M3（分区专项十六用例[range/list 捕获对拍/白名单四形态/
   流内 DDL 竞速/EXCHANGE 失效/跨分区迁移] + A 档全量复验[13 场景 × PG/A 参数化 + date
   专形] + A 档列存 ISE，2026-10-13）**。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（473 用例 = 离线 374 + Testcontainers
-  IT 99——PG 41 + openGauss 58，后者需本机 Docker）。
+- **VastBase G100 档（vastbase 2026-10-13）**：手动档真库 IT 三组（`-Dvb.it.vastbase=true`
+  ——非容器长活真库，常规 `mvn test` 全 skip）——catalog 四字典干扰对拍逐行全等 + 门面
+  判别链（relname 探测 → `WalLayoutVVastbase` → v6 检查点排他锚）/ DML 双路对拍 15 场景
+  （v2 六场景 + A 档 date 专形 + COPY 批量 MULTI_INSERT 真几何——基准路 = opengauss-jdbc
+  逻辑流 + `OgParityBaseline` 复用，认证 md5 码 5 一次过无 OG 码 11 死角）/ 生命周期 3
+  （检查点续传两轮启停对拍 / state 截断回落全新引导 / 门面全装配 direct 通道两轮启停）。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（515 用例 = 离线 396 + Testcontainers
+  IT 99——PG 41 + openGauss 58（需本机 Docker）+ VastBase 手动档真库 20（全 skip，
+  `-Dvb.it.vastbase=true` 才跑）；Windows 开发机另有环境性存量 7 例已知记档——
+  pg_receivexlog 文件通道族[FileWalSourceTest 6 + OgDualChannelParityIT 1]，非回归）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
 
@@ -194,6 +234,12 @@ ctid 重放 + 末态对拍全等）、双通道收流（file/direct 对拍一致
 TOAST/DDL-in-txn as-of/2PC/中途停续——双路对拍验收，见上文"M2 DML 面能力与限制"）；
 **分区表 DML 捕获**（母表身份输出、白名单母表名/分区名双匹配、流内 DDL 竞速 as-of——
 M3）；**A 兼容档库**（Oracle 风格——v2 全场景双档参数化复验，M3）。
+
+**✅ 支持（VastBase G100 V3.0 档，第四布局档）**：与 OG 档同构的 catalog 同步（四字典
+[含 pg_partition 分区捕获]）+ direct 通道收流 + 检查点续传/损坏回落 + DML 面（六场景 +
+COPY 批量 + A 档 date 专形经 oradate→timestamp 归一——双路对拍逐行全等，真库验收）；
+判别 = relname 探测（version() 无 branding 的三方撞号第二面）。已知差异面：uuid/numeric
+输出函数方言（对拍矩阵避开 + 记档）、file 通道未专项验证。
 
 **❌ 不支持（触发时的行为）**：
 - **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，

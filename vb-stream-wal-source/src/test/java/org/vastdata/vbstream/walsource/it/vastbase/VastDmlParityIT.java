@@ -4,6 +4,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
+import org.opengauss.copy.CopyManager;
+import org.opengauss.core.BaseConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.WalSource;
@@ -12,6 +14,8 @@ import org.vastdata.vbstream.walsource.it.OgParityBaseline;
 import org.vastdata.vbstream.walsource.it.OgParityBaseline.BaselineEndpoint;
 import org.vastdata.vbstream.walsource.it.OgParityBaseline.OgBlock;
 
+import java.io.IOException;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -36,7 +40,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * {@link OgParityBaseline}，仅连接参数换 {@link VastTestEnv}、槽/publication 用
  * {@code vb_wal_} 前缀）vs WalSource 直解路（{@code WalLayoutVVastbase} 判别 + direct
  * 通道 + opengauss-jdbc 前缀——门面装配面经 T5 {@code VastCatalogSyncIT} 验收），六场景
- * 按 xid 交集逐行 diff 空——{@code OgDmlParityIT} 场景面的真库翻译（无 CompatMode 维度
+ * 按 xid 交集逐行 diff 空（+ COPY 批量装载补充——vastbase T7 场景 1g，MULTI_INSERT
+ * 真几何的端到端收口）——{@code OgDmlParityIT} 场景面的真库翻译（无 CompatMode 维度
  * ——真库 test_a 恒 A 兼容档，M3 起护栏白名单内）。
  *
  * <p><b>A 档专面（真库恒 A 档）</b>：①<b>{@code date} 列落私有类型 {@code oradate}
@@ -225,6 +230,42 @@ class VastDmlParityIT {
                 });
         assertEquals(0, run.source().dmlSkippedTruncatedRows(), "截断 UPDATE 跳过计数应为 0");
         assertEquals(0, run.source().dmlReconstructedTruncatedRows(), "截断 UPDATE 重建计数应为 0（全量记录面）");
+    }
+
+    /**
+     * 场景 1g（vastbase T7 补钉，T6 延后项——COPY/MULTI_INSERT 真几何端到端收口）：
+     * 客户端侧 CopyManager COPY FROM STDIN 100 行单事务，走 heap2 MULTI_INSERT 记录
+     * （块 data 逐 entry {@code [datalen u16 只计 tail][xl_heap_header 5B][tail]}、步进
+     * SHORTALIGN(7+datalen)——OG M2 T7 修复 A 的真几何；VastBase 记录层与 OG 同构，
+     * main 前缀的 xid 殿后差异不在 entry walk 面上）。断言 100 行值全对（walk 错位在
+     * 第二 entry 起即红）。CSV 载荷含 NULL/奇长 text 值（奇长 entry 钉对齐面）；A 档
+     * 空串语义下 CSV 非引号空串两路同见 NULL。
+     */
+    @Test
+    void copyBatchMultiInsertParityRealEntryGeometry() throws Exception {
+        String[] ddl = {
+                "CREATE TABLE vb_wal_par.t_copy (id int4 NOT NULL, name text, v numeric, PRIMARY KEY (id))",
+                "ALTER TABLE vb_wal_par.t_copy REPLICA IDENTITY FULL",
+        };
+        StringBuilder csv = new StringBuilder();
+        for (int i = 1; i <= 100; i++) {
+            // CSV 格式的 NULL 是非引号空串（A 档空串语义两路同见 NULL，无分叉面）
+            String name = (i % 3 == 0) ? "" : "row-" + i + (i % 2 == 0 ? "-odd" : "");
+            String val = (i % 4 == 0) ? "" : i + ".25";
+            csv.append(i).append(',').append(name).append(',').append(val).append('\n');
+        }
+        ParityRun run = runParity("COPY 批量", "dml6", ddl, new String[]{"vb_wal_par.t_copy"},
+                1, 1, conn -> {
+                    copyIn("COPY vb_wal_par.t_copy FROM STDIN WITH (FORMAT csv)", csv.toString());
+                });
+        List<OgBlock> blocks = run.capture().blocks();
+        assertEquals(1, blocks.size(), "COPY 单事务应恰一个块");
+        assertEquals(100, blocks.get(0).rows().size(), "100 行 COPY 应逐 entry 全解出:\n"
+                + blocks.get(0).rows().subList(0, Math.min(5, blocks.get(0).rows().size())));
+        assertTrue(blocks.get(0).rows().get(0).contains("AFTER=[id=1, name=row-1, v=1.25]"),
+                "首行值全对:\n" + blocks.get(0).rows().get(0));
+        assertTrue(blocks.get(0).rows().get(2).contains("name=NULL"),
+                "CSV 非引号空串应解为 NULL:\n" + blocks.get(0).rows().get(2));
     }
 
     // ---- 场景 2：17 类型边界值 + A 档 date 专面 ----
@@ -862,6 +903,25 @@ class VastDmlParityIT {
             for (String sql : sqls) {
                 st.execute(sql);
             }
+        }
+    }
+
+    /**
+     * 客户端侧 COPY FROM STDIN（{@code OgDmlParityIT#copyIn} 的真库形态——固定
+     * {@link VastTestEnv} 连接档，vastbase T7 场景 1g 供用）：服务端侧 COPY 文件被
+     * OG 系安全策略禁止（OG M1 实测锚，VastBase 同源）。
+     *
+     * @param sql COPY 命令
+     * @param csv 装载文本
+     * @return 装载行数
+     * @throws SQLException COPY 失败
+     */
+    private static long copyIn(String sql, String csv) throws SQLException {
+        try (Connection c = VastTestEnv.newSqlConnection()) {
+            CopyManager cp = new CopyManager(c.unwrap(BaseConnection.class));
+            return cp.copyIn(sql, new StringReader(csv));
+        } catch (IOException e) {
+            throw new SQLException("COPY FROM STDIN 流读写失败", e);
         }
     }
 
