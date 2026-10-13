@@ -1,4 +1,4 @@
-# JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段，2.0 Task 5 增输出契约换血对照段，2026-10-13 wal-bench 增 wal-source 直解路段）
+# JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段，2.0 Task 5 增输出契约换血对照段，2026-10-13 wal-bench 增 wal-source 直解路段 + 同日窄行对照段）
 
 五个 JMH 基准（`vb-stream-engine/src/jmh/java/org/vastdata/vbstream/bench/`，`-Pjmh` 档才参与编译）以**真实录制语料**
 离线回放，度量 pgoutput 解码、路由窥探、组装总成本与管道路径（`MessagePipe` append / 冻结桶回放）
@@ -557,7 +557,7 @@ TRUNCATE 前起，负载 = TRUNCATE(被 skipped.operations 滤零) + 单事务 I
 - **macOS 段对照升级**：512B 修复后 WSL 25.0 万 vs macOS 5.6 万 rec/s——4.5×，与 slot 供给
   域的环境差同向叠加，"判读先看环境"通则再证。
 
-## vb-stream-wal-source 直解路（2026-10-13 wal-bench，VastBase 真库 WAL 语料离线回放）
+## vb-stream-wal-source 直解路（2026-10-13 wal-bench，VastBase 真库 WAL 语料离线回放 + 同日窄行对照）
 
 **性质**：与上文 engine 五基准同机制的离线语料回放，但对象是 wal-source 模块的**物理 WAL 直解路**
 （walker 走读 / 记录解析 / 四字典重放 / DML 解码），回答"每秒可解析多少 MB 的 WAL"（MB/s 主指标）。
@@ -575,7 +575,9 @@ TRUNCATE 前起，负载 = TRUNCATE(被 skipped.operations 滤零) + 单事务 I
 - **负载构成**（窗口内 `CREATE SCHEMA vb_wal_bench_nsp` 起步——**表与 schema 的全生命周期都在
   窗内是 L2 纯流内词典重建的前提**，含 pg_namespace 字典）：
   - 宽行表 t1（15 类型列 + PK + REPLICA IDENTITY FULL）：单行 INSERT 3,000 / UPDATE 2,000 /
-    DELETE 1,000（50 行事务分批）+ 批量 INSERT..SELECT 40,000（MULTI_INSERT 族）+ 批量
+    DELETE 1,000（50 行事务分批）+ 批量 INSERT..SELECT 40,000（~~MULTI_INSERT 族~~ 勘误[窄行
+    对照段构成归因]：VastBase 的 INSERT..SELECT 实为**逐行 heap INSERT**——9.2 基线行为，
+    multi-insert 批量仅 COPY 场景）+ 批量
     UPDATE 13,333 / DELETE 5,714 + 两轮容量补充（INSERT 60,000 / UPDATE 15,000 / DELETE 6,666）；
   - SAVEPOINT 子事务回滚 1 笔、DDL-in-txn（ADD COLUMN 后同事务 UPDATE）1 笔、2PC（PREPARE →
     COMMIT PREPARED）1 笔、CHECKPOINT×2（后继首写走 FPW 页镜像路径）；
@@ -621,6 +623,71 @@ TRUNCATE 前起，负载 = TRUNCATE(被 skipped.operations 滤零) + 单事务 I
   见上文 WSL 段），而本节 L2 是**全量物理 WAL**的纯 Java 离线回放——未过滤（含全部非用户表
   记录与并发业务流）、自建 catalog 字典、无网络/walsender 供给约束；两路数字各自作量级锚。
 
+### 窄行对照（2026-10-13 wal-bench 补测，对齐 engine 端到端基线的窄行形态）
+
+**动机**：上节语料是最重口径（FULL 双像 + 15 列 + TOAST），回答"直解路的解码上限"；本节补
+engine 端到端基线窄行档（8B 行宽 ~34 万条/s）的**同形态窄行数字**，回答"两条路到底差多少"。
+
+**语料**（`vast-corpus-narrow.bin` + `vast-corpus-narrow.meta`，同目录不入库，基准轮经
+`-Dvb.bench.corpus=<bin 路径>` 显式指定——`WalCorpus` 的语料位置覆盖键，见其 javadoc）：
+
+- **负载形态**（对齐 engine 基线窄行档）：单表 `vb_wal_narrow_t(id int PRIMARY KEY, val text,
+  n int)`——3 列小行、val 短值（`'v-'||g`，~8B）、**DEFAULT 身份**（PK 即缺省身份，不设
+  REPLICA IDENTITY FULL，与 engine 基线身份口径一致）；窗内 `CREATE SCHEMA vb_wal_narrow_s` +
+  建表起步（纯流内词典重建前提，沿宽行段踩过的坑）；
+- **负载量**：批量 INSERT..SELECT **50 万行**（50 语句 × 1 万行）+ 单行 UPDATE/DELETE 各
+  **5 千**（~1%）；无 TOAST、无大值、无 2PC/DDL 花样；
+- **规模**：**107,068,344 字节（102.1 MiB）/ 1,030,727 条 WAL 记录**（超出 10-30 MiB 目标——
+  窄行的 WAL 放大所致，见构成归因；收流侧 resyncs/lossyResyncs/carryDrops/zeroPageSkips 全零，
+  contrecords 12,052；采集结束 `vb_wal_narrow_` 前缀对象与临时槽全清零残留）；
+- **构成归因**（census 按首块 relfilenode）：本表 heap 510,000 条（52.7 MiB）+ 本表 PK btree
+  504,971 条（40.5 MiB）+ 本表 PRUNE 3,889 条，合计 ≈**96%**（按解析字节）；共享库业务噪声 +
+  catalog ≈3.5 MiB；
+- **VastBase 的 INSERT..SELECT 不走 multi-insert 批量**（9.2 基线行为——multi-insert 批量仅
+  COPY 场景使用，PG 11 的 INSERT..SELECT 批量化不在 9.2 基线内）：本轮本表 heap 记录
+  **510,000 条 == 51 万行精确吻合**；宽行段三分区 heap 桶 47,306/44,808/44,808 与逐行形态的
+  每分区账（4 万插 + 2.5 千更 + 2,308 删）也精确对上——multi-insert 批量（每页数百行/条）会把
+  记录数压低一个数量级，两轮均不符，上文宽行段"批量 INSERT..SELECT 40,000（MULTI_INSERT 族）"
+  的括注系误判已就地勘误。每行一条 heap INSERT（~108B）+ 一条 btree 记录（~84B）——
+  **窄行每行 WAL 成本 ≈192B**（32B 记录头 +
+  块引用 + PK 索引记录，对 ~20B 元组载荷放大 ~9.6×），记录数 ≈ 行数 ×2，语料随行数线性膨胀——
+  50 万行即 102 MiB，这是超出规模目标的机理。
+
+**基准轮**：`java -Dvb.bench.corpus=vb-stream-wal-source/target/corpus/vast-corpus-narrow.bin -cp
+<同上节 classpath> org.openjdk.jmh.Main "org.vastdata.vbstream.walsource.bench.VastCorpusBenchmark"
+-f 1 -wi 3 -i 5`。正确性锚：L1 回放记录数 == 采集侧（1,030,727 == 1,030,727）；L2 纯流内
+词典重建后发射 **150 桶 / 510,000 行**（= 50 万插 + 5 千更 + 5 千删，精确账）、skippedTruncated=0
+（DEFAULT 身份的 UPDATE/DELETE 正常解码，无截断守卫命中）。
+
+| 基准 | thrpt（ops/s） | avgt（s/op） | **MiB/s** | records/s | **行/s** |
+|---|---|---|---|---|---|
+| L1 `recordLayerParse` | 9.126 ± 0.157 | 0.110 | **≈932** | **≈941 万** | — |
+| L2 `fullChainDecode` | 4.473 ± 0.040 | 0.224 | **≈457** | **≈461 万** | **≈228 万** |
+
+（行/s = ops/s × 510,000；MiB/s 与 records/s = ops/s × 语料规模 102.1 MiB / 1,030,727 条）
+
+**结论**：
+
+- **窄行全链 ≈457 MiB/s / 228 万行/s**——较宽行基线（39 MiB/s / 16.5 万行/s）**11.7×（MiB/s）/
+  13.8×（行/s）**：差距全部在每行解码重量（宽行 FULL 双像 15 列 + TOAST 解压渲染 vs 窄行 3 列
+  短值）；记录层两形态同量级（932 vs 1180 MiB/s——窄行记录均值 ~104B 更碎、每字节走读开销
+  略高，但 records/s 反而更高：941 万 vs 732 万）。
+- **与 engine 端到端窄行基线对照：≈6.7×（228 万行/s vs 34 万条/s；connector 形态 37.4 万 →
+  6.1×）——只作量级锚，五点口径差不可直接对表**：①**离线回放 vs 在线端到端**——engine 34 万是
+  walsender 单线程供给上限下的在线数（服务端 C 承担 reorder/解码/过滤，自研管线 CPU 仅 ~15%、
+  瓶颈在供给），本节数字是录好语料的纯解码容量（无网络、无服务端供给约束）；②**客户端 Java
+  包揽 vs 服务端 C 分担**——直解路客户端从裸 WAL 起做（记录解析 + 词典 + 行解码渲染全在
+  Java），engine 路重活在服务端；③**流内容不同**——engine 收过滤后逻辑流（窄行 ~119B/条
+  消息），直解路收全量物理 WAL（本形态每行 ~192B，其中 ~42% 是 L2 不解码的 PK 索引字节——
+  L2 的 MiB/s 分母含它，**行/s 才是与 engine 可对照的量**）；④**单线程 vs 双线程**——离线基准
+  单线程串行全链，engine 在线 reader/consumer 双线程解耦；⑤**跨机器**——engine 基线在 WSL2
+  （Ryzen 8845HS），本节在 Windows 开发机（与宽行段同机）。
+- **在线供给视角**：按本语料行/字节比（51 万行 / 102.1 MiB），1GbE 线速（~118 MB/s）的裸 WAL
+  供给 ≈**56 万行/s** < 解码 228 万行/s（4× 余量）——**窄行形态下直解路的在线瓶颈在网络/接收
+  而非解码**；10GbE（供给 ≈560 万行/s）则反转为解码瓶颈。
+
+
+
 ### 运行方法（**勿 clean——语料在 target/corpus 下会被连带删除**）
 
 ```bash
@@ -631,13 +698,18 @@ mvn -pl vb-stream-wal-source -Pjmh test-compile dependency:build-classpath -Dmde
 java -cp "vb-stream-wal-source/target/classes;vb-stream-wal-source/target/test-classes;$(cat vb-stream-wal-source/target/cp.txt)" \
   org.openjdk.jmh.Main "org.vastdata.vbstream.walsource.bench" -f 1 -wi 3 -i 5
 # avgt 对照轮：追加 -bm avgt -tu s
+# 窄行对照轮：java 命令前加 -Dvb.bench.corpus=vb-stream-wal-source/target/corpus/vast-corpus-narrow.bin
+#（语料位置覆盖键：bin 文件或目录两形态，显式缺失 ISE fail-fast——缺省不设时走 target/corpus
+# 的 vast-corpus.bin/.meta 两档探测，见 WalCorpus javadoc）
 ```
 
 注意：默认 `mvn test -pl vb-stream-wal-source` 不受影响（profile 未激活时零 JMH 依赖、基准不
-编译）；语料缺失时基准启动即 ISE 附采集指引（不静默）；采集工具 `CorpusProbe.java` 在
+编译）；语料缺失时基准启动即 ISE 附采集指引（不静默）；采集工具 `CorpusProbe.java`（宽行）与
+`CorpusProbeNarrow.java`（窄行对照）在
 `vb-stream-wal-source/target/probe/`（一次性工具，不入库）——重采集 = 用 `DirectWalSource` 自
-写入位点起收流，窗内从 `CREATE SCHEMA` 起步制造全生命周期负载（含分区表/TOAST/COPY 批量/
-2PC/CHECKPOINT），收完落盘 bin + meta 并全清 `vb_wal_bench_*` 对象与临时槽。
+写入位点起收流，窗内从 `CREATE SCHEMA` 起步制造全生命周期负载（宽行含分区表/TOAST/COPY 批量/
+2PC/CHECKPOINT；窄行 = 3 列 DEFAULT 身份窄表 50 万行 + 1% 更删），收完落盘 bin + meta 并全清
+`vb_wal_bench_*` / `vb_wal_narrow_*` 对象与临时槽。
 
 ## 已知口径限制
 
