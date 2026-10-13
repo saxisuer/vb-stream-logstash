@@ -250,7 +250,11 @@ public final class CatalogReplay {
      * （parttype=NUL ≠ 'n' 即假阳性拒掉合法行）。防御口径：解码值为 NUL 字符的
      * char 槽按<strong>不可判</strong>处理（跳过该判据）；relbucket 零填充解 0、
      * reloptions 零填充解空串，两者本就不触发判别——即"越界/缺值槽不做假阳性
-     * 拒绝"。T8 裁定 OG 截断形态后可收紧为读区边界显式判。线程约束：纯函数。</p>
+     * 拒绝"。VastBase 档（{@code WalLayoutVVastbase}）同面读区边界为 relkind@207
+     * + 1 = 208B（NAMEDATALEN 128 加宽 + relhassecids/尾列插入使词典整体后移），
+     * parttype/reloptions/relbucket（物理槽 32/35/38，数据区 221+/varlena/240+）
+     * 同样越出——防御口径两档同式（vastbase T3 记档补文）。T8 裁定 OG 截断形态后
+     * 可收紧为读区边界显式判。线程约束：纯函数。</p>
      *
      * @param vals pg_class 解码值行（与 {@link #classDecodeKinds()} 同长）
      * @throws IllegalStateException 命中任一不支持存储形态

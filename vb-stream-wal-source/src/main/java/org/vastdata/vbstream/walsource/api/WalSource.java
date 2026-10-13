@@ -25,6 +25,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.HashSet;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -38,11 +39,14 @@ import java.util.function.LongSupplier;
  * <p>装配次序（委派 {@link CatalogSynchronizer#start(Connection, String, WalLayout,
  * String, String, StateConfig, long...)}）：① 普通 JDBC URL 建 SQL 会话；② 同会话查
  * {@code current_setting('server_version_num')} 经 {@link WalLayouts#forServer}（9 万段
- * 补充 version() 文本）分发布局——错配版本启动期 ISE fail-fast（绝不近似回退）；
+ * 补充 version() 文本；且无 openGauss branding 时再补 {@code pg_class.relname} attlen
+ * 探测——vastbase T4 判别第二面，128 分发 VastBase 档、64/不可得落既有拒绝面，建槽
+ * 之前、17/18 档零触碰）分发布局——错配版本启动期 ISE fail-fast（绝不近似回退）；
  * ③ 带凭据档 + 检查点配置起同步器（自愈接线；state.dir 有有效检查点 → 续传跳过引导，
  * 否则全新引导——决策见同步器 javadoc）。v1 门面无 tracked 面（interest 0 个，纯字典
  * 同步形态）。<strong>openGauss 5.0.0 档（M1 Task 6 + M2 Task 1）</strong>：判别命中
- * {@code WalLayoutVOpenGauss} 时转 {@code startOpenGauss}——槽走 ensureSlotOg（dummy_
+ * {@code WalLayoutVOpenGauss}（instanceof 门控——vastbase T4 起 VastBase 子类
+ * {@code WalLayoutVVastbase} 同走本装配）时转 {@code startOpenGauss}——槽走 ensureSlotOg（dummy_
  * standby 建槽 + xlog 位点函数）、收流按 {@code vb.wal.og.source} 走 WalByteSource
  * 双通道（file=sidecar tail / direct=裸 v3 直连）、DML 面与 PG 17/18 路同构装配
  * （M2 Task 1 撤销 M1 的 WARN 降级——{@code ogCatalogOnly} 位退役；listener 在场且
@@ -83,6 +87,16 @@ public final class WalSource implements AutoCloseable {
      * 量级（DirectWalSource 心跳周期 = 其一半）。
      */
     private static final long OG_DIRECT_STATUS_INTERVAL_MS = 10_000;
+
+    /**
+     * VastBase 判别第二面的探测 SQL（vastbase T4，spec §4.1）：查 {@code pg_class}
+     * 自身 {@code relname} 列的 {@code attlen}——NAMEDATALEN 128 是 VastBase G100
+     * 相对 OG/vanilla 9.2（64）的唯一稳定区分面（其 version() 报 vanilla 形态无
+     * branding，branding 只在 v$version）。public static final 供离线测试锚 SQL 形状
+     * （{@code VastProbeDiscriminatorTest}）。
+     */
+    public static final String RELNAME_PROBE_SQL =
+            "SELECT attlen FROM pg_attribute WHERE attrelid = 'pg_class'::regclass AND attname = 'relname'";
 
     /** PG 主机键（默认 localhost）。 */
     public static final String KEY_HOST = "vb.wal.host";
@@ -409,8 +423,12 @@ public final class WalSource implements AutoCloseable {
      * 单写者契约不破）；② {@code current_setting('server_version_num')}（文本数字，如
      * 180002）+ 9 万段补充的 {@code version()} 文本经 {@link WalLayouts#forServer} 分发
      * （17/18 区间返回与旧 {@code forServerVersion} 同实例——PG 档行为零变化），未注册
-     * 版本 ISE fail-fast；<strong>判别命中 openGauss 档时转入 {@link #startOpenGauss}
-     * （M1 Task 6：槽 OG 变体 + WalByteSource 双通道装配，与 PG 档互斥）</strong>；
+     * 版本 ISE fail-fast；<strong>9 万段且无 openGauss branding 时经 {@code
+     * pg_class.relname} attlen 探测（vastbase T4，spec §4——128 分发 VastBase 档；
+     * 探测在建槽之前，失败/64 落既有 vanilla 9.2 ISE 面消息附探测值，17/18 档
+     * 零触碰）</strong>；<strong>判别命中 openGauss 档（instanceof 门控——VastBase
+     * 子类同走）时转入 {@link #startOpenGauss}（M1 Task 6：槽 OG 变体 +
+     * WalByteSource 双通道装配，与 PG 档互斥）</strong>；
      * ③ {@link CatalogSynchronizer#start} 带凭据 + state 配置（interest 0 个）+ 可选
      * post-apply 接缝——ChangeStream 惰性建（快照视图需同步器实例，而 sink 在
      * startInternal 内接线先于 start 返回；接收线程单写者初始化、volatile 发布）。
@@ -433,8 +451,17 @@ public final class WalSource implements AutoCloseable {
         // 该查询（PG 档除分发调用形态外行为零变化）
         String versionText = versionNum >= 90_000 && versionNum < 100_000
                 ? queryServerVersionText(sqlConnection) : null;
-        WalLayout layout = WalLayouts.forServer(versionNum, versionText);
-        if (layout == WalLayoutVOpenGauss.INSTANCE) {
+        // VastBase 判别第二面(spec §4):9 万段无 openGauss branding 时探测 pg_class.relname
+        // 的 attlen——VastBase G100 的 version() 报 vanilla 形态无 branding,唯一稳定区分面是
+        // NAMEDATALEN 加宽(128);64/不可得落 vanilla 9.2 拒绝面(真 vanilla 零扰动)。
+        // 探测在建槽之前(ISE 先于槽副作用,M2 护栏纪律)。
+        int relnameAttlen = -1;
+        if (versionNum >= 90_000 && versionNum < 100_000
+                && (versionText == null || !versionText.contains("openGauss"))) {
+            relnameAttlen = queryRelnameAttlen(sqlConnection);
+        }
+        WalLayout layout = WalLayouts.forServer(versionNum, versionText, relnameAttlen);
+        if (layout instanceof WalLayoutVOpenGauss) {   // 原实例相等改 instanceof——VastBase 子类同走 OG 装配
             startOpenGauss(layout);
             return;
         }
@@ -866,5 +893,49 @@ public final class WalSource implements AutoCloseable {
             rs.next();
             return rs.getString(1);
         }
+    }
+
+    /**
+     * 探测 {@code pg_class.relname} 的 attlen（VastBase 判别第二面的执行面，vastbase T4）。
+     *
+     * <p>关键步骤：{@link #RELNAME_PROBE_SQL} 单行查询经 {@link #parseRelnameAttlen}
+     * 解析；无行或 SQLException 归 -1（不可得）记 DEBUG 不中断——探测失败落既有
+     * vanilla 9.2 ISE 拒绝面（三参重载消息附探测值可诊断），静默砖死启动不如拒绝面
+     * 可观测（探测是判别预检不是正确性锚，沿兼容模式护栏的 fail 语义收敛）。边界：
+     * 连接须已建立（start 装配线程内调用、建槽之前——ISE 先于槽副作用）；返回值
+     * 不缓存（单次探测，9 万段无 branding 才触达）。线程约束：静态，装配线程单次。</p>
+     *
+     * @param connection 已建立的 SQL 会话
+     * @return attlen 探测值（如 128/64）；不可得为 -1
+     */
+    private static int queryRelnameAttlen(Connection connection) {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(RELNAME_PROBE_SQL)) {
+            return parseRelnameAttlen(rs).orElse(-1);
+        } catch (SQLException e) {
+            LOG.debug("VastBase relname attlen 探测失败（归 -1 不可得——落 vanilla 9.2 拒绝面）: {}",
+                    e.getMessage());
+            return -1;
+        }
+    }
+
+    /**
+     * 解析探测结果集（{@link #queryRelnameAttlen} 的纯函数面，包可见供离线测试锚
+     * 128/64/无行三分支——{@code VastProbeDiscriminatorTest}）。
+     *
+     * <p>关键步骤：无行（next false）回 empty（不可得）；有行取首列 int。边界与
+     * 异常语义：SQLException 原样上抛由调用面归 -1；多行不期望出现（pg_class 的
+     * relname 列唯一），首行即答案；attlen 为 NULL 的形态不存在于该列（int2 非空），
+     * 不做 wasNull 分支。线程约束：静态纯函数。</p>
+     *
+     * @param rs 探测查询结果集
+     * @return attlen；无行为 empty
+     * @throws SQLException 游标推进/取值失败
+     */
+    static OptionalInt parseRelnameAttlen(ResultSet rs) throws SQLException {
+        if (!rs.next()) {
+            return OptionalInt.empty();
+        }
+        return OptionalInt.of(rs.getInt(1));
     }
 }

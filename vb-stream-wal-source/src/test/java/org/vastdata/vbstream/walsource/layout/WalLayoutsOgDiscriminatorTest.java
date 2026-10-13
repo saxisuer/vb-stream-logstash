@@ -15,6 +15,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * at ..."）。断言面：90204+openGauss 5.0.x 文本分发 OG 档；90204 无 openGauss 标记
  * （vanilla 9.2）ISE 拒绝；openGauss 其他主版本 ISE 附版本文本；V17/V18 分发不受
  * 新入口影响；旧 forServerVersion(int) 行为零变化（90204 仍 ISE）。</p>
+ *
+ * <p>vastbase T4 增三参重载 {@code forServer(int, String, int)}——9 万段无 branding
+ * 时按 {@code pg_class.relname} 的 attlen 探测判别 VastBase（128 = NAMEDATALEN 加宽，
+ * spec §4；探测 SQL/解析面归 {@code VastProbeDiscriminatorTest}，本类锚分发分支）。</p>
  */
 class WalLayoutsOgDiscriminatorTest {
 
@@ -78,5 +82,22 @@ class WalLayoutsOgDiscriminatorTest {
         assertThrows(IllegalStateException.class, () -> WalLayouts.forServerVersion(90204));
         assertEquals(18, WalLayouts.forServerVersion(180000).majorVersion());
         assertEquals(17, WalLayouts.forServerVersion(179999).majorVersion());
+    }
+
+    /**
+     * 三参重载 VastBase 分支:90204 + 无 openGauss branding + relname attlen=128
+     * → VastBase 档;attlen=64 → vanilla 9.2 ISE(消息含探测值);两参版行为不变。
+     */
+    @Test
+    void threeArgOverloadRoutesVastbaseByProbedNameWidth() {
+        String vanillaLike = "PostgreSQL 9.2.4 on x86_64-pc-linux-gnu, compiled by g++ (GCC) 7.3.0, 64-bit";
+        assertSame(WalLayoutVVastbase.INSTANCE, WalLayouts.forServer(90204, vanillaLike, 128));
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> WalLayouts.forServer(90204, vanillaLike, 64));
+        assertTrue(ex.getMessage().contains("128") || ex.getMessage().contains("64")); // 探测值透传可诊断
+        assertSame(WalLayoutVOpenGauss.INSTANCE,
+                WalLayouts.forServer(90204, "(openGauss 5.0.0 build x)", 64));        // branding 优先于探测
+        assertThrows(IllegalStateException.class,
+                () -> WalLayouts.forServer(90204, vanillaLike, -1));                   // 探测不可得仍拒
     }
 }
