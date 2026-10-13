@@ -43,6 +43,10 @@
         <!-- 手动档 IT 开关：Pg17DefaultWorkMemTest（默认 64MB work_mem 档流式回滚实证，单次 ~1-2 分钟），
              常规 mvn test 跳过，-Dvb.it.pg17.defaultmem=true 才进测试 JVM（经下方 surefire systemPropertyVariables 透传） -->
         <vb.it.pg17.defaultmem>false</vb.it.pg17.defaultmem>
+
+        <!-- 手动档 IT 开关（vastbase T5）：VastBase G100 真库 IT（直连 172.16.107.133，非 Testcontainers），
+             常规 mvn test 跳过，-Dvb.it.vastbase=true 才进测试 JVM（透传机制同上） -->
+        <vb.it.vastbase>false</vb.it.vastbase>
     </properties>
 
     <build>
@@ -59,6 +63,7 @@
                     <!-- mvn CLI 的 -D 不进 surefire fork 的测试 JVM，手动档开关在此显式透传 -->
                     <systemPropertyVariables>
                         <vb.it.pg17.defaultmem>${vb.it.pg17.defaultmem}</vb.it.pg17.defaultmem>
+                        <vb.it.vastbase>${vb.it.vastbase}</vb.it.vastbase>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>
