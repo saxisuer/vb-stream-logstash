@@ -94,6 +94,26 @@ public interface WalLayout {
     int sizeOfHeapInplace();
 
     /**
+     * DML 解码/渲染面的列类型 oid 重映射（方言专属类型 → 渲染矩阵等价 oid）。
+     *
+     * <p>背景：方言库会给 SQL 标准类型挂私有 oid（如 VastBase A 档 DDL 关键字
+     * {@code date} 落 {@code oradate}=9040），磁盘表示与某矩阵内类型同构（8B
+     * epoch-2000 微秒 = timestamp）——DML 面（{@code TableFilter} 组装
+     * {@code ColumnMeta} 时）经本方法把方言 oid 归一到等价矩阵 oid，解码词典
+     * （{@code DecodeKinds}）与渲染矩阵（{@code DiskValueRenderer}）零改动。
+     * catalog 字典/重放面<strong>不经本方法</strong>（atttypid 原值进 AttrRow，
+     * 对拍 JDBC 实查仍按原 oid）。</p>
+     *
+     * <p>缺省恒等（vanilla/OG 档无重映射）。</p>
+     *
+     * @param typeOid pg_attribute 原始 atttypid
+     * @return DML 解码/渲染面的等价 oid（缺省原值）
+     */
+    default long remapDmlTypeOid(long typeOid) {
+        return typeOid;
+    }
+
+    /**
      * pg_attribute 行解码词典（每列一个解码 kind）。
      *
      * <p>逐列 kind 与 pg_attribute.h 目录定义同序（各版本 STABLE 分支）；varlena

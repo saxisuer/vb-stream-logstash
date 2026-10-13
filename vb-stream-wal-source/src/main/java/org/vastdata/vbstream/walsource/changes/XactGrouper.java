@@ -697,17 +697,19 @@ public final class XactGrouper {
                         skipTruncatedUpdate(res);
                         return;
                     }
-                    int oldOff = rec.mainOff() + layout.sizeOfHeapUpdate();
+                    int oldOff = rec.mainOff() + layout.sizeOfHeapUpdate() + ogInitShift(rec);
                     Object[] before = decoder.decodePayload(rec.raw(), oldOff, res.kinds());
                     Object[] after = TruncatedUpdateSplice.reconstructNewTuple(decoder, rec.raw(), blk,
-                            updFlags, oldOff, rec.mainLen() - layout.sizeOfHeapUpdate() - 5, res.kinds());
+                            updFlags, oldOff, rec.mainLen() - layout.sizeOfHeapUpdate() - ogInitShift(rec) - 5,
+                            res.kinds());
                     noteReconstructedTruncatedUpdate(res);
                     appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.UPDATE, before, after);
                     resetToastWindow();
                     return;
                 }
                 Object[] before = (updFlags & HeapOps.XLH_UPDATE_CONTAINS_OLD) != 0
-                        ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapUpdate(), res.kinds())
+                        ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapUpdate()
+                                + ogInitShift(rec), res.kinds())
                         : null;
                 appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.UPDATE,
                         before, tupleFromBlock(rec, blk, v.newOffnum(), res.kinds()));
@@ -715,13 +717,28 @@ public final class XactGrouper {
             case HeapOps.XLOG_HEAP_DELETE -> {
                 HeapViews.HeapDeleteView v = HeapViews.HeapDeleteView.parse(rec, layout);
                 Object[] before = (v.flags() & HeapOps.XLH_DELETE_CONTAINS_OLD) != 0
-                        ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapDelete(), res.kinds())
+                        ? decoder.decodePayload(rec.raw(), rec.mainOff() + layout.sizeOfHeapDelete()
+                                + ogInitShift(rec), res.kinds())
                         : null;
                 appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.DELETE, before, null);
             }
             default -> { /* 未预期 opcode 静默忽略 */ }
         }
         resetToastWindow();
+    }
+
+    /**
+     * OG 系方言 INIT_PAGE 变体的旧元组载荷前移量（vastbase T6）：heap 记录 info 的
+     * 0x80 位置位时 xlrec 前置 pd_xid_base u64——UPDATE/DELETE 的旧行 tuple 载荷
+     * 起点须在 {@code layout.sizeOfHeapUpdate()/sizeOfHeapDelete()} 之上再 +8
+     * （与 {@code HeapViews} 各视图的字段 shift 同源；vanilla 档恒 0——vanilla 的
+     * 结构尺寸本就含完整前缀，无 INIT_PAGE 前移形态）。
+     *
+     * @param rec heap 记录
+     * @return 前移字节数（OG 系且 INIT_PAGE 位 = 8，否则 0）
+     */
+    private int ogInitShift(WalRecord rec) {
+        return layout.openGaussDialect() && (rec.info() & HeapOps.XLOG_HEAP_INIT_PAGE) != 0 ? 8 : 0;
     }
 
     /**

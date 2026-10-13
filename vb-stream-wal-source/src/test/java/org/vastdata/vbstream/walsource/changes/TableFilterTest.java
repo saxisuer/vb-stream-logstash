@@ -12,6 +12,7 @@ import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalLayoutV18;
 import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
+import org.vastdata.vbstream.walsource.layout.WalLayoutVVastbase;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -324,6 +325,32 @@ class TableFilterTest {
         assertEquals(new ColumnMeta(2, "........pg.dropped.2........", 25, true), cols.get(1),
                 "dropped 占位列须保留在其 attnum 键位");
         assertEquals(new ColumnMeta(3, "v", 25, false), cols.get(2));
+    }
+
+    /**
+     * 用例 ⑰（vastbase T6）：DML 面列类型重映射——VastBase 档布局下 oradate 列
+     * （atttypid 9040，A 档 DDL 关键字 {@code date} 的落点）组装为 timestamp 1114
+     * （{@code WalLayout#remapDmlTypeOid} 接缝——磁盘表示同构 8B epoch-2000 微秒，
+     * 真库 vastkind 探针实证）；vanilla 档布局对同列恒持原 oid 9040（方言 oid 空间
+     * 不越权认领——后续 {@code DecodeKinds} ISE 即矩阵外面）。
+     */
+    @Test
+    void vastbaseLayoutRemapsOracleDateColumnToTimestampForDmlFace() {
+        FakeSnapshot s = new FakeSnapshot();
+        s.relation(3001, 40001, "t_oradate", 11, "public", "r");
+        s.column(3001, new CatalogSnapshot.Column(1, "id", 23, false));
+        s.column(3001, new CatalogSnapshot.Column(2, "d", 9040, false));
+        TableMeta vbMeta = new TableFilter(s, Set.of(), WalLayoutVVastbase.INSTANCE)
+                .resolve(40001).orElseThrow();
+        assertEquals(new ColumnMeta(2, "d", 1114, false), vbMeta.columns().get(1),
+                "VastBase 档 oradate(9040) 应在 DML 面组装为 timestamp(1114)");
+        TableMeta vanillaMeta = new TableFilter(s, Set.of(), WalLayoutV18.INSTANCE)
+                .resolve(40001).orElseThrow();
+        assertEquals(new ColumnMeta(2, "d", 9040, false), vanillaMeta.columns().get(1),
+                "vanilla 档对 9040 无重映射（恒等）");
+        TableMeta noLayout = new TableFilter(s, Set.of()).resolve(40001).orElseThrow();
+        assertEquals(new ColumnMeta(2, "d", 9040, false), noLayout.columns().get(1),
+                "两参构造器（null layout）恒等");
     }
 
     /**

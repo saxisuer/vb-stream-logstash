@@ -2,8 +2,12 @@ package org.vastdata.vbstream.walsource.layout;
 
 /**
  * VastBase G100 V3.0（基于 openGauss 6.0.0 内核，2026-03-31 Build 9）第四布局档:
- * 记录层与 OG 5.0.0 全同构（页魔数/记录头/heap 尺寸/块引用——132019 条真实 WAL
- * 记录零 resync 实证，spec §0.2），差异集中在 catalog 词典几何——
+ * 记录层与 OG 5.0.0 基本同构（页魔数/记录头/块引用——132019 条真实 WAL
+ * 记录零 resync 实证，spec §0.2），两处记录层增量与词典差异——
+ * ① heap UPDATE/DELETE 的 main 前缀较 OG 再加 xid u64 尾（见
+ * {@link #sizeOfHeapUpdate()}/{@link #sizeOfHeapDelete()}，2026-10-13 T6 实测锚）；
+ * ② A 档 {@code date} 落私有类型 {@code oradate}=9040（见
+ * {@link #remapDmlTypeOid(long)}）；其余差异集中在 catalog 词典几何——
  * ① NAMEDATALEN 64→128（name 类型全 catalog 加宽，读区偏移统一 +64B）；
  * ② pg_class 42 列（OG 40）：attnum 25 插 relhassecids，尾部增 relminmxid/relrewrite；
  * ③ pg_attribute 29 列（OG 24）：attnum 20/21 插 attalias/attisquoted，尾部增
@@ -170,5 +174,44 @@ public final class WalLayoutVVastbase extends WalLayoutVOpenGauss {
     @Override
     public boolean supports(int pgVersionNum) {
         return pgVersionNum == 90204;
+    }
+
+    /**
+     * {@inheritDoc}——21（T6 2026-10-13 真库实测锚，vastdump 探针 UPDATE info=0x40）：
+     * VastBase 的 xl_heap_update = OG 老结构 5B（old@0/new@2/flags@4——字段偏移与
+     * OG 等同，{@code HeapViews} OG 分支零改动）+ LogCSN u64 + <b>xid u64 殿后</b>，
+     * 且 xid 尾无条件在场（OG 仅 INIT_PAGE 变体多 pd_xid_base 前缀、无常态 xid 尾）
+     * ——旧行 tuple 载荷起点 main+21（以 13 读会落在 xid 尾中段，natts 读出垃圾）。
+     * INIT_PAGE 变体（info 0x80 位）在此基础上再前置 pd_xid_base u64（+8——INSERT
+     * 探针实证该前缀形态，UPDATE 同构推导），旧元组偏移的 shift 由 XactGrouper 补。
+     */
+    @Override
+    public int sizeOfHeapUpdate() {
+        return 21;
+    }
+
+    /**
+     * {@inheritDoc}——19（T6 2026-10-13 真库实测锚，vastdump 探针 DELETE info=0x10）：
+     * xl_heap_delete = OG 老结构 3B（offnum@0/flags@2——字段偏移与 OG 等同）+
+     * LogCSN u64 + xid u64 殿后；旧行 tuple 载荷起点 main+19。INIT_PAGE 变体同
+     * {@link #sizeOfHeapUpdate()} 的 +8 形态。
+     */
+    @Override
+    public int sizeOfHeapDelete() {
+        return 19;
+    }
+
+    /**
+     * {@inheritDoc}——9040（oradate）→ 1114（timestamp）：VastBase A 档 DDL 关键字
+     * {@code date} 映射私有类型 {@code oradate}（oid 9040，typlen=8——2026-10-13
+     * 真库 pg_type 实查），磁盘表示与 timestamp 同构（8B epoch-2000 微秒，vastkind
+     * 探针以 timestamp kind 解码 INSERT 元组逐值正确实证）——DML 面归一到 timestamp
+     * 后 {@code DecodeKinds}/{@code DiskValueRenderer} 零改动。Oracle DATE 整秒粒度
+     * （微秒输入服务端截断）使渲染恒无小数秒，与基准路 oradate_out 文本天然同形。
+     * catalog 面 atttypid 保持原值 9040（AttrRow 对拍 JDBC 不受本重映射影响）。
+     */
+    @Override
+    public long remapDmlTypeOid(long typeOid) {
+        return typeOid == 9040 ? 1114 : typeOid;
     }
 }

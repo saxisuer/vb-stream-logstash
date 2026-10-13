@@ -72,6 +72,9 @@ public final class TableFilter {
     /** OG 方言档门控（构造期定格）：true 时第一闸走 parttype 语义（见类 javadoc）。 */
     private final boolean ogDialect;
 
+    /** 版本布局描述符（null 合法——方言门控与 DML 类型重映射两用，见构造器 javadoc）。 */
+    private final WalLayout layout;
+
     /** 分区链断的跳过计数（沿 nsp redirect miss 先例——逐次递增，观测面）。 */
     private final LongAdder partitionChainMisses = new LongAdder();
 
@@ -105,6 +108,7 @@ public final class TableFilter {
     public TableFilter(CatalogSnapshot snapshot, Set<String> whitelist, WalLayout layout) {
         this.snapshot = snapshot;
         this.whitelist = whitelist == null ? Set.of() : Set.copyOf(whitelist);
+        this.layout = layout;
         this.ogDialect = layout != null && layout.openGaussDialect();
     }
 
@@ -241,7 +245,9 @@ public final class TableFilter {
 
     /**
      * TableMeta 组装公共面（三表/分区链同构）：columnsOf 的有序含 dropped 占位
-     * 投影转 {@link ColumnMeta} 列表。
+     * 投影转 {@link ColumnMeta} 列表，列 typeOid 经 {@link WalLayout#remapDmlTypeOid}
+     * 归一（vastbase T6：方言私有 oid → 渲染矩阵等价 oid，如 oradate 9040 →
+     * timestamp 1114——catalog 字典面仍持原值，仅 DML 解码/渲染面归一）。
      *
      * @param oid    关系 oid（分区链形态 = 母表 oid）
      * @param schema 模式名
@@ -251,7 +257,8 @@ public final class TableFilter {
     private TableMeta assembleMeta(long oid, String schema, String name) {
         List<ColumnMeta> columns = new ArrayList<>();
         for (CatalogSnapshot.Column col : snapshot.columnsOf(oid)) {
-            columns.add(new ColumnMeta(col.attnum(), col.name(), col.typeOid(), col.dropped()));
+            long typeOid = layout == null ? col.typeOid() : layout.remapDmlTypeOid(col.typeOid());
+            columns.add(new ColumnMeta(col.attnum(), col.name(), typeOid, col.dropped()));
         }
         return new TableMeta(oid, schema, name, columns);
     }

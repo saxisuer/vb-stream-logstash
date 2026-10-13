@@ -149,6 +149,7 @@ class VastCatalogSyncIT {
             st.execute("VACUUM ANALYZE pg_attribute");
             st.execute("ALTER TABLE vb_wal_adv_renamed SET (autovacuum_enabled = false)");
             st.execute("ALTER TABLE vb_wal_adv_toast SET (autovacuum_enabled = false)");
+            st.execute("ALTER TABLE vb_wal_adv_nsp.scoped SET (autovacuum_enabled = false)");
             st.execute("INSERT INTO vb_wal_adv_tail VALUES (1)");
             target = VastTestEnv.writeLsn(c);
         }
@@ -197,6 +198,7 @@ class VastCatalogSyncIT {
         assertTrue(source.stateDir() != null, "配置了 state.dir 时门面应暴露状态目录");
         try (Connection c = VastTestEnv.newSqlConnection()) {
             execDdl(c,
+                    "DROP TABLE IF EXISTS vb_wal_src_smoke",
                     "CREATE TABLE vb_wal_src_smoke (id int primary key, v text)",
                     "INSERT INTO vb_wal_src_smoke VALUES (1, 'a'), (2, 'b')",
                     "ALTER TABLE vb_wal_src_smoke ADD COLUMN extra int",
@@ -858,7 +860,7 @@ class VastCatalogSyncIT {
     }
 
     /**
-     * 兑底清理之一（测试对象面）：DROP 本 IT 全部场景表/schema（含 RENAME 后名与
+     * 兜底清理之一（测试对象面）：DROP 本 IT 全部场景表/schema（含 RENAME 后名与
      * 分区表——分区随母表级联删除）——真库卫生纪律；正常路径测试内不再单独 DROP（本钩子是
      * 唯一清理面，异常路径与正常路径都走这里）；单语失败 WARN 不掩盖后续清理步。
      */
@@ -879,7 +881,7 @@ class VastCatalogSyncIT {
     }
 
     /**
-     * 兑底清理之二（管线面）：停全部同步器/门面 → 关全部引导会话 → 删全部槽（正常路径测试内已完成，
+     * 兜底清理之二（管线面）：停全部同步器/门面 → 关全部引导会话 → 删全部槽（正常路径测试内已完成，
      * 这里是异常路径保险；停机次序即依赖次序：字节源先于会话消亡）。
      */
     @AfterEach
@@ -914,7 +916,7 @@ class VastCatalogSyncIT {
     }
 
     /**
-     * PG 文本 ctid "(block,off)" 折为 ctid 键（委托主代码 {@link CatalogReplay#ctidKey}；
+     * PG 文本 ctid "(block,off)" 折为 ctid 键（委托主代码 {@link CatalogReplay#ctidKey}
      * ——快照侧字典与本侧 JDBC 实查的键控同源，杜绝两套折键式的漂移面）。
      *
      * @param ctid 服务端文本形态

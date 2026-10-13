@@ -41,6 +41,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ——同套对拍场景经维度参数化后可在 m2pg（PG 档）与 m2a（A 档）双库零复制复跑，
  * T5 的 A 档全量复验消费。</p>
  *
+ * <p><b>连接档参数化（vastbase T6）</b>：{@link BaselineEndpoint} 公共入口把连接参数从
+ * {@code OgTestEnv}（容器环境）解耦——VastBase G100 真库经 T0 spike 裁定<strong>同形</strong>
+ * （pgoutput 帧与 OG 5.0.0 逐帧同构，B 帧 xid Int64 / TupleData Int16 ncols 前缀两处
+ * 帧级差异原样成立，见 {@code docs/wal-source-vastbase-adaptation-spike.md} §3）后
+ * <strong>零复制复用本类</strong>——Normalizer 布局假设在 VastBase 上原样成立；认证走
+ * 真库 md5 码 5 直连（无 M2 码 11 死角，无需专用角色），application_name 由调用方携带
+ * （walsender 清理面按名匹配）。</p>
+ *
  * <p><b>为什么不用 engine 的 {@code PgOutputDecoder}</b>：OG 帧与 vanilla 有两处帧级差异
  * ——B 帧 xid 是 Int64（vanilla Int32）与 TupleData 带 Int16 ncols 前缀（vanilla 列读到
  * 消息尾），归一化器按 spike 文档 {@code docs/wal-source-opengauss-m2-spike.md} §2 的
@@ -85,7 +93,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code forceUpdateStatus()}（连接死亡即 SQLException 上抛，不以"流恒存活"为前提）。
  * DDL/TRUNCATE/两阶段帧不在 M2 对拍面——到达即显式拒绝（不静默吞）。</p>
  */
-final class OgParityBaseline {
+public final class OgParityBaseline {
 
     private static final Logger LOG = LoggerFactory.getLogger(OgParityBaseline.class);
 
@@ -109,6 +117,20 @@ final class OgParityBaseline {
     }
 
     /**
+     * 基准路连接档（vastbase T6——连接参数与 {@code OgTestEnv} 容器环境解耦的公共装配面）：
+     * SQL 会话 JDBC URL + 凭证对。普通会话（建/删槽）直用 URL；复制连接（{@link #capture}）
+     * 在其后拼 {@code replication=database&assumeMinServerVersion=9.4&ApplicationName=..}
+     * 后缀。VastBase 真库走 md5 码 5 同凭证直连；OG 容器缺省档以 {@code gaussdb} 建/删槽、
+     * {@link OgTestEnv#PARITY_ROLE} 收流（两凭证档并存即两 endpoint）。
+     *
+     * @param jdbcUrl  普通 SQL 会话 JDBC URL（形如 {@code jdbc:opengauss://host:port/db}）
+     * @param user     连接用户
+     * @param password 口令
+     */
+    public record BaselineEndpoint(String jdbcUrl, String user, String password) {
+    }
+
+    /**
      * 建逻辑槽（pgoutput 插件，建在 m2pg 库）——须在写被解码 DML 之前调用（槽只从建槽
      * 位点起解码）；publication 须更早存在（历史快照语义，spike 坑 2）。
      *
@@ -128,7 +150,22 @@ final class OgParityBaseline {
      * @throws SQLException 建槽失败（如重名残留）
      */
     static void createLogicalSlot(String slotName, OgTestEnv.CompatMode mode) throws SQLException {
-        try (Connection c = OgTestEnv.newSqlConnection(mode.database());
+        createLogicalSlot(new BaselineEndpoint(OgTestEnv.sqlJdbcUrl(mode.database()),
+                OgTestEnv.USER, OgTestEnv.PASSWORD), slotName);
+    }
+
+    /**
+     * 建逻辑槽的连接档参数化形态（vastbase T6）：槽语义与环境无关——pgoutput 插件、
+     * 建于被解码 DML 之前（槽只从建槽位点起解码）、返回 record 列名 [slotname,
+     * xlog_position] 非 vanilla 形态只消费游标（spike §0 惯例）。VastBase 真库与 OG
+     * 容器共用本实现（T0 spike 同形基座——零复制复用）。
+     *
+     * @param endpoint 基准路连接档
+     * @param slotName 槽名（测试前缀，避开既有槽清理面）
+     * @throws SQLException 建槽失败（如重名残留）
+     */
+    public static void createLogicalSlot(BaselineEndpoint endpoint, String slotName) throws SQLException {
+        try (Connection c = DriverManager.getConnection(endpoint.jdbcUrl(), endpoint.user(), endpoint.password());
              PreparedStatement ps = c.prepareStatement(
                      "SELECT * FROM pg_create_logical_replication_slot(?, 'pgoutput')")) {
             ps.setString(1, slotName);
@@ -159,31 +196,73 @@ final class OgParityBaseline {
      */
     static void dropLogicalSlotQuietly(String slotName, OgTestEnv.CompatMode mode) {
         try (Connection c = OgTestEnv.newSqlConnection(mode.database())) {
-            List<Long> pids = new ArrayList<>();
-            try (Statement st = c.createStatement();
-                 ResultSet rs = st.executeQuery(
-                         "SELECT pid FROM pg_stat_replication WHERE application_name LIKE '%"
-                                 + APP_NAME + "%'")) {
-                while (rs.next()) {
-                    pids.add(rs.getLong(1));
-                }
-            }
-            for (long pid : pids) {
-                try (Statement st = c.createStatement()) {
-                    st.execute("SELECT pg_terminate_backend(" + pid + ")");
-                }
-            }
-            Thread.sleep(200);   // walsender 退出竞态：立即 drop 会报 slot is active
-            try (PreparedStatement ps = c.prepareStatement("SELECT pg_drop_replication_slot(?)")) {
-                ps.setString(1, slotName);
-                ps.executeQuery();
-            }
+            dropLogicalSlotOn(c, APP_NAME, slotName);
         } catch (Exception e) {
-            if (e.getMessage() != null && e.getMessage().contains("does not exist")) {
-                LOG.debug("OG 逻辑槽 {} 不存在——前置清理空转", slotName);
-            } else {
-                LOG.warn("清理 OG 逻辑槽 {} 失败: {}", slotName, e.getMessage());
+            logSlotDropResult(slotName, e);
+        }
+    }
+
+    /**
+     * 静默删逻辑槽的连接档参数化形态（vastbase T6）：与应用名参数化共用核心——VastBase
+     * 基准路以独立 application_name 区分清理面（真库共享，不得误伤他路 walsender）。
+     *
+     * @param endpoint 基准路连接档
+     * @param appName  基准路复制连接的 application_name（walsender 清理匹配面）
+     * @param slotName 槽名
+     */
+    public static void dropLogicalSlotQuietly(BaselineEndpoint endpoint, String appName, String slotName) {
+        try (Connection c = DriverManager.getConnection(endpoint.jdbcUrl(), endpoint.user(), endpoint.password())) {
+            dropLogicalSlotOn(c, appName, slotName);
+        } catch (Exception e) {
+            logSlotDropResult(slotName, e);
+        }
+    }
+
+    /**
+     * 删逻辑槽的核心实现（在已开的连接上执行）：先按 application_name 物化本路 walsender
+     * pid 再逐个 terminate（先物化再按值 terminate 防视图谓词下推自杀）→ 200ms 竞态缓冲 →
+     * 删槽。槽不存在等情况由调用方的日志归一吸收（清理路径不掩盖断言失败）。
+     *
+     * @param c       已开的 SQL 会话
+     * @param appName 复制连接 application_name（LIKE 匹配面）
+     * @param slotName 槽名
+     * @throws SQLException          查询/terminate/删槽失败
+     * @throws InterruptedException  竞态缓冲睡眠被中断
+     */
+    private static void dropLogicalSlotOn(Connection c, String appName, String slotName)
+            throws SQLException, InterruptedException {
+        List<Long> pids = new ArrayList<>();
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT pid FROM pg_stat_replication WHERE application_name LIKE '%" + appName + "%'")) {
+            while (rs.next()) {
+                pids.add(rs.getLong(1));
             }
+        }
+        for (long pid : pids) {
+            try (Statement st = c.createStatement()) {
+                st.execute("SELECT pg_terminate_backend(" + pid + ")");
+            }
+        }
+        Thread.sleep(200);   // walsender 退出竞态：立即 drop 会报 slot is active
+        try (PreparedStatement ps = c.prepareStatement("SELECT pg_drop_replication_slot(?)")) {
+            ps.setString(1, slotName);
+            ps.executeQuery();
+        }
+    }
+
+    /**
+     * 删槽失败的结果归一日志：槽不存在（"does not exist"）DEBUG 空转；其余 WARN（不重抛
+     * ——测试清理路径不得掩盖断言失败）。
+     *
+     * @param slotName 槽名
+     * @param e        删槽异常
+     */
+    private static void logSlotDropResult(String slotName, Exception e) {
+        if (e.getMessage() != null && e.getMessage().contains("does not exist")) {
+            LOG.debug("逻辑槽 {} 不存在——前置清理空转", slotName);
+        } else {
+            LOG.warn("清理逻辑槽 {} 失败: {}", slotName, e.getMessage());
         }
     }
 
@@ -228,11 +307,32 @@ final class OgParityBaseline {
      */
     static List<OgBlock> capture(String slotName, String publication, long expectedTxns, long timeoutMs,
             OgTestEnv.CompatMode mode) throws SQLException {
-        String url = OgTestEnv.sqlJdbcUrl(mode.database())
-                + "?replication=database&assumeMinServerVersion=9.4&ApplicationName=" + APP_NAME;
+        return capture(new BaselineEndpoint(OgTestEnv.sqlJdbcUrl(mode.database()),
+                OgTestEnv.PARITY_ROLE, OgTestEnv.PARITY_ROLE_PASSWORD),
+                APP_NAME, slotName, publication, expectedTxns, timeoutMs);
+    }
+
+    /**
+     * 起一次基准路逻辑流的连接档参数化形态（vastbase T6）：连接参数与应用名外提，帧收流/
+     * 归一化/活性护栏/EOF 竞态吞异常的语义与 OG 档完全共用（T0 spike 同形基座——VastBase
+     * 真库零复制复用；认证面差异经 {@link BaselineEndpoint} 凭证对吸收）。帧布局与异常
+     * 语义见 {@link #capture(String, String, long, long, OgTestEnv.CompatMode)} 的既有 javadoc。
+     *
+     * @param endpoint     基准路连接档（复制连接凭证）
+     * @param appName      复制连接 application_name（清理面匹配 + 诊断）
+     * @param slotName     逻辑槽名
+     * @param publication  publication 名（槽选项必传——spike 坑 3）
+     * @param expectedTxns 期望收到的已提交事务数（C 帧计数）
+     * @param timeoutMs    drain 上限（毫秒）
+     * @return 归一化事务块（出现序；行文本与 wal 直解路渲染面对齐）
+     * @throws SQLException 连接/起流/活性探测失败
+     */
+    public static List<OgBlock> capture(BaselineEndpoint endpoint, String appName, String slotName,
+            String publication, long expectedTxns, long timeoutMs) throws SQLException {
+        String url = endpoint.jdbcUrl()
+                + "?replication=database&assumeMinServerVersion=9.4&ApplicationName=" + appName;
         Normalizer n = new Normalizer();
-        try (Connection c = DriverManager.getConnection(url, OgTestEnv.PARITY_ROLE,
-                OgTestEnv.PARITY_ROLE_PASSWORD)) {
+        try (Connection c = DriverManager.getConnection(url, endpoint.user(), endpoint.password())) {
             PGReplicationStream stream = c.unwrap(PGConnection.class).getReplicationAPI()
                     .replicationStream().logical()
                     .withSlotName(slotName)
@@ -579,7 +679,7 @@ final class OgParityBaseline {
      * {@link #begins()} 在 WalSource close（含接收线程 join）之后调用——
      * happens-before 经线程结束建立。</p>
      */
-    static final class WalCapture implements ChangeOutputListener {
+    public static final class WalCapture implements ChangeOutputListener {
 
         private final List<OgBlock> done = new ArrayList<>();
         private final List<BatchBegin> begins = new ArrayList<>();
@@ -641,7 +741,7 @@ final class OgParityBaseline {
          *
          * @return 事务块（出现序）
          */
-        List<OgBlock> blocks() {
+        public List<OgBlock> blocks() {
             return List.copyOf(done);
         }
 
@@ -651,7 +751,7 @@ final class OgParityBaseline {
          *
          * @return BatchBegin 事件（出现序，与 {@link #blocks()} 一一对应）
          */
-        List<BatchBegin> begins() {
+        public List<BatchBegin> begins() {
             return List.copyOf(begins);
         }
 
@@ -701,7 +801,7 @@ final class OgParityBaseline {
      * @param scenario  场景名（失败消息上下文）
      * @param walAborted 场景内被回滚的子事务行数（wal 记账与实付的期望差）
      */
-    static void assertParity(List<OgBlock> baseline, List<OgBlock> wal, String scenario, long walAborted) {
+    public static void assertParity(List<OgBlock> baseline, List<OgBlock> wal, String scenario, long walAborted) {
         Map<Long, OgBlock> base = byXid(baseline, scenario + " 基准路");
         Map<Long, OgBlock> w = byXid(wal, scenario + " wal 路");
         Set<Long> intersection = new LinkedHashSet<>(base.keySet());
@@ -771,7 +871,7 @@ final class OgParityBaseline {
      * @param rows      行文本序列（两路渲染规则同构，逐字面可比）
      * @param changes   记账变更数（语义按路别，见上）
      */
-    record OgBlock(long xid, long commitLsn, Instant commitTs, List<String> rows, long changes) {
+    public record OgBlock(long xid, long commitLsn, Instant commitTs, List<String> rows, long changes) {
     }
 
     /** 归一化器的关系缓存条目：限定名 + 列名序列（列序权威）。 */

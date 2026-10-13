@@ -59,6 +59,39 @@ class WalLayoutVVastbaseTest {
         assertEquals(128, vb.nameDatumWidth());
     }
 
+    /**
+     * T6 实测锚（2026-10-13 真库 vastdump 探针——UPDATE info=0x40 main 前缀
+     * {@code [old u16][new u16][flags u8][CSN u64][xid u64]}、DELETE info=0x10 同构）：
+     * heap UPDATE/DELETE 的 main 前缀较 OG 各恰 +8（xid u64 殿后无条件在场——OG 仅
+     * INIT_PAGE 变体有 +8 前缀）；INPLACE 与 OG 同构（T5 catalog 对拍实证）。以 13
+     * 偏移读旧行会落在 xid 尾中段——natts 解出 xid 低位垃圾（首轮 IT 实测复现面）。
+     */
+    @Test
+    void heapRecordPrefixesCarryTrailingXidEightBytesBeyondOpenGauss() {
+        WalLayout og = WalLayoutVOpenGauss.INSTANCE;
+        WalLayout vb = WalLayoutVVastbase.INSTANCE;
+        assertEquals(21, vb.sizeOfHeapUpdate());
+        assertEquals(8, vb.sizeOfHeapUpdate() - og.sizeOfHeapUpdate(), "UPDATE: OG 13 + xid u64 尾恰 +8");
+        assertEquals(19, vb.sizeOfHeapDelete());
+        assertEquals(8, vb.sizeOfHeapDelete() - og.sizeOfHeapDelete(), "DELETE: OG 11 + xid u64 尾恰 +8");
+        assertEquals(og.sizeOfHeapInplace(), vb.sizeOfHeapInplace(), "INPLACE 与 OG 同构");
+    }
+
+    /**
+     * T6 实测锚（真库 pg_type 实查 + vastkind 探针）：A 档 DDL 关键字 {@code date} 落
+     * 私有类型 {@code oradate}=9040（8B epoch-2000 微秒——timestamp kind 解码逐值正确
+     * 实证）——DML 面重映射 1114；矩阵内 oid 与他 oid 恒等；OG/vanilla 档无重映射
+     * （方言 oid 空间不越权认领）。
+     */
+    @Test
+    void oracleDateOidRemapsToTimestampForDmlFaceOnlyOnVastbase() {
+        assertEquals(1114L, WalLayoutVVastbase.INSTANCE.remapDmlTypeOid(9040));
+        assertEquals(9041L, WalLayoutVVastbase.INSTANCE.remapDmlTypeOid(9041), "他 oid 恒等");
+        assertEquals(1114L, WalLayoutVVastbase.INSTANCE.remapDmlTypeOid(1114), "矩阵内 oid 恒等");
+        assertEquals(9040L, WalLayoutVOpenGauss.INSTANCE.remapDmlTypeOid(9040), "OG 档无重映射");
+        assertEquals(9040L, WalLayoutV18.INSTANCE.remapDmlTypeOid(9040), "vanilla 档无重映射");
+    }
+
     /** 分叉点后护栏槽位 +1;分叉点前不变;majorVersion=6;supports 覆盖 90204。 */
     @Test
     void guardSlotIndexesAndVersionIdentity() {
