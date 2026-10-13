@@ -46,7 +46,11 @@ import java.util.TreeMap;
  *   <li><b>归集面空 → 返回 {@link #UNCHANGED_TOAST_MARKER}</b>（值不在窗口，不回查）
  *   ——对齐 engine 的 pgoutput wire 契约：'u'（LOGICALREP_COLUMN_UNCHANGED，proto.c
  *   L812-819——"Unchanged toasted datum ... a cheap check to avoid sending large
- *   values unnecessarily"，VARATT_IS_EXTERNAL_ONDISK 的列不发值）。服务端只有
+ *   values unnecessarily"，VARATT_IS_EXTERNAL_ONDISK 的列不发值）。<b>INSERT 新元组
+ *   例外（2026-10-13 flake 根因修复）</b>：经 {@link #insertTupleResolver()} 视图的
+ *   剥解对空面走 probe 回查——INSERT 的 external 值必为本事务新写，空面成因是重启
+ *   续传重放窗口切断（页对齐 floor 落在 chunk 记录与 heap 行之间）或清窗窄缝，
+ *   engine 对照面持真值，见 {@link #resolveExternalForInsert(byte[], int)} javadoc。服务端只有
  *   reorder buffer 的本事务 toast hash 命中才内联替换（reorderbuffer.c
  *   ReorderBufferToastReplace 按 valueid 查 {@code txn->toast_hash}），而
  *   <b>每条已施加的用户表变更后 hash 即重置</b>（decode.c 对 INSERT/UPDATE/DELETE/
@@ -147,6 +151,32 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
     }
 
     /**
+     * INSERT 新元组解码专用的解析器视图（{@code TupleDecoder.VarlenaResolver} 接缝）——
+     * external 指针经 {@link #resolveExternalForInsert(byte[], int)}（归集面空时回查，
+     * 见其 javadoc 的值面裁定），行内压缩解压与主视图同面直通。
+     *
+     * <p>调用方（{@code XactGrouper}）以本视图构造第二个 {@code TupleDecoder}，仅在
+     * 解码 INSERT / MULTI_INSERT 的<b>新元组</b>时使用；UPDATE 前后像与 DELETE 前像
+     * 走主视图（'u' 对齐）。视图无独立状态（共享本实例归集面与 probe），生命周期与
+     * 本实例一致。线程约束：单写者（与主视图同线程交替调用合法）。</p>
+     *
+     * @return 委派本实例 INSERT 档剥解的解析器视图
+     */
+    public TupleDecoder.VarlenaResolver insertTupleResolver() {
+        return new TupleDecoder.VarlenaResolver() {
+            @Override
+            public byte[] resolveExternal(byte[] src, int off) {
+                return resolveExternalForInsert(src, off);
+            }
+
+            @Override
+            public byte[] decompressInlineCompressed(byte[] payload) {
+                return ToastAssembler.this.decompressInlineCompressed(payload);
+            }
+        };
+    }
+
+    /**
      * 采集一条 toast chunk 行——toast 关系 heap 记录经 v1 {@code TupleDecoder}
      * （词典三列 oid/int4/bytea）解出的值行按 valueid/seq 归集。
      *
@@ -184,7 +214,9 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * 扫描——主表重写后 relfilenode 与 oid 分叉的容错）；③<b>归集面空 → 返回
      * {@link #UNCHANGED_TOAST_MARKER}</b>（Task 10 值面裁定：值不在窗口——未变列指针
      * /跨事务/重启窗口前，engine 同形发 'u'，不回查；<b>空面判定先于方法位检查</b>
-     * ——lz4 列的未变列指针同走哨兵，先查方法位会把该形态错杀成 ISE；依据与三分支
+     * ——lz4 列的未变列指针同走哨兵，先查方法位会把该形态错杀成 ISE；INSERT 新元组
+     * 经 {@link #resolveExternalForInsert(byte[], int)} 视图对空面回查（例外裁定见其
+     * javadoc）；依据与三分支
      * 语义见类 javadoc）；④非空时方法位判定——未知方法码（非 pglz/lz4 的保留值）
      * ISE fail-fast（走读错位信号）；⑤拼接总长 != extsize → probe 回查合并后复检，
      * 仍缺 → 降级 {@code toast-unavailable}；⑥未压缩（extsize == rawsize-4）拼接
@@ -206,6 +238,61 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
      * @throws IllegalStateException    指针形态/未知方法码/tcinfo/压缩流数据不符
      */
     public byte[] resolveExternal(byte[] src, int off) {
+        return resolveExternal(src, off, false);
+    }
+
+    /**
+     * <b>INSERT 新元组专用解析视图</b>（{@link #insertTupleResolver()} 返回的接缝）——
+     * 与 {@link #resolveExternal(byte[], int)} 的唯一差异在<b>归集面空时的处置</b>：
+     * probe 在场时走回查链而不是立即返回 unchanged 哨兵。
+     *
+     * <p><b>为什么 INSERT 可以（且必须）对空面回查（2026-10-13 对拍 flake 根因修复，
+     * DualPathParityIT TOAST 重启续传场景实测钉）</b>：INSERT 新元组引用的 external
+     * 值必然由<b>本事务</b>的 toast 写路径新写（tuptoaster.c toast_save_datum——
+     * valueid 经 oid 计数器新分配，不存在跨事务复用），故"归集面空"只有两种成因，
+     * 且两者的 engine 侧对照面都持真值：①<b>重启续传重放窗口切断</b>——续传流起点 =
+     * stored lsn 页对齐下取整，页边界落在最后一个 chunk 记录与 heap INSERT 记录之间
+     * 时 chunk 整体不在重放窗口内（重发行到达期归集面空），而 engine 路不重启、其
+     * 首交付按 reorder buffer 的本事务 toast hash 持真值——重发块渲
+     * {@code <toast-unchanged>} 与首交付不等（对拍 flake 的失败面）；②全局清窗把本
+     * 事务早先 chunk 清掉（交错/逐行清窗窄缝）。两成因下该值此刻<b>已提交可见</b>
+     * （重放的是已提交事务的行），probe 按 (toastrelid, valueid) 回查即可重建——
+     * engine 首交付也是真值，双路一致。回查仍缺（值已被后续 DELETE + VACUUM 清扫、
+     * 或进行中事务 chunk 未提交不可见）落回既有降级链（WARN +
+     * {@code toast-unavailable}，不 fail 流）。</p>
+     *
+     * <p><b>UPDATE 后像不走本视图</b>（维持 {@link #resolveExternal(byte[], int)}
+     * 的空面哨兵）：未变列指针指向别事务（或本事务更早语句）写的值，engine 的
+     * pgoutput wire 恒发 'u'（LOGICALREP_COLUMN_UNCHANGED）——空面回查反而产出
+     * engine 没有的值破坏对拍（Task 10 值面裁定不变）。残余窄缝（记档）：UPDATE
+     * <b>改写</b>宽列且恰逢重放窗口切断 chunk 的形态，空面无本地判别式与 'u' 形态
+     * 区分，仍按哨兵分叉——对拍矩阵不构造该形态（v3 持久化已发射前沿过滤线是根治
+     * 方向）。</p>
+     *
+     * <p>线程约束：单写者（与 {@link #onChunkRow} 同线程；视图共享本实例归集面，
+     * 与主视图交替调用合法——按记录种类选视图是调用方 {@code XactGrouper} 的接线
+     * 责任）。</p>
+     *
+     * @param src 完整源缓冲（契约只读）
+     * @param off 指针起点
+     * @return 拼装解压后的原值字节；probe 禁用/查无时走降级链
+     * @throws IllegalArgumentException src 为 null 或 off 越界
+     * @throws IllegalStateException    指针形态/未知方法码/tcinfo/压缩流数据不符
+     */
+    byte[] resolveExternalForInsert(byte[] src, int off) {
+        return resolveExternal(src, off, true);
+    }
+
+    /**
+     * 两视图共核的剥解实现——差异仅在归集面空且 probe 在场时是否落入回查链
+     * （INSERT 视图落入：空面经 probe 合并后按完整性判定继续，查无落降级链）。
+     *
+     * @param src         完整源缓冲
+     * @param off         指针起点
+     * @param insertTuple true = INSERT 新元组视图
+     * @return 原值字节 / unchanged 哨兵 / toast-unavailable 降级字面（见两公开视图 javadoc）
+     */
+    private byte[] resolveExternal(byte[] src, int off, boolean insertTuple) {
         if (src == null) {
             throw new IllegalArgumentException("source buffer must not be null");
         }
@@ -224,12 +311,15 @@ public final class ToastAssembler implements TupleDecoder.VarlenaResolver {
         long extsize = extinfo & EXTSIZE_MASK;
         int method = (int) (extinfo >>> EXTSIZE_BITS);
         TreeMap<Integer, byte[]> collected = collectChunks(toastrelid, valueid);
-        if (collected.isEmpty()) {
+        if (collected.isEmpty() && !(insertTuple && probe != null)) {
             // Task 10 值面裁定：归集面空 = 值不在当前窗口（未变列指针/跨事务/重启窗口前）
             // ——engine 的 pgoutput 同形发 'u'（proto.c LOGICALREP_COLUMN_UNCHANGED），
             // 回查反而会产出 engine 没有的值、破坏双路对拍；渲染层按 UNCHANGED_TOAST_TEXT 输出。
             // 空面判定先于方法位检查（Task 13 顺手修）：lz4 列的未变列指针同走哨兵——
-            // 值不在窗口即无需解压，engine 同形发 'u'，先查方法位会把该形态错杀成 ISE
+            // 值不在窗口即无需解压，engine 同形发 'u'，先查方法位会把该形态错杀成 ISE。
+            // INSERT 视图例外（2026-10-13 flake 根因修复）：INSERT 新元组的值必为本事务
+            // 新写、空面成因是重放窗口切断或清窗——engine 对照面持真值，落回查链（见
+            // resolveExternalForInsert javadoc）
             return UNCHANGED_TOAST_MARKER;
         }
         if (method != METHOD_PGLZ && method != METHOD_LZ4) {

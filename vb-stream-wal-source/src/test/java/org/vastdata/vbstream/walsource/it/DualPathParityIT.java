@@ -528,8 +528,11 @@ class DualPathParityIT {
      * ①UPDATE 后像双路同渲染 {@code w=<toast-unchanged>}；②<b>前像</b>（FULL 身份
      * 旧元组，服务端 toast_flatten_tuple 写入时已拍扁内联）双路同渲染完整值——Java
      * 侧独立复算 md5 链的 64 截断形态逐字面断言；③{@code JdbcToastProbe} 的对拍角色
-     * 收窄为"补全窗口内新写值的 FPI 缺口"（离线 {@code ToastAssemblerTest} 锚定），
-     * 窗口前指针不回查。另wal 段二的页对齐重叠窗口会重发已检查点的 INSERT 事务
+     * 收窄为"补全窗口内新写值的 FPI 缺口"+ <b>INSERT 新元组的空面回查</b>（离线
+     * {@code ToastAssemblerTest} 锚定）——UPDATE 后像的窗口前指针不回查（'u' 对齐），
+     * 但重放窗口切断 chunk 的<b>重发 INSERT</b> 空面回查补全（2026-10-13 flake 根因
+     * 修复，段一 WAL 相位填充钉该几何，见场景体注释）。另wal 段二的页对齐重叠窗口
+     * 会重发已检查点的 INSERT 事务
      * （at-least-once，与 engine 重启重发同语义）——{@code parse} 的重复块全等容忍
      * 面吸收，重发块参与对拍断言（幂等重发逐字节全等）。</p>
      */
@@ -551,6 +554,19 @@ class DualPathParityIT {
             try (wal1) {
                 wal1.start();
                 try (Connection conn = ParityEnv.newSqlConnection()) {
+                    // WAL 相位填充（对拍 flake 根因修复的确定性锚，2026-10-13）：目录面
+                    // COMMENT 写入（pg_description 属系统模式——不进 wal 路变更流，
+                    // engine publication 亦不含）把后续 INSERT 事务推到特定页相位——
+                    // 段二续传的页对齐重放起点恰落在主 INSERT 的最后一个 toast chunk
+                    // 记录与 heap 行记录之间（重放窗口内 chunk 归集面为空）。修复前该
+                    // 几何下重发块渲 <toast-unchanged> 与首交付不等（本 flake 的失败面，
+                    // 实测复现钉）；修复后 INSERT 新元组空面走 probe 回查补全，重发块
+                    // 与首交付全等。刻意不用用户表写入做填充——那会膨胀
+                    // emittedTxns/dmlEmittedBuckets 计数面，使下方 await 的"恰本事务已
+                    // 输出"语义提前满足（UPDATE 桶未发即关流的竞态）。全量套件内 WAL
+                    // 相位受背景写入漂移，锚退化为概率命中——语义面由
+                    // ToastAssemblerTest 的空面回查用例钉死
+                    exec(conn, "COMMENT ON TABLE parity.t_parity_toast IS '" + md5Chain(199) + "'");
                     exec(conn, "INSERT INTO parity.t_parity_toast VALUES (1,"
                             + " (SELECT string_agg(md5(i::text),'') FROM generate_series(1,220) i))");
                 }

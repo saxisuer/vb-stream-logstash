@@ -157,6 +157,67 @@ class ToastAssemblerTest {
     }
 
     /**
+     * <b>INSERT 新元组空面回查（2026-10-13 对拍 flake 根因修复锚）</b>：归集面全空
+     * （重启续传重放窗口切断 chunk 的形态——chunk 记录在页对齐 floor 之下不重发）经
+     * {@code insertTupleResolver()} 视图剥解时<b>走 probe 回查</b>拼装完整值——INSERT
+     * 的 external 值必为本事务新写且已提交可见，engine 对照面（首交付 reorder buffer
+     * hash 命中）持真值，回查补全后双路一致；断言回查键与指针一致。
+     */
+    @Test
+    void insertViewEmptyCollectionProbesAndAssembles() {
+        StubProbe probe = new StubProbe();
+        String text = "insert-replay-probe-payload-0123456";   // 31 字节
+        byte[] payload = text.getBytes(StandardCharsets.UTF_8);
+        TreeMap<Long, byte[]> fetched = new TreeMap<>();
+        fetched.put(0L, copyOfRange(payload, 0, 15));
+        fetched.put(1L, copyOfRange(payload, 15, payload.length));
+        probe.serve(TOAST_REL, VALUE_ID, fetched);
+        ToastAssembler assembler = new ToastAssembler(probe);
+
+        byte[] resolved = assembler.insertTupleResolver()
+                .resolveExternal(pointer(payload.length + 4, payload.length, 0, VALUE_ID, TOAST_REL), 0);
+
+        assertEquals(text, new String(resolved, StandardCharsets.UTF_8));
+        assertEquals(TOAST_REL, probe.lastToastOid, "INSERT 视图空面应触发回查（回查键 = 指针 toastrelid）");
+        assertEquals(VALUE_ID, probe.lastValueid, "INSERT 视图空面应触发回查（回查键 = 指针 valueid）");
+    }
+
+    /**
+     * INSERT 视图 + probe 禁用（纯回放档 / 无 SQL 会话）：空面维持 unchanged 哨兵
+     * ——回查通道不在场时无可补全，落 Task 10 的空面哨兵（与主视图同形）。
+     */
+    @Test
+    void insertViewWithoutProbeKeepsUnchangedMarker() {
+        ToastAssembler assembler = new ToastAssembler(null);
+
+        byte[] resolved = assembler.insertTupleResolver()
+                .resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
+
+        assertTrue(resolved == ToastAssembler.UNCHANGED_TOAST_MARKER,
+                "probe 禁用时 INSERT 视图空面应返回 unchanged 哨兵，实得 " + Arrays.toString(resolved));
+    }
+
+    /**
+     * INSERT 视图 + 回查查无（值已被后续 DELETE + VACUUM 清扫、或进行中事务 chunk
+     * 未提交不可见）：落既有降级链——{@code toast-unavailable} + WARN（含
+     * valueid/toastrelid 上下文），不 fail 流；不落 unchanged 哨兵（空面成因已知是
+     * "应有值而不可得"，降级字面比哨兵诚实）。
+     */
+    @Test
+    void insertViewProbeMissDegradesToUnavailable() {
+        StubProbe probe = new StubProbe();
+        probe.serve(TOAST_REL, VALUE_ID, Map.of());   // 回查查无
+        ToastAssembler assembler = new ToastAssembler(probe);
+
+        byte[] resolved = assembler.insertTupleResolver()
+                .resolveExternal(pointer(35, 31, 0, VALUE_ID, TOAST_REL), 0);
+
+        assertEquals("toast-unavailable", new String(resolved, StandardCharsets.UTF_8));
+        assertEquals(TOAST_REL, probe.lastToastOid, "空面应已触达 probe");
+        assertEquals(1, appender.list.stream().filter(e -> e.getLevel() == Level.WARN).count(), "恰一条 WARN");
+    }
+
+    /**
      * 任务书 ④（Task 10 收窄后）：归集面<b>非空但不完整</b>、回查也缺 →
      * {@code toast-unavailable} + WARN 一次（含 valueid/toastrelid 上下文）——先喂
      * seq 0 使归集面非空（空面走 unchanged 哨兵分支不回查），probe 返回的 chunk 仍

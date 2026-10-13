@@ -103,7 +103,13 @@ import java.util.Set;
  * 镜像服务端 {@code clear_toast_afterwards} 的逐变更 hash 重置（Task 10 值面裁定：
  * 未变列指针 engine 恒发 pgoutput 'u'，wal 侧归集面空 →
  * {@link ToastAssembler#UNCHANGED_TOAST_MARKER} → 渲染 {@code <toast-unchanged>} 同形；
- * 依据全文与 REL_18 源码钉见 ToastAssembler 类 javadoc）。<b>行内 external 接线
+ * 依据全文与 REL_18 源码钉见 ToastAssembler 类 javadoc）。<b>INSERT 新元组走
+ * {@link #insertDecoder}</b>（2026-10-13 对拍 flake 根因修复）——external 指针经
+ * {@link ToastAssembler#insertTupleResolver()} 视图剥解，归集面空时 probe 回查
+ * （重启续传重放窗口切断 chunk 的补全通道：页对齐 floor 落在 chunk 记录与 heap 行
+ * 之间时 chunk 不重发，engine 对照面持真值；依据全文见
+ * {@code ToastAssembler.resolveExternalForInsert} javadoc）；UPDATE 后像与 DELETE
+ * 前像仍走主 decoder（'u' 对齐裁定不变）。<b>行内 external 接线
  * （Task 7 硬前置②）</b>：本类构造的 {@link TupleDecoder} 注入
  * {@code toast::resolveExternal}——用户表元组内首字节 0x01 的 external 短指针经
  * 已归集 chunk 拼装/解压/回查兜底重建原值（缺值降级 {@code toast-unavailable}
@@ -191,6 +197,7 @@ public final class XactGrouper {
     private final TableFilter filter;
     private final WalLayout layout;
     private final TupleDecoder decoder;
+    private final TupleDecoder insertDecoder;
     private final ToastAssembler toast;
     private final ChangeOutputListener out;
 
@@ -250,6 +257,12 @@ public final class XactGrouper {
         this.filter = new TableFilter(snapshot, whitelist, layout);
         this.layout = layout;
         this.decoder = new TupleDecoder(layout, toast);
+        // INSERT 新元组专用解码器（2026-10-13 对拍 flake 根因修复）：external 指针经
+        // ToastAssembler 的 INSERT 视图剥解——归集面空时回查（重放窗口切断 chunk 的
+        // 补全通道），UPDATE 后像/DELETE 前像仍走主 decoder（'u' 对齐）；toast 禁用
+        // 档两者同构（resolver 均为 null 的拒绝面不变）
+        this.insertDecoder = toast == null ? this.decoder
+                : new TupleDecoder(layout, toast.insertTupleResolver());
         this.toast = toast;
         this.out = out;
     }
@@ -669,7 +682,7 @@ public final class XactGrouper {
             case HeapOps.XLOG_HEAP_INSERT -> {
                 HeapViews.HeapInsertView v = HeapViews.HeapInsertView.parse(rec, layout);
                 appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
-                        null, tupleFromBlock(rec, blk, v.offnum(), res.kinds()));
+                        null, tupleFromBlock(rec, blk, v.offnum(), res.kinds(), insertDecoder));
             }
             case HeapOps.XLOG_HEAP_UPDATE, HeapOps.XLOG_HEAP_HOT_UPDATE -> {
                 HeapViews.HeapUpdateView v = HeapViews.HeapUpdateView.parse(rec, layout);
@@ -751,7 +764,7 @@ public final class XactGrouper {
                     throw new IllegalStateException("multi_insert entry 越界: i=" + i + ", datalen=" + datalen);
                 }
                 appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
-                        null, decoder.decodeEntry(raw, off, res.kinds()));
+                        null, insertDecoder.decodeEntry(raw, off, res.kinds()));
                 off += MULTI_INSERT_ENTRY_HEADER + datalen;
             }
         } else {
@@ -759,7 +772,7 @@ public final class XactGrouper {
             for (int i = 0; i < v.ntuples(); i++) {
                 int lp = PageImages.linePointerOffset(page, v.offsetAt(i));
                 appendRow(top, origin, res, rec.lsn(), ChangeOutputListener.DmlKind.INSERT,
-                        null, decoder.decodePageTuple(page, lp, res.kinds()));
+                        null, insertDecoder.decodePageTuple(page, lp, res.kinds()));
             }
         }
         resetToastWindow();   // MULTI_INSERT 末行镜像（clear_toast_afterwards 只在 LAST_IN_MULTI 置位）
@@ -929,6 +942,24 @@ public final class XactGrouper {
      * @throws IllegalStateException 块既无 data 又无镜像（不可解码形态）
      */
     private Object[] tupleFromBlock(WalRecord rec, BlockRef blk, int offnum, String[] kinds) {
+        return tupleFromBlock(rec, blk, offnum, kinds, decoder);
+    }
+
+    /**
+     * {@link #tupleFromBlock(WalRecord, BlockRef, int, String[])} 的解码器可变档——
+     * INSERT 新元组传 {@link #insertDecoder}（external 空面回查视图），UPDATE 新元组
+     * 传主 decoder（'u' 对齐）。两路径（块 data / FPW 镜像）与原实现同构。
+     *
+     * @param rec     记录
+     * @param blk     新元组所在块
+     * @param offnum  元组行号（data 缺位时的镜像路径锚）
+     * @param kinds   列词典
+     * @param decoder 本行使用的解码器
+     * @return 值数组（长度 natts）
+     * @throws IllegalStateException 块既无 data 又无镜像（不可解码形态）
+     */
+    private Object[] tupleFromBlock(WalRecord rec, BlockRef blk, int offnum, String[] kinds,
+            TupleDecoder decoder) {
         if (blk.hasData()) {
             return decoder.decodePayload(rec.raw(), blk.dataOff(), kinds);
         }
