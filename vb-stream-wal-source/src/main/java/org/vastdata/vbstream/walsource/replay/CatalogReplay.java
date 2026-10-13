@@ -181,19 +181,24 @@ public final class CatalogReplay {
     }
 
     /**
-     * pg_class 腿的解码词典（Task 7 OG 适配）：V17/V18 透传
-     * {@code layout.pgClassKinds()}；OG 档前置虚拟头 oid 槽（见字段注记）——
-     * 值行长度 = 物理词典 + {@code layout.classValsSlotDelta()}、槽 0 = 元组头 oid。
+     * pg_class 腿的解码词典（Task 7 OG 适配；vastbase T3 增自含前导槽判别）：
+     * V17/V18 透传 {@code layout.pgClassKinds()}；OG 档物理词典无 oid 槽，前置
+     * 虚拟头 oid 槽（见字段注记）——值行长度 = 物理词典 +
+     * {@code layout.classValsSlotDelta()}、槽 0 = 元组头 oid；<b>VastBase 档的
+     * {@code pgClassKinds()} 自含 oidhdr 前导槽</b>（43 项 = oidhdr + 42，数组槽
+     * = attnum），本方法直接透传不再二次注入（双 oidhdr 会使词典首位语义落在
+     * 第二槽——解码撞未注册 kind ISE）。
      *
      * <p>边界与异常语义：产物缓存复用（构造后只读数组，调用方不得改写）。
      * 线程约束：惰性初始化竞态无害（幂等赋值、数组内容恒定）。</p>
      *
-     * @return pg_class 解码词典（V17/18=物理词典 / OG=前导 oidhdr + 物理词典）
+     * @return pg_class 解码词典（V17/18=物理词典 / OG=前导 oidhdr + 物理词典 /
+     *         VastBase=自含前导 oidhdr 的物理词典原样）
      */
     private String[] classDecodeKinds() {
         if (classDecodeKinds == null) {
             String[] phys = layout.pgClassKinds();
-            if (!layout.classOidInTupleHeader()) {
+            if (!layout.classOidInTupleHeader() || TupleDecoder.OIDHDR_KIND.equals(phys[0])) {
                 classDecodeKinds = phys;
             } else {
                 String[] aug = new String[phys.length + 1];
@@ -887,7 +892,7 @@ public final class CatalogReplay {
     /**
      * pg_namespace 截断更新的值编码重建（v2 扩链，{@link #reconstructClassTruncated}
      * 的 nsp 面同构）——prefix 落在读区（V17/V18 ≤{@link CatalogRow.NspRow#READ_REGION_LEN}
-     * = 72 / OG ≤80，经 {@link CatalogRow.NspRow#readRegionLen(WalLayout)} 取）时由已知
+     * = 72 / OG ≤80 / VastBase ≤144，经 {@link CatalogRow.NspRow#readRegionLen(WalLayout)} 取）时由已知
      * 旧行 {@link CatalogRow.NspRow#encodeReadRegion(WalLayout)} 重编码前缀，
      * 中段取自记录；后缀零填充仅在读区之外合法，与读区的重叠段按旧行读区字节回填
      * （语义同 class 面的 High-1：典型形态是 ALTER SCHEMA ... RENAME——prefix 落
@@ -948,16 +953,18 @@ public final class CatalogReplay {
 
     /**
      * pg_partition 截断更新的值编码重建（openGauss M3 Task 1 第四腿，
-     * {@link #reconstructNspTruncated} 的 partition 面同构）——prefix 落在读区
-     * （OG 恒 {@link CatalogRow.PartitionRow#READ_REGION_LEN}=120）时由已知旧行
-     * {@link CatalogRow.PartitionRow#encodeReadRegion()} 重编码前缀，中段取自记录；
-     * 后缀零填充仅在读区之外合法，与读区的重叠段按旧行读区字节回填（语义同
-     * class/nsp 面：典型形态是 MERGE 改名/EXCHANGE 换段号——prefix 落 relname/
-     * parttype 区、suffix 起点越入读区）。
+     * {@link #reconstructNspTruncated} 的 partition 面同构；vastbase T3 起读区
+     * 版本感知）——prefix 落在读区（OG 恒 {@link CatalogRow.PartitionRow#READ_REGION_LEN}
+     * =120 / VastBase 184，经 {@link CatalogRow.PartitionRow#readRegionLen(WalLayout)}
+     * 取）时由已知旧行 {@link CatalogRow.PartitionRow#encodeReadRegion(WalLayout)}
+     * 重编码前缀，中段取自记录；后缀零填充仅在读区之外合法，与读区的重叠段按旧行
+     * 读区字节回填（语义同 class/nsp 面：典型形态是 MERGE 改名/EXCHANGE 换段号——
+     * prefix 落 relname/parttype 区、suffix 起点越入读区）。
      *
-     * <p>关键步骤与边界语义同 {@link #reconstructNspTruncated}（读区末尾 = 120
-     * 恒定、词典 = {@link #partitionDecodeKinds()} 无版本分派）；
-     * 返回 null 表示 prefix 越过读区（落 rawTail splice）；线程约束：纯函数。</p>
+     * <p>关键步骤与边界语义同 {@link #reconstructNspTruncated}（读区末尾经
+     * readRegionLen(WalLayout) 版本感知取值、词典 = {@link #partitionDecodeKinds()}
+     * 的 name128 变体分派）；返回 null 表示 prefix 越过读区（落 rawTail splice）；
+     * 线程约束：纯函数。</p>
      *
      * @param r      走读完成的 UPDATE 记录
      * @param b0     新页块引用（须携带 data）
@@ -969,7 +976,7 @@ public final class CatalogReplay {
         int prefix = p[0];
         int suffix = p[1];
         int cur = p[2];
-        int readEnd = CatalogRow.PartitionRow.READ_REGION_LEN;
+        int readEnd = CatalogRow.PartitionRow.readRegionLen(layout);
         if (prefix > readEnd) {
             return null;
         }
@@ -985,7 +992,7 @@ public final class CatalogReplay {
         } else {
             out.write(raw, cur, bitmapLen);    // 位图 + 垫齐
             cur += bitmapLen;
-            out.write(oldRow.encodeReadRegion(), 0, prefix);
+            out.write(oldRow.encodeReadRegion(layout), 0, prefix);
             out.write(raw, cur, b0.dataLen() - (cur - b0.dataOff()));    // 中段
         }
         out.write(new byte[suffix], 0, suffix);    // 后缀零填充占位（读区重叠段下方回填）
@@ -998,7 +1005,7 @@ public final class CatalogReplay {
             return null;    // 防御：suffix 超数据区长（畸形记录）——落 tail/skip 兜底
         }
         if (zeroStart < readEnd) {
-            byte[] readRegion = oldRow.encodeReadRegion();
+            byte[] readRegion = oldRow.encodeReadRegion(layout);
             int backfillEnd = Math.min(dataLen, readEnd);
             for (int i = zeroStart; i < backfillEnd; i++) {
                 assembled[bitmapLen + i] = readRegion[i];
@@ -1054,11 +1061,12 @@ public final class CatalogReplay {
      *
      * <p>关键步骤：值编码优先——classRowLookup 非空且 prefix ≤ 88 时查旧行，命中
      * 即走 {@link #reconstructClassTruncated}（prefix 越界防御性再判一次）；
-     * nspRowLookup 非空且 prefix ≤ {@link CatalogRow.NspRow#READ_REGION_LEN} 时查
-     * 旧行走 {@link #reconstructNspTruncated}（同语义的 nsp 面）；
+     * nspRowLookup 非空且 prefix ≤ {@link CatalogRow.NspRow#readRegionLen(WalLayout)}
+     * 时查旧行走 {@link #reconstructNspTruncated}（同语义的 nsp 面）；
      * partRowLookup 非空且 prefix ≤
-     * {@link CatalogRow.PartitionRow#READ_REGION_LEN} 时查旧行走
-     * {@link #reconstructPartitionTruncated}（同语义的 partition 面）；未命中或
+     * {@link CatalogRow.PartitionRow#readRegionLen(WalLayout)} 时查旧行走
+     * {@link #reconstructPartitionTruncated}（同语义的 partition 面——两读区
+     * 均版本感知，VastBase 档各 +64）；未命中或
      * 未配 lookup 则取 rawTailStore 的旧 tail 走 splice；两者皆无时若 healer 与
      * healStores 均可用（pg_class 面）走 {@code selfHealTruncated} ctid 寻址精确
      * 采纳（spec §6② 的收敛形态——末态回填而非历史重建），classRowLookup 与
@@ -1195,9 +1203,10 @@ public final class CatalogReplay {
         CatalogRow.ClassRow row = end.row();
         // 值行组装（Task 7 OG 适配）：长度/漂移槽位与 classDecodeKinds() 的解码值行
         // 同构——OG 档前八列槽位恰与 IX_* 镜像对齐（零位移），toast/relkind 槽位
-        // = 访问器（物理词典槽位）+ classValsSlotDelta()
+        // = 访问器（物理词典槽位）+ classValsSlotDelta()；vastbase T3 起长度直接取
+        // classDecodeKinds()（VastBase 词典自含前导槽，"物理长度+delta"口径失真 +1）
         int delta = layout.classValsSlotDelta();
-        Object[] vals = new Object[layout.pgClassKinds().length + delta];
+        Object[] vals = new Object[classDecodeKinds().length];
         vals[IX_CLASS_OID] = row.relOid();
         vals[IX_CLASS_RELNAME] = row.relname();
         vals[IX_CLASS_RELNAMESPACE] = row.relnamespace();

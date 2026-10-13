@@ -1,46 +1,174 @@
 package org.vastdata.vbstream.walsource.layout;
 
 /**
- * VastBase G100 V3.0（基于 openGauss 6.0.0 内核）第四布局档——<b>骨架</b>
- * （vastbase 适配 Task 2 预埋类声明与档位身份；完整词典几何与读区偏移归 Task 3
- * 落地，届时替换本骨架的覆写面）。
- *
- * <p><b>定位</b>：记录层与 OG 5.0.0 全同构（页魔数/记录头/heap 尺寸/块引用——
- * 132019 条真实 WAL 记录零 resync 实证，vastbase spec §0.2），差异集中在 catalog
- * 词典几何：① NAMEDATALEN 64→128（name 类型全 catalog 加宽，读区偏移统一 +64B，
- * 经 {@link WalLayout#nameDatumWidth()} 供数——骨架期暂承接口缺省 64，Task 3 覆写
- * 128）；② pg_class 42 列（OG 40）；③ pg_attribute 29 列（OG 24）——列序/attlen
- * 锚定 2026-10-13 真库实查（spec 附录 A）。继承 {@link WalLayoutVOpenGauss} 取
- * OG 侧缺省（{@code openGaussDialect()=true}、9.2 式元组头 oid、记录层全部常量），
- * 本骨架仅覆写档位身份两方法（{@link #supports(int)} / {@link #majorVersion()}）。
- * 判别经 relname attlen 探测（{@code WalLayouts} 三参重载，Task 4 落地前本档不经
- * 分发器触达，{@link #INSTANCE} 仅由 nsp/partition 词典的版本感知分派
- * {@code instanceof} 消费）。majorVersion=6 使 v5 检查点在本档拒载回落全新引导。</p>
- *
- * <p>线程约束：无状态单例，并发安全。</p>
+ * VastBase G100 V3.0（基于 openGauss 6.0.0 内核，2026-03-31 Build 9）第四布局档:
+ * 记录层与 OG 5.0.0 全同构（页魔数/记录头/heap 尺寸/块引用——132019 条真实 WAL
+ * 记录零 resync 实证，spec §0.2），差异集中在 catalog 词典几何——
+ * ① NAMEDATALEN 64→128（name 类型全 catalog 加宽，读区偏移统一 +64B）；
+ * ② pg_class 42 列（OG 40）：attnum 25 插 relhassecids，尾部增 relminmxid/relrewrite；
+ * ③ pg_attribute 29 列（OG 24）：attnum 20/21 插 attalias/attisquoted，尾部增
+ * attidentity/attextraopt/attdroppedname。
+ * 全部列序/attlen 锚定 2026-10-13 真库实查（spec 附录 A）。判别经 relname attlen
+ * 探测（WalLayouts 三参重载）；majorVersion=6 使 v5 检查点拒载回落全新引导。
+ * <b>槽位口径</b>：本档 {@link #pgClassKinds()} 数组自带 oidhdr 前导槽使数组槽
+ * 恰等于 attnum；护栏访问器（{@link #classParttypeIndex()} 等）沿用 OG 的
+ * "attnum-1 物理槽"口径，消费面 +{@code classValsSlotDelta()}(=1，继承) 落回
+ * attnum 值行槽位——与 OG 档同式桥接（{@code CatalogReplay.classDecodeKinds()}
+ * 对已带前导槽的词典不再二次注入）。
+ * 线程约束:无状态单例,并发安全。
  */
 public final class WalLayoutVVastbase extends WalLayoutVOpenGauss {
 
-    /** 唯一实例：零状态描述符，无并发约束。 */
+    /** 单例。 */
     public static final WalLayoutVVastbase INSTANCE = new WalLayoutVVastbase();
 
-    /** 私有构造器：单例描述符，经 {@link #INSTANCE} 访问。 */
+    /** pg_attribute 词典（29 项,无 oidhdr——元组无 oid）,列序 2026-10-13 实查。 */
+    private static final String[] PG_ATTRIBUTE_KINDS = {
+            "oid",     // attrelid
+            "name128", // attname(VastBase NAMEDATALEN 128)
+            "oid",     // atttypid
+            "int4",    // attstattarget(PG≤16 位次)
+            "int2",    // attlen
+            "int2",    // attnum                  <-- 槽 5(继承 attrAttnumIndex)
+            "int4",    // attndims
+            "int4",    // attcacheoff
+            "int4",    // atttypmod
+            "bool",    // attbyval
+            "char",    // attstorage
+            "char",    // attalign
+            "bool",    // attnotnull
+            "bool",    // atthasdef
+            "bool",    // attisdropped           <-- 槽 14(继承 attrDroppedIndex)
+            "bool",    // attislocal
+            "int1",    // attcmprmode
+            "int4",    // attinhcount
+            "oid",     // attcollation            ---- 分叉点(槽 19 起)----
+            "name128", // attalias(VastBase 插入,实查 typid 19/attlen 128)
+            "bool",    // attisquoted(VastBase 插入)
+            "skip",    // attacl
+            "skip",    // attoptions
+            "skip",    // attfdwoptions
+            "skip",    // attinitdefval
+            "int1",    // attkvtype
+            "char",    // attidentity(VastBase 插入,typid 18)
+            "int8",    // attextraopt(VastBase 插入,typid 20/attlen 8)
+            "name128", // attdroppedname(VastBase 插入)
+    };
+
+    /** pg_class 词典（oidhdr + 42 项 = 43,数组槽 = attnum——oidhdr 前导）。 */
+    private static final String[] PG_CLASS_KINDS = {
+            TupleDecoder.OIDHDR_KIND, // 元组头 oid(9.2 式,继承 classOidInTupleHeader)
+            "name128", // relname(VastBase NAMEDATALEN 128)
+            "oid",     // relnamespace
+            "oid",     // reltype
+            "oid",     // reloftype
+            "oid",     // relowner
+            "oid",     // relam
+            "oid",     // relfilenode            <-- attnum 7
+            "oid",     // reltablespace
+            "float8",  // relpages
+            "float8",  // reltuples
+            "int4",    // relallvisible
+            "oid",     // reltoastrelid          <-- attnum 12
+            "oid",     // reltoastidxid
+            "oid",     // reldeltarelid          <-- 物理槽 13(护栏,分叉前)
+            "oid",     // reldeltaidx
+            "oid",     // relcudescrelid         <-- 物理槽 15(护栏,分叉前)
+            "oid",     // relcudescidx
+            "bool",    // relhasindex
+            "bool",    // relisshared
+            "char",    // relpersistence
+            "char",    // relkind                <-- attnum 21
+            "int2",    // relnatts
+            "int2",    // relchecks
+            "bool",    // relhasoids             ---- 分叉点(槽 24/attnum 25 起)----
+            "bool",    // relhassecids(VastBase 插入)
+            "bool",    // relhaspkey
+            "bool",    // relhasrules
+            "bool",    // relhastriggers
+            "bool",    // relhassubclass
+            "int1",    // relcmprs
+            "bool",    // relhasclusterkey
+            "bool",    // relrowmovement
+            "char",    // parttype               <-- attnum 33(OG 32;物理槽 32)
+            "int4",    // relfrozenxid
+            "skip",    // relacl
+            "text",    // reloptions             <-- 物理槽 35(护栏;UStore/段页式 sniff 面)
+            "char",    // relreplident
+            "int8",    // relfrozenxid64
+            "oid",     // relbucket              <-- 物理槽 38(护栏)
+            "skip",    // relbucketkey
+            "int8",    // relminmxid             <-- attnum 41(OG 40)
+            "oid",     // relrewrite(VastBase 新增尾列)
+    };
+
+    /** 私有构造器:单例描述符。 */
     private WalLayoutVVastbase() {
     }
 
-    /**
-     * {@inheritDoc}——90204（VastBase 与 OG/vanilla 9.2 撞号；档位判别在
-     * {@code WalLayouts} 三参重载的 relname attlen 探测，Task 4 落地前不经
-     * 分发器触达——返回值仅声明档位覆盖区间，不构成分发入口）。
-     */
+    /** {@inheritDoc}——29 项(OG 24 + attalias/attisquoted 尾部三列,槽 19 起分叉)。 */
     @Override
-    public boolean supports(int pgVersionNum) {
-        return pgVersionNum == 90204;
+    public String[] pgAttributeKinds() {
+        return PG_ATTRIBUTE_KINDS.clone();
     }
 
-    /** {@inheritDoc}——6（档号延续：OG=5；v5 检查点在本档拒载回落全新引导）。 */
+    /** {@inheritDoc}——43 项(oidhdr + 42;槽 24 起分叉,读区偏移 +64)。 */
+    @Override
+    public String[] pgClassKinds() {
+        return PG_CLASS_KINDS.clone();
+    }
+
+    /** {@inheritDoc}——148(relname 128 + 5×oid;OG 84 + 64,实查列宽推演)。 */
+    @Override
+    public int pgClassRelfilenodeDataOffset() {
+        return 148;
+    }
+
+    /** {@inheritDoc}——180(148 + reltablespace 4 + float8×2 d 对齐 + relallvisible 4)。 */
+    @Override
+    public int pgClassReltoastrelidDataOffset() {
+        return 180;
+    }
+
+    /** {@inheritDoc}——207(180 + oid×5 + bool×2 + char;类注释锚,投影走词典槽 21)。 */
+    @Override
+    public int pgClassRelkindDataOffset() {
+        return 207;
+    }
+
+    /** {@inheritDoc}——32(attnum 33;relhassecids 插入使 OG 31 + 1——流内存储护栏判别面)。 */
+    @Override
+    public int classParttypeIndex() {
+        return 32;
+    }
+
+    /** {@inheritDoc}——35(OG 34 + 1;UStore/段页式 reloptions sniff 判别面)。 */
+    @Override
+    public int classReloptionsIndex() {
+        return 35;
+    }
+
+    /** {@inheritDoc}——38(OG 37 + 1;bucket/段页式判别面)。 */
+    @Override
+    public int classRelbucketIndex() {
+        return 38;
+    }
+
+    /** {@inheritDoc}——128(VastBase NAMEDATALEN 加宽;V17/V18/OG 64)。 */
+    @Override
+    public int nameDatumWidth() {
+        return 128;
+    }
+
+    /** {@inheritDoc}——6(档号延续:OG=5;v5 检查点在本档拒载回落全新引导)。 */
     @Override
     public int majorVersion() {
         return 6;
+    }
+
+    /** {@inheritDoc}——90204(VastBase 与 OG/vanilla 9.2 撞号;档位判别在 WalLayouts 探测)。 */
+    @Override
+    public boolean supports(int pgVersionNum) {
+        return pgVersionNum == 90204;
     }
 }

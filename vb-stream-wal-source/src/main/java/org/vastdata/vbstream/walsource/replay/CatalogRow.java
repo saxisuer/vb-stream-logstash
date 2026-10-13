@@ -35,6 +35,14 @@ public final class CatalogRow {
      * 一条重放中的 pg_attribute 行（按物理 ctid 键控）——as-of 字典面（列名/类型/
      * 列号/dropped 占位）的最小投影。
      *
+     * <p><b>无值编码读区（vastbase T3 核查注记）</b>：attr 面不提供
+     * {@code encodeReadRegion}——五字段投影无法重编码全列前缀（class/nsp/partition
+     * 的读区重建前提是投影列覆盖定宽前段），截断更新走 rawTail splice / ctid 精确
+     * 采纳两通道（{@code CatalogReplay.reconstructTruncatedUpdate} 的 attr 分支），
+     * attname 不以 64B 硬编码参与任何值编码重建——故 VastBase 的 nameDatumWidth
+     * 加宽在本 record 无读区消费面（词典宽度差异由 pgAttributeKinds() 的 name128
+     * kind 承担，投影槽位全在词典分叉点槽 19 之前零漂移）。</p>
+     *
      * @param attrelid    所属关系 oid
      * @param attname     列名（DROP COLUMN 后为 "........pg.dropped.N........"）
      * @param atttypid    类型 oid
@@ -133,7 +141,8 @@ public final class CatalogRow {
          *
          * <p><strong>读区布局（数据区偏移，与 layout
          * {@code pgClassRelfilenodeDataOffset()/pgClassReltoastrelidDataOffset()/
-         * pgClassRelkindDataOffset()} 锚定）</strong>，按 oid 形态分两版：
+         * pgClassRelkindDataOffset()} 锚定；name 定宽经 {@code nameDatumWidth()} 取）
+         * </strong>，按 oid 形态分档：
          * <b>V17/V18（oid 是数据列）</b>：oid@0（u32 小端）、relname@4（定宽 64B，
          * UTF-8 + NUL 尾垫，超 63B 截断——与 NameData 存储一致）、
          * relnamespace..relam@[68,88)（5 个 oid 各 u32）、relfilenode@88（u32）、
@@ -146,17 +155,21 @@ public final class CatalogRow {
          * relname@0（64B）、relnamespace..relam@[64,84)（5 oid）、relfilenode@84、
          * 填零 [88,116)（tablespace + float8 加宽的 pages/tuples + allvisible）、
          * reltoastrelid@116、填零 [120,143)（五 oid 列存四件 + reltoastidxid + 三
-         * 单字节列）、relkind@143——合计 144 字节。
+         * 单字节列）、relkind@143——合计 144 字节。<b>VastBase（OG 几何 + name128，
+         * vastbase T3）</b>：relname@0（128B）、relnamespace..relam@[128,148)、
+         * relfilenode@148、填零 [152,180)、reltoastrelid@180、填零 [184,207)、
+         * relkind@207——合计 208 字节（= OG 144 + 64，name 加宽净效果；两个填零段
+         * 宽度经 layout 偏移差自适应，无需独立分叉）。
          * <strong>消费面</strong>：截断更新的 prefix 重编码（prefix ≤ 读区末尾均可由
          * 旧行无损重编码）与<strong>后缀读区回填</strong>（suffix 截断时被省略的尾段与
          * 读区的重叠段按本编码回填——后缀与旧元组逐字节相同是 suffix 截断的定义，
          * 回填即精确值；审查 High-1：此前盲零填充在 RENAME 形态（prefix 落 relname 区、
          * 后缀起点 &lt; 读区末尾）会把 relnamespace..relam 等读区列清零）。
-         * 边界与异常语义：relname 超 63B 截断不抛（防御）；读区末尾之外的列不可由
+         * 边界与异常语义：relname 超定宽-1 截断不抛（防御）；读区末尾之外的列不可由
          * 行值重编码，属零填充合法区（定宽不读值）。线程约束：纯函数，并发安全。</p>
          *
-         * @param layout 版本布局描述符（toast/relkind 偏移锚定读区几何；OG 档经
-         *               {@code classOidInTupleHeader()} 分派无 oid 前缀形态）
+         * @param layout 版本布局描述符（toast/relkind 偏移锚定读区几何 + name 宽度；
+         *               OG 档经 {@code classOidInTupleHeader()} 分派无 oid 前缀形态）
          * @return {@code layout.pgClassRelkindDataOffset()+1} 字节数据区读区编码
          */
         public byte[] encodeReadRegion(WalLayout layout) {
@@ -164,13 +177,14 @@ public final class CatalogRow {
             int relkindOff = layout.pgClassRelkindDataOffset();
             boolean oidHeader = layout.classOidInTupleHeader();
             int filenodeOff = layout.pgClassRelfilenodeDataOffset();
+            int nameWidth = layout.nameDatumWidth();
             ByteArrayOutputStream out = new ByteArrayOutputStream(relkindOff + 1);
             if (!oidHeader) {
                 writeU32(out, relOid);
             }
             byte[] n = relname.getBytes(StandardCharsets.UTF_8);
-            out.write(n, 0, Math.min(63, n.length));
-            for (int i = Math.min(63, n.length); i < 64; i++) {
+            out.write(n, 0, Math.min(nameWidth - 1, n.length));
+            for (int i = Math.min(nameWidth - 1, n.length); i < nameWidth; i++) {
                 out.write(0);   // NUL 尾垫
             }
             writeU32(out, relnamespace);
@@ -179,12 +193,13 @@ public final class CatalogRow {
             writeU32(out, relowner);
             writeU32(out, relam);
             writeU32(out, relfilenode);
-            // [filenodeOff+4,toastOff) 定宽列（V17 四列 16B / V18 五列 20B / OG 六列
-            // 28B——tablespace + float8 pages/tuples + allvisible）——不被投影, 零值合法
+            // [filenodeOff+4,toastOff) 定宽列（V17 四列 16B / V18 五列 20B / OG 与
+            // VastBase 均 28B——tablespace + float8 pages/tuples + allvisible）——
+            // 不被投影, 零值合法
             out.write(new byte[toastOff - filenodeOff - 4], 0, toastOff - filenodeOff - 4);
             writeU32(out, reltoastrelid);
-            // [toastOff+4,relkindOff) 单字节/oid 列（V17/V18 三单字节列；OG 另含五个
-            // 4B oid 列——列存四件 + reltoastidxid）——不被投影, 零值合法
+            // [toastOff+4,relkindOff) 单字节/oid 列（V17/V18 三单字节列；OG/VastBase
+            // 另含五个 4B oid 列——列存四件 + reltoastidxid）——不被投影, 零值合法
             out.write(new byte[relkindOff - toastOff - 4], 0, relkindOff - toastOff - 4);
             out.write(relkind == null || relkind.isEmpty() ? 0 : (byte) relkind.charAt(0));
             return out.toByteArray();
@@ -279,7 +294,7 @@ public final class CatalogRow {
      * 值行槽位（0/1）与 vanilla 对齐）。</p>
      *
      * @param nspOid  模式 oid（列 1）
-     * @param nspname 模式名（列 2，定宽 64B name）
+     * @param nspname 模式名（列 2，定宽 name——V17/18/OG 64B / VastBase 128B）
      */
     public record NspRow(long nspOid, String nspname) {
 
@@ -290,7 +305,8 @@ public final class CatalogRow {
          * 扩展的 nsp 面）。nspowner 不在投影面，读区编码的 [68,72) 以 0 占位——
          * 投影/解码不消费该列，仅重建几何需要（与 ClassRow 读区 [92,toastOff)
          * 不投影列零占位同惯例）；nspacl varlena@72 不可值编码，prefix 越过 72
-         * 落 rawTail splice。<b>OG 档读区长 80</b>（见 {@link #readRegionLen(WalLayout)}）。
+         * 落 rawTail splice。<b>OG 档读区长 80、VastBase 档 144</b>（经
+         * {@link #readRegionLen(WalLayout)} 取）。
          */
         public static final int READ_REGION_LEN = 72;
 
@@ -373,15 +389,22 @@ public final class CatalogRow {
         }
 
         /**
-         * 值编码<strong>读区</strong>长度（版本感知档）：V17/V18=72（见
-         * {@link #READ_REGION_LEN}）；OG=80——数据区 nspname@0（64B）+ nspowner@64
-         * （4B）+ 垫 4B + nsptimeline int8@72（8 对齐）至 80，nspacl varlena@80
-         * 不可值编码。
+         * 值编码<strong>读区</strong>长度（版本感知档；vastbase T3 增 VastBase 分支）：
+         * V17/V18=72（见 {@link #READ_REGION_LEN}）；OG=80——数据区 nspname@0
+         * （64B）+ nspowner@64（4B）+ 垫 4B + nsptimeline int8@72（8 对齐）至 80，
+         * nspacl varlena@80 不可值编码；<b>VastBase=144</b>（= OG 80 + 64）——
+         * nspname@0（128B）+ nspowner@128（4B）+ 垫 4B + nsptimeline int8@136
+         * （8 对齐）至 144，nspacl varlena@144 不可值编码。判别 {@code instanceof
+         * WalLayoutVVastbase} 先行于 {@code openGaussDialect()}（VastBase 继承
+         * OG 方言位 true，次序颠倒会误取 OG 读区）。
          *
          * @param layout 版本布局描述符
-         * @return 读区字节数（V17/18=72，OG=80）
+         * @return 读区字节数（V17/18=72，OG=80，VastBase=144）
          */
         public static int readRegionLen(WalLayout layout) {
+            if (layout instanceof WalLayoutVVastbase) {
+                return 144;
+            }
             return layout.openGaussDialect() ? 80 : READ_REGION_LEN;
         }
 
@@ -430,30 +453,40 @@ public final class CatalogRow {
         }
 
         /**
-         * 编码<strong>读区</strong>的数据区字节（版本感知档，Task 7 OG 适配）。
+         * 编码<strong>读区</strong>的数据区字节（版本感知档，Task 7 OG 适配；
+         * vastbase T3 起 name 定宽经 {@code layout.nameDatumWidth()} 参数化，
+         * 读区总长与尾段零占位经 {@link #readRegionLen(WalLayout)} 收口）。
          *
          * <p><b>openGauss 读区布局</b>（数据区偏移，oid 在元组头）：nspname@0
          * （定宽 64B，NUL 尾垫）、nspowner@64（u32，0 占位——不投影）、垫 4B、
-         * nsptimeline@72（int8，0 占位——不投影）——合计 {@value #READ_REGION_LEN}+8
-         * = 80B（长度经 {@link #readRegionLen(WalLayout)} 取）。vanilla 档委派
-         * {@link #encodeReadRegion()}。边界与异常语义同 vanilla 档；线程约束：
-         * 纯函数，并发安全。</p>
+         * nsptimeline@72（int8，0 占位——不投影）——合计 80B。<b>VastBase</b>
+         * （vastbase T3）：nspname@0（128B，NUL 尾垫）、nspowner@128（0 占位）、
+         * 垫 4B、nsptimeline int8@136（0 占位）——合计 144B。vanilla 档委派
+         * {@link #encodeReadRegion()}。<strong>vastbase T3 连带修正（OG 档）</strong>：
+         * 原实现 name 后仅写 12B（nspowner 4 + 8B），实长 76 与声明读区 80 不符
+         * ——prefix∈(76,80] 或回填触达 [76,80) 会数组越界；现按读区总长零占位
+         * 收口（实长 == readRegionLen），越界窗口关死，[76,80) 属 nsptimeline
+         * 上半段的 0 占位（不投影，解码消费恒无害）。
+         * 边界与异常语义同 vanilla 档；线程约束：纯函数，并发安全。</p>
          *
-         * @param layout 版本布局描述符（openGaussDialect 决定读区几何）
-         * @return 读区字节数据区编码（V17/18=72 / OG=80）
+         * @param layout 版本布局描述符（openGaussDialect/nameDatumWidth 决定读区几何）
+         * @return 读区字节数据区编码（V17/18=72 / OG=80 / VastBase=144）
          */
         public byte[] encodeReadRegion(WalLayout layout) {
             if (!layout.openGaussDialect()) {
                 return encodeReadRegion();
             }
-            ByteArrayOutputStream out = new ByteArrayOutputStream(readRegionLen(layout));
+            int nameWidth = layout.nameDatumWidth();
+            int total = readRegionLen(layout);
+            ByteArrayOutputStream out = new ByteArrayOutputStream(total);
             byte[] n = nspname.getBytes(StandardCharsets.UTF_8);
-            out.write(n, 0, Math.min(63, n.length));
-            for (int i = Math.min(63, n.length); i < 64; i++) {
+            out.write(n, 0, Math.min(nameWidth - 1, n.length));
+            for (int i = Math.min(nameWidth - 1, n.length); i < nameWidth; i++) {
                 out.write(0);   // NUL 尾垫
             }
-            out.write(new byte[4], 0, 4);   // nspowner@64：0 占位（不投影）
-            out.write(new byte[8], 0, 8);   // [68,80)：4B 垫 + nsptimeline@72 0 占位
+            // [nameWidth,total)：nspowner（4B，0 占位）+ 垫 4B + nsptimeline int8
+            // （0 占位）——不投影列，仅重建几何需要
+            out.write(new byte[total - nameWidth], 0, total - nameWidth);
             return out.toByteArray();
         }
     }
@@ -478,20 +511,23 @@ public final class CatalogRow {
      *
      * @param partOid     行自身 oid（元组头 oid 虚拟槽；分区行 INSERT 时与 relfilenode
      *                    同值，EXCHANGE 后换源表段号——以重放末态为准，T0 坑 3）
-     * @param relname     分区/母表名（定宽 64B name）
+     * @param relname     分区/母表名（定宽 name——OG 64B / VastBase 128B）
      * @param parttype    行身份（'r'=母表行 / 'p'=分区行——与 pg_class.parttype
      *                    值域不同语义：这里区分行身份，投影恒裸字符）
      * @param parentid    母表 pg_class oid（母表行=自 oid）
-     * @param relfilenode 分区物理段号（数据区偏移 84；路由锚——heap 记录落此段号）
-     * @param reltoastrelid 分区自有 toast 关系 oid（数据区偏移 116；'r' 行恒 0）
+     * @param relfilenode 分区物理段号（OG 数据区偏移 84 / VastBase 148；路由锚——
+     *                    heap 记录落此段号）
+     * @param reltoastrelid 分区自有 toast 关系 oid（OG 数据区偏移 116 / VastBase 180；
+     *                    'r' 行恒 0）
      */
     public record PartitionRow(long partOid, String relname, String parttype,
                                long parentid, long relfilenode, long reltoastrelid) {
 
         /**
-         * 值编码<strong>读区</strong>长度（数据区偏移，自 t_hoff 起）：[0,120) 定宽段
-         * = relname 64B@0 + parttype 1B@64 + 垫 3 + parentid u32@68 + rangenum@72 +
-         * intervalnum@76 + partstrategy@80 + 垫 3 + relfilenode u32@84 +
+         * 值编码<strong>读区</strong>长度（<b>OG 5.0.0 几何</b>，数据区偏移自 t_hoff 起；
+         * VastBase 档读区长经 {@link #readRegionLen(WalLayout)} 取——184，见其 javadoc）：
+         * [0,120) 定宽段 = relname 64B@0 + parttype 1B@64 + 垫 3 + parentid u32@68 +
+         * rangenum@72 + intervalnum@76 + partstrategy@80 + 垫 3 + relfilenode u32@84 +
          * reltablespace@88（0 占位——不投影）+ 垫 4 + relpages float8@96（0 占位）+
          * reltuples float8@104（0 占位）+ relallvisible@112（0 占位）+
          * reltoastrelid u32@116——截断更新值编码重建的合法 prefix 上界与后缀读区
@@ -504,19 +540,20 @@ public final class CatalogRow {
         /** 词典索引：元组头 oid（虚拟槽 0——9.2 式 [t_hoff-4,t_hoff) 垫区）。 */
         private static final int IX_PARTOID = 0;
 
-        /** 词典索引：relname（attnum 1，数据区 @0）。 */
+        /** 词典索引：relname（attnum 1，数据区 @0；VastBase @0 宽 128）。 */
         private static final int IX_RELNAME = 1;
 
-        /** 词典索引：parttype（attnum 2，数据区 @64）。 */
+        /** 词典索引：parttype（attnum 2，OG 数据区 @64；VastBase @128）。 */
         private static final int IX_PARTTYPE = 2;
 
-        /** 词典索引：parentid（attnum 3，数据区 @68）。 */
+        /** 词典索引：parentid（attnum 3，OG 数据区 @68；VastBase @132）。 */
         private static final int IX_PARENTID = 3;
 
-        /** 词典索引：relfilenode（attnum 7，数据区 @84——虚拟槽使值行槽位 = attnum）。 */
+        /** 词典索引：relfilenode（attnum 7，OG 数据区 @84 / VastBase @148——虚拟槽使
+         *  值行槽位 = attnum）。 */
         private static final int IX_RELFILENODE = 7;
 
-        /** 词典索引：reltoastrelid（attnum 12，数据区 @116）。 */
+        /** 词典索引：reltoastrelid（attnum 12，OG 数据区 @116 / VastBase @180）。 */
         private static final int IX_RELTOASTRELID = 12;
 
         /**
@@ -544,12 +581,12 @@ public final class CatalogRow {
                 "int4",    // rangenum
                 "int4",    // intervalnum
                 "char",    // partstrategy（'r'/'l'）
-                "oid",     // relfilenode          <-- 槽 7（数据区 84）
+                "oid",     // relfilenode          <-- 槽 7（OG 数据区 84 / VastBase 148）
                 "oid",     // reltablespace
                 "float8",  // relpages（float8——与 pg_class OG 同形加宽）
                 "float8",  // reltuples
                 "int4",    // relallvisible
-                "oid",     // reltoastrelid        <-- 槽 12（数据区 116）
+                "oid",     // reltoastrelid        <-- 槽 12（OG 数据区 116 / VastBase 180）
                 "oid",     // reltoastidxid
                 "oid",     // indextblid
                 "bool",    // indisusable
@@ -576,7 +613,8 @@ public final class CatalogRow {
          * pg_partition 列解码词典的 VastBase G100 变体（33 项 = 虚拟头 oid 槽 +
          * 32 数据列）：与 {@link #KINDS} 逐列同名同序（live 实查，vastbase spec
          * 附录 A），仅 relname 加宽为 name128（VastBase NAMEDATALEN 128）——
-         * 槽 1 之外与 OG 词典逐项相等。
+         * 槽 1 之外与 OG 词典逐项相等。数据区几何 = OG 各偏移 +64（relname 加宽
+         * 净效果，见 {@link #readRegionLen(WalLayout)}）。
          */
         private static final String[] VAST_KINDS = {
                 TupleDecoder.OIDHDR_KIND,   // 元组头 oid（虚拟槽）
@@ -586,12 +624,12 @@ public final class CatalogRow {
                 "int4",    // rangenum
                 "int4",    // intervalnum
                 "char",    // partstrategy（'r'/'l'）
-                "oid",     // relfilenode          <-- 槽 7（数据区 84）
+                "oid",     // relfilenode          <-- 槽 7（VastBase 数据区 148；OG 84）
                 "oid",     // reltablespace
                 "float8",  // relpages（float8——与 pg_class OG 同形加宽）
                 "float8",  // reltuples
                 "int4",    // relallvisible
-                "oid",     // reltoastrelid        <-- 槽 12（数据区 116）
+                "oid",     // reltoastrelid        <-- 槽 12（VastBase 数据区 180；OG 116）
                 "oid",     // reltoastidxid
                 "oid",     // indextblid
                 "bool",    // indisusable
@@ -643,6 +681,24 @@ public final class CatalogRow {
         }
 
         /**
+         * 值编码<strong>读区</strong>长度（版本感知档，vastbase T3）：
+         * VastBase=184（= {@link #READ_REGION_LEN} + 64）——数据区各列较 OG 几何
+         * 整体 +64（relname 128B 加宽的净效果，64 是 8 的倍数使全部对齐不变）：
+         * relname 128B@0 + parttype 1B@128 + 垫 3 + parentid u32@132 + rangenum@136 +
+         * intervalnum@140 + partstrategy@144 + 垫 3 + relfilenode u32@148 +
+         * reltablespace@152（0 占位）+ 垫 4 + relpages float8@160（0 占位）+
+         * reltuples float8@168（0 占位）+ relallvisible@176（0 占位）+
+         * reltoastrelid u32@180——变长段不可值编码，prefix 越过 184 落 rawTail
+         * splice。其余档返回 OG 几何 120（vanilla 无此表，返回值不被消费）。
+         *
+         * @param layout 版本布局描述符（WalLayoutVVastbase 决定读区几何）
+         * @return 读区字节数（OG=120，VastBase=184）
+         */
+        public static int readRegionLen(WalLayout layout) {
+            return layout instanceof WalLayoutVVastbase ? READ_REGION_LEN + 64 : READ_REGION_LEN;
+        }
+
+        /**
          * 把 pg_partition 解码值行投影为行模型。
          *
          * <p>关键步骤与异常语义同 {@link AttrRow#fromDecoded(Object[], WalLayout)}
@@ -666,7 +722,7 @@ public final class CatalogRow {
         }
 
         /**
-         * 编码<strong>读区</strong>的数据区字节（值编码——语义同
+         * 编码<strong>读区</strong>的数据区字节（值编码——<b>OG 5.0.0 几何</b>，语义同
          * {@link ClassRow#encodeReadRegion(WalLayout)} 的 partition 面，布局见
          * {@link #READ_REGION_LEN} javadoc）。消费面：截断更新的 prefix 重编码与
          * 后缀读区回填。边界与异常语义：relname 超 63B 截断不抛（防御）；
@@ -689,6 +745,38 @@ public final class CatalogRow {
             ClassRow.writeU32(out, relfilenode);     // relfilenode@84
             out.write(new byte[28], 0, 28); // [88,116) 垫 4 + relpages/reltuples float8 + relallvisible：0 占位
             ClassRow.writeU32(out, reltoastrelid);   // reltoastrelid@116
+            return out.toByteArray();
+        }
+
+        /**
+         * 编码<strong>读区</strong>的数据区字节（版本感知档，vastbase T3）：
+         * VastBase 分支 = OG 几何逐段 +64（布局见 {@link #readRegionLen(WalLayout)}
+         * javadoc——relname 128B 定宽 + NUL 尾垫、parttype@128、parentid@132、
+         * relfilenode@148、reltoastrelid@180，合计 184B）；其余档委派
+         * {@link #encodeReadRegion()}。边界与异常语义同 OG 档（relname 超 127B
+         * 截断不抛——防御）；线程约束：纯函数，并发安全。
+         *
+         * @param layout 版本布局描述符（WalLayoutVVastbase 决定读区几何与 name 宽度）
+         * @return 读区字节数据区编码（OG=120 / VastBase=184）
+         */
+        public byte[] encodeReadRegion(WalLayout layout) {
+            if (!(layout instanceof WalLayoutVVastbase)) {
+                return encodeReadRegion();
+            }
+            int nameWidth = layout.nameDatumWidth();
+            ByteArrayOutputStream out = new ByteArrayOutputStream(readRegionLen(layout));
+            byte[] n = relname.getBytes(StandardCharsets.UTF_8);
+            out.write(n, 0, Math.min(nameWidth - 1, n.length));
+            for (int i = Math.min(nameWidth - 1, n.length); i < nameWidth; i++) {
+                out.write(0);   // NUL 尾垫
+            }
+            out.write(parttype == null || parttype.isEmpty() ? 0 : (byte) parttype.charAt(0));   // parttype@128
+            out.write(new byte[3], 0, 3);   // [129,132) 垫
+            ClassRow.writeU32(out, parentid);        // parentid@132
+            out.write(new byte[12], 0, 12); // [136,148) rangenum/intervalnum/partstrategy/垫：0 占位（不投影）
+            ClassRow.writeU32(out, relfilenode);     // relfilenode@148
+            out.write(new byte[28], 0, 28); // [152,180) 垫 4 + relpages/reltuples float8 + relallvisible：0 占位
+            ClassRow.writeU32(out, reltoastrelid);   // reltoastrelid@180
             return out.toByteArray();
         }
     }
