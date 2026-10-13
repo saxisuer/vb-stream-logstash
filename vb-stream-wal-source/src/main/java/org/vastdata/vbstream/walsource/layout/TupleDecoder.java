@@ -18,9 +18,11 @@ import java.time.ZoneOffset;
  * （t_bits），natts 取 infomask2 &amp; 0x07FF；varlena 双头——1B 头总长
  * {@code (b>>1)&0x7F}、4B 头总长 {@code u32le>>>2}（spike 发现 21，小端是实测锚，
  * 防大端误读回归）；dropped 列恒 null 零消耗（spike 发现 26）、skip 列消耗 varlena
- * 不取值；name 定宽 64B 按 NUL 截断；timestamp 按 epoch 2000 微秒渲染为 UTC
+ * 不取值；name 定宽 64B 按 NUL 截断；name128 定宽 128B（VastBase G100 NAMEDATALEN
+加宽）同式 NUL 截断但对齐 'c'（1B 无填充——与 name 的 4 对齐不同式）；timestamp
+按 epoch 2000 微秒渲染为 UTC
  * ISO-8601 字符串。值 → Java 类型映射：bool→Boolean、char→String（左引号单字符，
- * 与 spike 渲染逐字一致）、name/text/timestamp→String、bytea→byte[]、int2→Short、
+ * 与 spike 渲染逐字一致）、name/name128/text/timestamp→String、bytea→byte[]、int2→Short、
  * int4→Integer、int8/oid→Long（oid 无符号语义）、float4→Float、float8→Double、
  * int1→Byte（OG 独有单字节有符号，Task 7）、dropped/skip/null→null。</p>
  *
@@ -241,6 +243,18 @@ public final class TupleDecoder {
                     // 显式 UTF-8：与 spike 平台默认字符集的有意差异（跨环境确定性）
                     vals[i + base] = new String(src, c, n, StandardCharsets.UTF_8);
                     c += 64;
+                }
+                case "name128" -> {   // VastBase G100 NameData：定宽 128B（NAMEDATALEN 加宽），对齐 'c'（1B）无填充，NUL 截断
+                    int n = 128;
+                    for (int k = 0; k < 128; k++) {
+                        if (src[c + k] == 0) {
+                            n = k;
+                            break;
+                        }
+                    }
+                    // 截断与编码同 name 分支式（字节面找 NUL——UTF-8 多字节序列不含零字节）
+                    vals[i + base] = new String(src, c, n, StandardCharsets.UTF_8);
+                    c += 128;
                 }
                 case "timestamp" -> {   // i64 微秒，epoch 2000 起点
                     c = tupleStart + align(c - tupleStart, 8);

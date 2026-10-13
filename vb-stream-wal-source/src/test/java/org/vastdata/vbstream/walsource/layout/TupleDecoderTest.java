@@ -155,6 +155,47 @@ class TupleDecoderTest {
     }
 
     /**
+     * name128 kind（VastBase G100，NAMEDATALEN 64→128 加宽）：定宽 128B——尾零截断、
+     * 非 ASCII 名完整解出（手工直拼 128B 数据区，同 {@link #fourByteVarlenaHeaderReadsLittleEndian}
+     * 的手造形态）。
+     */
+    @Test
+    void name128KindDecodesFixedWidthAndTruncatesAtNul() {
+        byte[] payload = new byte[5 + 1 + 128];
+        payload[0] = 1;    // infomask2 = natts 1
+        payload[4] = 24;   // t_hoff = MAXALIGN(23)；payload[5] = 垫字节（tuple offset 23）
+        byte[] name = "vb_wal_probe表".getBytes(StandardCharsets.UTF_8);
+        System.arraycopy(name, 0, payload, 6, name.length);   // 数据区 tuple offset 24 起 128B 定宽区，余零即 NUL 填充
+        Object[] vals = decoder.decodePayload(payload, 0, new String[]{"name128"});
+        assertEquals("vb_wal_probe表", vals[0]);
+    }
+
+    /**
+     * name128 磁盘几何三面（设计 §3.5）：对齐 'c'（1B）——bool 列后未 4 对齐偏移直接
+     * 起读（若误按 name 分支 4 对齐，名首字节错位即值不等）；恰消耗 128B——尾部活
+     * bool 须读到其专属字节（欠耗如 64B 落入零填充区读 false）；null 位图占位列
+     * （int4 null 零消耗）共存不扰走读。
+     */
+    @Test
+    void name128AfterBoolStaysUnalignedAndConsumesExactly128Bytes() {
+        String[] kinds = {"bool", "name128", "int4", "bool"};
+        byte[] payload = new byte[5 + 1 + 1 + 128 + 1];
+        payload[0] = 4;      // infomask2 = natts 4
+        payload[2] = 1;      // infomask = HEAP_HASNULL（int4 null 占位）
+        payload[4] = 24;     // t_hoff = MAXALIGN(23 + 1)；payload[5] = 位图
+        payload[5] = 0x0B;   // 位图：bool/name128/尾 bool 活（bit 0/1/3），int4 null（bit 2 清）
+        payload[6] = 1;      // bool true（tuple offset 24）——name128 随之落于未 4 对齐的 tuple offset 25
+        byte[] name = "vast_g100分区probe".getBytes(StandardCharsets.UTF_8);
+        System.arraycopy(name, 0, payload, 7, name.length);   // 128B 定宽区（余零填充）
+        payload[135] = 1;    // 尾 bool true（tuple offset 25+128=153）——恰耗尽 128B 才读到
+        Object[] vals = decoder.decodePayload(payload, 0, kinds);
+        assertEquals(Boolean.TRUE, vals[0]);
+        assertEquals("vast_g100分区probe", vals[1]);
+        assertNull(vals[2]);
+        assertEquals(Boolean.TRUE, vals[3]);
+    }
+
+    /**
      * 用例 5：multi-insert entry 形态——[datalen u16 前缀][payload]，decodeEntry 相对
      * entryOff 偏移 +2；前置 7B 杂字节同时验证对齐相对 tuple 起点而非缓冲起点。
      */
