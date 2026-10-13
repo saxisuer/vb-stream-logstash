@@ -156,7 +156,7 @@ class TupleDecoderTest {
 
     /**
      * name128 kind（VastBase G100，NAMEDATALEN 64→128 加宽）：定宽 128B——尾零截断、
-     * 非 ASCII 名完整解出（手工直拼 128B 数据区，同 {@link #fourByteVarlenaHeaderReadsLittleEndian}
+     * 非 ASCII 名完整解出（手工直拼 128B 数据区，同 {@link #fourByteVarlenaHeaderReadsLittleEndianLength}
      * 的手造形态）。
      */
     @Test

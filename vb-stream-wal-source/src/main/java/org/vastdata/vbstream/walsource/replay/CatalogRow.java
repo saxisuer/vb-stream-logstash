@@ -2,6 +2,7 @@ package org.vastdata.vbstream.walsource.replay;
 
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
+import org.vastdata.vbstream.walsource.layout.WalLayoutVVastbase;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -324,6 +325,22 @@ public final class CatalogRow {
         };
 
         /**
+         * VastBase G100 pg_namespace 词典（8 项 = 虚拟头 oid 槽 + 七数据列）：
+         * 列集与 {@link #OG_KINDS} 同名同序（live 实查，vastbase spec 附录 A），
+         * 仅 nspname 加宽为 name128（VastBase NAMEDATALEN 128）。
+         */
+        private static final String[] VAST_KINDS = {
+                TupleDecoder.OIDHDR_KIND,   // 元组头 oid（虚拟槽）
+                "name128",   // nspname（VastBase NAMEDATALEN 128）
+                "oid",    // nspowner
+                "int8",   // nsptimeline
+                "skip",   // nspacl
+                "char",   // in_redistribution
+                "bool",   // nspblockchain
+                "oid",    // nspcollation
+        };
+
+        /**
          * pg_namespace 列解码词典（防御副本——调用方改写不污染静态词典；V17/V18 档）。
          *
          * @return 列 kind 数组（4 项）
@@ -333,17 +350,25 @@ public final class CatalogRow {
         }
 
         /**
-         * pg_namespace 列解码词典（版本感知档，Task 7 OG 适配）。
+         * pg_namespace 列解码词典（版本感知档，Task 7 OG 适配；vastbase Task 2 增
+         * VastBase 分支）。
          *
-         * <p>关键步骤：{@code layout.openGaussDialect()} 时返回 OG 七数据列 + 虚拟
-         * 头 oid 前导槽的 8 项词典（值行槽 0/1 与 vanilla 的 oid/nspname 对齐，
+         * <p>关键步骤：{@code layout instanceof WalLayoutVVastbase} 时返回 G100
+         * name128 变体词典（8 项，列集与 OG 同名同序仅 nspname 加宽——判别先行于
+         * openGaussDialect，VastBase 档继承 OG 方言位 true）；否则
+         * {@code layout.openGaussDialect()} 时返回 OG 七数据列 + 虚拟头 oid 前导槽
+         * 的 8 项词典（值行槽 0/1 与 vanilla 的 oid/nspname 对齐，
          * {@link #fromDecoded} 无需分版本）；否则返回 vanilla 4 项词典（与
          * {@link #kinds()} 同值）。防御副本。线程约束：纯函数。</p>
          *
-         * @param layout 版本布局描述符（openGaussDialect 决定词典分派）
-         * @return 列 kind 数组（V17/18=4 项 / OG=8 项含虚拟头 oid 槽）
+         * @param layout 版本布局描述符（WalLayoutVVastbase / openGaussDialect 决定词典分派）
+         * @return 列 kind 数组（V17/18=4 项 / OG=8 项含虚拟头 oid 槽 /
+         *         VastBase=8 项含虚拟头 oid 槽且 nspname 为 name128）
          */
         public static String[] kinds(WalLayout layout) {
+            if (layout instanceof WalLayoutVVastbase) {
+                return VAST_KINDS.clone();
+            }
             return layout.openGaussDialect() ? OG_KINDS.clone() : KINDS.clone();
         }
 
@@ -446,7 +471,9 @@ public final class CatalogRow {
      * pg_attribute 实查 2026-10-13：attnum 1-32 见 {@link #KINDS} 列序注）；行身份
      * 双面——parttype 'r'=母表行（relfilenode/reltoastrelid 恒 0）与 'p'=分区行。
      * 词典自持于 {@link #kinds()}（首位虚拟头 oid 槽使投影槽位与值行对齐），
-     * 不经 layout。<b>无伴生结构</b>（OG 5.0.0 不存在 pg_partition_fn/
+     * VastBase G100 档经 {@link #kinds(WalLayout)} 返回 name128 变体（vastbase
+     * Task 2——32 数据列与 OG 逐列同名同序，仅 relname 加宽）。
+     * <b>无伴生结构</b>（OG 5.0.0 不存在 pg_partition_fn/
      * pg_partition_enum，T0 锚①），watched 面单表。</p>
      *
      * @param partOid     行自身 oid（元组头 oid 虚拟槽；分区行 INSERT 时与 relfilenode
@@ -546,6 +573,48 @@ public final class CatalogRow {
         };
 
         /**
+         * pg_partition 列解码词典的 VastBase G100 变体（33 项 = 虚拟头 oid 槽 +
+         * 32 数据列）：与 {@link #KINDS} 逐列同名同序（live 实查，vastbase spec
+         * 附录 A），仅 relname 加宽为 name128（VastBase NAMEDATALEN 128）——
+         * 槽 1 之外与 OG 词典逐项相等。
+         */
+        private static final String[] VAST_KINDS = {
+                TupleDecoder.OIDHDR_KIND,   // 元组头 oid（虚拟槽）
+                "name128",  // relname（VastBase NAMEDATALEN 128）
+                "char",    // parttype（'r'/'p' 行身份）
+                "oid",     // parentid
+                "int4",    // rangenum
+                "int4",    // intervalnum
+                "char",    // partstrategy（'r'/'l'）
+                "oid",     // relfilenode          <-- 槽 7（数据区 84）
+                "oid",     // reltablespace
+                "float8",  // relpages（float8——与 pg_class OG 同形加宽）
+                "float8",  // reltuples
+                "int4",    // relallvisible
+                "oid",     // reltoastrelid        <-- 槽 12（数据区 116）
+                "oid",     // reltoastidxid
+                "oid",     // indextblid
+                "bool",    // indisusable
+                "oid",     // reldeltarelid
+                "oid",     // reldeltaidx
+                "oid",     // relcudescrelid
+                "oid",     // relcudescidx
+                "int4",    // relfrozenxid（xid32 4B）
+                "int4",    // intspnum
+                "skip",    // partkey int2vector
+                "skip",    // intervaltablespace oidvector
+                "skip",    // interval _text
+                "skip",    // boundaries _text
+                "skip",    // transit _text
+                "skip",    // reloptions _text
+                "int8",    // relfrozenxid64（xid 8B）
+                "int8",    // relminmxid（xid 8B）
+                "skip",    // partkeyexpr text
+                "int4",    // partitionno
+                "int4",    // subpartitionno
+        };
+
+        /**
          * pg_partition 列解码词典（防御副本——调用方改写不污染静态词典）。OG 专属表
          * 无 vanilla 档变体：第四腿仅在 OG 引导回填 pgPartitionRelfilenode 后激活
          * （vanilla 恒 0 不匹配，词典不被消费）。
@@ -553,6 +622,23 @@ public final class CatalogRow {
          * @return 列 kind 数组（33 项含虚拟头 oid 槽）
          */
         public static String[] kinds() {
+            return KINDS.clone();
+        }
+
+        /**
+         * pg_partition 列解码词典（版本感知，vastbase Task 2）：VastBase G100 档返回
+         * name128 变体（32 数据列与 OG 5.0 逐列同名同序——live 实查，vastbase spec
+         * 附录 A；仅 relname 加宽），其余档返回既有 OG 词典（vanilla 无此表，返回值
+         * 不被消费——第四腿激活面由 pgPartitionRelfilenode 门控）。防御副本。
+         * 线程约束：纯函数。
+         *
+         * @param layout 版本布局描述符（WalLayoutVVastbase 决定词典分派）
+         * @return 列 kind 数组（33 项含虚拟头 oid 槽；VastBase 档槽 1 为 name128）
+         */
+        public static String[] kinds(WalLayout layout) {
+            if (layout instanceof WalLayoutVVastbase) {
+                return VAST_KINDS.clone();
+            }
             return KINDS.clone();
         }
 

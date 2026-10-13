@@ -6,6 +6,7 @@ import org.vastdata.vbstream.walsource.layout.TupleBytes;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalLayoutV17;
+import org.vastdata.vbstream.walsource.layout.WalLayoutV18;
 import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.layout.WalRecordParser;
@@ -270,6 +271,19 @@ class OgPartitionDictionaryTest {
                 ogPartitionTuple(P1_OID, "p1", 'p', MOTHER_OID, P1_OID, P1_TOAST).payload())
                 .mainData(insertMain(1)).build()), stores));
         assertTrue(stores.partitionRows().isEmpty(), "未注册 watched 段号不得落行");
+    }
+
+    /**
+     * 用例 ⑩：词典版本感知重构零回归锚——{@code PartitionRow.kinds(WalLayout)} 对
+     * vanilla（V17/V18）与 OG 档均返回与既有静态 KINDS 逐项相等：vastbase Task 2
+     * 的重构仅引入 VastBase 分派点（{@code instanceof WalLayoutVVastbase}），既有
+     * 三档词典内容零变化（VastBase 变体断言归 Task 3 词典落地后一并锁）。
+     */
+    @Test
+    void partitionKindsVersionAwareReturnsExistingDictionariesUnchanged() {
+        assertArrayEquals(CatalogRow.PartitionRow.kinds(), CatalogRow.PartitionRow.kinds(WalLayoutV17.INSTANCE));
+        assertArrayEquals(CatalogRow.PartitionRow.kinds(), CatalogRow.PartitionRow.kinds(WalLayoutV18.INSTANCE));
+        assertArrayEquals(CatalogRow.PartitionRow.kinds(), CatalogRow.PartitionRow.kinds(WalLayoutVOpenGauss.INSTANCE));
     }
 
     // ---- 测试基建：OG 分区元组 DSL 与记录拼装（与 OgCatalogReplayTest 同源双写） --------

@@ -206,9 +206,10 @@ public final class CatalogReplay {
     }
 
     /**
-     * pg_partition 腿的解码词典（openGauss M3 Task 1）：透传
-     * {@link CatalogRow.PartitionRow#kinds()}（OG 专属表，33 项含虚拟头 oid 槽——
-     * 值行槽 0 = 元组头 oid，attnum n 的值行槽位恰为 n）。
+     * pg_partition 腿的解码词典（openGauss M3 Task 1；vastbase Task 2 起版本感知）：
+     * 透传 {@link CatalogRow.PartitionRow#kinds(WalLayout)}——VastBase G100 档返回
+     * name128 变体（仅 relname 加宽），其余档与静态词典同值（OG 专属表，33 项含
+     * 虚拟头 oid 槽——值行槽 0 = 元组头 oid，attnum n 的值行槽位恰为 n）。
      *
      * <p>边界与异常语义：产物缓存复用（构造后只读数组，调用方不得改写）。
      * 线程约束：惰性初始化竞态无害（幂等赋值、数组内容恒定）。</p>
@@ -217,7 +218,7 @@ public final class CatalogReplay {
      */
     private String[] partitionDecodeKinds() {
         if (partitionDecodeKinds == null) {
-            partitionDecodeKinds = CatalogRow.PartitionRow.kinds();
+            partitionDecodeKinds = CatalogRow.PartitionRow.kinds(layout);
         }
         return partitionDecodeKinds;
     }

@@ -44,8 +44,14 @@ package org.vastdata.vbstream.walsource.layout;
  *
  * <p>WAL 面常量（magic/页头/记录头）与任务书一致，且经段页字节链式走读复核：
  * 15 条记录 MAXALIGN 步进下 prev 链逐条自洽（pageaddr+off 对齐）。</p>
+ *
+ * <p><b>可继承声明（vastbase 适配 Task 2 起）</b>：VastBase G100 第四布局档
+ * {@link WalLayoutVVastbase} 继承本类——记录层与 OG 5.0 全同构（132019 条真实 WAL
+ * 记录零 resync 实证，vastbase spec §0.2），仅 catalog 词典几何分叉（NAMEDATALEN
+ * 128 等，Task 3 落地）。本类自身无状态、行为零变化；{@code WalSource} 等消费面
+ * 的档位分派走 {@code == INSTANCE} 恒等或版本文本判别，子类实例不误命中。</p>
  */
-public final class WalLayoutVOpenGauss implements WalLayout {
+public class WalLayoutVOpenGauss implements WalLayout {
 
     /** 唯一实例：零状态描述符，无并发约束。 */
     public static final WalLayoutVOpenGauss INSTANCE = new WalLayoutVOpenGauss();
@@ -240,8 +246,10 @@ public final class WalLayoutVOpenGauss implements WalLayout {
             "int8",   // relminmxid（OG xid 为 8B——vanilla multixact 4B）
     };
 
-    /** 私有构造器：单例描述符，经 {@link #INSTANCE} 访问。 */
-    private WalLayoutVOpenGauss() {
+    /** 构造器：单例描述符，经 {@link #INSTANCE} 访问；包可见仅授同包的第四布局档
+     *  {@link WalLayoutVVastbase} 继承（vastbase Task 2——类摘 final 的配套收窄，
+     *  类外不可实例化语义不变）。 */
+    WalLayoutVOpenGauss() {
     }
 
     /** {@inheritDoc}——openGauss 5.0.0 页魔数 0xD074（xlog_basic.h，段首字节实测）。 */

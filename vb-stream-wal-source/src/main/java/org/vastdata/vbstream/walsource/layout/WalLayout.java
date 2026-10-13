@@ -477,6 +477,19 @@ public interface WalLayout {
     boolean supports(int pgVersionNum);
 
     /**
+     * name 类型（NameData）在本档的定宽字节数。
+     *
+     * <p>V17/V18/OG 5.0 均为 64（NAMEDATALEN 缺省）；VastBase G100 加宽至 128
+     * （live 实查 pg_attribute 的 name 列 attlen=128，spec §0.2）。消费面：nsp/partition
+     * 词典分派与读区重建几何的 name 差计算。缺省 64。</p>
+     *
+     * @return name 定宽字节数（64 / VastBase 128）
+     */
+    default int nameDatumWidth() {
+        return 64;
+    }
+
+    /**
      * 本描述符的 PG 大版本号。
      *
      * @return 大版本（如 18）
