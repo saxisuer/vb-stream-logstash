@@ -1,4 +1,4 @@
-# JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段，2.0 Task 5 增输出契约换血对照段）
+# JMH 基准与性能基线（assembly-spill Task 13 建立，1.7 Task 9 换管道口径，1.7.1 Task 2 增归因段，2.0 Task 5 增输出契约换血对照段，2026-10-13 wal-bench 增 wal-source 直解路段）
 
 五个 JMH 基准（`vb-stream-engine/src/jmh/java/org/vastdata/vbstream/bench/`，`-Pjmh` 档才参与编译）以**真实录制语料**
 离线回放，度量 pgoutput 解码、路由窥探、组装总成本与管道路径（`MessagePipe` append / 冻结桶回放）
@@ -556,6 +556,88 @@ TRUNCATE 前起，负载 = TRUNCATE(被 skipped.operations 滤零) + 单事务 I
   复算用真值行数而非量化读回值。
 - **macOS 段对照升级**：512B 修复后 WSL 25.0 万 vs macOS 5.6 万 rec/s——4.5×，与 slot 供给
   域的环境差同向叠加，"判读先看环境"通则再证。
+
+## vb-stream-wal-source 直解路（2026-10-13 wal-bench，VastBase 真库 WAL 语料离线回放）
+
+**性质**：与上文 engine 五基准同机制的离线语料回放，但对象是 wal-source 模块的**物理 WAL 直解路**
+（walker 走读 / 记录解析 / 四字典重放 / DML 解码），回答"每秒可解析多少 MB 的 WAL"（MB/s 主指标）。
+语料取自 VastBase G100 真库（172.16.107.133:55433/test_a，共享长活环境）一次性采集——基准运行
+零 Docker、零网络、零 PG。与 engine 逻辑解码路基线**不可直接对表**（口径差见结论注记）。
+
+### 语料（`vb-stream-wal-source/target/corpus/`，不入库）
+
+- **采集**：`DirectWalSource` 裸 v3 直连收流，窗口 [0x1FC000000, 0x200365F30]（起点为写入位点
+  段对齐下取整），落盘单文件 `vast-corpus.bin`：**70,672,176 字节（67.4 MiB）/ 417,959 条 WAL
+  记录**（均值 169 B/条），contrecord 8,229；采集侧 resyncs / lossyResyncs / carryDrops /
+  zeroPageSkips **全零**（锚定协议全程零重锚）。元信息 `vast-corpus.meta` 携带起止 LSN、记录数与
+  四 watched 目录物理段号（pg_attribute=19799 / pg_class=19827 / pg_namespace=19938 /
+  pg_partition=19833——L2 离线重放的块匹配注册面）。
+- **负载构成**（窗口内 `CREATE SCHEMA vb_wal_bench_nsp` 起步——**表与 schema 的全生命周期都在
+  窗内是 L2 纯流内词典重建的前提**，含 pg_namespace 字典）：
+  - 宽行表 t1（15 类型列 + PK + REPLICA IDENTITY FULL）：单行 INSERT 3,000 / UPDATE 2,000 /
+    DELETE 1,000（50 行事务分批）+ 批量 INSERT..SELECT 40,000（MULTI_INSERT 族）+ 批量
+    UPDATE 13,333 / DELETE 5,714 + 两轮容量补充（INSERT 60,000 / UPDATE 15,000 / DELETE 6,666）；
+  - SAVEPOINT 子事务回滚 1 笔、DDL-in-txn（ADD COLUMN 后同事务 UPDATE）1 笔、2PC（PREPARE →
+    COMMIT PREPARED）1 笔、CHECKPOINT×2（后继首写走 FPW 页镜像路径）；
+  - TOAST 表（REPLICA IDENTITY FULL）：200 行宽值插入（28KB pglz 可压 + 9KB 不可压）+ 150 行
+    UPDATE（含未变列 unchanged-TOAST 形态）+ 40 行 DELETE；
+  - 分区表（RANGE 三分区 + ADD PARTITION，母表 FULL）：INSERT 120,000 / UPDATE 7,500 /
+    DELETE 6,923（第四字典 pg_partition 路由面）；
+  - 共享库的**并发业务写入与窗内混杂**（真实混合流，非净负载）。
+- 采集与回放**同机**（Windows 11 开发机）；采集结束全清验证零残留（pg_class / pg_partition /
+  pg_namespace `vb_wal_bench%` 计数归零、临时槽已删）。
+
+### 基准口径（`vb-stream-wal-source/src/jmh/java/.../bench/VastCorpusBenchmark.java`，`-Pjmh` 档）
+
+- **L1 记录层**（`recordLayerParse`）：`WalStreamWalker.feed`（64KB chunk 走读 + pageaddr 锚定 +
+  contrecord 缝合）→ `WalRecordParser`（头区/块链/main 定位）——直解路的下界成本。
+- **L2 全链**（`fullChainDecode`）：L1 之上叠 `CatalogReplay` 四字典**纯流内重建**（无 JDBC 引导、
+  SelfHealer null 纯回放禁回查档）+ `ChangeStream` DML 解码（XactGrouper 事务组装 / TOAST 重组
+  解压 / 磁盘值 PG text 渲染，listener 计数丢弃）——与生产 `WalSource` sink 分发同构，仅缺网络
+  接收与检查点面。
+- **1 op = 单遍全语料**；walker/词典/组装器每次调用全新构造（页锚定与 ctid 重放状态跨遍历不可
+  复用），语料 trial 级只读共享；布局 `WalLayoutVVastbase.INSTANCE`。
+- **正确性锚**：L1 回放记录数 == 采集侧 walker 记录数（417,959 == 417,959，逐条无差）；L2 离线
+  重建四字典（classRows=15 / attrRows=48 / partitionRows=4）后发射 **98 桶 / 285,048 行**。
+- **MB/s = ops/s × 67.4 MiB；records/s = ops/s × 417,959**。
+
+### 结果（2026-10-13，Windows 11 开发机，JDK 17，`-f 1 -wi 3 -i 5`）
+
+| 基准 | thrpt（ops/s） | avgt（s/op） | **MB/s** | records/s |
+|---|---|---|---|---|
+| L1 `recordLayerParse` | 17.510 ± 0.501 | 0.057 ± 0.002 | **≈1180 MiB/s** | **≈732 万** |
+| L2 `fullChainDecode` | 0.579 ± 0.029 | 1.613 ± 0.329 | **≈39 MiB/s** | **≈24.2 万** |
+
+**结论**：
+
+- **每秒可解析约 1180 MiB 的物理 WAL（记录层）**——walker 走读 + 头区/块链解析对 169B 均值记录
+  跑到 732 万条/s，接收路（1GbE ≈118 MB/s 线速）远打不满它，记录层永不构成直解路瓶颈。
+- **全链（含词典重放 + DML 解码渲染）约 39 MiB/s / 24.2 万记录/s**，折合约 16.5 万行/s 发射
+  （0.579 × 285,048）；单遍 ~1.7s 里记录层仅 ~57ms（约 3%）——**全链成本几乎全部在 heap 载荷
+  解码**（REPLICA IDENTITY FULL 的双像解码 + TOAST pglz 解压 + 15 类型 PG text 渲染），L1/L2
+  约 30 倍差即解码面的优化空间所在。
+- **与 engine 逻辑解码路的对照视角（口径不同，不可直接比）**：engine 端到端在线基线量的是
+  walsender **过滤后逻辑流**的供给与消费上限（条数域 ~34 万 msg/s / 字节域依行宽 ~365-544 MB/s，
+  见上文 WSL 段），而本节 L2 是**全量物理 WAL**的纯 Java 离线回放——未过滤（含全部非用户表
+  记录与并发业务流）、自建 catalog 字典、无网络/walsender 供给约束；两路数字各自作量级锚。
+
+### 运行方法（**勿 clean——语料在 target/corpus 下会被连带删除**）
+
+```bash
+# 1) 编译（jmh profile 同 engine 档：jmh-core/annprocess test-scope + src/jmh/java 挂 test 源码根）
+mvn -pl vb-stream-wal-source -Pjmh test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+
+# 2) 运行（吞吐档；仓库根目录执行，Windows classpath 分隔符 ';'，macOS/Linux 为 ':'）
+java -cp "vb-stream-wal-source/target/classes;vb-stream-wal-source/target/test-classes;$(cat vb-stream-wal-source/target/cp.txt)" \
+  org.openjdk.jmh.Main "org.vastdata.vbstream.walsource.bench" -f 1 -wi 3 -i 5
+# avgt 对照轮：追加 -bm avgt -tu s
+```
+
+注意：默认 `mvn test -pl vb-stream-wal-source` 不受影响（profile 未激活时零 JMH 依赖、基准不
+编译）；语料缺失时基准启动即 ISE 附采集指引（不静默）；采集工具 `CorpusProbe.java` 在
+`vb-stream-wal-source/target/probe/`（一次性工具，不入库）——重采集 = 用 `DirectWalSource` 自
+写入位点起收流，窗内从 `CREATE SCHEMA` 起步制造全生命周期负载（含分区表/TOAST/COPY 批量/
+2PC/CHECKPOINT），收完落盘 bin + meta 并全清 `vb_wal_bench_*` 对象与临时槽。
 
 ## 已知口径限制
 

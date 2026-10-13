@@ -99,4 +99,67 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- JMH 基准档（wal-bench）：形态照抄 vb-stream-engine 的同名 profile。-Pjmh 激活，基准源码放
+         独立根 src/jmh/java（build-helper 挂为 test 源码目录）——默认构建完全不引入 JMH 依赖与基准
+         编译，`mvn clean test` 不受影响；`-Pjmh test-compile` 才把基准类与 JMH 桩编进
+         target/test-classes。基准 = VastBase 真库 WAL 语料离线回放（语料在 target/corpus，经
+         target/probe 一次性采集，不入库）——注意勿对带着语料跑 clean（见 docs/benchmarks-baseline.md
+         wal-source 段）。annprocess 经 compiler 的 annotationProcessorPaths 显式接入；桩类由
+         Surefire 默认命名规则排除（*Benchmark 非 *Test），`mvn -Pjmh test` 不会误跑基准。 -->
+    <profiles>
+        <profile>
+            <id>jmh</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-core</artifactId>
+                    <version>${jmh.version}</version>
+                    <scope>test</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.openjdk.jmh</groupId>
+                    <artifactId>jmh-generator-annprocess</artifactId>
+                    <version>${jmh.version}</version>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>${maven-build-helper-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>add-jmh-test-source</id>
+                                <phase>generate-test-sources</phase>
+                                <goals>
+                                    <goal>add-test-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/jmh/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-compiler-plugin</artifactId>
+                        <configuration>
+                            <annotationProcessorPaths>
+                                <path>
+                                    <groupId>org.openjdk.jmh</groupId>
+                                    <artifactId>jmh-generator-annprocess</artifactId>
+                                    <version>${jmh.version}</version>
+                                </path>
+                            </annotationProcessorPaths>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
