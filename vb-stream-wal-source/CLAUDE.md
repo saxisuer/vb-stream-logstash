@@ -98,7 +98,7 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | `ChangeStream` | DML 门面：单入口 `onRecord(WalRecord)`，WalSource sink 分发的第二消费者（catalog 同步器之后）；内建组装三件套装配（ToastAssembler probe 取 SQL 会话建 JdbcToastProbe，null 连接 = 纯回放禁回查档） |
 | `XactGrouper` | 事务组装状态机：heap I/U/D 行入桶累积（到达期解码 + 渲染），XACT 终态驱动发射/弃桶/挂起；子事务归并双通道（TOPLEVEL_XID 收割优先 + ASSIGNMENT 兜底）；TableMeta 按 relfilenode 缓存、字典三表 heap 记录到达即全清失效 |
 | `TableFilter` | relkind 'r'/'p' + `vb.wal.tables` 白名单（`schema.table` 逗号分隔，空 = 全放行）；从 v1 三表字典 as-of 解析表身份与列序 |
-| `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz/lz4 双方法解压（`inflate` 分派面）+ 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
+| `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz/lz4 双方法解压（`inflate` 分派面）+ 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵 + **INSERT 新元组空面回查视图**（`insertTupleResolver`——重放窗口切断 chunk 的补全通道，2026-10-13 flake 根因修复）；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
 | `Pglz` | PG pglz 解压纯移植（`pg_lzcompress.c` 主循环逐行转录，control byte 分组 + match 回拷，L705-790 源码锚） |
 | `Lz4` | lz4 裸 block 解压（lz4-java safeDecompressor 定长目标形态；PG `toast_decompress_datum`→`LZ4_decompress_safe` 同格式，JNI 优先纯 Java回落；2026-10-07 随 lz4 值面支持引入） |
 | `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `0x` + WARN 一次、dropped 列 ∅） |
@@ -173,7 +173,7 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
 | **STREAMED kind**（logical_decoding_work_mem 驱逐形态） | ⚠️ 差异面 | wal 侧恒 NORMAL、engine 侧 kind=STREAMED+行尾缀——parity 环境禁驱逐规避；真流式对齐 v3 |
 | **NSP redirect 缺行**（schema DDL 竞态窄面） | ⚠️ v2 限制 | 静默跳过（DEBUG + nspRedirectMisses 计数）→ 该 schema 表从输出消失——fail-safe 方向（漏数据非错数据）、重启全新引导自愈；v3 加精确采纳通道 |
 | **跨停机点 DDL + DDL 前行落重发页**（四重叠加窄缝） | ⚠️ v3 方向 | 重发块渲染用字典末态非行时刻态——对拍判"不等"（假红非静默错值）；v3 按记录 lsn 重建 as-of |
-| **交错事务 B 清掉 A 的 toast 窗口** | ⚠️ v3 方向 | A 行多见 `<toast-unchanged>`（engine 发真值）——fail-safe 方向已知分叉；v3 per-txn 窗口 |
+| **交错事务 B 清掉 A 的 toast 窗口 / 重放窗口切断 chunk** | ⚠️ UPDATE 面 v3 方向（**INSERT 面已修**，2026-10-13：空面 probe 回查，`insertTupleResolver` 视图） | UPDATE 行多见 `<toast-unchanged>`（engine 发真值）——fail-safe 方向已知分叉；v3 per-txn 窗口 |
 | **长挂起 2PC + 频繁重启** | ⚠️ 无护栏 | 挂起桶整段重放（floor 不前进）——功能正确但重放成本线性增长；桶快照持久化 v3 |
 
 **已知限制与 v3 方向**：
@@ -195,9 +195,17 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
   attcompression=='l' 启动 WARN + ISE 拒绝面已删（lz4Guard 从未接线且语义已废）。
 - **大事务输出缓冲 O(事务)**：pending 桶攒行文本至提交，与 engine block 模式同级；
   落盘化（格式层/file）是 v3 升级路径。
-- **清窗全局 vs per-txn 窄缝**（v3 合并条目）：全局清窗使交错事务 B 的行夹在 A 的
-  chunk 写入与引用行之间时 A 的窗口被清（服务端按事务分 hash 不受影响），A 行多见
-  一个 `<toast-unchanged>` 占位——对拍面已知分叉；同类窄缝：①目录三表行不经
+- **清窗全局 vs per-txn 窄缝**（v3 合并条目；**INSERT 面已修**，2026-10-13 对拍 flake
+  根因修复）：空面成因两类——①全局清窗使交错事务 B 的行夹在 A 的 chunk 写入与引用行
+  之间时 A 的窗口被清（服务端按事务分 hash 不受影响）②**重启续传重放窗口切断**——
+  续传流起点页对齐下取整，页边界落在最后 chunk 记录与 heap 行之间时 chunk 不重发
+  （实测复现 DualPathParityIT TOAST 重启续传场景：重发 INSERT 渲 `<toast-unchanged>`
+  vs engine 首交付真值 → 重发块不等）。**修复 = INSERT 新元组专用解析视图**
+  （`ToastAssembler.insertTupleResolver` + `XactGrouper.insertDecoder`）：INSERT 的
+  external 值必为本事务新写（valueid 新分配无跨事务复用），空面即重放切断或清窗、
+  engine 对照面持真值，probe 回查补全（值已提交可见）——两类成因一次关死；UPDATE
+  后像维持空面哨兵（'u' 对齐——未变列不可探测判别），残余窄缝 = UPDATE **改写**宽列
+  且恰逢重放切断（无本地判别式，对拍矩阵不构造）。同类窄缝：①目录三表行不经
   resetToastWindow（catalog 行无 TOAST 面，理论无值面影响）②重放窗口内字典 as-of
   断裂边界（同事务 DDL+挂起+检查点跨页+重启四重叠加）③**重发渲染用字典持久化末态
   而非行记录时刻态**——跨停机点 DDL + DDL 前行落重发页的四重叠加窄缝会判"重发块
@@ -512,12 +520,18 @@ CU 族 WAL 是独立大项，除非呈报）；跨分区 UPDATE 迁移 = DELETE+
 
 ## 已知限制
 
-- **对拍 IT 满负载偶发（非回归，2026-10-12 M2 T1 记档）**：`mvn test` 全量（PG 17/18 +
-  OG 容器并发满载）下偶发单用例红——`DualPathParityIT` TOAST 重发场景（wal 侧重发行渲
-  `<toast-unchanged>` vs engine 真值，即下文"交错清窗/重发渲染末态"已知分叉面的窄缝形
-  态；改动前基线复现同形）与 `OgDualChannelParityIT`（boundary 越界 +160B / 中窗记录数
-  差 ≤25@16k+），二者单跑/组跑稳定全绿且与 M2 T1 改动零代码路径交叠——负载相关竞态，
-  根因待查。
+- **~~对拍 IT 满负载偶发（非回归，2026-10-12 M2 T1 记档）~~ 已修（2026-10-13 双 flake
+  根因修复，均实测复现钉）**：①`DualPathParityIT` TOAST 重发场景——根因是**重启续传
+  重放窗口切断**（续传起点页对齐下取整，页边界落在最后 chunk 记录与 heap 行之间时
+  chunk 不重发 → 重发 INSERT 空面渲 `<toast-unchanged>` vs engine 首交付真值；单跑
+  稳定绿是全新容器的确定性 WAL 相位恰好落安全区，满负载下背景写入漂移相位入危险区），
+  修复 = INSERT 新元组空面 probe 回查（`ToastAssembler.insertTupleResolver`，见"清窗
+  全局 vs per-txn 窄缝"条目），场景内 WAL 相位填充钉该几何 + ToastAssemblerTest 三
+  用例钉语义；②`OgDualChannelParityIT` boundary 断言——根因是追平等待窗内**服务端
+  背景写入**（autoanalyze 等）使两路各收到 boundary 之后的记录，旧断言
+  `upper <= boundary + 8` 在良性越界（+0x30~+0x140 一条背景记录）假红；修复 = 覆盖面
+  断言改自下覆盖（min 末记录末尾距 boundary ≤ 两页余量 + 双路前沿诊断输出），对拍
+  窗口按 upper 归一排除 boundary 后记录的构造不变。
 - **接收器终态死亡进程面**：接收器 5 次重连失败/解析 ISE 后线程自行退出（ERROR），
   冒烟 `Main` 周期行经 `WalSource.receiverTerminalFailure()` 检测到终态 → ERROR 一行 +
   `System.exit(1)`（对齐引擎 fail-fast，终审 I2）；库形态宿主须自行轮询该面。
@@ -590,7 +604,8 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**473 用例 = 离线 374 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）**
+**476 用例 = 离线 377 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）**
+（2026-10-13 双 flake 根因修复 +3：ToastAssemblerTest INSERT 视图空面回查三用例）
 （2026-10-13 M3 收口 surefire 逐类对账口径）。
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 15
@@ -620,7 +635,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
   往返 + OG 档 majorVersion=5；**M3：formatVersion 4 第四字典序列化往返 + v3 检查点
   拒载回落全新引导**）/ StateConfigTest 5；`changes`（v2 DML 面：
   DiskValueRendererTest 18 / XactGrouperTest 22（含 M2 T7 修复 A 的 MULTI_INSERT
-  SHORTALIGN 真几何锚）/ ToastAssemblerTest 13（含 lz4 双形态
+  SHORTALIGN 真几何锚）/ ToastAssemblerTest 16（含 lz4 双形态
   解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 16（M2 T5 OG 档
   parttype 判别闸——V17/V18 用例零改动零回归；**M3：分区身份链四用例[母表身份/白名单
   双匹配含分区名不外溢负例/链断 WARN 恰一次+计数/vanilla 无视分区链] + EXCHANGE 换绑

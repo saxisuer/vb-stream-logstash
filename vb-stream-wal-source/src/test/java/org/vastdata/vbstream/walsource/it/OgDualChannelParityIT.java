@@ -38,7 +38,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p><strong>边界与窗口归一</strong>：两路起点独立（各自把当前 xlogpos 段对齐下取整，
  * 时点差至多差一个段号）——对拍窗口取 [W, boundary)，W = 两路首条记录 LSN 的较大者
  * （覆盖较少的一路必然包含另一路窗口），boundary = 末次写入后的
- * {@code pg_current_xlog_location()}。段切换用 {@code pg_switch_xlog()} 钉出完成段
+ * {@code pg_current_xlog_location()}。boundary 之后的记录（追平等待窗内服务端背景
+ * 写入——autoanalyze 等）被对拍窗口按 upper 归一排除，不作失败（2026-10-13 flake
+ * 修复：覆盖面断言只看自下覆盖，见 {@code assertWindowParity} javadoc）。段切换用
+ * {@code pg_switch_xlog()} 钉出完成段
  * （switch 记录按 XLogSwitch 语义垫到段边界——完成段尾零恒不足一页，<b>实测勘误</b>：
  * "完成段恒整页零垫尾"不成立，整零页的真实来源是预分配 .partial 的未写区与服务端
  * 跳页补位零，零页容忍分支由离线 WalStreamWalkerTest 锚定，本 IT 不做 zeroPageSkips
@@ -122,6 +125,8 @@ class OgDualChannelParityIT {
         // 统一按"consumed ≥ boundary 页下取整 + 记录流 1.5s 静止"双条件收敛
         awaitCaughtUp("direct", direct::consumedLsn, directRecs, boundary);
         awaitCaughtUp("file", file::consumedLsn, fileRecs, boundary);
+        long directConsumedAtStop = direct.consumedLsn();
+        long fileConsumedAtStop = file.consumedLsn();
 
         OgTestEnv.stopReceivexlog();
         direct.stop();
@@ -133,7 +138,8 @@ class OgDualChannelParityIT {
         LOG.info("双通道 census（direct）: {}", directMetrics.censusSnapshot());
         LOG.info("双通道 census（file）:   {}", fileMetrics.censusSnapshot());
 
-        assertWindowParity(fileRecs, directRecs, boundary);
+        assertWindowParity(fileRecs, directRecs, boundary, layout.walBlockSize(),
+                fileConsumedAtStop, directConsumedAtStop);
     }
 
     /**
@@ -168,17 +174,31 @@ class OgDualChannelParityIT {
     }
 
     /**
-     * 窗口归一比对：W = 两路首记录 LSN 较大者；过滤 [W, boundary) 的记录成
-     * (lsn, totLen, rmid, info) 四元组行逐行全等。
+     * 窗口归一比对：W = 两路首记录 LSN 较大者；过滤 [W, upper) 的记录成
+     * (lsn, totLen, rmid, info) 四元组行逐行全等（upper = 两路末条交付记录末尾的较小者）。
      *
-     * <p>窗口外差异（两路起停窗口造成的首尾段差）被 W/boundary 归一吸收——与
+     * <p>窗口外差异（两路起停窗口造成的首尾段差）被 W/upper 归一吸收——与
      * {@code DualPathParityIT} 的 xid 交集归一化同思路。</p>
      *
-     * @param fileRecs   file 通道交付记录
-     * @param directRecs direct 通道交付记录
-     * @param boundary   对拍窗口上界（不含）
+     * <p><b>覆盖面断言方向（2026-10-13 flake 根因修复）</b>：只断言<b>自下覆盖</b>
+     * （min 末记录末尾距 boundary 不超过两页余量），不断言"无记录越过 boundary"——
+     * 追平等待窗（最长 120s + 1.5s 静止）内服务端背景写入（autoanalyze/autovacuum 的
+     * catalog 记录，满负载下更活跃）会使两路各收到 boundary 之后的记录，属服务端
+     * 不可控行为且对拍窗口已按 upper 排除之（实测复现：upper = boundary + 0x30~
+     * 0x140 即一条背景记录，旧断言 {@code upper <= boundary + 8} 在该形态假红）。
+     * 两页余量的依据：file 通道"末非零字节 + 1"前沿语义可能扣留末条记录（已文档化
+     * 边界，至多一条），叠加 MAXALIGN 取整——超出两页的短缺才是真截断信号；真欠额
+     * 由 {@code awaitCaughtUp} 的 consumed ≥ boundary 页下取整双条件先行拦截。</p>
+     *
+     * @param fileRecs            file 通道交付记录
+     * @param directRecs          direct 通道交付记录
+     * @param boundary            对拍窗口上界参照（写入序列后的 write 位点）
+     * @param walBlockSize        WAL 页大小（覆盖余量 = 2 页）
+     * @param fileConsumedAtStop  停机时 file 通道消费前沿（失败诊断面）
+     * @param directConsumedAtStop 停机时 direct 通道消费前沿（失败诊断面）
      */
-    private void assertWindowParity(List<WalRecord> fileRecs, List<WalRecord> directRecs, long boundary) {
+    private static void assertWindowParity(List<WalRecord> fileRecs, List<WalRecord> directRecs,
+            long boundary, long walBlockSize, long fileConsumedAtStop, long directConsumedAtStop) {
         assertTrue(fileRecs.size() > 10 && directRecs.size() > 10,
                 "两路各须交付足量记录: file=" + fileRecs.size() + " direct=" + directRecs.size());
         long floor = Math.max(
@@ -186,10 +206,17 @@ class OgDualChannelParityIT {
                 directRecs.stream().mapToLong(WalRecord::lsn).min().orElse(0));
         // 上界取两路末条交付记录末尾的较小者：file 前沿语义止于"末非零字节 + 1"，末条
         // 记录尾字节为零（CRC/垫）时该条不被交付属已文档化边界——窗口上界按两路都已
-        // 完整交付的区段归一（下一条记录起点 ≥ 上界，被排除的至多是末条竞态记录）
+        // 完整交付的区段归一（下一条记录起点 ≥ 上界，被排除的至多是末条竞态记录；
+        // boundary 之后的背景记录同被排除，见方法 javadoc 覆盖面断言方向）
         long upper = Math.min(lastRecordEnd(fileRecs), lastRecordEnd(directRecs));
-        assertTrue(upper <= boundary + 8,
-                "两路交付须覆盖到 boundary 附近: upper=" + Lsn.format(upper) + " boundary=" + Lsn.format(boundary));
+        long tailSlack = 2L * walBlockSize;
+        assertTrue(upper + tailSlack >= boundary,
+                "两路交付未覆盖到 boundary 附近（min 末记录末尾短缺超两页余量）: upper="
+                        + Lsn.format(upper) + ", boundary=" + Lsn.format(boundary)
+                        + ", fileEnd=" + Lsn.format(lastRecordEnd(fileRecs))
+                        + ", directEnd=" + Lsn.format(lastRecordEnd(directRecs))
+                        + ", fileConsumed=" + Lsn.format(fileConsumedAtStop)
+                        + ", directConsumed=" + Lsn.format(directConsumedAtStop));
         List<String> fileWindow = windowLines(fileRecs, floor, upper);
         List<String> directWindow = windowLines(directRecs, floor, upper);
         assertEquals(fileWindow.size(), directWindow.size(),
