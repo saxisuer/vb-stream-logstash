@@ -171,3 +171,44 @@ DirectWalSource（v3 自研客户端，VastBase 真库码面已验证）收流 �
 真库轮复现：`sql/vb-batch1.sql` / `vb-batch2.sql` / `vb-cleanup.sql` +
 `WalSegmentRecorder`（先起 recorder 再起 Main——c1 检查点所在段须在采集范围内），
 harness 第 4 参传 `vastbase` 切第四布局档。
+
+## 第三轮：真 pg_xlog 段直读 + 潜伏 bug 实证（2026-10-14 同日）
+
+用户澄清 hongye/hongye@50 是 **Linux 系统用户**（ssh 拷 WAL 用，pgdata=
+`/home/hongye/data/v3_A`）——按原生设想补验"从 pg_xlog 直接拷段文件"形态（sshpass
+经 alpine 容器：`scp hongye@172.16.107.133:/home/hongye/data/v3_A/pg_xlog/...`，
+拷当前活跃段 `000000010000000200000007` + 前一段）。
+
+### 发现：FileWalSource.parseSegNo 段号语义错误（潜伏 bug，正式修复项）
+
+PG/OG 的 24-hex 段名语义是 `tli(8) + log(8) + seg(8)`，其中 **log = 段号 N / 256、
+seg = 段号 N % 256**（`XLogSegmentsPerXLogId` = 4GB/段尺寸 = 256，vanilla 11~18 与
+OG 9.2 系同款宏）。真库当前段 `...0002 00000007` = N 519 = 2×256+7。
+
+而 `FileWalSource.parseSegNo`（receive/FileWalSource.java:555-563）按
+`(hi << 32) | lo` 直拼——N < 256 时 hi=0 恰好自洽（**M1 以来全部 OG 测试都在
+log=0 区间——WAL 累计 <4GB 的容器从未暴露**）；N ≥ 256（真实库常态）时解析出
+`(2<<32)|7` 级别的错位段号，寻址整体错乱。
+
+**实测表现（原样喂真段）**：不产静默错数据——walker 的 pageaddr 锚定协议兜住正确性
+（页头真实地址 `2/071CA000` vs 错位游标 `0/321CA000`，差超 2 页容差 →
+`WAL pageaddr anchoring lost` ISE 终态失败，fail-fast）；但**流中途死亡**
+（错位后 15s 停滞 EOF 判定退出，段尾未读全——本例 6 块 DML 恰在死点前交付属侥幸相位）。
+
+**规避实证**：段重命名为连续段号直拆形态（`00000001000000020000000[67]` →
+`0000000100000000000002[06/07]`，即 `tli + %016X(N)`）后寻址正确——**离线重放
+与在线基准 6 块逐字节全等（PASS）**，`resyncs=0`、EOF 正常。真 pg_xlog 段字节
+与 recorder 段内容同构，唯一差异就是文件名编码。
+
+**修复方向（正式任务）**：`parseSegNo` 改 `hi * 256 + lo`（除数 = 0x100000000 /
+segmentSize，段尺寸参数化时连动）；`WalSegmentRecorder`（spike）的段名编码同步；
+顺带检查 `FileWalSource` 段切写侧假设（只读面不受影响）。OG 系 file 通道在
+lsn ≥ 4GB 的库上当前不可用（direct 通道不受影响——不走段文件寻址）。
+
+### 环境补充发现
+
+- pg_xlog 目录混有 **log=3 分支的 275 个历史段**（9/25~10/13 时间戳，timeline/
+  分支切换残留）——拷段时按 mtime/活跃段号定位，勿按字典序尾取（tail 字典序取到的
+  是废弃分支段）；正式离线档的"段覆盖校验"应同时校验段名 tli 与当前流 tli 一致。
+- 真库当前段拷贝时刻仍在写（mtime 滚动）——段尾不完整记录由 walker 等待/停滞语义
+  消化，EOF 判定正常退出。
