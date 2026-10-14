@@ -6,7 +6,9 @@
 > DML？
 >
 > 代码：`spike/offline-replay/`（**throwaway**，不进 Maven 模块树；SqlRunner /
-> OfflineReplaySpike / ParityDiff 三件 + sql/ 两批数据脚本）。
+> OfflineReplaySpike / ParityDiff / WalSegmentRecorder 四件 + sql/ 数据脚本）。
+> **两轮验证**：①openGauss 5.0.0 容器（机制链路）；②**VastBase G100 真库**
+> 172.16.107.133:55433/test_a（第四布局档实测，见文末专节）。
 
 ## 结论：链路成立（PASS——离线重放与在线基准 CDC 输出逐字节全等）
 
@@ -117,3 +119,55 @@ java -cp "spike/offline-replay/classes" ParityDiff spike/offline-replay/online.l
 
 （Windows 备注：宿主 SQL 面必须 opengauss-jdbc——OG hba=md5 + sha256 存储命中认证码 11，
 vanilla pgjdbc 过不去；log 文件为 GBK 字节，ParityDiff 按 ISO-8859-1 透传读入。）
+
+---
+
+## 第二轮：VastBase G100 真库验证（2026-10-14 同日，PASS）
+
+**环境**（用户提供：172.16.107.133，pgdata=`/home/hongye/data/v3_A`；连接
+172.16.107.133:55433/test_a，用户 test/Tester123，rolreplication=t，A 档库）：
+
+| 探测面 | 实测值 | 判别意义 |
+|---|---|---|
+| version() | `PostgreSQL 9.2.4 ...`（无 branding） | 与 vanilla 9.2/OG 三方撞号 |
+| pg_class.relname attlen | **128** | 三参判别命中 `WalLayoutVVastbase`（name128 词典） |
+| hongye/hongye@50 | `FATAL: Forbid remote connection with initial user` | **hongye 是初始用户**——OG 系内核禁初始用户远程 TCP（凭据有效但策略拒绝，服务器本地 gsql 才能登录） |
+
+**验证流程与第一轮同构**，WAL 段获取改为 **`WalSegmentRecorder`**（spike 新增）：
+DirectWalSource（v3 自研客户端，VastBase 真库码面已验证）收流 → 按 LSN 稀疏写入
+16MB 段文件（24-hex 段名与 pg_xlog 同形态）→ 离线 harness 用 FileWalSource external
+读同一目录。**真库不可杀**——"库死亡"语义由"停 Main + 独立收集的段文件"承载（离线
+输入面与拷 pg_xlog 等价：FileWalSource 只认段文件形态）。
+
+**结果**（`spike/offline-replay-vb/`）：
+
+| 验证面 | 结果 |
+|---|---|
+| 对拍（在线 direct 全程 vs 离线 c1 检查点重放） | **6 块逐行全等，diff 空** |
+| 布局档恢复 | `WalLayoutVVastbase`（三参判别）+ StateStore pgVersion=6 检查点档位校验通过 |
+| 字典灌回 | attrRows=13292 / classRows=1267（name128 词典） |
+| TOAST ~6.4KB external | 真值输出（非哨兵） |
+| DDL-in-txn as-of | 前段 3 列 / 后段 5 列（extra=777） |
+| 2PC | kind=TWO_PHASE gid=vbspike2pc |
+| 重放计数 | records=82、resyncs=0、lossyResyncs=0、carryDrops=0（recorder 段无预分配零尾，zeroPageSkips=0） |
+| 离线检查点推进 | applied=2/071BF288（离线结束时落盘，衔接面成立） |
+
+**真库轮新增发现**：
+
+1. **libpq 侧车兼容性坑（file 通道 VastBase 部署风险）**：OG 5.0.0 容器内
+   `pg_receivexlog`（libpq 客户端）对 VastBase 6.0.0 内核的 replication 认证握手
+   失败（`Invalid username/password,login denied`——服务端拒绝客户端应答，非密码
+   错误；同凭据 SQL 会话/direct 通道均一次通过）。**libpq 版本交叉的 sha256 挑战
+   应答不兼容**疑因（与 opengauss-jdbc 码 11 缺 ITERATION_STRING 尾缀被拒的 M2 T6
+   发现同族）。替代 = 自研 `WalSegmentRecorder`（DirectWalSource 落段）——也说明
+   正式"离线档"若配 file 通道 sidecar，VastBase 部署须自带配套版本 pg_receivexlog
+   或走 direct 采集。
+2. `pg_hba_file_rules` 视图在 VastBase 上查询异常（列名/形态差异，spike 未深究）；
+   hba 排障可走服务器本地文件直读。
+3. 真库背景写入使离线 applied 前沿略超在线基准末尾（共享库的正常形态，交集对拍
+   归一化吸收）。
+4. **验证后清理**：t_vbspike 表与 vb_offline_spike 槽均已 drop（共享环境无残留）。
+
+真库轮复现：`sql/vb-batch1.sql` / `vb-batch2.sql` / `vb-cleanup.sql` +
+`WalSegmentRecorder`（先起 recorder 再起 Main——c1 检查点所在段须在采集范围内），
+harness 第 4 参传 `vastbase` 切第四布局档。

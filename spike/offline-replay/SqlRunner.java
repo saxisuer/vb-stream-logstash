@@ -12,9 +12,13 @@ import java.sql.Statement;
  */
 public class SqlRunner {
     public static void main(String[] args) throws Exception {
-        String url = "jdbc:opengauss://localhost:55440/postgres";
-        String sql = Files.readString(Path.of(args[0]), StandardCharsets.UTF_8);
-        try (Connection c = DriverManager.getConnection(url, "gaussdb", "OgTest#2026");
+        // 参数化形态（VastBase 真库验证）：<url> <user> <pass> <sqlFile>；单参形态保留 OG 容器缺省
+        String url = args.length >= 4 ? args[0] : "jdbc:opengauss://localhost:55440/postgres";
+        String user = args.length >= 4 ? args[1] : "gaussdb";
+        String pass = args.length >= 4 ? args[2] : "OgTest#2026";
+        String sqlFile = args.length >= 4 ? args[3] : args[0];
+        String sql = Files.readString(Path.of(sqlFile), StandardCharsets.UTF_8);
+        try (Connection c = DriverManager.getConnection(url, user, pass);
              Statement st = c.createStatement()) {
             for (String raw : sql.split(";")) {
                 StringBuilder sb = new StringBuilder();
@@ -27,9 +31,24 @@ public class SqlRunner {
                 if (stmt.isEmpty()) {
                     continue;
                 }
-                st.execute(stmt);
+                boolean hasRs = st.execute(stmt);
                 String head = stmt.substring(0, Math.min(70, stmt.length())).replace("\n", " ");
-                System.out.println("OK: " + head);
+                if (hasRs) {
+                    try (java.sql.ResultSet rs = st.getResultSet()) {
+                        StringBuilder out = new StringBuilder("OK: " + head + " =>");
+                        while (rs.next()) {
+                            int n = rs.getMetaData().getColumnCount();
+                            out.append(" [");
+                            for (int i = 1; i <= n; i++) {
+                                out.append(rs.getString(i)).append(i < n ? " | " : "");
+                            }
+                            out.append("]");
+                        }
+                        System.out.println(out);
+                    }
+                } else {
+                    System.out.println("OK: " + head);
+                }
             }
         }
     }

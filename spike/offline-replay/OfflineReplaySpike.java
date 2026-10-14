@@ -50,9 +50,11 @@ public class OfflineReplaySpike {
         Path walDir = Path.of(args[0]);
         Path stateDir = Path.of(args[1]);
         Set<String> tables = Set.of(args[2].split(","));
+        boolean vastbase = args.length > 3 && "vastbase".equals(args[3]);
 
         // ① 检查点恢复（离线模式的前提：必须有一份有效检查点——失效回落是引导，而引导需要活库）
-        StateStore store = new StateStore(stateDir, 5);   // OG majorVersion=5
+        // 档位：OG=5 / VastBase=6（layout.majorVersion()——检查点 header pgVersion 校验面）
+        StateStore store = new StateStore(stateDir, vastbase ? 6 : 5);
         StoredState st = store.load().orElseThrow(() ->
                 new IllegalStateException("检查点缺失/损坏——离线模式无法引导（需要活库）"));
         long storedLsn = st.lsn();
@@ -64,9 +66,12 @@ public class OfflineReplaySpike {
         // ② 字典灌回 + 组件装配（全部公开 API，零门面）
         CatalogStores stores = new CatalogStores();
         st.restoreInto(stores);
-        // 布局经工厂分发（OG 档单例）——正式特性的"从检查点 pgVersion 恢复档位"改造点
-        // 应同样收敛到本工厂面（pgVersion 5 → 90204+openGauss 文本）
-        WalLayout layout = WalLayouts.forServer(90204, "(openGauss 5.0.0 spike offline)", -1);
+        // 布局经工厂分发——VastBase 三参判别（90204 + 无 branding 文本 + relname attlen 128）；
+        // OG 两参判别。正式特性的"从检查点 pgVersion 恢复档位"应同样收敛到本工厂面
+        WalLayout layout = vastbase
+                ? WalLayouts.forServer(90204, "PostgreSQL 9.2.0 vastbase offline", 128)
+                : WalLayouts.forServer(90204, "(openGauss 5.0.0 spike offline)", -1);
+        System.out.println("[spike] 布局档: " + layout.getClass().getSimpleName());
         AtomicLong appliedLsn = new AtomicLong(storedLsn);   // 续传严格过滤线（非页对齐）
         CatalogReplay replay = new CatalogReplay(layout, new TupleDecoder(layout));   // healer=null 档
         AtomicLong floor = new AtomicLong(storedFloor);
