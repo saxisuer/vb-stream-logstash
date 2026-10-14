@@ -42,6 +42,9 @@ class FileWalSourceTest {
     /** 异步等待的上限（毫秒）——tail 轮询 50ms 节拍下所有场景秒内收敛，10s 已是宽松界。 */
     private static final long AWAIT_TIMEOUT_MS = 10_000;
 
+    /** 每 xlogid 段数：0x100000000 / 段尺寸（XLogSegmentsPerXLogId 同式；16KB 档 = 262144）。 */
+    private static final long SEGS_PER_XLOG_ID = 0x100000000L / SEG_SIZE;
+
     @TempDir
     Path dir;
 
@@ -72,6 +75,37 @@ class FileWalSourceTest {
         assertEquals(end, source.consumedLsn());
         assertFalse(frontier.isEmpty(), "chunkEndLsnSink 须有前沿通知");
         assertEquals(end, frontier.get(frontier.size() - 1), "前沿通知末值 = 末块锚");
+    }
+
+    /**
+     * 用例 ①g（log/seg 段名语义锚——真库 lsn ≥ 4GB 形态）：段名 24-hex 的语义是
+     * tli(8) + log(8) + seg(8)，其中 log = 段号 / 每-xlogid-段数、seg = 段号 % 同除数
+     * （XLogSegmentsPerXLogId = 4GB/段尺寸；16KB 档除数 262144）——段号恰达除数边界时
+     * 标准名是 log=1/seg=0。若解析按 (log&lt;&lt;32)|seg 直拼，该形态段号错位 2^32 量级、
+     * 寻址整体错乱（真库 pg_xlog 直读实测 walker pageaddr 锚定 ISE，spike 第三轮锚）；
+     * 断言标准命名段文件的记录按真 LSN 交付。
+     */
+    @Test
+    void standardLogSegNameAtFourGbBoundaryAddressesCorrectLsn() throws Exception {
+        long segNo = SEGS_PER_XLOG_ID;                  // 262144：标准名 log=1/seg=0（4GB 边界）
+        long base = segNo * SEG_SIZE;
+        byte[] p0 = WalBytes.page(base, rec(1), rec(2));
+        byte[] p1 = WalBytes.page(base + 8192, rec(3));
+        Files.write(dir.resolve(segName(segNo)), concat(p0, p1));
+
+        List<WalRecord> records = new ArrayList<>();
+        WalStreamWalker walker = new WalStreamWalker(WalLayoutV18.INSTANCE, new WalStreamMetrics(), records::add);
+        FileWalSource source = new FileWalSource(dir, SEG_SIZE, 0, 8192);
+        source.start(lsn -> { }, walker::feed);
+
+        try {
+            awaitTrue(() -> source.consumedLsn() == base + SEG_SIZE, "4GB 边界段须按真段号寻址读尽");
+        } finally {
+            source.stop();
+        }
+
+        assertEquals(List.of(base + 24, base + 24 + align8(rec(1).length), base + 8192 + 24),
+                records.stream().map(WalRecord::lsn).toList(), "边界段三记录零丢零重");
     }
 
     /** 用例 ②：.partial 分两次增长 + rename 切段 → 记录序列跨段连续（零丢零重）。 */
@@ -202,6 +236,38 @@ class FileWalSourceTest {
 
         assertEquals(List.of(baseB + 8192 + 24), records.stream().map(WalRecord::lsn).toList(),
                 "A 段与 B 页 0 的记录不得交付（跳过已读过的）");
+    }
+
+    /**
+     * 用例 ②d（log/seg 段名语义锚——续传面）：fromLsn ≥ 4GB 时目标段的标准名是
+     * log=1/seg=0 形态——直拼解析下目录键错位 2^32 量级，{@code ceilingKey(真段号)}
+     * 选中的是错位段、锚错乱挂起（真库实测流中断形态）；断言 fromLsn 越过 4GB 边界
+     * 仍选中标准名目标段、更早段全部跳过。
+     */
+    @Test
+    void resumeFromLsnBeyondFourGbSelectsStandardNamedSegment() throws Exception {
+        long segLo = SEGS_PER_XLOG_ID - 1;      // 262143：标准名 log=0/seg=262143（边界前一段）
+        long segHi = SEGS_PER_XLOG_ID;          // 262144：标准名 log=1/seg=0（fromLsn 目标段）
+        long baseLo = segLo * SEG_SIZE;
+        long baseHi = segHi * SEG_SIZE;
+        Files.write(dir.resolve(segName(segLo)),
+                concat(WalBytes.page(baseLo, rec(1)), WalBytes.page(baseLo + 8192, rec(2))));
+        Files.write(dir.resolve(segName(segHi)),
+                concat(WalBytes.page(baseHi, rec(3)), WalBytes.page(baseHi + 8192, rec(4))));
+
+        List<WalRecord> records = new ArrayList<>();
+        WalStreamWalker walker = new WalStreamWalker(WalLayoutV18.INSTANCE, new WalStreamMetrics(), records::add);
+        FileWalSource source = new FileWalSource(dir, SEG_SIZE, baseHi, 8192);
+        source.start(lsn -> { }, walker::feed);
+
+        try {
+            awaitTrue(() -> source.consumedLsn() == baseHi + SEG_SIZE, "4GB 后续传须选中标准名目标段读尽");
+        } finally {
+            source.stop();
+        }
+
+        assertEquals(List.of(baseHi + 24, baseHi + 8192 + 24), records.stream().map(WalRecord::lsn).toList(),
+                "只交付目标段记录（4GB 边界前一段跳过）");
     }
 
     /** 用例 ③：假二进制验证拉起面——配置经参数传递、密码只经 PGPASSWORD 环境变量（绝不经命令行）+ 终止链。 */
@@ -405,13 +471,14 @@ class FileWalSourceTest {
     }
 
     /**
-     * 组装段文件名（pg_receivexlog 命名契约）：tli 固定 1，段号拆 8+8 十六进制高低调。
+     * 组装段文件名（pg_receivexlog / pg_xlog 命名契约）：tli 固定 1，段号按每-xlogid-段数
+     * 拆 log（高 8 位十六进制）与 seg（低 8 位）——seg &lt; 除数（段名字段的真实值域）。
      *
      * @param segNo 绝对段号
      * @return 24 字符段文件名（不含 .partial 后缀）
      */
     private static String segName(long segNo) {
-        return String.format("%08X%08X%08X", 1L, segNo >>> 32, segNo & 0xFFFFFFFFL);
+        return String.format("%08X%08X%08X", 1L, segNo / SEGS_PER_XLOG_ID, segNo % SEGS_PER_XLOG_ID);
     }
 
     /**

@@ -666,7 +666,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**515 用例 = 离线 396 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+**517 用例 = 离线 398 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
 VastBase 手动档真库 IT 20（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
@@ -685,8 +685,12 @@ OgXactGrouperSeam +2] + OgPartitionDictionary 9→10 的 M3 期漏记 1 一并�
   文本判别 + vastbase T4 三参探测）/ **OgXactViewTest 6（M2 T2：XACT 四记录族手造 + 语料锚——含无 252
   TOPLEVEL_XID 的终态 subxacts 归并面）/ OgMultiInsertViewTest 4（M2 T3：九条真 COPY
   语料收口 + 手造变体）**）；`receive` WalStreamWalkerTest 14（锚定协议含 mid-stream 漂移免疫 +
-  OG 整零页容忍）/ FileWalSourceTest 10（目录 tail + .partial 预分配全零的前向扫描
-  交付上限）/ direct 子包（**M1 裸 v3 客户端**：V3ProtocolChannelTest 6 / OgAuthTest 6
+  OG 整零页容忍）/ FileWalSourceTest 12（目录 tail + .partial 预分配全零的前向扫描
+  交付上限 + **log/seg 段名语义锚——4GB 边界标准名寻址与续传选段两用例[2026-10-15
+  修复 `parseSegNo` 直拼 bug：段号 = log × (0x100000000/段尺寸) + seg，seg 字段值域
+  校验越界跳过；spike 第三轮真库 pg_xlog 实证 M1 以来全部 OG 测试在 log=0 区间从未
+  暴露，lsn ≥ 4GB 寻址错乱——修前 file 通道在该形态不可用，见 spike 文档第三轮节]**）
+  / direct 子包（**M1 裸 v3 客户端**：V3ProtocolChannelTest 6 / OgAuthTest 6
   （sha256 码 11/码 10-3.0 签名/md5 三认证面）/ DirectWalSourceStreamTest 6 /
   DirectWalSourceFeedbackTest 2（65B 'r' 反馈 + 心跳））；`replay` CatalogReplayTest
   16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 10（含引导前沿种子

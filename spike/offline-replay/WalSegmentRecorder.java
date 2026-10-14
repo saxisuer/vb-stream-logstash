@@ -32,15 +32,16 @@ public class WalSegmentRecorder {
         Thread.currentThread().join();
     }
 
-    /** 把 [start, start+len) 字节按 16MB 段切分写入对应段文件对应偏移。 */
+    /** 把 [start, start+len) 字节按 16MB 段切分写入对应段文件对应偏移。段名 = tli + log + seg（标准 PG 编码，除数 = 0x100000000/段尺寸）。 */
     private static synchronized void write(Path dir, long start, byte[] data) throws Exception {
+        long segsPerXLogId = 0x100000000L / SEG;
         long pos = 0;
         while (pos < data.length) {
             long abs = start + pos;
             long segNo = Math.floorDiv(abs, SEG);
             long inSeg = abs - segNo * SEG;
             int len = (int) Math.min(data.length - pos, SEG - inSeg);
-            String name = String.format("%08X%016X", 1L, segNo);
+            String name = String.format("%08X%08X%08X", 1L, segNo / segsPerXLogId, segNo % segsPerXLogId);
             try (RandomAccessFile f = new RandomAccessFile(dir.resolve(name).toFile(), "rw")) {
                 f.seek(inSeg);
                 f.write(data, (int) pos, len);

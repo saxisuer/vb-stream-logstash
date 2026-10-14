@@ -21,8 +21,9 @@ import java.util.function.LongConsumer;
  *
  * <p>关键机制（与 WalStreamWalker 的 feed/锚定协议对齐）：</p>
  * <ol>
- *   <li><strong>段发现与排序</strong>：按段文件名（{@code %08X%08X%08X}——tli/段号高/段号低，
- *       可带 {@code .partial} 后缀）扫描目录，段号（高 32 位左移或低 32 位）为序消费；
+ *   <li><strong>段发现与排序</strong>：按段文件名（{@code %08X%08X%08X}——tli/log/seg，
+ *       可带 {@code .partial} 后缀；绝对段号 = log × 每-xlogid-段数 + seg）扫描目录，
+ *       段号为序消费；
  *       同段完成文件与 partial 并存时取完成文件。external 模式目录里"既有完成段又有
  *       新 partial"的任意组合按段号序全量消化，已读过的（段号低于游标的）跳过。</li>
  *   <li><strong>.partial 增长读</strong>：记录上次读偏移，交付上界 = <b>已接收前沿</b>——
@@ -77,7 +78,7 @@ public final class FileWalSource implements WalByteSource {
     /** pg_receivexlog 的完成中段后缀。 */
     private static final String PARTIAL_SUFFIX = ".partial";
 
-    /** 段文件名长度（24 个十六进制字符 = tli 8 + 段号高 8 + 段号低 8）。 */
+    /** 段文件名长度（24 个十六进制字符 = tli 8 + log 8 + seg 8）。 */
     private static final int SEGMENT_NAME_LENGTH = 24;
 
     private final Path dir;
@@ -532,7 +533,7 @@ public final class FileWalSource implements WalByteSource {
                 if (name.length() != SEGMENT_NAME_LENGTH) {
                     continue;
                 }
-                Long segNo = parseSegNo(name);
+                Long segNo = parseSegNo(name, segmentsPerXLogId());
                 if (segNo == null) {
                     LOG.debug("跳过非段文件: {}", p.getFileName());
                     continue;
@@ -546,17 +547,36 @@ public final class FileWalSource implements WalByteSource {
     }
 
     /**
-     * 解析 24 字符段名的段号：字符 [8,16) 为段号高 32 位（左移 32 位），[16,24) 为低
-     * 32 位；[0,8) 是时间线，不参与寻址（地址空间按段号×段尺寸展开）。
+     * 每 xlogid 段数（段名 log 字段的进位基数）——与 PG {@code XLogSegmentsPerXLogId}
+     * 同式：0x100000000 / 段尺寸（16MB 档 = 256，参数化小段档相应放大）。
      *
-     * @param name 24 个十六进制字符的段名（已剥 .partial）
-     * @return 绝对段号；含非十六进制字符返回 null
+     * @return 每 xlogid 的段数
      */
-    private static Long parseSegNo(String name) {
+    private long segmentsPerXLogId() {
+        return 0x100000000L / segmentSize;
+    }
+
+    /**
+     * 解析 24 字符段名的段号：字符 [0,8) 是时间线（不参与寻址——地址空间按段号×段尺寸
+     * 展开），[8,16) 是 log（段号 ÷ 每-xlogid-段数），[16,24) 是 seg（段号 % 同除数）——
+     * 绝对段号 = log × 除数 + seg。首版曾按 (log&lt;&lt;32)|seg 直拼——log=0（WAL 累计
+     * &lt;4GB）时两式同值而全部 OG 系测试未曾暴露，真库 log≥1 段（如
+     * {@code 000000010000000200000007} = 段号 519）寻址整体错乱（2026-10-14 spike 第三轮
+     * 真库 pg_xlog 直读实证：walker pageaddr 锚定 ISE 终态失败）。
+     *
+     * @param name           24 个十六进制字符的段名（已剥 .partial）
+     * @param segsPerXLogId  每 xlogid 段数（段尺寸参数化的进位基数）
+     * @return 绝对段号；含非十六进制字符、或 seg 字段越值域（≥ 除数——非本段几何的
+     *         段名，段尺寸参数与文件名不符等）返回 null
+     */
+    private static Long parseSegNo(String name, long segsPerXLogId) {
         try {
-            long hi = Long.parseUnsignedLong(name.substring(8, 16), 16);
-            long lo = Long.parseUnsignedLong(name.substring(16), 16);
-            return (hi << 32) | lo;
+            long log = Long.parseUnsignedLong(name.substring(8, 16), 16);
+            long seg = Long.parseUnsignedLong(name.substring(16), 16);
+            if (seg >= segsPerXLogId) {
+                return null;
+            }
+            return log * segsPerXLogId + seg;
         } catch (NumberFormatException e) {
             return null;
         }
@@ -592,7 +612,7 @@ public final class FileWalSource implements WalByteSource {
     /**
      * 目录扫描的一项：段号与其文件路径（含 .partial 标记）。
      *
-     * @param segNo   绝对段号（高 32 位左移或低 32 位，寻址 = 段号×段尺寸）
+     * @param segNo   绝对段号（log×每-xlogid-段数+seg，寻址 = 段号×段尺寸）
      * @param path    段文件路径
      * @param partial 是否 .partial 名（写入方尚未 rename 的完成中段）
      */

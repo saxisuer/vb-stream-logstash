@@ -205,6 +205,11 @@ segmentSize，段尺寸参数化时连动）；`WalSegmentRecorder`（spike）�
 顺带检查 `FileWalSource` 段切写侧假设（只读面不受影响）。OG 系 file 通道在
 lsn ≥ 4GB 的库上当前不可用（direct 通道不受影响——不走段文件寻址）。
 
+> **已修复（2026-10-15）**：`parseSegNo` 改 `log × (0x100000000/段尺寸) + seg` +
+> seg 字段值域校验（越界按非段文件跳过）；`FileWalSourceTest` 增 4GB 边界两用例
+> （标准名寻址/续传选段）；`WalSegmentRecorder` 段名编码同步标准 log/seg。上文
+> "规避实证"的重命名（连续段号直拆）在修复后反而会被值域校验拒绝（seg=519 ≥ 256），勿再使用。
+
 ### 环境补充发现
 
 - pg_xlog 目录混有 **log=3 分支的 275 个历史段**（9/25~10/13 时间戳，timeline/
