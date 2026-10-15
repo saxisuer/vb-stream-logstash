@@ -526,6 +526,66 @@ class FileWalSourceTest {
     }
 
     /**
+     * 静态档<strong>末段</strong>解析边界软 EOF（2026-10-15 真库 pg_xlog 拷段实证）：
+     * 末段交付中 sink 抛 {@link WalStreamParseException}（页链锚定丢失/记录头损坏——
+     * 裸拷 pg_xlog 活跃段撞回收残留旧 WAL 的写前沿指纹）→ 降级软 EOF——eofReached
+     * 置位、terminalFailure 空、撞点之前的字节照常交付（宿主据此落最终检查点优雅退出
+     * exit 0，无需 endLsn 上界）。
+     */
+    @Test
+    void staticDirectoryLastSegmentParseBoundarySoftEofs() throws Exception {
+        writeSegment(dir, "000000010000000000000003", SEG_SIZE);
+        writeSegment(dir, "000000010000000000000004", SEG_SIZE);
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, 0L);
+        List<byte[]> chunks = new ArrayList<>();
+        // 段 3（清单首段）正常交付；段 4（清单末段）首块抛解析边界异常——模拟 walker 撞进
+        // 回收残留旧 WAL 的写前沿
+        src.start(lsn -> { }, (end, b) -> {
+            if (end > 4L * SEG_SIZE) {
+                throw new WalStreamParseException("simulated anchor lost at " + end);
+            }
+            chunks.add(b);
+        });
+        try {
+            awaitTrue(src::eofReached, "末段解析边界须降级软 EOF（eofReached 置位）");
+        } finally {
+            src.stop();
+        }
+        assertFalse(src.terminalFailure().isPresent(), "末段软 EOF 非终态失败");
+        long total = chunks.stream().mapToLong(b -> b.length).sum();
+        assertTrue(total >= SEG_SIZE, "撞点之前的段 3 全量交付（实测 total=" + total + "）");
+        assertTrue(src.consumedLsn() <= 4L * SEG_SIZE,
+                "消费前沿停在撞点之前（实测 " + src.consumedLsn() + "）");
+    }
+
+    /**
+     * 静态档<strong>非末段</strong>解析边界仍终态失败：清单首段（后面还有段）交付中撞
+     * {@link WalStreamParseException}——段间断链 = 真缺口/真损坏，不得软 EOF 静默截停
+     * （否则后续段数据整体丢失）；terminalFailure 暴露根因、eofReached 不置位。
+     */
+    @Test
+    void staticDirectoryNonLastSegmentParseBoundaryStaysTerminal() throws Exception {
+        writeSegment(dir, "000000010000000000000003", SEG_SIZE);
+        writeSegment(dir, "000000010000000000000004", SEG_SIZE);
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, 0L);
+        List<byte[]> chunks = new ArrayList<>();
+        src.start(lsn -> { }, (end, b) -> {
+            if (end > 3L * SEG_SIZE) {
+                throw new WalStreamParseException("simulated anchor lost at " + end);
+            }
+            chunks.add(b);
+        });
+        try {
+            awaitTrue(() -> src.terminalFailure().isPresent(), "非末段解析边界须终态失败");
+        } finally {
+            src.stop();
+        }
+        assertTrue(src.terminalFailure().orElseThrow() instanceof WalStreamParseException,
+                "终态根因为解析边界异常原样透传");
+        assertFalse(src.eofReached(), "终态失败不置 eofReached（失败 ≠ 读尽）");
+    }
+
+    /**
      * 判定文本文件是否已含指定行（文件级 await 的内容条件——吸收 shell 逐行 append 的
      * 写入竞态窗；读失败按未就绪处理）。
      *

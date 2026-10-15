@@ -168,6 +168,16 @@ java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/
 # 库修复后同 state 目录直接在线运行即续传——检查点同目录续写，离线/在线双向互通
 ```
 
+**裸拷 pg_xlog 活跃段的写前沿坑（2026-10-15 真库实证）**：pg_xlog 段文件循环复用，
+写前沿之后的尾区不是零而是上一生命周期残留的旧 WAL——原样拷贝活跃段且不设 `endLsn`
+时，读尽会撞进残留区。处置两法：①**库尚可查时（推荐）**：拷贝时点执行
+`SELECT pg_current_xlog_location()`，把结果设为 `-Dvb.wal.offline.endLsn`（WAL 只追加，
+该界之前的字节在任何后续拷贝中不变，交付到界精确截停）；②**库已挂、无上界可知时**：
+直接跑——清单末段撞解析边界（页链锚定丢失/记录头损坏）自动降级**软 EOF**（WARN 一行
+附撞点 + exit 0，撞点之前的记录已全部交付、检查点停在最后一条完整记录）；非末段撞
+解析边界仍终态失败（段间断链 = 真缺口/真损坏）。零尾（pg_receivexlog/落段工具的
+`.partial` 预分配）无此问题。
+
 能力/限制（仅 VastBase 档；TOAST INSERT 空面窄缝渲哨兵等已知限制）详见模块
 `CLAUDE.md`"离线回放档"节。
 

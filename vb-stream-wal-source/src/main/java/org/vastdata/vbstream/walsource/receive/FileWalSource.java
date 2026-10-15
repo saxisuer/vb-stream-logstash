@@ -583,22 +583,45 @@ public final class FileWalSource implements WalByteSource {
      * 重扫、无 IO 重试。
      *
      * <p>关键步骤：清单序每段 {@link #deliverStaticSegment}（endLsn 上界到达即返回
-     * true 提前退出）；清单尽置 {@code eofReached} 自然退出。边界与异常语义：静态档
+     * true 提前退出）；清单尽置 {@code eofReached} 自然退出。<strong>末段写前沿软 EOF
+     * （2026-10-15）</strong>：清单<strong>末段</strong>交付中 sink 抛
+     * {@link WalStreamParseException}（页链锚定丢失/记录头损坏——裸拷 pg_xlog 活跃段
+     * 撞回收残留旧 WAL 的写前沿指纹）降级为软 EOF——WARN + eofReached 置位、已交付
+     * 字节照常成立（宿主落最终检查点优雅退出）；非末段撞到仍终态失败（段间断链 = 真缺口/
+     * 真损坏）。边界与异常语义：静态档
      * 无暂态——段文件消失（开句柄的 FileNotFoundException——快照目录不容突变，
      * spec §5；终审 F3 修正：原 catch NIO NoSuchFileException 在 RandomAccessFile
-     * 路径不可达）与其余 IOException 一律置 terminalFailure 退出；sink 的
+     * 路径不可达）与其余 IOException 一律置 terminalFailure 退出；sink 的其余
      * RuntimeException 属确定性失败
      * （同 tail 档契约）；stopRequested 置位即退出且<b>不</b>置 EOF（停机 ≠ 读尽）。
      * 线程约束：静态线程为 consumedLsn/eofReached/段句柄的单写者。</p>
      */
     private void runStaticLoop() {
         try {
-            for (Segment segment : staticManifest) {
+            for (int i = 0; i < staticManifest.size(); i++) {
                 if (stopRequested) {
                     return;
                 }
-                if (deliverStaticSegment(segment)) {
-                    return;   // endLsn 上界到达（deliverStaticSegment 内已置 eofReached）
+                try {
+                    if (deliverStaticSegment(staticManifest.get(i))) {
+                        return;   // endLsn 上界到达（deliverStaticSegment 内已置 eofReached）
+                    }
+                } catch (WalStreamParseException e) {
+                    // 末段写前沿软 EOF（2026-10-15 真库 pg_xlog 拷段实证）：pg_xlog 段文件循环
+                    // 复用，写前沿之后的尾区是上一生命周期残留的旧 WAL（非零）——裸拷活跃段无
+                    // endLsn 上界时读尽必撞残留区，本异常即"撞上写前沿"的指纹。清单<strong>末段</strong>
+                    // 降级软 EOF（pg_waldump 语义）：已交付字节照常成立、eofReached 置位（宿主
+                    // 落最终检查点优雅退出），WARN 附撞点；非末段撞到仍按终态失败上抛（段间断链
+                    // = 真缺口/真损坏，静默截停会丢数据）。sink 侧其他 RuntimeException 不在此
+                    // 分流——真 bug 不软化。
+                    if (i == staticManifest.size() - 1) {
+                        eofReached = true;
+                        LOG.warn("静态档末段解析边界到达——按写前沿软 EOF（撞点之前的记录已全部交付，"
+                                + "检查点停在最后一条完整记录；精确截停可设 vb.wal.offline.endLsn"
+                                + " 为拷贝时点的 pg_current_xlog_location）: {}", e.getMessage());
+                        return;
+                    }
+                    throw e;
                 }
             }
             eofReached = true;

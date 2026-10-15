@@ -328,7 +328,7 @@ public final class WalStreamWalker {
                 continue;
             }
             if (totLen < recHdr) {
-                throw new IllegalStateException("corrupt record header: totLen=" + totLen
+                throw new WalStreamParseException("corrupt record header: totLen=" + totLen
                         + " < header size " + recHdr + " at " + Lsn.format(cur));
             }
             // 记录缝合：跨页按"当前页剩余"取数（发现 11 坐标系教训——pageEnd 相对 curL 自身）
@@ -468,7 +468,7 @@ public final class WalStreamWalker {
             return new Adoption(dropFrom, len - dropped);
         }
         if (len - dropFrom >= tolerance) {
-            throw new IllegalStateException("WAL pageaddr anchoring lost: expected "
+            throw new WalStreamParseException("WAL pageaddr anchoring lost: expected "
                     + Lsn.format(expectedAddr) + " but found " + Lsn.format(foundAddr)
                     + " at cursor " + Lsn.format(curAtDropFrom) + " — no legal page header within "
                     + tolerance + " bytes (tolerance " + RESYNC_TOLERANCE_PAGES + " pages)");

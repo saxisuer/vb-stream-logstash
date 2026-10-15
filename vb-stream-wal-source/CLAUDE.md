@@ -628,7 +628,15 @@ tli 一致性（目录内全部段名 tli 必须一致，混杂 ISE 列出冲突
 不轮询增长、无 rename 等待；`.partial` 段已接收前沿（末非零字节 +1）语义保留（拷出的
 活跃段可能是预分配 partial）；可选 `endLsn` 上界——交付前沿到达即截停提前 EOF；**撕裂
 尾天然消化**——末段半条记录的字节停在 walker carry 里不产出记录，appliedLsn 只随完整
-记录推进，EOF 停机即弃 carry（检查点停在最后一条完整记录，无专门处理面）；**运行中段
+记录推进，EOF 停机即弃 carry（检查点停在最后一条完整记录，无专门处理面）；**末段解析
+边界软 EOF（2026-10-15 真库 pg_xlog 拷段实证补面）**：pg_xlog 段文件循环复用，写前沿
+之后的尾区是上一生命周期残留的旧 WAL（非零——裸拷活跃段无 endLsn 时读尽必撞，残留页
+pageaddr 低 24 位恰等于文件内偏移是其指纹）——清单**末段**撞 walker 解析边界（页链锚定
+丢失/记录头损坏，`WalStreamParseException` extends ISE）降级软 EOF（pg_waldump 语义：
+WARN 附撞点 + eofReached 置位 + exit 0，撞点前记录全量交付、检查点停最后完整记录；
+库尚可查时的精确截停 = 拷贝时点 `pg_current_xlog_location()` 设 endLsn），**非末段**撞
+到仍终态失败（段间断链 = 真缺口/真损坏），sink 侧其他 RuntimeException 不软化（真 bug
+不静默截停）；**运行中段
 文件消失 → 终态失败不重试**（与 tail 档分叉：快照目录不容突变）。
 
 **错误表与生命周期**：state 未启用 / 检查点缺失损坏 / 档位非 6 / 起点段缺席 / 段号
@@ -754,7 +762,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**536 用例 = 离线 413 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+**538 用例 = 离线 415 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
 VastBase 手动档真库 IT 24（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
@@ -770,6 +778,7 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
 （2026-10-15 终审 F1 修复 +1：CatalogOffline +1[离线 DML 发射计数接线——offlineChangeStream
 供给面 + 门面 dml* 观测面]；F2 审计失败重试断言并入 FileWalSourceTest 既有用例不加数
 ——离线 412→413、总 535→536）
+（2026-10-15 末段解析边界软 EOF +2：FileWalSourceTest 末段软 EOF/非末段仍终态——离线 413→415、总 536→538）
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 17
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
