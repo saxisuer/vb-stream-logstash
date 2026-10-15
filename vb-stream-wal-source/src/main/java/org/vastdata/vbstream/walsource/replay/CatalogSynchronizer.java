@@ -3,10 +3,14 @@ package org.vastdata.vbstream.walsource.replay;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
+import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
+import org.vastdata.vbstream.walsource.changes.ChangeStream;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
+import org.vastdata.vbstream.walsource.layout.WalLayoutVVastbase;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
+import org.vastdata.vbstream.walsource.receive.FileWalSource;
 import org.vastdata.vbstream.walsource.receive.PhysicalSlotManager;
 import org.vastdata.vbstream.walsource.receive.WalByteSource;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
@@ -17,6 +21,7 @@ import org.vastdata.vbstream.walsource.state.StateStore;
 import org.vastdata.vbstream.walsource.state.StoredState;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -28,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.function.Consumer;
 import java.util.function.LongFunction;
@@ -61,6 +67,15 @@ import java.util.function.LongSupplier;
  * user/password（密码认证/scram 环境的推荐档，Task 15 WalSource 接线用）；原四参
  * 签名为无凭据回落——凭据取引导连接 URL 的 query 参数（{@code ?user=..&amp;password=..}，
  * 缺省 user 取 metadata 用户名、password 空串即 trust 认证）并 WARN 一行提示。</p>
+ *
+ * <p><strong>离线装配档（offline replay，2026-10-15 spec）</strong>：数据库不可访问
+ * 时凭本地检查点 + WAL 段目录快照离线续传——{@link #startOffline} 仅认 VastBase 档
+ * 检查点（pgVersion=6），复用 startOg 的运行期管线（ctid 重放/检查点节拍/快照视图
+ * 零复制）而无一 SQL 面：无会话/无槽/无引导/无护栏探测（healer 与 TOAST probe 双
+ * null——截断更新保留 skip 计数、缺 chunk 降级 toast-unavailable）；检查点是唯一
+ * 状态源与入口凭证（缺失/损坏/档位不符启动期 ISE——冷启动离线非目标），同目录续写
+ * 使离线/在线双向互通；读尽终态经 {@link #eofReached()} 观测（静态目录清单读尽或
+ * endLsn 上界到达——确定性 EOF，宿主据此 {@link #stop()} 落最终检查点）。</p>
  *
  * <p>线程约束：{@link #apply} 在接收线程（wal-receiver）单写者执行；stores 行字典
  * /tail 存储为 ConcurrentHashMap（跨线程快照迭代弱一致、不抛 CME，复合搬迁仍按单
@@ -536,6 +551,163 @@ public final class CatalogSynchronizer {
     }
 
     /**
+     * 无库装配档（离线回放，spec §3.2）：数据库不可访问时凭本地检查点 + WAL 段目录
+     * 快照离线续传——复用 {@code startOg} 的运行期管线（applyRecord 过滤线 /
+     * maybeCheckpoint 节拍 / snapshot() as-of 视图零复制），但无 SQL 会话/无槽/无引导/
+     * 无护栏探测（healer 与 TOAST probe 双 null——截断更新保留 skip 计数、TOAST 缺
+     * chunk 降级 toast-unavailable，在线档已过闸的护栏在离线期视为当时已通过）。
+     *
+     * <p>关键步骤（七步，与 startOg 骨架同构）：① {@link StateStore}(dir, 6) 载入检查
+     * 点——离线入口凭证就是一份合法检查点（冷启动非目标），缺失/损坏 ISE 附"先在线
+     * 运行"采集指引；档位不符（StateStore 按 pgVersion 拒载 → empty）由已知档位探针
+     * 甄别后附"仅支持 VastBase"档位指引；② {@link StoredState#restoreInto} 灌回四
+     * 字典，appliedLsn 种子 = stored lsn（未对齐的<strong>续传严格过滤线</strong>——
+     * 重投递窗口不二次施加，与在线续传同式）；③ 流起点 = min(stored, floor)
+     * （dmlFloorLsn 回退语义同在线档——重放段重建待决桶，catalog 过滤线不动）；
+     * ④ 布局 = VastBase 单例（档位已由检查点判定，无 relname 探测）；⑤ 私有全参构造
+     * （receiver/slotName/advanceConnection 全 null——advanceSlot 既有空保护 no-op，
+     * 检查点照常落盘只是不推槽）；⑥ out 非 null 时装配 {@link ChangeStream}
+     * （sqlConn=null 纯回放禁回查档）并接 pendingFloor 供应者；⑦ walker sink 组合
+     * （applyRecord → postApply → maybeCheckpoint，次序与 startOg 逐字同构）+
+     * {@link FileWalSource#staticDirectory} 静态目录源（启动期审计 fail-fast + 读尽
+     * 确定性 EOF）。</p>
+     *
+     * <p>边界与异常语义：state 未启用 ISE（检查点是离线档唯一状态源）；静态目录审计
+     * 失败（清单空/起点段缺席/段号缺口/tli 混杂）在 source.start 启动期 ISE——本方法
+     * 内 catch 净退出（就地停源防孤儿静态线程）；EOF 终态经 {@link #eofReached()}
+     * 观测（清单读尽或 endLsn 上界到达），EOF 后调用方 {@link #stop()} 落最终检查点
+     * （同目录续写，离线/在线双向互通）。线程约束：装配线程单次调用；此后 apply 在
+     * 静态线程（wal-file-static）单写者执行——与 startOg 的字节源线程同契约。</p>
+     *
+     * @param state  检查点配置（须启用——dir 即检查点续写目录）
+     * @param walDir WAL 段快照目录（只读消费，审计语义见 FileWalSource 静态档 javadoc）
+     * @param endLsn 可选交付上界（0 = 无上界，清单读尽即 EOF）
+     * @param tables DML 表白名单（null/空 = 全放行；out 为 null 时不装配 DML 面）
+     * @param out    变更事件输出契约（null = 纯 catalog 形态）
+     * @return 已运行的同步器（EOF 终态经 {@link #eofReached()} 观测）
+     * @throws IllegalStateException state 未启用 / 检查点缺失损坏或档位非 VastBase /
+     *                               静态目录审计失败
+     */
+    public static CatalogSynchronizer startOffline(StateConfig state, Path walDir,
+            long endLsn, Set<String> tables, ChangeOutputListener out) {
+        if (state == null || !state.enabled()) {
+            throw new IllegalStateException("离线回放必须启用检查点（vb.wal.state.dir）——"
+                    + "检查点是离线档的唯一状态源与入口凭证");
+        }
+        WalLayoutVVastbase layout = WalLayoutVVastbase.INSTANCE;
+        // VastBase 档 biased 载入：StateStore 的 decode 以构造档位为校验面——present 即
+        // pgVersion==6（Task 1 记档"构造时点两值已证相等"），档位甄别在 empty 分支探针完成
+        StateStore stateStore = new StateStore(state.dir(), layout.majorVersion());
+        Optional<StoredState> loaded = stateStore.load();
+        if (loaded.isEmpty()) {
+            throw offlineCheckpointMissing(state.dir(), layout.majorVersion());
+        }
+        StoredState st = loaded.get();
+        CatalogStores stores = new CatalogStores();
+        st.restoreInto(stores);
+        long start = st.lsn();
+        long storedFloor = st.dmlFloorLsn();
+        CatalogSynchronizer sync = new CatalogSynchronizer(stores,
+                new CatalogReplay(layout, new TupleDecoder(layout)),
+                null, null, state, stateStore, null);
+        // 槽推进 SQL 去 pg_lsn cast（OG 系无该类型）：离线档 advanceConnection=null 推进
+        // 恒 no-op，覆写属"新 OG 系装配路径须同步覆写"的既有纪律（模块 CLAUDE.md 记档）
+        sync.advanceLsnCast = "";
+        // 前沿种子 = stored lsn（未对齐的严格过滤线——离线永远是续传语义：已施加记录的
+        // 重投递窗口不二次施加，与在线续传/forced 路径同式，终审 C1 两级种子的续传档）
+        sync.appliedLsn = start;
+        sync.resumedFromState = true;
+        sync.lastCheckpointWallMs = System.currentTimeMillis();
+        sync.replayedAtCheckpoint = stores.metrics().get(CatalogStores.CatalogMetrics.REPLAYED);
+        // DML 面（out 非 null）：sqlConn=null → TOAST probe 禁用（纯回放禁回查档）；
+        // pendingFloor 接 ChangeStream（floor 含本记录新建的待决桶）。赋值先于
+        // source.start——Thread.start 的 happens-before 覆盖静态线程可见性
+        ChangeStream changes = out == null ? null : new ChangeStream(sync.snapshot(), null, layout, tables, out);
+        if (changes != null) {
+            sync.pendingFloor = changes::pendingFloorLsn;
+        }
+        // 流起点（dmlFloorLsn 回退语义同在线档 startOg）：floor 低于 stored 时回退起流
+        // ——重放段把待决桶的行记录重新喂给 postApply 面重建桶；catalog 过滤线仍 =
+        // stored lsn（appliedLsn 种子不变），重放段不二次施加字典
+        long streamStart = start;
+        if (storedFloor > 0 && storedFloor < start) {
+            streamStart = storedFloor;
+            LOG.info("离线流起点按 DML 待决桶下界回退: floor {} < stored {}（重放段重建待决桶，catalog 过滤线不动）",
+                    Lsn.format(storedFloor), Lsn.format(start));
+        }
+        // 收流组装（与 startOg 同构）：walker 自有计数（streamMetrics 来源）；sink 组合
+        // 次序固定——先施加字典（变更面读到施加后的 as-of 快照）再组装、检查点殿后
+        WalStreamMetrics metrics = new WalStreamMetrics();
+        WalStreamWalker walker = new WalStreamWalker(layout, metrics, changes == null
+                ? sync::apply
+                : rec -> {
+                    sync.applyRecord(rec);
+                    changes.onRecord(rec);
+                    sync.maybeCheckpoint();
+                });
+        FileWalSource source = FileWalSource.staticDirectory(walDir,
+                FileWalSource.DEFAULT_SEGMENT_SIZE, streamStart, layout.walBlockSize(), endLsn);
+        sync.byteSource = source;
+        sync.externalMetrics = metrics;
+        sync.externalConsumedLsn = sync.appliedLsn;   // 种子化：首块前即报告 stored lsn（与 startOg 同形）
+        try {
+            source.start(lsn -> { }, (chunkEnd, bytes) -> {
+                walker.feed(chunkEnd, bytes);
+                sync.externalConsumedLsn = walker.consumedLsn();
+            });
+        } catch (RuntimeException e) {
+            // 启动失败净退出（同 startOg）：sync 尚未返回调用方、无人再触 stop——就地
+            // 停源防孤儿静态线程（wal-file-static 非守护）
+            source.stop();
+            throw e;
+        }
+        LOG.info("CatalogSynchronizer 启动（离线档）: 段目录 {} 流起点 {} endLsn={}（tables {} 个, DML={})",
+                walDir, Lsn.format(streamStart), endLsn > 0 ? Lsn.format(endLsn) : "无上界",
+                tables == null ? 0 : tables.size(), changes != null);
+        return sync;
+    }
+
+    /**
+     * 构造"离线入口凭证缺失"的启动期异常（startOffline ① 步 empty 分支的甄别面）：
+     * VastBase 档 biased 载入为 empty 有两族成因——文件不存在/损坏/格式拒载，或检查点
+     * 档位不符被 {@link StateStore} 的 pgVersion 校验拒载（decode 以构造档位为校验面，
+     * 档位值在拒载路径不可得）。对后者按已知档位（OG=5 / PG 17 / PG 18）探针重载甄别，
+     * 命中即附"仅支持 VastBase"档位指引；全 miss 保持"先在线运行"采集指引——spec §5
+     * 错误表两行的落点。线程约束：装配线程失败路径单次调用，无并发面。
+     *
+     * @param dir           检查点目录
+     * @param vastbasePgVer VastBase 档位（WalLayoutVVastbase.INSTANCE.majorVersion()，6）
+     * @return 待抛的启动期异常
+     */
+    private static IllegalStateException offlineCheckpointMissing(Path dir, int vastbasePgVer) {
+        for (int tier : new int[]{5, 17, 18}) {
+            if (new StateStore(dir, tier).load().isPresent()) {
+                return new IllegalStateException("离线档检查点档位不符: pgVersion=" + tier
+                        + "（" + offlineTierName(tier) + "）——本版离线档仅支持 VastBase"
+                        + "（pgVersion=" + vastbasePgVer + "），请以对应档在线运行或改用"
+                        + "VastBase 检查点目录: " + dir);
+            }
+        }
+        return new IllegalStateException("离线无法引导：检查点缺失/损坏/拒载——离线档入口凭证是"
+                + "一份合法检查点（冷启动离线非目标），需先在线运行产生: " + dir);
+    }
+
+    /**
+     * 已知档位的显示名（离线档位甄别探针的文案面）。
+     *
+     * @param tier 检查点 pgVersion（5/17/18）
+     * @return 档位名（探针集合外值返回 pgVersion=N 字面）
+     */
+    private static String offlineTierName(int tier) {
+        return switch (tier) {
+            case 5 -> "openGauss 5.0.0 档";
+            case 17 -> "PostgreSQL 17 档";
+            case 18 -> "PostgreSQL 18 档";
+            default -> "pgVersion=" + tier;
+        };
+    }
+
+    /**
      * 组装共核（全部公开 start 重载的唯一实现）：healer 与 state 注入是各档差异——带凭据
      * 档注入 {@link SelfHealer}（probe 复用引导会话），无凭据回落档 healer=null（截断
      * 未知 oldCtid 保留 skip + 计数行为）；state 启用时按续传/引导双路决策（见全参档
@@ -919,6 +1091,20 @@ public final class CatalogSynchronizer {
         }
         WalByteSource source = byteSource;
         return source != null ? source.terminalFailure() : Optional.empty();
+    }
+
+    /**
+     * 静态目录字节源的读尽终态面（离线档，{@code startOffline} 装配）：清单读尽或
+     * endLsn 上界到达后 true——EOF 是确定性的，宿主据此终止离线回放会话（{@link #stop()}
+     * 落最终检查点）而非等待增长；tail 档文件源（在线 OG file 通道）与接收器路
+     * （PG 17/18 档）/纯逻辑缝恒 false（活管道无读尽概念）。线程约束：volatile 读，
+     * 任意线程可轮询（静态线程单写者置位）。
+     *
+     * @return 静态档读尽为 true；在线档/未读尽/未装配字节源为 false
+     */
+    public boolean eofReached() {
+        WalByteSource source = byteSource;
+        return source instanceof FileWalSource f && f.eofReached();
     }
 
     /**
