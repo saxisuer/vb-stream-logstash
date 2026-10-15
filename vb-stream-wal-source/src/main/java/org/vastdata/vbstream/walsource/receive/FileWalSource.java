@@ -8,10 +8,14 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.BiConsumer;
 import java.util.function.LongConsumer;
 
@@ -55,6 +59,14 @@ import java.util.function.LongConsumer;
  * 见接收器终态死亡契约）；文件系统 IO 异常视为暂态（WARN 后下轮重扫重试——rename 竞态
  * 窗口的 NoSuchFile 属预期）。目录为空/起始段未出现时静默等待（managed 模式子进程正在
  * 拉流；external 模式等待对端落盘）。</p>
+ *
+ * <p><strong>静态目录档</strong>（离线回放，{@link #staticDirectory} 工厂）：目录是 WAL
+ * 段文件快照（拷 pg_xlog / recorder 落段）而非活管道——start 调用线程同步执行
+ * {@code auditStaticDirectory()}（清单空/tli 混杂/起点段缺席或段号缺口，任一不过 ISE
+ * fail-fast），随后 wal-file-static 线程按清单序一次读尽（{@code .partial} 上限 =
+ * 末非零字节 + 1 一次性扫定；首段起点 fromLsn 页对齐下取整、余段自 0；endLsn&gt;0 时
+ * 截停置 EOF）即确定性 EOF（{@link #eofReached()}）——无轮询等待、无 IO 重试（快照
+ * 目录不容突变，段文件消失即 terminalFailure）。</p>
  */
 public final class FileWalSource implements WalByteSource {
 
@@ -89,6 +101,12 @@ public final class FileWalSource implements WalByteSource {
     /** managed 模式的 sidecar 子进程管理器；external 模式为 null（纯 tail，无子进程）。 */
     private final ReceivexlogProcess process;
 
+    /** 静态目录档标志（true = 启动期审计 + 清单读尽即 EOF，无轮询；tail 档恒 false）。 */
+    private final boolean staticMode;
+
+    /** 静态档可选交付上界（0 = 无；交付前沿到达即截停置 EOF）。 */
+    private final long endLsn;
+
     /** 消费前沿的跨线程镜像——tail 线程每块交付后刷新，任意线程读。 */
     private volatile long consumedLsn;
 
@@ -98,12 +116,21 @@ public final class FileWalSource implements WalByteSource {
     /** 终态失败原因（sink 确定性异常）：volatile 发布，宿主经 terminalFailure() 轮询。 */
     private volatile Throwable terminalFailure;
 
+    /** 静态档读尽终态位（volatile——静态线程置位，宿主轮询；tail 档恒 false）。 */
+    private volatile boolean eofReached;
+
     /** start/stop 的单程闸门（synchronized 方法互斥保护）。 */
     private boolean started;
     private boolean stopped;
 
     /** tail 线程句柄（start 时创建）。 */
     private Thread worker;
+
+    /**
+     * 静态档审计清单（start 调用线程装配、静态线程只读——经 Thread.start 的
+     * happens-before 发布；tail 档恒空）。
+     */
+    private List<Segment> staticManifest = List.of();
 
     /** 交付回调（start 时注入，tail 线程独占调用）。 */
     private LongConsumer chunkEndLsnSink;
@@ -161,11 +188,50 @@ public final class FileWalSource implements WalByteSource {
      */
     public FileWalSource(Path dir, long segmentSize, long fromLsn, int walBlockSize,
                          ReceivexlogProcess process) {
+        this(dir, segmentSize, fromLsn, walBlockSize, process, false, 0L);
+    }
+
+    /**
+     * 静态目录档工厂（离线回放，spec §3.3）：目录是 WAL 段文件快照（拷 pg_xlog /
+     * recorder 落段）而非活管道——start 时一次性审计（清单非空/tli 一致/fromLsn 段恰
+     * 在场且至末段连续，任一不过 ISE fail-fast）后按清单序读尽即确定性 EOF。与 tail 档
+     * 同 {@code start/stop/consumedLsn/terminalFailure} 契约，另有 {@link #eofReached()}
+     * 读尽观测面。
+     *
+     * @param dir          段快照目录（只读消费——读尽即终态，运行期不容突变）
+     * @param segmentSize  段尺寸（字节，须与快照命名几何一致）
+     * @param fromLsn      回放起点（0 = 从目录最早段起；&gt;0 须所在段恰在场，无跳段容忍）
+     * @param walBlockSize 页大小（fromLsn 段内偏移的页对齐下取整基准，来自 WalLayout）
+     * @param endLsn       可选交付上界（0 = 无上界；交付前沿到达即截停置 EOF）
+     * @return 静态档实例（start 前无副作用）
+     */
+    public static FileWalSource staticDirectory(Path dir, long segmentSize, long fromLsn,
+                                                int walBlockSize, long endLsn) {
+        return new FileWalSource(dir, segmentSize, fromLsn, walBlockSize, null, true, endLsn);
+    }
+
+    /**
+     * 全参主构造（模块内唯一实构造器）：tail 两档（external/managed）与静态档共用字段
+     * 装配，行为分叉由 {@code staticMode} 在 start/线程体分流——既有两公开构造器与
+     * 静态工厂均委派至此。
+     *
+     * @param dir          段文件目录
+     * @param segmentSize  段尺寸（字节）
+     * @param fromLsn      起点（tail = 断点续传；静态 = 回放起点）
+     * @param walBlockSize 页大小（页对齐下取整基准）
+     * @param process      子进程管理器（tail managed 模式；其余 null）
+     * @param staticMode   静态目录档标志
+     * @param endLsn       静态档交付上界（0 = 无）
+     */
+    private FileWalSource(Path dir, long segmentSize, long fromLsn, int walBlockSize,
+                          ReceivexlogProcess process, boolean staticMode, long endLsn) {
         this.dir = dir;
         this.segmentSize = segmentSize;
         this.fromLsn = fromLsn;
         this.walBlockSize = walBlockSize;
         this.process = process;
+        this.staticMode = staticMode;
+        this.endLsn = endLsn;
     }
 
     /**
@@ -192,11 +258,14 @@ public final class FileWalSource implements WalByteSource {
     }
 
     /**
-     * 同步启动 tail 线程（wal-file-tail，非守护）；managed 模式先拉起子进程。
+     * 同步启动 tail 线程（wal-file-tail，非守护）；managed 模式先拉起子进程；静态档改
+     * 起静态线程（wal-file-static）。
      *
      * <p>关键步骤：闸门校验（重复 start / 停机后再 start 抛 ISE——生命周期单程，新会话
-     * 新实例）→ 注入回调 → process.start()（managed）→ 起线程即返回（目录为空等暂态在
-     * 线程内静默等待，不阻塞调用方）。chunk 回调在 tail 线程同步执行。</p>
+     * 新实例）→ 注入回调 → 静态档在<b>调用线程</b>同步执行 {@link #auditStaticDirectory()}
+     * （审计不过即 ISE fail-fast，不落任何线程/句柄副作用）；tail 档 process.start()
+     * （managed）→ 起线程即返回（tail 目录为空等暂态在线程内静默等待，不阻塞调用方；
+     * 静态档审计已保证清单非空）。chunk 回调在源线程同步执行。</p>
      *
      * @param chunkEndLsnSink 前沿通知：每块交付后以本块末锚回调（供宿主前沿记账；纯
      *                        文件源无"无字节伴随的 LSN 推进"，恒与 chunkSink 同拍）
@@ -214,14 +283,30 @@ public final class FileWalSource implements WalByteSource {
         started = true;
         this.chunkEndLsnSink = chunkEndLsnSink;
         this.chunkSink = chunkSink;
-        if (process != null) {
-            process.start();
+        if (staticMode) {
+            staticManifest = auditStaticDirectory();
+            worker = new Thread(this::runStaticLoop, "wal-file-static");
+        } else {
+            if (process != null) {
+                process.start();
+            }
+            worker = new Thread(this::runTailLoop, "wal-file-tail");
         }
-        worker = new Thread(this::runTailLoop, "wal-file-tail");
         worker.setDaemon(false);
         worker.start();
         LOG.info("WAL 文件源启动: dir={} 段尺寸 {} 起点 {}（{} 模式）", dir, segmentSize,
-                Lsn.format(fromLsn), process != null ? "managed" : "external");
+                Lsn.format(fromLsn), staticMode ? "static" : process != null ? "managed" : "external");
+    }
+
+    /**
+     * 静态档读尽观测面：清单读尽或 endLsn 上界到达后返回 true（EOF 是确定性的——宿主
+     * 据此终止回放会话而非等待增长）；tail 档恒 false（活管道无读尽概念）；停机
+     * （stopRequested）不算读尽。
+     *
+     * @return 静态档读尽为 true；tail 档/静态档未读尽为 false
+     */
+    public boolean eofReached() {
+        return eofReached;
     }
 
     /**
@@ -410,6 +495,219 @@ public final class FileWalSource implements WalByteSource {
             p += n;
         }
         scannedDataEnd = frontier;
+        return frontier;
+    }
+
+    /**
+     * 静态档启动期目录审计（start 调用线程同步执行，任一不过 ISE fail-fast）+ 清单构建。
+     *
+     * <p>关键步骤：自扫目录文件名（24-hex 可带 {@code .partial}，解析与同段号去重规则
+     * 同 {@link #listSegments()}——完成文件优先）逐段解析 (tli, segNo) 对（tli 取
+     * [0,8)、segNo 走 {@link #parseSegNo}）；三项校验：①清单空——快照目录无段文件即
+     * 回放前提不成立；②tli 一致——多时间线段混杂 = 快照混入历史分支段，ISE 列出冲突
+     * 值；③起点与连续——{@code fromLsn>0} 时期望段 {@code floorDiv(fromLsn, segmentSize)}
+     * <b>恰在场</b>（tail 档 ceilingKey 静默跳后继段的容忍在离线回放不可接受——起点前
+     * 字节静默丢失），且起点段至末段逐 +1 无缺口（中段缺口 = WAL 字节丢失）；
+     * {@code fromLsn==0} 自最早段起同样查连续。清单 = 自起点段（含）起按段号升序，
+     * 起点前的既有段跳过（与 tail 档续传跳过语义一致）。</p>
+     *
+     * <p>边界与异常语义：目录扫描 IOException 包装 ISE 抛出（启动期无暂态容忍）。
+     * 线程约束：start 调用线程单次执行，产出清单经 Thread.start 的 happens-before
+     * 发布给静态线程单读者。</p>
+     *
+     * @return 审计通过的静态清单（按段号升序，供 {@link #runStaticLoop()} 消费）
+     */
+    private List<Segment> auditStaticDirectory() {
+        TreeMap<Long, Segment> segments = new TreeMap<>();
+        TreeSet<Long> tlis = new TreeSet<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            for (Path p : stream) {
+                String name = p.getFileName().toString();
+                boolean partial = name.endsWith(PARTIAL_SUFFIX);
+                if (partial) {
+                    name = name.substring(0, name.length() - PARTIAL_SUFFIX.length());
+                }
+                if (name.length() != SEGMENT_NAME_LENGTH) {
+                    continue;
+                }
+                Long segNo = parseSegNo(name, segmentsPerXLogId());
+                if (segNo == null) {
+                    LOG.debug("跳过非段文件: {}", p.getFileName());
+                    continue;
+                }
+                long tli;
+                try {
+                    tli = Long.parseUnsignedLong(name.substring(0, 8), 16);
+                } catch (NumberFormatException e) {
+                    LOG.debug("跳过非段文件（tli 字段非十六进制）: {}", p.getFileName());
+                    continue;
+                }
+                tlis.add(tli);
+                segments.merge(segNo, new Segment(segNo, p, partial),
+                        (a, b) -> a.partial() && !b.partial() ? b : a);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("静态目录审计失败：目录扫描失败 " + dir, e);
+        }
+        if (segments.isEmpty()) {
+            throw new IllegalStateException("静态目录审计失败：清单为空（目录 " + dir + " 无段文件）");
+        }
+        if (tlis.size() > 1) {
+            throw new IllegalStateException(
+                    "静态目录审计失败：tli 不一致——目录混入多时间线段（冲突 tli: " + tlis + "）");
+        }
+        long startSeg = fromLsn > 0 ? Math.floorDiv(fromLsn, segmentSize) : segments.firstKey();
+        if (fromLsn > 0 && !segments.containsKey(startSeg)) {
+            throw new IllegalStateException("静态目录审计失败：fromLsn " + Lsn.format(fromLsn)
+                    + " 期望段 " + startSeg + " 不在目录（实况段号: " + segments.keySet()
+                    + "）——静态档无跳段容忍");
+        }
+        long prev = startSeg;
+        for (long segNo : segments.tailMap(startSeg, false).keySet()) {
+            if (segNo != prev + 1) {
+                throw new IllegalStateException("静态目录审计失败：段号缺口——段 " + (prev + 1)
+                        + " 缺席（实况段号: " + segments.keySet() + "）");
+            }
+            prev = segNo;
+        }
+        return new ArrayList<>(segments.tailMap(startSeg).values());
+    }
+
+    /**
+     * 静态档主循环（wal-file-static 线程体）：按审计清单序逐段读尽交付——无轮询、无
+     * 重扫、无 IO 重试。
+     *
+     * <p>关键步骤：清单序每段 {@link #deliverStaticSegment}（endLsn 上界到达即返回
+     * true 提前退出）；清单尽置 {@code eofReached} 自然退出。边界与异常语义：静态档
+     * 无暂态——段文件消失（NoSuchFileException——快照目录不容突变，spec §5）与其余
+     * IOException 一律置 terminalFailure 退出；sink 的 RuntimeException 属确定性失败
+     * （同 tail 档契约）；stopRequested 置位即退出且<b>不</b>置 EOF（停机 ≠ 读尽）。
+     * 线程约束：静态线程为 consumedLsn/eofReached/段句柄的单写者。</p>
+     */
+    private void runStaticLoop() {
+        try {
+            for (Segment segment : staticManifest) {
+                if (stopRequested) {
+                    return;
+                }
+                if (deliverStaticSegment(segment)) {
+                    return;   // endLsn 上界到达（deliverStaticSegment 内已置 eofReached）
+                }
+            }
+            eofReached = true;
+            LOG.info("静态目录读尽: dir={} 前沿 {}（{} 段）", dir, Lsn.format(consumedLsn),
+                    staticManifest.size());
+        } catch (NoSuchFileException e) {
+            terminalFailure = new IllegalStateException(
+                    "静态目录段文件消失——快照目录不容突变，静态档读尽语义被破坏: " + e.getFile(), e);
+            LOG.error("静态目录段文件消失（终态，不重试）", e);
+        } catch (IOException e) {
+            terminalFailure = new IllegalStateException(
+                    "静态目录读失败（静态档无暂态，按终态处理）", e);
+            LOG.error("静态目录读失败（终态，不重试）", e);
+        } catch (RuntimeException e) {
+            terminalFailure = e;
+            LOG.error("WAL 文件源交付失败（确定性错误）——源停机，前沿 {}",
+                    Lsn.format(consumedLsn), e);
+        } finally {
+            closeInputQuietly();
+        }
+    }
+
+    /**
+     * 交付单个静态段：开句柄 → 定交付上限 → 按 {@value #CHUNK_LIMIT} 分块交付双回调。
+     *
+     * <p>关键步骤：完成段上限 = 文件全长；{@code .partial} 上限 = 末非零字节 + 1
+     * （{@link #scanStaticPartialFrontier} 一次性扫定——预分配零尾不交付）；首段起点 =
+     * fromLsn 段内偏移的页对齐下取整（与 tail 档续传同式，经段号等于
+     * {@code floorDiv(fromLsn, segmentSize)} 判定首段）、其余段自 0；endLsn&gt;0 且块末
+     * 越界时截断本块至恰上界、置 eofReached 并返回 true（调用方即退出，清单残余段不再
+     * 交付；上界在本段起点之前则零交付直接置位）。</p>
+     *
+     * @param segment 审计清单项
+     * @return endLsn 上界到达（EOF 已置）为 true；段读尽未达上界为 false
+     * @throws IOException 开句柄/读失败（静态档按终态处理）
+     */
+    private boolean deliverStaticSegment(Segment segment) throws IOException {
+        closeInputQuietly();
+        input = new RandomAccessFile(segment.path().toFile(), "r");
+        long segBase = segment.segNo() * segmentSize;
+        long limit = segment.partial() ? scanStaticPartialFrontier(input) : input.length();
+        long offset = (fromLsn > 0 && segment.segNo() == Math.floorDiv(fromLsn, segmentSize))
+                ? (fromLsn % segmentSize) & ~((long) walBlockSize - 1)
+                : 0L;
+        while (offset < limit) {
+            if (stopRequested) {
+                return false;
+            }
+            int n = (int) Math.min(limit - offset, CHUNK_LIMIT);
+            long absStart = segBase + offset;
+            if (endLsn > 0 && absStart + n > endLsn) {
+                n = (int) Math.max(0L, endLsn - absStart);   // 截断至恰上界
+                if (n > 0) {
+                    deliverChunk(endLsn, offset, n);
+                }
+                eofReached = true;
+                LOG.info("静态档 endLsn 上界到达: {}（目录 {}）", Lsn.format(endLsn), dir);
+                return true;
+            }
+            deliverChunk(absStart + n, offset, n);
+            offset += n;
+        }
+        return false;
+    }
+
+    /**
+     * 读 [{@code offset}, {@code offset}+n) 交付一对回调并刷新消费前沿——与 tail 档
+     * pumpOnce 的内联交付同构（独立成法以免触碰 tail 路径）：chunkSink 第一参 = 本块
+     * 末字节之后的绝对 LSN。
+     *
+     * @param chunkEnd 本块末字节之后的绝对 LSN
+     * @param offset   段内读偏移
+     * @param n        读取字节数
+     * @throws IOException 读失败
+     */
+    private void deliverChunk(long chunkEnd, long offset, int n) throws IOException {
+        byte[] buf = new byte[n];
+        input.seek(offset);
+        input.readFully(buf);
+        chunkSink.accept(chunkEnd, buf);
+        chunkEndLsnSink.accept(chunkEnd);
+        consumedLsn = chunkEnd;
+    }
+
+    /**
+     * 静态档 {@code .partial} 段的一次性数据前沿（末非零字节 + 1）：与 tail 档
+     * {@link #receivedFrontier} 同式的前向扫描（{@value #FRONTIER_SCAN_BLOCK}B 块自头
+     * 向尾扫，首见全零块即停；已知限制同源——中段零区后更高偏移真数据的形态会停在零区
+     * 前，实测未出现），差异在不做增量缓存（静态目录只读一遍，一次扫定终局）。
+     *
+     * @param file 已打开的段文件句柄（游标由本方法自行 seek）
+     * @return 交付上限（空/全零文件为 0）
+     * @throws IOException 块读失败
+     */
+    private long scanStaticPartialFrontier(RandomAccessFile file) throws IOException {
+        long fileLen = file.length();
+        long frontier = 0;
+        long p = 0;
+        byte[] block = new byte[FRONTIER_SCAN_BLOCK];
+        while (p < fileLen) {
+            int n = (int) Math.min(FRONTIER_SCAN_BLOCK, fileLen - p);
+            file.seek(p);
+            file.readFully(block, 0, n);
+            int lastNonZero = -1;
+            for (int i = n - 1; i >= 0; i--) {
+                if (block[i] != 0) {
+                    lastNonZero = i;
+                    break;
+                }
+            }
+            if (lastNonZero < 0) {
+                break;   // 全零块：已写区上界定格（稀疏零尾不交付）
+            }
+            frontier = p + lastNonZero + 1;
+            p += n;
+        }
         return frontier;
     }
 

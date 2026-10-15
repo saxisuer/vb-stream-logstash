@@ -13,12 +13,14 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -30,6 +32,10 @@ import static org.junit.jupiter.api.Assertions.fail;
  * + LSN 连续"验收源的分块/锚语义（锚 = 段号×段尺寸+文件内偏移，页头 pageaddr 随后接管
  * 纠偏）。段尺寸走参数面（16MB 生产值对离线测试过大，用 2 页 = 16KB 档）。增长/rename
  * 由测试线程直接写临时目录模拟 pg_receivexlog 的落盘行为。</p>
+ *
+ * <p>静态目录档（offline-replay Task 2）用例组：启动期审计 fail-fast（起点段缺席/tli
+ * 混杂/段号缺口）+ 读尽确定性 EOF/endLsn 截停/.partial 前沿——段文件经
+ * {@link #writeSegment} 稀疏造、零 rename、零 POSIX 权限依赖（Windows 本机可跑）。</p>
  */
 class FileWalSourceTest {
 
@@ -403,6 +409,117 @@ class FileWalSourceTest {
         awaitTrue(() -> !proc.supervisorAlive(), "源停机须连带监督线程终止");
     }
 
+    // ---- 静态目录档（offline-replay Task 2）：启动期审计 fail-fast + 清单读尽确定性 EOF ----
+
+    /**
+     * 静态档确定性 EOF：单段目录（非零字节全量写 + 文件长恰交付断言依据）读尽后
+     * eofReached 置位、sink 收到的字节总量 = 文件全长（无轮询等待——读尽即终态）。
+     */
+    @Test
+    void staticDirectoryReachesDeterministicEof() throws Exception {
+        writeSegment(dir, "000000010000000000000003", 3 * 8192 + 4096);
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, 0L);
+        List<byte[]> chunks = new ArrayList<>();
+        src.start(lsn -> { }, (end, b) -> chunks.add(b));
+        try {
+            awaitTrue(src::eofReached, "静态档单段读尽须确定性置 eofReached（无轮询等待）");
+        } finally {
+            src.stop();
+        }
+        long total = chunks.stream().mapToLong(b -> b.length).sum();
+        assertEquals(3 * 8192 + 4096, total, "已写字节全量交付（完成段按文件全长读）");
+        assertFalse(src.terminalFailure().isPresent(), "确定性读尽非终态失败");
+    }
+
+    /**
+     * 静态档起点段缺失 fail-fast：fromLsn 落段 5 而目录只有段 3——启动期 ISE（tail 档
+     * ceilingKey 静默跳后继段语义在静态档不可接受，spec §3.3）。
+     */
+    @Test
+    void staticDirectoryRejectsMissingStartSegment() throws Exception {
+        writeSegment(dir, "000000010000000000000003", 8192);
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 5L * SEG_SIZE, 8192, 0L);
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> src.start(lsn -> { }, (end, b) -> { }));
+        assertTrue(e.getMessage().contains("段 5"), "消息含期望段号: " + e.getMessage());
+    }
+
+    /**
+     * 静态档 tli 混杂 fail-fast：目录混入 tli=2 段名——ISE 列出冲突 tli（真库 pg_xlog
+     * 混历史分支段的正解，spec §3.3）。
+     */
+    @Test
+    void staticDirectoryRejectsMixedTimeline() throws Exception {
+        writeSegment(dir, "000000010000000000000003", 8192);
+        writeSegment(dir, "000000020000000000000004", 8192);
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, 0L);
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> src.start(lsn -> { }, (end, b) -> { }));
+        assertTrue(e.getMessage().contains("tli"), "消息含 tli 冲突: " + e.getMessage());
+    }
+
+    /**
+     * 静态档段号缺口 fail-fast：目录只有段 3 与段 5（缺段 4）——快照读尽语义下中段缺口
+     * 即 WAL 字节丢失，启动期 ISE 消息含缺口段号（spec §3.3 连续性校验）。
+     */
+    @Test
+    void staticDirectoryRejectsSegmentGap() throws Exception {
+        writeSegment(dir, "000000010000000000000003", 8192);
+        writeSegment(dir, "000000010000000000000005", 8192);
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, 0L);
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> src.start(lsn -> { }, (end, b) -> { }));
+        assertTrue(e.getMessage().contains("段 4"), "消息含缺口段号: " + e.getMessage());
+    }
+
+    /**
+     * 静态档 endLsn 上界截停：endLsn 落段 3 的段内偏移（页 1 中段）、清单尚有段 4 残余
+     * ——末块截断至恰 endLsn、eofReached 置位、消费前沿钉在上界，残余段零交付。
+     */
+    @Test
+    void staticDirectoryStopsAtEndLsn() throws Exception {
+        writeSegment(dir, "000000010000000000000003", SEG_SIZE);
+        writeSegment(dir, "000000010000000000000004", SEG_SIZE);
+        long end = 3L * SEG_SIZE + 8192 + 100;
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, end);
+        List<byte[]> chunks = new ArrayList<>();
+        List<Long> frontier = new ArrayList<>();
+        src.start(frontier::add, (e, b) -> chunks.add(b));
+        try {
+            awaitTrue(src::eofReached, "endLsn 到达须置 eofReached 并退出");
+        } finally {
+            src.stop();
+        }
+        long total = chunks.stream().mapToLong(b -> b.length).sum();
+        assertEquals(8192 + 100, total, "交付总量恰到 endLsn（残余段零交付）");
+        assertEquals(end, frontier.get(frontier.size() - 1), "末块锚 = endLsn");
+        assertEquals(end, src.consumedLsn(), "消费前沿钉在 endLsn");
+    }
+
+    /**
+     * 静态档 .partial 前沿交付上限：段文件预分配稀疏零区（前 8292B 非零、其后零至
+     * 段尾）——交付上限 = 末非零字节 + 1，稀疏零区不交付（与 tail 档 receivedFrontier
+     * 同式，静态档一次性扫定）。
+     */
+    @Test
+    void staticDirectoryPartialSegmentFrontier() throws Exception {
+        writeSegment(dir, "000000010000000000000003.partial", 8192 + 100);
+        try (RandomAccessFile raf = new RandomAccessFile(
+                dir.resolve("000000010000000000000003.partial").toFile(), "rw")) {
+            raf.setLength(SEG_SIZE);   // 尾部扩出稀疏零区（模拟 pg_receivexlog 预分配形态）
+        }
+        FileWalSource src = FileWalSource.staticDirectory(dir, SEG_SIZE, 0L, 8192, 0L);
+        List<byte[]> chunks = new ArrayList<>();
+        src.start(lsn -> { }, (end, b) -> chunks.add(b));
+        try {
+            awaitTrue(src::eofReached, ".partial 前沿读尽须置 eofReached");
+        } finally {
+            src.stop();
+        }
+        long total = chunks.stream().mapToLong(b -> b.length).sum();
+        assertEquals(8192 + 100, total, ".partial 交付上限 = 末非零字节+1（稀疏零区不交付）");
+    }
+
     /**
      * 判定文本文件是否已含指定行（文件级 await 的内容条件——吸收 shell 逐行 append 的
      * 写入竞态窗；读失败按未就绪处理）。
@@ -431,6 +548,26 @@ class FileWalSourceTest {
         Files.writeString(script, content);
         Files.setPosixFilePermissions(script, PosixFilePermissions.fromString("rwx------"));
         return script;
+    }
+
+    /**
+     * 造一个静态档测试段文件：文件长恰 len、内容全为非零字节（0x5A 填充）——计划裁定
+     * 语义：完成段按文件全长交付（用例断言交付总量 = len 依赖此），.partial 的稀疏
+     * 零尾由调用方事后 setLength 扩出（本辅助只负责非零前段）。
+     *
+     * @param dir  段目录
+     * @param name 段文件名（24-hex，可带 .partial 后缀）
+     * @param len  文件长度（= 非零前段长度）
+     * @throws IOException 建文件/写失败
+     */
+    private static void writeSegment(Path dir, String name, long len) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile(dir.resolve(name).toFile(), "rw")) {
+            raf.setLength(len);
+            byte[] fill = new byte[(int) len];
+            Arrays.fill(fill, (byte) 0x5A);
+            raf.seek(0);
+            raf.write(fill);
+        }
     }
 
     /**
