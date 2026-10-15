@@ -3,6 +3,7 @@ package org.vastdata.vbstream.walsource.it.vastbase;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.WalSource;
+import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.state.StateConfig;
 
@@ -109,25 +110,138 @@ public final class VastTestEnv {
     }
 
     /**
+     * JDBC 建连重试上限与退避（2026-10-15 网络路径实测记档）：本机到真库的跨网段路径
+     * （172.16.22.x → 172.16.107.x）偶发丢新连接的首个数据包——TCP 握手恒成功但认证
+     * 响应永不到达，驱动 ~5s 超时；服务器本机 20/20 全通、{@code pg_stat_activity} 低水位
+     * （非库忙/非凭据问题），丢包既有按流随机（重开即通）也有持续数十秒的坏窗
+     * （2026-10-15 实测 6 连×1s 退避仍全挂后自愈）——故退避取指数（1s→2s→4s→8s→封顶
+     * 15s，8 次合计覆盖 ~2 分钟坏窗），测试层有界重试绕过。
+     */
+    private static final int CONNECT_ATTEMPTS = 8;
+
+    /** 建连重试退避基数（毫秒）——逐次翻倍。 */
+    private static final long CONNECT_RETRY_BACKOFF_BASE_MS = 1_000;
+
+    /** 建连重试退避上限（毫秒）。 */
+    private static final long CONNECT_RETRY_BACKOFF_CAP_MS = 15_000;
+
+    /**
+     * 带有界重试的 JDBC 建连（网络路径丢首包面的测试层绕过，见
+     * {@link #CONNECT_ATTEMPTS} 记档）。
+     *
+     * <p>关键步骤：循环 {@link #CONNECT_ATTEMPTS} 次
+     * {@link DriverManager#getConnection}，失败 WARN 一行 + 退避后重试，末次失败原样
+     * 抛。边界与异常语义：认证失败（密码错）等确定性 SQLException 同样会被重试满
+     * （md5 认证失败无锁定面，代价仅数秒延迟，真因以末次异常透传为准）；中断位恢复后
+     * 立即以上抛。线程约束：任意线程（各测试自持连接，无共享态）。</p>
+     *
+     * @param url  JDBC URL
+     * @param user 用户
+     * @param pass 口令
+     * @return 已认证的 JDBC 连接
+     * @throws SQLException 重试耗尽后透传末次异常
+     */
+    public static Connection openConnectionWithRetry(String url, String user, String pass) throws SQLException {
+        SQLException last = null;
+        for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+            try {
+                return DriverManager.getConnection(url, user, pass);
+            } catch (SQLException e) {
+                last = e;
+                if (attempt == CONNECT_ATTEMPTS) {
+                    break;
+                }
+                long backoff = backoffForAttempt(attempt);
+                LOG.warn("JDBC 建连失败（第 {}/{} 次，{}ms 后重试——跨网段路径偶发丢首包面）: {}",
+                        attempt, CONNECT_ATTEMPTS, backoff, e.getMessage());
+                try {
+                    Thread.sleep(backoff);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        throw last;
+    }
+
+    /**
+     * 第 n 次失败后的退避毫秒（指数：基数 1s 逐次翻倍封顶 15s——{@link #CONNECT_ATTEMPTS}
+     * 记档的持续坏窗覆盖面）。
+     *
+     * @param attempt 刚失败的尝试序号（1 起）
+     * @return 退避毫秒
+     */
+    private static long backoffForAttempt(int attempt) {
+        long backoff = CONNECT_RETRY_BACKOFF_BASE_MS << (attempt - 1);
+        return Math.min(backoff, CONNECT_RETRY_BACKOFF_CAP_MS);
+    }
+
+    /**
+     * 带有界重试的在线门面启动（{@code wal.start()} 内部是一次性
+     * {@link DriverManager#getConnection}——同一丢首包面，且门面单程闸门使失败实例
+     * 不可复用）：失败即 close 丢弃半开实例，按同配置新建重试。
+     *
+     * <p>关键步骤：循环内 {@code new WalSource(cfg, out)} → {@code start()} 成功即返回；
+     * {@link SQLException}（含网络面）WARN + 退避重试（{@link #CONNECT_ATTEMPTS} 次），
+     * 末次原样抛；{@link IllegalStateException} 等确定性失败不重试立即抛（重试真配置
+     * 错只会延迟可诊断性）。边界与异常语义：失败实例已 close（ensureSlot 幂等建槽 /
+     * 检查点未落盘，重试无副作用残留）；中断位恢复后立即上抛。线程约束：装配线程。</p>
+     *
+     * @param cfg 门面配置（重试间可复用——纯 Properties 无状态）
+     * @param out DML 变更输出契约（null = 纯 catalog 形态）
+     * @return 已启动的门面（调用方负责 close）
+     * @throws SQLException 重试耗尽后透传末次异常
+     */
+    public static WalSource startOnlineWithRetry(Properties cfg, ChangeOutputListener out) throws SQLException {
+        SQLException last = null;
+        for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+            WalSource source = new WalSource(cfg, out);
+            try {
+                source.start();
+                return source;
+            } catch (SQLException e) {
+                last = e;
+                source.close();
+                if (attempt == CONNECT_ATTEMPTS) {
+                    break;
+                }
+                long backoff = backoffForAttempt(attempt);
+                LOG.warn("WalSource 在线启动失败（第 {}/{} 次，{}ms 后重试——建连丢首包面）: {}",
+                        attempt, CONNECT_ATTEMPTS, backoff, e.getMessage());
+                try {
+                    Thread.sleep(backoff);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        throw last;
+    }
+
+    /**
      * 新建一条普通 SQL 会话（opengauss-jdbc）——干扰线程/交错 DDL/对拍 probe 等并发面
-     * 一律走本方法（共享会话非线程安全）；调用方负责关闭。
+     * 一律走本方法（共享会话非线程安全）；调用方负责关闭。经
+     * {@link #openConnectionWithRetry}（跨网段偶发丢首包面的有界重试）。
      *
      * @return 已认证的 JDBC 连接
      * @throws SQLException 连接失败
      */
     public static Connection newSqlConnection() throws SQLException {
-        return DriverManager.getConnection(jdbcUrl(), user(), pass());
+        return openConnectionWithRetry(jdbcUrl(), user(), pass());
     }
 
     /**
-     * 共享 SQL 会话（懒建单连接；已关则重建）——仅装配线程串行 DDL 用。
+     * 共享 SQL 会话（懒建单连接；已关则重建）——仅装配线程串行 DDL 用。经
+     * {@link #openConnectionWithRetry}（跨网段偶发丢首包面的有界重试）。
      *
      * @return 已认证的共享连接
      * @throws SQLException 连接失败
      */
     public static synchronized Connection sql() throws SQLException {
         if (shared == null || shared.isClosed()) {
-            shared = DriverManager.getConnection(jdbcUrl(), user(), pass());
+            shared = openConnectionWithRetry(jdbcUrl(), user(), pass());
         }
         return shared;
     }

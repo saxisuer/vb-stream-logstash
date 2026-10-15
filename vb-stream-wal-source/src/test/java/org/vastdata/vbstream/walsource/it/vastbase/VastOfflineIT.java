@@ -119,9 +119,8 @@ class VastOfflineIT {
         closables.add(recorder);
 
         OgParityBaseline.WalCapture online = new OgParityBaseline.WalCapture();
-        WalSource wal = new WalSource(onlineConfig(slot, table, stateDir), online);
+        WalSource wal = VastTestEnv.startOnlineWithRetry(onlineConfig(slot, table, stateDir), online);
         closables.add(wal);
-        wal.start();
         try (Connection c = VastTestEnv.newSqlConnection()) {
             c.setAutoCommit(true);
             // 阶段 A：检查点快照之前的在线独有事务（离线窗口按隔离带原理不可达——在线独有面）
@@ -234,9 +233,8 @@ class VastOfflineIT {
         closables.add(recorder);
 
         OgParityBaseline.WalCapture seg1 = new OgParityBaseline.WalCapture();
-        WalSource wal = new WalSource(onlineConfig(slot, table, stateDir), seg1);
+        WalSource wal = VastTestEnv.startOnlineWithRetry(onlineConfig(slot, table, stateDir), seg1);
         closables.add(wal);
-        wal.start();
         try (Connection c = VastTestEnv.newSqlConnection()) {
             c.setAutoCommit(true);
             exec(c, "INSERT INTO " + table + " VALUES (1, 'online-seg1')");
@@ -279,9 +277,8 @@ class VastOfflineIT {
                         + " AFTER=[id=3, name=offline-b-upd]"));
 
         OgParityBaseline.WalCapture seg2 = new OgParityBaseline.WalCapture();
-        WalSource wal2 = new WalSource(onlineConfig(slot, table, stateDir), seg2);
+        WalSource wal2 = VastTestEnv.startOnlineWithRetry(onlineConfig(slot, table, stateDir), seg2);
         closables.add(wal2);
-        wal2.start();
         assertTrue(wal2.resumedFromState(), "在线回切应自离线检查点续传（双向互通前提）");
         try (Connection c = VastTestEnv.newSqlConnection()) {
             c.setAutoCommit(true);
@@ -320,9 +317,8 @@ class VastOfflineIT {
         closables.add(recorder);
 
         OgParityBaseline.WalCapture online = new OgParityBaseline.WalCapture();
-        WalSource wal = new WalSource(onlineConfig(slot, table, stateDir), online);
+        WalSource wal = VastTestEnv.startOnlineWithRetry(onlineConfig(slot, table, stateDir), online);
         closables.add(wal);
-        wal.start();
         try (Connection c = VastTestEnv.newSqlConnection()) {
             c.setAutoCommit(true);
             exec(c, "INSERT INTO " + table + " VALUES (1, 'crash-seg1')");
@@ -407,9 +403,8 @@ class VastOfflineIT {
         closables.add(recorder);
 
         OgParityBaseline.WalCapture online = new OgParityBaseline.WalCapture();
-        WalSource wal = new WalSource(onlineConfig(slot, table, stateDir), online);
+        WalSource wal = VastTestEnv.startOnlineWithRetry(onlineConfig(slot, table, stateDir), online);
         closables.add(wal);
-        wal.start();
         try (Connection c = VastTestEnv.newSqlConnection()) {
             c.setAutoCommit(true);
             exec(c, "INSERT INTO " + table + " VALUES (1, 'bounds-seg1')");

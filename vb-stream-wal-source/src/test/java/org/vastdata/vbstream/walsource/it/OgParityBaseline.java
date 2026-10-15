@@ -8,12 +8,12 @@ import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.changes.ColumnMeta;
 import org.vastdata.vbstream.walsource.changes.TableMeta;
 import org.vastdata.vbstream.walsource.changes.ToastAssembler;
+import org.vastdata.vbstream.walsource.it.vastbase.VastTestEnv;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -165,7 +165,7 @@ public final class OgParityBaseline {
      * @throws SQLException 建槽失败（如重名残留）
      */
     public static void createLogicalSlot(BaselineEndpoint endpoint, String slotName) throws SQLException {
-        try (Connection c = DriverManager.getConnection(endpoint.jdbcUrl(), endpoint.user(), endpoint.password());
+        try (Connection c = VastTestEnv.openConnectionWithRetry(endpoint.jdbcUrl(), endpoint.user(), endpoint.password());
              PreparedStatement ps = c.prepareStatement(
                      "SELECT * FROM pg_create_logical_replication_slot(?, 'pgoutput')")) {
             ps.setString(1, slotName);
@@ -211,7 +211,7 @@ public final class OgParityBaseline {
      * @param slotName 槽名
      */
     public static void dropLogicalSlotQuietly(BaselineEndpoint endpoint, String appName, String slotName) {
-        try (Connection c = DriverManager.getConnection(endpoint.jdbcUrl(), endpoint.user(), endpoint.password())) {
+        try (Connection c = VastTestEnv.openConnectionWithRetry(endpoint.jdbcUrl(), endpoint.user(), endpoint.password())) {
             dropLogicalSlotOn(c, appName, slotName);
         } catch (Exception e) {
             logSlotDropResult(slotName, e);
@@ -332,7 +332,7 @@ public final class OgParityBaseline {
         String url = endpoint.jdbcUrl()
                 + "?replication=database&assumeMinServerVersion=9.4&ApplicationName=" + appName;
         Normalizer n = new Normalizer();
-        try (Connection c = DriverManager.getConnection(url, endpoint.user(), endpoint.password())) {
+        try (Connection c = VastTestEnv.openConnectionWithRetry(url, endpoint.user(), endpoint.password())) {
             PGReplicationStream stream = c.unwrap(PGConnection.class).getReplicationAPI()
                     .replicationStream().logical()
                     .withSlotName(slotName)
