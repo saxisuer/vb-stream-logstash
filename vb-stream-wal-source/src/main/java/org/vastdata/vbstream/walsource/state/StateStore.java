@@ -435,7 +435,7 @@ public final class StateStore {
                 rawAttrTails, rawClassTails, rawNspTails, rawPartitionTails,
                 trackedTableCtid, trackedToastCtid, pgAttrRelfilenode, pgClassRelfilenode,
                 pgNspRelnode, pgPartitionRelfilenode,
-                interestRelOids, staleOids, dmlFloorLsn);
+                interestRelOids, staleOids, dmlFloorLsn, storedPgVersion);
     }
 
     /**

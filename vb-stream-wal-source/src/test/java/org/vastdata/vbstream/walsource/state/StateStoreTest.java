@@ -321,6 +321,24 @@ class StateStoreTest {
     }
 
     /**
+     * 用例 ⑬（离线回放 Task 1）：pgVersion 回读往返（离线档位判定的供数面，spec
+     * §3.1）——写入时 header 的 pgVersion 在 load 后可经 StoredState 组件取得：
+     * decode 自 header 回读填充，不改 VBWS 文件格式（formatVersion 不动）；5（OG）/
+     * 6（VastBase）/18（PG）三档各写各读，供后续 Task 3 以 {@code == 6} 判定
+     * VastBase 档。
+     */
+    @Test
+    void storedStateCarriesPgVersionAfterRoundTrip() throws Exception {
+        for (int pg : new int[]{5, 6, 18}) {
+            Path dir = Files.createTempDirectory("vbws-pgv");
+            StateStore store = new StateStore(dir, pg);
+            store.checkpoint(new CatalogStores(), 0x100L, 0L);
+            StoredState st = new StateStore(dir, pg).load().orElseThrow();
+            assertEquals(pg, st.pgVersion(), "pgVersion 应自 header 回读");
+        }
+    }
+
+    /**
      * 构造全字段灌满的 stores（确定性数据）：attr 三行（含 dropped 占位行）、class
      * 两行（用户表 'r' + toast 关系行 't'——relkind 两形态）、nsp 两行（public +
      * pg_catalog）、三 tail 各一条、tracked 双 ctid、三 relfilenode、interest/stale

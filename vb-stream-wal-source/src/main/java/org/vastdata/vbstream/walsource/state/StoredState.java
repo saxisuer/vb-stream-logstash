@@ -16,6 +16,9 @@ import java.util.Set;
  * stale 两 oid 集，加检查点 LSN（v2 扩链：nsp 行字典 + nsp tail + pgNspRelnode；
  * v3 扩链：dmlFloorLsn——DML 待决桶重放下界；v4 扩链：pg_partition 面——
  * openGauss M3 第四 watched 字典，vanilla 档空集/0 恒为合法值）。
+ * 末位另携 {@code pgVersion} 检查点档位——decode 自 header 回读填充的只读面
+ * （不参与序列化：header 本就落盘该值，VBWS formatVersion 不动；离线回放档位
+ * 判定的供数面，2026-10-15 离线回放 Task 1）。
  *
  * <p>控制器裁定：持久化面 = 完整 CatalogStores 可重建态<strong>除 metrics 外全部
  * 字段</strong>（任务书基础 record 的 attr/class 表 + tracked 双 ctid 之上，扩展
@@ -46,6 +49,8 @@ import java.util.Set;
  * @param staleOids           自愈失败 stale oid 集
  * @param dmlFloorLsn         DML 待决桶重放下界（v3 扩链——首记录 lsn 最小值，0 = 无
  *                            待决桶；续传时流起点按它回退，catalog 过滤线仍 = lsn）
+ * @param pgVersion           检查点档位（layout.majorVersion()——17/18/OG=5/VastBase=6；
+ *                            load 自 header 回读填充，不参与序列化）
  */
 public record StoredState(long lsn,
                           Map<Long, AttrRow> attrs,
@@ -64,7 +69,8 @@ public record StoredState(long lsn,
                           long pgPartitionRelfilenode,
                           Set<Long> interestRelOids,
                           Set<Long> staleOids,
-                          long dmlFloorLsn) {
+                          long dmlFloorLsn,
+                          int pgVersion) {
 
     /**
      * 把本状态灌回目标 stores（Task 15 续传路径）：先清空八 map 与 interest/stale
