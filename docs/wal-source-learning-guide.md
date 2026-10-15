@@ -183,6 +183,31 @@ OG 上 pgjdbc 的 replication API 物理流不可用（`replication=database` �
 VastBase 档在 receive 包零专用代码——`instanceof WalLayoutVOpenGauss` 门控命中同一
 `startOpenGauss` 装配。
 
+### 2.5 离线回放档（2026-10-15）
+
+库不可访问（宕机/网络隔离）时的第三种字节源形态：**凭本地检查点 + WAL 段快照目录
+离线续传**（段目录 = 拷 pg_xlog 或复制流按 LSN 落段），仅 VastBase 档——检查点是
+唯一状态源与入口凭证（缺失/损坏 ISE 附"先在线运行"指引；pgVersion≠6 经 5/17/18
+已知档位探针甄别后 ISE 附"本版仅 VastBase"——冷启动离线非目标）。
+
+- **入口**：库 API `WalSource.startOffline()`（与 start 共用单程闸门、两路互斥）或
+  Main `-Dvb.wal.mode=offline`（mode 是 Main 层直读键，不进门面配置/walconfig
+  白名单）+ `vb.wal.offline.dir`（offline 档必填）/`vb.wal.offline.endLsn`（可选
+  交付上界，到达即提前停）。
+- **装配**（`CatalogSynchronizer.startOffline`，与 startOg 骨架同构、零 SQL 面——无
+  会话/槽/引导/护栏）：restoreInto 灌回四字典 → appliedLsn 种子 = stored lsn（未对齐
+  续传严格过滤线）→ 流起点 = min(stored, floor)（dmlFloorLsn 回退语义——重放段重建
+  待决桶）→ `ChangeStream` 以 sqlConn=null 装配（纯回放禁回查档，TOAST probe 禁用）
+  → sink 组合 applyRecord → postApply → maybeCheckpoint 次序与在线逐字同构。
+- **字节源**（`FileWalSource.staticDirectory`，与 tail 档共存——tail 档零改动）：
+  启动期一次性审计三项（起点段在场/段号连续/tli 一致；tail 档"静默跳后继段等落盘"
+  语义在快照目录 = 静默丢数据，必须显式拒绝）；按清单序读尽即**确定性 EOF**（不轮询
+  增长、无 rename 等待）；撕裂尾天然消化——半条记录的字节停在 walker carry 里，
+  appliedLsn 只随完整记录推进，EOF 停机即弃 carry。
+- **衔接在线**：检查点同目录续写，离线/在线双向互通——库修复后同 state 目录在线
+  `start()` 即续传（stored ≥ P₀ 天然通过）；EOF 经 `eofReached()` 观测（在线档恒
+  false），Main 据此 close 落最终检查点优雅退出（exit 0）。
+
 ---
 
 ## 3. catalog 一致性
@@ -641,6 +666,8 @@ partMiss=K]`。接收器终态死亡（5 次重连失败/解析 ISE）经 `recei
 | `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` | v2 DML 面设计（changes 包、双路对拍） |
 | `docs/superpowers/specs/2026-10-11/12/13-wal-source-opengauss-m1/m2/m3-design.md` | OG 档三里程碑（双通道/XACT 接缝/分区第四字典） |
 | `docs/superpowers/specs/2026-10-13-wal-source-vastbase-adaptation-design.md` | VastBase G100 档（第四布局档） |
+| `docs/superpowers/specs/2026-10-15-wal-source-offline-replay-design.md` | 离线回放档（2026-10-15：检查点 + 段快照目录离线续传，§2.5） |
+| `docs/wal-source-offline-replay-spike.md` | 离线回放三轮 spike（含 parseSegNo 段号 bug 实证） |
 | `docs/wal-source-opengauss-adaptation-research.md` | OG 适配调研（含 VastBase 勘误表） |
 | `vb-stream-wal-source/CLAUDE.md` | 模块全量文档：演进史、OG/VastBase 差异表、已知限制详版 |
 | `vb-stream-wal-source/README.md` | 快速开始（含 openGauss 快速开始） |

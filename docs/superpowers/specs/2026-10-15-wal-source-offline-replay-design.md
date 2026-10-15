@@ -1,7 +1,7 @@
 # vb-stream-wal-source 离线回放档（offline replay）设计
 
 - 日期：2026-10-15
-- 状态：已评审（brainstorming 收敛），待实施
+- 状态：已实施（2026-10-15，feature/offline-replay 分支 commits c300194..c93ddd9）
 - 先导：`docs/wal-source-offline-replay-spike.md`（三轮 spike——OG 容器机制链路 / VastBase
   真库 / 真 pg_xlog 段直读，全部 PASS；潜伏 bug `FileWalSource.parseSegNo` 已于 2026-10-15
   修复，commit `8e32702`）

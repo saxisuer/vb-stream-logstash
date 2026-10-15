@@ -143,8 +143,32 @@ java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/
 mvn test -pl vb-stream-wal-source -Dtest='Vast*IT' -Dvb.it.vastbase=true
 ```
 
-配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键，默认值即下表；单一来源
-`WalSource`/`StateConfig`）：
+## 离线回放模式（VastBase 档，2026-10-15）
+
+库不可访问（宕机/网络隔离）时凭**本地检查点 + WAL 段快照目录**离线续传解析 DML 直至
+WAL 耗尽。**前提：须先在线运行产生检查点**——`vb.wal.state.dir` 已有 VastBase 档
+（pgVersion=6）检查点；冷启动离线不支持（检查点缺失/损坏/档位不符启动期 ISE 附"先在线
+运行"或档位指引）。段目录 = 从数据库侧拿到的 WAL 段文件（拷 pg_xlog 或复制流按 LSN
+落段），启动期审计三项（起点段在场/段号连续/tli 一致）任一不过即 ISE fail-fast。三键
+用法（`vb.wal.mode` 是 `-D` 专属分派键，不进 walconfig.properties 白名单）：
+
+```bash
+java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/cp.txt)" \
+     -Dvb.wal.mode=offline \
+     -Dvb.wal.offline.dir=/path/to/wal-segments \
+     -Dvb.wal.state.dir=/path/to/wal-state \
+     org.vastdata.vbstream.walsource.Main
+# 可选 -Dvb.wal.offline.endLsn=2/071BF288（交付上界——到达即提前停，缺省清单读尽即 EOF）
+# EOF 读尽即优雅退出（exit 0，最终检查点同目录落盘）；state 三键与 DML 两键
+# （tables/dml）照常生效，在线专用键（host/port/db/user/pass/slot/og.*）忽略；
+# 库修复后同 state 目录直接在线运行即续传——检查点同目录续写，离线/在线双向互通
+```
+
+能力/限制（仅 VastBase 档；TOAST INSERT 空面窄缝渲哨兵等已知限制）详见模块
+`CLAUDE.md`"离线回放档"节。
+
+配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键 + 离线回放两键，默认值即下表；
+单一来源 `WalSource`/`StateConfig`；`vb.wal.mode` 是 Main 层分派键不入本表）：
 
 | 键 | 默认 | 语义 |
 |---|---|---|
@@ -164,6 +188,8 @@ mvn test -pl vb-stream-wal-source -Dtest='Vast*IT' -Dvb.it.vastbase=true
 | `vb.wal.og.rx.dir` | `wal-og-queue` | OG file 通道落盘目录（managed 亦作 `-D` 参数） |
 | `vb.wal.og.rx.bin` | `pg_receivexlog` | OG managed 模式可执行文件（走 PATH） |
 | `vb.wal.og.jdbc.prefix` | `jdbc:postgresql:` | OG 档 SQL 会话驱动前缀（`jdbc:opengauss:`=sha256 推荐；缺省保 pgjdbc 防 PG 档反噬，见上文认证二选一） |
+| `vb.wal.offline.dir` | 缺省 = 在线档 | **离线回放档**段快照目录（`vb.wal.mode=offline` 时必填，缺失启动期 ISE；见上文"离线回放模式"） |
+| `vb.wal.offline.endLsn` | 缺省 = 无上界 | 离线回放可选交付上界（十六进制 LSN 文本如 `2/071BF288`，到达即提前 EOF；非法文本启动期 fail-fast） |
 
 ## 架构
 
@@ -215,9 +241,14 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   （v2 六场景 + A 档 date 专形 + COPY 批量 MULTI_INSERT 真几何——基准路 = opengauss-jdbc
   逻辑流 + `OgParityBaseline` 复用，认证 md5 码 5 一次过无 OG 码 11 死角）/ 生命周期 3
   （检查点续传两轮启停对拍 / state 截断回落全新引导 / 门面全装配 direct 通道两轮启停）。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（515 用例 = 离线 396 + Testcontainers
-  IT 99——PG 41 + openGauss 58（需本机 Docker）+ VastBase 手动档真库 20（全 skip，
-  `-Dvb.it.vastbase=true` 才跑）；Windows 开发机另有环境性存量 7 例已知记档——
+- **离线回放档（2026-10-15，仅 VastBase 档）**：离线单测 +14（StateStore pgVersion 回读 /
+  FileWalSource 静态目录档六用例——确定性 EOF·三审计 fail-fast·endLsn 截停·partial 前沿 /
+  CatalogOfflineTest 无库装配三用例 / 配置面 +4）+ `VastOfflineIT` 真库手动档 4 用例
+  （在线/离线按 xid 交集逐块全等 + 离线→在线双向回切 + 崩溃再离线 + endLsn 截停）。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（535 用例 = 离线 412 + Testcontainers
+  IT 99——PG 41 + openGauss 58（需本机 Docker）+ VastBase 手动档真库 24（全 skip，
+  `-Dvb.it.vastbase=true` 才跑——catalog 对拍 2 / DML 对拍 15 / 生命周期 3 / 离线回放
+  4[VastOfflineIT，2026-10-15]）；Windows 开发机另有环境性存量 7 例已知记档——
   pg_receivexlog 文件通道族[FileWalSourceTest 6 + OgDualChannelParityIT 1]，非回归）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
@@ -240,6 +271,11 @@ M3）；**A 兼容档库**（Oracle 风格——v2 全场景双档参数化复�
 COPY 批量 + A 档 date 专形经 oradate→timestamp 归一——双路对拍逐行全等，真库验收）；
 判别 = relname 探测（version() 无 branding 的三方撞号第二面）。已知差异面：uuid/numeric
 输出函数方言（对拍矩阵避开 + 记档）、file 通道未专项验证。
+
+**✅ 支持（离线回放档，2026-10-15——仅 VastBase 档）**：库不可访问时凭本地检查点 +
+WAL 段快照目录离线续传 DML（`-Dvb.wal.mode=offline`——启动期目录审计三项 fail-fast +
+读尽确定性 EOF + 可选 endLsn 上界；检查点同目录续写，离线/在线双向互通——含崩溃再离线
+与回切，真库手动档 IT 钉）。冷启动离线与 OG/vanilla 档离线非目标（ISE 附指引）。
 
 **❌ 不支持（触发时的行为）**：
 - **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，
