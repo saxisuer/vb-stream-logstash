@@ -174,6 +174,16 @@ public final class CatalogSynchronizer {
     private LongSupplier pendingFloor = () -> 0L;
 
     /**
+     * 离线装配的 DML 门面（{@code startOffline} 装配路径注入；DML 禁用档——listener
+     * 为 null——恒 null；在线三档恒 null，其 ChangeStream 由 {@code WalSource} 接收线程
+     * 惰性建）。<b>volatile（终审 F1 JMM）</b>：字段写在装配线程 source.start 之前完成、
+     * 门面 {@code WalSource.startOffline} 在 start 返回路径上同线程读——volatile 为防御
+     * 性补齐（与 {@code externalConsumedLsn} 同款镜像语义），{@link #offlineChangeStream()}
+     * 供门面把离线 ChangeStream 接进 {@code dml*} 发射计数观测面（spec §3.4 复用计数）。
+     */
+    private volatile ChangeStream offlineChangeStream;
+
+    /**
      * 纯逻辑构造缝（测试/离线组装用：直接持 stores + 重放引擎，无接收器——apply 面
      * 与 start 组装路径完全同源）。
      *
@@ -626,6 +636,9 @@ public final class CatalogSynchronizer {
         if (changes != null) {
             sync.pendingFloor = changes::pendingFloorLsn;
         }
+        // 终审 F1：离线装配的 ChangeStream 存字段供门面接线（在线档的惰性建路径在离线档
+        // 不存在——dml* 发射计数观测面离线恒 0 会让 Main 周期行误导操作员，spec §3.4）
+        sync.offlineChangeStream = changes;
         // 流起点（dmlFloorLsn 回退语义同在线档 startOg）：floor 低于 stored 时回退起流
         // ——重放段把待决桶的行记录重新喂给 postApply 面重建桶；catalog 过滤线仍 =
         // stored lsn（appliedLsn 种子不变），重放段不二次施加字典
@@ -673,7 +686,9 @@ public final class CatalogSynchronizer {
      * 档位不符被 {@link StateStore} 的 pgVersion 校验拒载（decode 以构造档位为校验面，
      * 档位值在拒载路径不可得）。对后者按已知档位（OG=5 / PG 17 / PG 18）探针重载甄别，
      * 命中即附"仅支持 VastBase"档位指引；全 miss 保持"先在线运行"采集指引——spec §5
-     * 错误表两行的落点。线程约束：装配线程失败路径单次调用，无并发面。
+     * 错误表两行的落点。探针经 {@link StateStore#loadSilently()}（终审 F5）——档位
+     * 不符拒载是甄别的预期路径，静默档 DEBUG 不占 ERROR 面（否则损坏检查点最多 4 行
+     * ERROR + 堆栈）。线程约束：装配线程失败路径单次调用，无并发面。
      *
      * @param dir           检查点目录
      * @param vastbasePgVer VastBase 档位（WalLayoutVVastbase.INSTANCE.majorVersion()，6）
@@ -681,7 +696,7 @@ public final class CatalogSynchronizer {
      */
     private static IllegalStateException offlineCheckpointMissing(Path dir, int vastbasePgVer) {
         for (int tier : new int[]{5, 17, 18}) {
-            if (new StateStore(dir, tier).load().isPresent()) {
+            if (new StateStore(dir, tier).loadSilently().isPresent()) {
                 return new IllegalStateException("离线档检查点档位不符: pgVersion=" + tier
                         + "（" + offlineTierName(tier) + "）——本版离线档仅支持 VastBase"
                         + "（pgVersion=" + vastbasePgVer + "），请以对应档在线运行或改用"
@@ -1105,6 +1120,20 @@ public final class CatalogSynchronizer {
     public boolean eofReached() {
         WalByteSource source = byteSource;
         return source instanceof FileWalSource f && f.eofReached();
+    }
+
+    /**
+     * 离线装配的 DML 门面观测面（终审 F1，{@code startOffline} 装配路径）：门面
+     * {@code WalSource.startOffline} 经本 getter 把离线 ChangeStream 接进
+     * {@code dmlEmittedBuckets/dmlEmittedRows/...} 发射计数观测面（在线档同一字段由
+     * 接收线程惰性建——离线档无惰性路径，装配后即在场）。DML 禁用档（listener 为
+     * null）与在线三档恒 null。线程约束：volatile 读；返回引用为装配线程构造的完整
+     * 对象（赋值先于 source.start，静态线程经 Thread.start HB 边可见安全构造）。
+     *
+     * @return 离线装配的变更流门面；DML 禁用档 / 在线档 / 未 start 为 null
+     */
+    public ChangeStream offlineChangeStream() {
+        return offlineChangeStream;
     }
 
     /**

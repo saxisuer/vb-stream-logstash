@@ -433,7 +433,8 @@ class FileWalSourceTest {
 
     /**
      * 静态档起点段缺失 fail-fast：fromLsn 落段 5 而目录只有段 3——启动期 ISE（tail 档
-     * ceilingKey 静默跳后继段语义在静态档不可接受，spec §3.3）。
+     * ceilingKey 静默跳后继段语义在静态档不可接受，spec §3.3）；且审计失败不置 started
+     * （终审 F2）——同实例重试 start 重新审计而非"already started"单程拒绝。
      */
     @Test
     void staticDirectoryRejectsMissingStartSegment() throws Exception {
@@ -442,6 +443,10 @@ class FileWalSourceTest {
         IllegalStateException e = assertThrows(IllegalStateException.class,
                 () -> src.start(lsn -> { }, (end, b) -> { }));
         assertTrue(e.getMessage().contains("段 5"), "消息含期望段号: " + e.getMessage());
+        IllegalStateException retry = assertThrows(IllegalStateException.class,
+                () -> src.start(lsn -> { }, (end, b) -> { }));
+        assertTrue(retry.getMessage().contains("段 5"),
+                "审计失败后重试 start 重新审计（非 already started）: " + retry.getMessage());
     }
 
     /**

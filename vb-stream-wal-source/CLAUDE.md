@@ -607,7 +607,8 @@ WARN 忽略，离线切换只走 `-D`）。门面委派 `CatalogSynchronizer.sta
 walDir, endLsn, tables, out)` 七步装配（与 startOg 骨架同构）：① `StateStore(dir, 6)`
 载入检查点——**离线入口凭证就是一份合法检查点**：缺失/损坏 ISE 附"先在线运行"采集
 指引，档位不符（StateStore 按 pgVersion 拒载 → empty）经 5/17/18 已知档位探针甄别后
-ISE 附"本版仅 VastBase"档位指引；② `restoreInto` 灌回四字典、appliedLsn 种子 = stored
+ISE 附"本版仅 VastBase"档位指引（探针经 `StateStore.loadSilently` 静默档——档位不符
+拒载是甄别预期路径不占 ERROR 面，主 `load()` 不动，终审 F5）；② `restoreInto` 灌回四字典、appliedLsn 种子 = stored
 lsn（未对齐**续传严格过滤线**——重投递窗口不二次施加，与在线续传/forced 路径同式）；
 ③ 流起点 = min(stored, floor)（dmlFloorLsn 回退语义——重放段重建待决桶，catalog 过滤
 线不动）；④ 布局 = `WalLayoutVVastbase.INSTANCE`（档位已由检查点判定，无 relname
@@ -645,10 +646,12 @@ slot/og.*——含 `vb.wal.og.source` 全忽略，离线字节源只认 `offline
 合并解决；UPDATE 后像不受影响——OG 系 heap_update 重写 toast 值）；冷启动与 OG/vanilla
 档离线见场景矩阵（spec §7 非目标记档）。
 
-**验收**：离线单测 +14（StateStoreTest +1 pgVersion 回读往返 / FileWalSourceTest +6
-静态档——确定性 EOF·起点段缺失·段号缺口·tli 混杂·endLsn 截停·partial 前沿 /
-CatalogOfflineTest 新 3——无检查点 ISE 附指引·非 VastBase 档 ISE 指引·手造检查点+段
-目录全链冒烟[记录送达 + EOF + 最终检查点落盘] / WalSourceConfigTest +3 离线键解析 /
+**验收**：离线单测 +15（StateStoreTest +1 pgVersion 回读往返 / FileWalSourceTest +6
+静态档——确定性 EOF·起点段缺失·段号缺口·tli 混杂·endLsn 截停·partial 前沿[起点段
+缺失用例终审 F2 增补：审计失败不置 started，重试 start 重新审计断言] /
+CatalogOfflineTest 4——无检查点 ISE 附指引·非 VastBase 档 ISE 指引·手造检查点+段
+目录全链冒烟[记录送达 + EOF + 最终检查点落盘]·终审 F1 离线 DML 发射计数接线[offlineChangeStream
+供给/禁用 null/门面 dml* 冒烟] / WalSourceConfigTest +3 离线键解析 /
 WalConfigFileTest +1 白名单含离线两键而 mode 排除）；真库手动档 `VastOfflineIT` 4
 （`-Dvb.it.vastbase=true`：在线/离线按 xid 交集逐块全等 + 离线→在线双向回切 + 崩溃再
 离线续传 + endLsn 截停——段目录获取经 `WalSegmentRecorder` 上移 `it/vastbase` 测试树
@@ -751,7 +754,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**535 用例 = 离线 412 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+**536 用例 = 离线 413 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
 VastBase 手动档真库 IT 24（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
@@ -764,6 +767,9 @@ OgXactGrouperSeam +2] + OgPartitionDictionary 9→10 的 M3 期漏记 1 一并�
 （2026-10-15 离线回放档收口同口径 +18：离线 +14[StateStore +1 / FileWalSource +6 /
 CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[VastOfflineIT]
 ——离线 398→412、手动档 20→24）
+（2026-10-15 终审 F1 修复 +1：CatalogOffline +1[离线 DML 发射计数接线——offlineChangeStream
+供给面 + 门面 dml* 观测面]；F2 审计失败重试断言并入 FileWalSourceTest 既有用例不加数
+——离线 412→413、总 535→536）
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 17
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
@@ -779,15 +785,18 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
   校验越界跳过；spike 第三轮真库 pg_xlog 实证 M1 以来全部 OG 测试在 log=0 区间从未
   暴露，lsn ≥ 4GB 寻址错乱——修前 file 通道在该形态不可用，见 spike 文档第三轮节]** +
   **静态目录档六用例[2026-10-15 离线回放：确定性 EOF / 起点段缺失·段号缺口·tli 混杂
-  三审计 fail-fast / endLsn 上界截停 / partial 段前沿]**）
+  三审计 fail-fast（起点段缺失用例含终审 F2 审计失败不置 started、重试 start 重新
+  审计断言）/ endLsn 上界截停 / partial 段前沿]**）
   / direct 子包（**M1 裸 v3 客户端**：V3ProtocolChannelTest 6 / OgAuthTest 6
   （sha256 码 11/码 10-3.0 签名/md5 三认证面）/ DirectWalSourceStreamTest 6 /
   DirectWalSourceFeedbackTest 2（65B 'r' 反馈 + 心跳））；`replay` CatalogReplayTest
   16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 10（含引导前沿种子
   过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚 + M2 T7 修复 C 映射目录段号直认
-  接缝锚）/ **CatalogOfflineTest 3（2026-10-15 离线回放档无库装配——无检查点 ISE 附
+  接缝锚）/ **CatalogOfflineTest 4（2026-10-15 离线回放档无库装配——无检查点 ISE 附
   "先在线运行"指引 / 非 VastBase 档检查点 ISE 附档位指引 / 手造检查点 + 手造段目录
-  全链冒烟：记录送达 + 确定性 EOF + 最终检查点落盘断言）** / SelfHealerTest 4 /
+  全链冒烟：记录送达 + 确定性 EOF + 最终检查点落盘断言 / 终审 F1 离线 DML 发射计数
+  接线：offlineChangeStream 供给面非 null·禁用档 null·门面 dml* 观测面冒烟）** /
+  SelfHealerTest 4 /
   **OG 档**：
   OgCatalogReplayTest 11（头 oid/护栏/OG 词典/attnum -7/-8 合法下界——②b 已随修复 B
   反转为 parttype='p' 放行断言）/ OgCatalogBootstrapSqlTest 4 / OgCatalogBootstrapSeedWarnTest

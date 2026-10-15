@@ -229,7 +229,11 @@ public final class WalSource implements AutoCloseable {
     /** DML 输出开关与输出 listener（listener 为 null 时 DML 面恒关——纯 catalog 形态）。 */
     private final ChangeOutputListener dmlOut;
 
-    /** 变更流门面（start 后接收线程首条记录到达时惰性建——需要同步器的活快照视图）。 */
+    /**
+     * 变更流门面（start 后接收线程首条记录到达时惰性建——需要同步器的活快照视图；
+     * 离线档由 {@link #startOffline()} 装配后自同步器接线——离线无惰性路径，终审 F1：
+     * 不接线则 {@code dml*} 发射计数观测面离线恒 0，Main 周期行误导操作员）。
+     */
     private volatile ChangeStream changeStream;
 
     /** 同步器全管线装配用 SQL 会话（start 建，close 关；probe 与槽推进复用）。 */
@@ -568,7 +572,9 @@ public final class WalSource implements AutoCloseable {
      * ——不建 SQL 会话、不建槽（{@code sqlConnection} 本路径恒 null，{@link #close()} 的
      * null 安全面是既有现状）；DML 面按 {@link #dmlEnabled()} 裁定：false（无 listener
      * 或 {@code vb.wal.dml=false}）时 listener 传 null——纯 catalog 形态，true 时传
-     * {@code dmlOut} 原值。边界与异常语义：state 未启用/检查点缺失损坏或档位不符/静态
+     * {@code dmlOut} 原值，装配后离线 ChangeStream 自同步器接进 {@code changeStream}
+     * 字段（{@code dml*} 发射计数观测面离线同源，终审 F1）。
+     * 边界与异常语义：state 未启用/检查点缺失损坏或档位不符/静态
      * 目录审计失败由同步器 ISE 原样上抛（已建资源由本类持有、调用方 close 释放——离线
      * 档失败面即启动失败，无半开会话）；读尽终态经 {@link #eofReached()} 观测，宿主据此
      * close 落最终检查点（同目录续写，离线/在线双向互通）。线程约束：装配线程单次调用
@@ -587,6 +593,11 @@ public final class WalSource implements AutoCloseable {
         }
         sync = CatalogSynchronizer.startOffline(state, offlineDir, offlineEndLsn,
                 tables, dmlEnabled() ? dmlOut : null);
+        // 终审 F1：把离线装配的 ChangeStream 接进 changeStream 字段——dml* 发射计数观测面
+        // （含 Main 周期行 dml=[buckets=.. rows=..]）零新观测面即离线复用（spec §3.4）。
+        // DML 禁用档 getter 回 null，字段保持 null 与"面未装配"同语义；装配线程写先于
+        // started=true，Main 线程读 volatile 字段安全。
+        this.changeStream = sync.offlineChangeStream();
         started = true;
         LOG.info("WalSource 启动（离线回放档）: dir={} endLsn={} state={} dml={} tables={} 续传起点 {}",
                 offlineDir, offlineEndLsn > 0 ? Lsn.format(offlineEndLsn) : "无上界",

@@ -149,7 +149,11 @@ mvn test -pl vb-stream-wal-source -Dtest='Vast*IT' -Dvb.it.vastbase=true
 WAL 耗尽。**前提：须先在线运行产生检查点**——`vb.wal.state.dir` 已有 VastBase 档
 （pgVersion=6）检查点；冷启动离线不支持（检查点缺失/损坏/档位不符启动期 ISE 附"先在线
 运行"或档位指引）。段目录 = 从数据库侧拿到的 WAL 段文件（拷 pg_xlog 或复制流按 LSN
-落段），启动期审计三项（起点段在场/段号连续/tli 一致）任一不过即 ISE fail-fast。三键
+落段），启动期审计三项（起点段在场/段号连续/tli 一致）任一不过即 ISE fail-fast。
+段目录另有两项隐含前提：**段尺寸假设 16MB**（`wal_segment_size` 非 16MB 的实例段名
+log/seg 进位几何不符，寻址错位——须以 16MB 段快照重制）；**原样拷贝的 pg_xlog 若混入
+历史 timeline 段会被 tli 审计 ISE 拒绝**——重放前须从快照目录清除旧 tli 段（真库
+pg_xlog 常混 275 个历史分支段，仅保留与主 timeline 同 tli 的段）。三键
 用法（`vb.wal.mode` 是 `-D` 专属分派键，不进 walconfig.properties 白名单）：
 
 ```bash
@@ -241,11 +245,12 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   （v2 六场景 + A 档 date 专形 + COPY 批量 MULTI_INSERT 真几何——基准路 = opengauss-jdbc
   逻辑流 + `OgParityBaseline` 复用，认证 md5 码 5 一次过无 OG 码 11 死角）/ 生命周期 3
   （检查点续传两轮启停对拍 / state 截断回落全新引导 / 门面全装配 direct 通道两轮启停）。
-- **离线回放档（2026-10-15，仅 VastBase 档）**：离线单测 +14（StateStore pgVersion 回读 /
+- **离线回放档（2026-10-15，仅 VastBase 档）**：离线单测 +15（StateStore pgVersion 回读 /
   FileWalSource 静态目录档六用例——确定性 EOF·三审计 fail-fast·endLsn 截停·partial 前沿 /
-  CatalogOfflineTest 无库装配三用例 / 配置面 +4）+ `VastOfflineIT` 真库手动档 4 用例
+  CatalogOfflineTest 无库装配四用例——含终审 F1 离线 DML 发射计数接线 / 配置面 +4）+
+  `VastOfflineIT` 真库手动档 4 用例
   （在线/离线按 xid 交集逐块全等 + 离线→在线双向回切 + 崩溃再离线 + endLsn 截停）。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（535 用例 = 离线 412 + Testcontainers
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（536 用例 = 离线 413 + Testcontainers
   IT 99——PG 41 + openGauss 58（需本机 Docker）+ VastBase 手动档真库 24（全 skip，
   `-Dvb.it.vastbase=true` 才跑——catalog 对拍 2 / DML 对拍 15 / 生命周期 3 / 离线回放
   4[VastOfflineIT，2026-10-15]）；Windows 开发机另有环境性存量 7 例已知记档——

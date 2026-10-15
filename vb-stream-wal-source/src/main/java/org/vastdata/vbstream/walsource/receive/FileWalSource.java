@@ -4,11 +4,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -263,7 +263,8 @@ public final class FileWalSource implements WalByteSource {
      *
      * <p>关键步骤：闸门校验（重复 start / 停机后再 start 抛 ISE——生命周期单程，新会话
      * 新实例）→ 注入回调 → 静态档在<b>调用线程</b>同步执行 {@link #auditStaticDirectory()}
-     * （审计不过即 ISE fail-fast，不落任何线程/句柄副作用）；tail 档 process.start()
+     * （审计不过即 ISE fail-fast，不落任何线程/句柄副作用，且<b>不置 started</b>——重试
+     * start 重新审计，终审 F2）；tail 档 process.start()
      * （managed）→ 起线程即返回（tail 目录为空等暂态在线程内静默等待，不阻塞调用方；
      * 静态档审计已保证清单非空）。chunk 回调在源线程同步执行。</p>
      *
@@ -280,13 +281,16 @@ public final class FileWalSource implements WalByteSource {
         if (started) {
             throw new IllegalStateException("source already started");
         }
-        started = true;
         this.chunkEndLsnSink = chunkEndLsnSink;
         this.chunkSink = chunkSink;
         if (staticMode) {
+            // 终审 F2：started 在审计成功后才置——审计 ISE 时实例未标记 started，重试
+            // start 重新审计（快照目录可修复后重来）而非"already started"单程拒绝
             staticManifest = auditStaticDirectory();
+            started = true;
             worker = new Thread(this::runStaticLoop, "wal-file-static");
         } else {
+            started = true;
             if (process != null) {
                 process.start();
             }
@@ -331,7 +335,8 @@ public final class FileWalSource implements WalByteSource {
             }
             if (worker.isAlive()) {
                 worker.interrupt();
-                LOG.warn("wal-file-tail 线程 {}ms 内未退出——已 interrupt（停机位已置）", STOP_JOIN_TIMEOUT_MS);
+                LOG.warn("{} 线程 {}ms 内未退出——已 interrupt（停机位已置）",
+                        worker.getName(), STOP_JOIN_TIMEOUT_MS);
             }
         }
         if (process != null) {
@@ -579,8 +584,10 @@ public final class FileWalSource implements WalByteSource {
      *
      * <p>关键步骤：清单序每段 {@link #deliverStaticSegment}（endLsn 上界到达即返回
      * true 提前退出）；清单尽置 {@code eofReached} 自然退出。边界与异常语义：静态档
-     * 无暂态——段文件消失（NoSuchFileException——快照目录不容突变，spec §5）与其余
-     * IOException 一律置 terminalFailure 退出；sink 的 RuntimeException 属确定性失败
+     * 无暂态——段文件消失（开句柄的 FileNotFoundException——快照目录不容突变，
+     * spec §5；终审 F3 修正：原 catch NIO NoSuchFileException 在 RandomAccessFile
+     * 路径不可达）与其余 IOException 一律置 terminalFailure 退出；sink 的
+     * RuntimeException 属确定性失败
      * （同 tail 档契约）；stopRequested 置位即退出且<b>不</b>置 EOF（停机 ≠ 读尽）。
      * 线程约束：静态线程为 consumedLsn/eofReached/段句柄的单写者。</p>
      */
@@ -597,9 +604,11 @@ public final class FileWalSource implements WalByteSource {
             eofReached = true;
             LOG.info("静态目录读尽: dir={} 前沿 {}（{} 段）", dir, Lsn.format(consumedLsn),
                     staticManifest.size());
-        } catch (NoSuchFileException e) {
+        } catch (FileNotFoundException e) {
+            // 段文件消失的到达面：RandomAccessFile 开句柄抛 FileNotFoundException（NIO 的
+            // NoSuchFileException 在本路径不可达——终审 F3 死 catch 修正）
             terminalFailure = new IllegalStateException(
-                    "静态目录段文件消失——快照目录不容突变，静态档读尽语义被破坏: " + e.getFile(), e);
+                    "静态目录段文件消失——快照目录不容突变，静态档读尽语义被破坏: " + e.getMessage(), e);
             LOG.error("静态目录段文件消失（终态，不重试）", e);
         } catch (IOException e) {
             terminalFailure = new IllegalStateException(

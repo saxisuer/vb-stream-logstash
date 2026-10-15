@@ -181,16 +181,50 @@ public final class StateStore {
     }
 
     /**
-     * 读正名检查点并校验解码（拒载语义见类 javadoc）。
+     * 读正名检查点并校验解码（拒载语义见类 javadoc；实现在 {@link #doLoad} 共核）。
      *
      * <p>关键步骤：正名不存在 → empty（静默——首启无检查点是常态）；存在则整读 +
      * 双 CRC/版本/lsn 双验 + 逐段解码。边界与异常语义：任一校验或解析失败（含
-     * 截断 EOF）→ ERROR 日志 + empty（不部分载入、不上抛）；{@code .part} 残留
+     * 截断 EOF）→ ERROR 日志 + empty（不部分载入、不上抛——主载入面的拒载回落
+     * 全新引导是需运维可见的异常形态，ERROR 保留）；{@code .part} 残留
      * 不在本方法读取面内。线程约束：无共享可变状态，任意线程可调。</p>
      *
      * @return 解出的完整可重建态；无正名文件或校验不符为 empty
      */
     public Optional<StoredState> load() {
+        return doLoad(true);
+    }
+
+    /**
+     * 读正名检查点并校验解码——<b>静默档</b>（终审 F5，档位甄别探针专用）：逻辑与
+     * {@link #load()} 全同（同一 {@link #doLoad} 共核），差异仅在拒载日志降为 DEBUG。
+     *
+     * <p>探针用途（javadoc 契约）：档位甄别以"构造档位试载"为手段——如
+     * {@code CatalogSynchronizer.offlineCheckpointMissing} 对 5/17/18 已知档位的逐档
+     * 重载甄别，档位不符拒载是<b>预期路径</b>而非错误（检查点缺失/损坏场景下逐档
+     * 全 miss 也属常态），复用 {@link #load()} 会让探针循环每次拒载打 ERROR + 堆栈
+     * （最多 4 行）占满错误面。主载入路径不受影响——仍走 {@link #load()} 的 ERROR。</p>
+     *
+     * @return 解出的完整可重建态；无正名文件或校验不符为 empty（拒载痕迹 DEBUG 级）
+     */
+    public Optional<StoredState> loadSilently() {
+        return doLoad(false);
+    }
+
+    /**
+     * load 家族共核（{@link #load()} 与 {@link #loadSilently()} 的唯一实现，差异仅
+     * 拒载日志级——共核防两份复制漂移）。
+     *
+     * <p>关键步骤：正名不存在 → empty（静默——首启无检查点是常态，两档同形）；存在则
+     * 整读 + 双 CRC/版本/lsn 双验 + 逐段解码。边界与异常语义：任一校验或解析失败
+     * （含截断 EOF）→ empty（不部分载入、不上抛），日志级由 {@code loud} 决定
+     * （true = ERROR 主载入面 / false = DEBUG 探针甄别面）。线程约束：无共享可变状态，
+     * 任意线程可调。</p>
+     *
+     * @param loud true = 拒载走 ERROR（主载入面）；false = DEBUG（探针甄别面）
+     * @return 解出的完整可重建态；无正名文件或校验不符为 empty
+     */
+    private Optional<StoredState> doLoad(boolean loud) {
         if (!Files.exists(target)) {
             return Optional.empty();
         }
@@ -198,14 +232,23 @@ public final class StateStore {
         try {
             bytes = Files.readAllBytes(target);
         } catch (IOException e) {
-            LOG.error("StateStore 检查点读取失败，拒载回落: {}", target, e);
+            if (loud) {
+                LOG.error("StateStore 检查点读取失败，拒载回落: {}", target, e);
+            } else {
+                LOG.debug("StateStore 检查点读取失败，静默拒载（探针甄别面）: {}", target, e);
+            }
             return Optional.empty();
         }
         try {
             return Optional.of(decode(bytes));
         } catch (IOException | RuntimeException e) {
-            LOG.error("StateStore 检查点校验/解码不符（magic/版本/CRC/lsn 双验之一），拒载回落: {} 原因: {}",
-                    target, e.getMessage(), e);
+            if (loud) {
+                LOG.error("StateStore 检查点校验/解码不符（magic/版本/CRC/lsn 双验之一），拒载回落: {} 原因: {}",
+                        target, e.getMessage(), e);
+            } else {
+                LOG.debug("StateStore 检查点校验/解码不符（探针甄别的预期路径），静默拒载: {} 原因: {}",
+                        target, e.getMessage(), e);
+            }
             return Optional.empty();
         }
     }

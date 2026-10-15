@@ -50,7 +50,9 @@ import java.util.Set;
  * @param dmlFloorLsn         DML 待决桶重放下界（v3 扩链——首记录 lsn 最小值，0 = 无
  *                            待决桶；续传时流起点按它回退，catalog 过滤线仍 = lsn）
  * @param pgVersion           检查点档位（layout.majorVersion()——17/18/OG=5/VastBase=6；
- *                            load 自 header 回读填充，不参与序列化）
+ *                            load 自 header 回读填充，不参与序列化。离线装配档位甄别当前
+ *                            经 StateStore biased 载入协议实现——本组件保留为未来档位扩展
+ *                            供数面，勿以 YAGNI 删除，终审 F6）
  */
 public record StoredState(long lsn,
                           Map<Long, AttrRow> attrs,
