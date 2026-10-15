@@ -139,4 +139,23 @@ class WalConfigFileTest {
         assertEquals("15700", cfg.getProperty(WalSource.KEY_PORT), "-D 空串不覆盖文件值");
         assertFalse(cfg.containsKey(WalConfigFile.CONFIG_FILE_KEY));
     }
+
+    /**
+     * 离线回放两键（offline.dir/offline.endLsn）进白名单——文件层可配离线档的目录与
+     * 上界；{@code vb.wal.mode} 是 Main 层直读分派键（计划裁定不进门面配置/白名单），
+     * 文件里写了也按白名单外键忽略——离线档切换只走 {@code -Dvb.wal.mode=offline}。
+     */
+    @Test
+    void loadFileKeepsOfflineReplayKeysButModeStaysExcluded(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("walconfig.properties");
+        Files.writeString(file, """
+                vb.wal.offline.dir=D:/wal-archive
+                vb.wal.offline.endLsn=2/071BF288
+                vb.wal.mode=offline
+                """);
+        Properties props = WalConfigFile.loadFile(file);
+        assertEquals("D:/wal-archive", props.getProperty(WalSource.KEY_OFFLINE_DIR));
+        assertEquals("2/071BF288", props.getProperty(WalSource.KEY_OFFLINE_END_LSN));
+        assertNull(props.getProperty("vb.wal.mode"), "vb.wal.mode 是 Main 层分派键，不进门面白名单");
+    }
 }

@@ -57,22 +57,34 @@ import java.util.function.LongSupplier;
  * WARN 放行——catalog 面与兼容模式无关，M1 OG IT 即在 'A' 档缺省库全绿）；
  * 观测面（consumedLsn/metrics/terminalFailure/检查点/槽推进）经同步器同源透传。</p>
  *
+ * <p><strong>离线回放档（offline replay，2026-10-15 spec）</strong>：数据库不可访问时
+ * 经 {@link #startOffline()} 凭本地检查点 + WAL 段目录快照离线续传——不建 SQL 会话/
+ * 不建槽/无引导无护栏探测（{@code sqlConnection} 本路径恒 null，close 的 null 安全是
+ * 既有现状），委派 {@link CatalogSynchronizer#startOffline(StateConfig, Path, long, Set,
+ * ChangeOutputListener)} 复用 OG 档运行期管线（ctid 重放/检查点节拍/快照视图）而无一
+ * SQL 面；检查点是唯一状态源与入口凭证（state 未启用/检查点缺失损坏或档位不符由同步器
+ * 启动期 ISE）。读尽终态经 {@link #eofReached()} 透传（在线档恒 false——EOF 是静态
+ * 目录档专属概念），宿主据此 close 落最终检查点（同目录续写，离线/在线双向互通）。</p>
+ *
  * <p>配置面：构造入参 {@link Properties} 读 {@code vb.wal.host/port/db/user/pass/slot}
  * 六键 + {@code vb.wal.state.dir/interval.ms/events} 三键 + v2 两键
  * （{@code vb.wal.tables} 白名单 / {@code vb.wal.dml} DML 输出开关，Task 7）+ openGauss
  * 档五键（M1 Task 6，spec §7：{@code vb.wal.og.source} file|direct / {@code
  * vb.wal.og.rx.mode} managed|external / {@code vb.wal.og.rx.dir} / {@code
  * vb.wal.og.rx.bin} / {@code vb.wal.og.jdbc.prefix}——前缀分流 opengauss-jdbc 与
- * pgjdbc，缺省 jdbc:postgresql: 保 PG 档零感知），默认 {@code localhost:5432/postgres}、
+ * pgjdbc，缺省 jdbc:postgresql: 保 PG 档零感知）+ 离线回放两键（{@code
+ * vb.wal.offline.dir} 段快照目录——缺省 null = 在线档 / {@code vb.wal.offline.endLsn}
+ * 可选交付上界——缺省 0 = 无上界），默认 {@code localhost:5432/postgres}、
  * {@code postgres/postgres}、槽 {@code wal_source}、state 禁用（三键语义/默认值见
  * {@link StateConfig}，单一来源不双写）、白名单空 = 全放行、dml 缺省 true。port/interval/
  * events 非数字启动构造期抛 {@link NumberFormatException}；{@code vb.wal.dml} 非
- * true/false、OG 五键取值域外 / 显式空白 rx.dir/rx.bin 构造期 IAE（fail-fast 优于
- * 静默连错端口/吞掉 DML 面）。</p>
+ * true/false、OG 五键取值域外 / 显式空白 rx.dir/rx.bin/offline.dir / offline.endLsn
+ * 非法 LSN 文本构造期 IAE（fail-fast 优于静默连错端口/吞掉 DML 面）。</p>
  *
  * <p>生命周期：start/close 单程（重复 start 抛 ISE；close 幂等，实现 AutoCloseable；
- * close 含最终 best-effort 检查点 + 槽推进——委派 {@link CatalogSynchronizer#stop()}）；
- * start 中途失败（SQLException/ISE）时内部资源由本类持有，调用方 close 释放。
+ * close 含最终 best-effort 检查点 + 槽推进——委派 {@link CatalogSynchronizer#stop()}；
+ * {@link #startOffline()} 与 start 共用同一单程闸门，两路互斥）；start/startOffline
+ * 中途失败（SQLException/ISE）时内部资源由本类持有，调用方 close 释放。
  * <strong>契约（Med-3）：一个检查点目录同一时刻仅一个活实例</strong>——旧实例后
  * stop 会以陈旧状态覆盖新实例的检查点（文件锁后续任务）。线程约束：
  * start/close 仅装配线程调用；{@link #consumedLsn()} 与 {@link #metrics()} 快照面任意
@@ -167,6 +179,21 @@ public final class WalSource implements AutoCloseable {
      */
     public static final String KEY_OG_JDBC_PREFIX = "vb.wal.og.jdbc.prefix";
 
+    /**
+     * 离线回放档段快照目录键（offline replay，2026-10-15 spec）：指向 WAL 段文件的
+     * 静态快照目录（拷 pg_xlog / recorder 落段），{@link #startOffline()} 的字节源。
+     * 缺省 null = 在线档；显式空白构造期 IAE（沿 {@code vb.wal.og.rx.dir} 的空白纪律）。
+     * 注意：{@code vb.wal.mode} 分派键是 Main 层直读，不属门面配置面。
+     */
+    public static final String KEY_OFFLINE_DIR = "vb.wal.offline.dir";
+
+    /**
+     * 离线回放档可选交付上界键：十六进制 LSN 文本（如 {@code 2/071BF288}），经
+     * {@link Lsn#parse} 解析；缺省 0 = 无上界（静态目录清单读尽即 EOF）。非法值
+     * 构造期 IAE（fail-fast 优于运行期跳错位）。
+     */
+    public static final String KEY_OFFLINE_END_LSN = "vb.wal.offline.endLsn";
+
     private final String host;
     private final int port;
     private final String database;
@@ -189,6 +216,12 @@ public final class WalSource implements AutoCloseable {
 
     /** OG 档 pg_receivexlog 可执行文件（managed 模式）。 */
     private final String ogRxBin;
+
+    /** 离线回放段快照目录（null = 在线档——startOffline 的前置判据）。 */
+    private final Path offlineDir;
+
+    /** 离线回放可选交付上界（0 = 无上界，清单读尽即 EOF）。 */
+    private final long offlineEndLsn;
 
     /** SQL 会话 URL 驱动前缀（jdbc:postgresql: / jdbc:opengauss:——DriverManager 分流面）。 */
     private final String ogJdbcPrefix;
@@ -235,12 +268,15 @@ public final class WalSource implements AutoCloseable {
      * 经 {@link StateConfig#fromProperties} 解析，非数字构造期抛 NumberFormatException
      * （fail-fast）；白名单 {@code vb.wal.tables} 逗号切分（逐项 trim、空项跳过，空集 =
      * 全放行）；DML 开关 {@code vb.wal.dml} <b>严格布尔解析</b>（true/false 之外构造期
-     * IAE——静默当 false 会吞掉整个 DML 面）。本方法不建任何连接（纯字段装配，连接
-     * 推迟到 {@link #start()}——失败配置不应留半开资源）。</p>
+     * IAE——静默当 false 会吞掉整个 DML 面）；离线两键——{@code vb.wal.offline.dir}
+     * 缺省 null（在线档）显式空白 IAE、{@code vb.wal.offline.endLsn} 缺省 0（无上界）
+     * present 即 {@link Lsn#parse}（IAE 转译附键名）。本方法不建任何连接（纯字段装配，
+     * 连接推迟到 {@link #start()}——失败配置不应留半开资源）。</p>
      *
      * @param cfg     配置源（典型 {@code System.getProperty} 收集产物；null 键直接走默认）
      * @param dmlOut  DML 变更事件输出契约实现（null = 纯 v1 catalog 形态）
-     * @throws IllegalArgumentException {@code vb.wal.dml} 非 true/false 字面
+     * @throws IllegalArgumentException {@code vb.wal.dml} 非 true/false 字面 / OG 五键
+     *                                  取值域外 / 离线键显式空白或非法 LSN 文本
      */
     public WalSource(Properties cfg, ChangeOutputListener dmlOut) {
         this.host = cfg.getProperty(KEY_HOST, "localhost");
@@ -268,6 +304,20 @@ public final class WalSource implements AutoCloseable {
                 "jdbc:postgresql:", "jdbc:opengauss:");
         this.ogRxDir = parseNonBlankPath(cfg, KEY_OG_RX_DIR, "wal-og-queue");
         this.ogRxBin = parseNonBlank(cfg, KEY_OG_RX_BIN, "pg_receivexlog");
+        // 离线回放两键（offline replay）：dir 缺省 null = 在线档（显式空白 IAE 沿空白纪律）；
+        // endLsn 缺省 0 = 无上界，present 即 Lsn.parse（IAE 家族异常转译附键名便于归因）
+        this.offlineDir = parseOptionalPath(cfg, KEY_OFFLINE_DIR);
+        String endLsnCfg = cfg.getProperty(KEY_OFFLINE_END_LSN);
+        if (endLsnCfg == null) {
+            this.offlineEndLsn = 0L;
+        } else {
+            try {
+                this.offlineEndLsn = Lsn.parse(endLsnCfg.trim());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(KEY_OFFLINE_END_LSN
+                        + " 须为十六进制 LSN 文本（如 2/071BF288）: " + endLsnCfg, e);
+            }
+        }
     }
 
     /**
@@ -320,6 +370,27 @@ public final class WalSource implements AutoCloseable {
      */
     private static Path parseNonBlankPath(Properties cfg, String key, String defaultValue) {
         return Path.of(parseNonBlank(cfg, key, defaultValue));
+    }
+
+    /**
+     * 可选路径配置（离线回放 {@code vb.wal.offline.dir} 面）：键缺席取 null（在线档——
+     * "未设"与"设了空串"语义分立）；显式设置但空白抛 IAE（沿 {@link #parseNonBlank} 的
+     * 空白纪律——显式空白属配置面错误，不得静默当在线档跑）。
+     *
+     * @param cfg 配置源
+     * @param key 键
+     * @return 路径；键缺席为 null
+     * @throws IllegalArgumentException 显式空白
+     */
+    private static Path parseOptionalPath(Properties cfg, String key) {
+        String value = cfg.getProperty(key);
+        if (value == null) {
+            return null;
+        }
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(key + " 显式设置时不得为空白（键缺席才表示在线档）");
+        }
+        return Path.of(value.trim());
     }
 
     /** 显式关闸（vb.wal.dml=false）；缺省 null = 由 listener 有无决定。 */
@@ -413,6 +484,15 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
+     * 离线回放段快照目录观测面（配置直读——{@code vb.wal.offline.dir}）。
+     *
+     * @return 目录；缺省（在线档）为 null
+     */
+    public Path offlineDir() {
+        return offlineDir;
+    }
+
+    /**
      * 启动全管线：建 SQL 会话 → 版本分发布局 → 起同步器（续传/引导决策 + 接收线程 +
      * 检查点/槽推进生命周期）；DML 面启用时 sink 串接 {@link ChangeStream}（post-apply
      * 分发：先 catalog 施加后变更组装，as-of 次序保证）。
@@ -475,6 +555,43 @@ public final class WalSource implements AutoCloseable {
         LOG.info("WalSource 启动: server_version_num={} slot={} state={} dml={} tables={} 续传起点 {}",
                 versionNum, slotName, state.enabled() ? state.dir() : "禁用", dmlEnabled(),
                 tables.isEmpty() ? "全放行" : tables, Lsn.format(sync.consumedLsn()));
+    }
+
+    /**
+     * 启动离线回放档（offline replay，2026-10-15 spec）：数据库不可访问时凭本地检查点 +
+     * WAL 段快照目录离线续传——与 {@link #start()} 互斥（共用 started/closed 单程闸门，
+     * 两路任一已走即 ISE）。
+     *
+     * <p>关键步骤：① {@code vb.wal.offline.dir} 缺失（null）启动期 ISE（消息附键名——
+     * {@code vb.wal.mode=offline} 而目录未设是配置面残缺，spec §5）；② 委派
+     * {@link CatalogSynchronizer#startOffline(StateConfig, Path, long, Set, ChangeOutputListener)}
+     * ——不建 SQL 会话、不建槽（{@code sqlConnection} 本路径恒 null，{@link #close()} 的
+     * null 安全面是既有现状）；DML 面按 {@link #dmlEnabled()} 裁定：false（无 listener
+     * 或 {@code vb.wal.dml=false}）时 listener 传 null——纯 catalog 形态，true 时传
+     * {@code dmlOut} 原值。边界与异常语义：state 未启用/检查点缺失损坏或档位不符/静态
+     * 目录审计失败由同步器 ISE 原样上抛（已建资源由本类持有、调用方 close 释放——离线
+     * 档失败面即启动失败，无半开会话）；读尽终态经 {@link #eofReached()} 观测，宿主据此
+     * close 落最终检查点（同目录续写，离线/在线双向互通）。线程约束：装配线程单次调用
+     * （synchronized 与 start 同锁）。</p>
+     */
+    public synchronized void startOffline() {
+        if (closed) {
+            throw new IllegalStateException("WalSource already closed");
+        }
+        if (started) {
+            throw new IllegalStateException("WalSource already started");
+        }
+        if (offlineDir == null) {
+            throw new IllegalStateException("离线回放档必须设置 " + KEY_OFFLINE_DIR
+                    + "（vb.wal.mode=offline 而 offline.dir 未设是配置面残缺，spec §5）");
+        }
+        sync = CatalogSynchronizer.startOffline(state, offlineDir, offlineEndLsn,
+                tables, dmlEnabled() ? dmlOut : null);
+        started = true;
+        LOG.info("WalSource 启动（离线回放档）: dir={} endLsn={} state={} dml={} tables={} 续传起点 {}",
+                offlineDir, offlineEndLsn > 0 ? Lsn.format(offlineEndLsn) : "无上界",
+                state.dir(), dmlEnabled(), tables.isEmpty() ? "全放行" : tables,
+                Lsn.format(sync.consumedLsn()));
     }
 
     /**
@@ -702,6 +819,19 @@ public final class WalSource implements AutoCloseable {
     public long consumedLsn() {
         CatalogSynchronizer s = sync;
         return s == null ? 0L : s.consumedLsn();
+    }
+
+    /**
+     * 静态目录读尽终态透传面（离线回放档）：清单读尽或 endLsn 上界到达后 true——EOF
+     * 是确定性的，宿主（冒烟 Main 周期循环）据此 close 落最终检查点优雅退出而非等待
+     * 增长。在线档恒 false（接收器路字节源为 null、OG file 通道的 tail 档源无读尽
+     * 概念——{@link CatalogSynchronizer#eofReached()} 的既有裁定），行为零变化。
+     *
+     * @return 离线档读尽为 true；在线档/未读尽/未 start 为 false
+     */
+    public boolean eofReached() {
+        CatalogSynchronizer s = sync;
+        return s != null && s.eofReached();
     }
 
     /**

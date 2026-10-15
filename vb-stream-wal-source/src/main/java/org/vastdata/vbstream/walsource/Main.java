@@ -7,6 +7,7 @@ import org.vastdata.vbstream.walsource.changes.OutputRenderer;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 
+import java.sql.SQLException;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
@@ -29,9 +30,16 @@ import java.util.stream.Collectors;
  * （形态面收敛到最热 rmgr，冒烟时一眼看出 DDL/写入落在哪个资源管理器）。</p>
  *
  * <p>生命周期：启动失败 ERROR + close 清理 + {@code System.exit(1)}（对齐引擎 Main 约定）；
- * 运行期每个分片醒来先检 {@link WalSource#receiverTerminalFailure()}——接收器终态死亡
+ * 运行档分派（offline replay，2026-10-15 spec）——直读 {@code vb.wal.mode}（缺省
+ * {@code online}，仅允许 online|offline，非法值启动期 ISE）：offline 走
+ * {@link WalSource#startOffline()} 离线回放（段快照目录 + 本地检查点，无 SQL 会话），
+ * online 走 {@link WalSource#start()}（在线档行为零变化）；运行期每个分片醒来先检
+ * {@link WalSource#eofReached()}——离线回放静态目录读尽（确定性 EOF）即 INFO 一行 +
+ * close（落最终检查点）+ 正常返回（exit 0），再检
+ * {@link WalSource#receiverTerminalFailure()}——接收器终态死亡
  * （5 次重连失败/解析 ISE 后线程自行退出，终审 I2）即 ERROR 一行 + close + exit 1，
- * 不让进程带死接收器空转；正常路径主线程以 {@link CountDownLatch#await(long, TimeUnit)}
+ * 不让进程带死接收器空转（在线档 eofReached 恒 false，EOF 分支零变化）；正常路径主线程
+ * 以 {@link CountDownLatch#await(long, TimeUnit)}
  * 分片睡 10s（hook countDown 即时打断，停机不等当前周期耗尽）；hook 内 close 幂等，
  * 先于 JVM halt 排干接收线程（已收数据至少留痕 census）。</p>
  */
@@ -45,32 +53,50 @@ public final class Main {
     /** censusTop3 展示的形态桶数。 */
     private static final int CENSUS_TOP_N = 3;
 
+    /**
+     * 运行档分派键（offline replay，2026-10-15 spec）：Main 层直读
+     * {@code System.getProperty}——计划裁定不进门面配置/文件白名单（walconfig.properties
+     * 里写本键按白名单外键忽略），离线档切换只走 {@code -Dvb.wal.mode=offline}。
+     */
+    static final String KEY_MODE = "vb.wal.mode";
+
+    /** 运行档常量：在线（缺省）——物理复制流接收。 */
+    private static final String MODE_ONLINE = "online";
+
+    /** 运行档常量：离线回放——检查点 + 段快照目录离线续传。 */
+    private static final String MODE_OFFLINE = "offline";
+
     /** 私有构造器：入口类仅静态 main。 */
     private Main() {
     }
 
     /**
-     * 冒烟入口：收集配置 → 起门面（DML 面默认开——OutputRenderer 注入；openGauss 档
-     * 起库级兼容模式护栏——白名单 {'PG','A'} 外档位库启动期 ISE 附档位与 M4 指引，
-     * 'PG'/'A' 档库 DML 面与 PG 17/18 路同构装配，M2 Task 1 / M3 Task 3 放宽；仅
-     * catalog 形态可 {@code -Dvb.wal.dml=false} 显式声明）→ 周期统计行循环 → hook 优雅停。
+     * 冒烟入口：收集配置 → 按运行档起门面（DML 面默认开——OutputRenderer 注入；
+     * openGauss 档起库级兼容模式护栏——白名单 {'PG','A'} 外档位库启动期 ISE 附档位与
+     * M4 指引，'PG'/'A' 档库 DML 面与 PG 17/18 路同构装配，M2 Task 1 / M3 Task 3 放宽；
+     * 仅 catalog 形态可 {@code -Dvb.wal.dml=false} 显式声明；offline 档离线回放无 SQL
+     * 会话不经护栏）→ 周期统计行循环 → hook 优雅停。
      *
-     * <p>关键步骤：① 六键 + state 三键 + v2 两键（tables/dml）逐一
+     * <p>关键步骤：① 全部门面键逐一
      * {@code System.getProperty} 非 null 才入 Properties（null 不覆盖门面默认值）；
-     * ② {@link WalSource#start()} 失败（连不上/版本不支持/权限不足）ERROR 记录后
+     * ② {@link #dispatchMode(WalSource)} 按 {@code vb.wal.mode} 分派
+     * {@link WalSource#start()} / {@link WalSource#startOffline()}，失败（连不上/
+     * 版本不支持/权限不足/离线前置缺失/mode 非法值）ERROR 记录后
      * close 释放半开资源并 {@code System.exit(1)}；③ shutdown hook（名
      * wal-source-shutdown）调 close + countDown——主线程 await 以 10s 分片睡，被打断
-     * 即退出循环由 hook 收尾；每个分片醒来打一行 {@link #logSmokeLine(WalSource)}。
+     * 即退出循环由 hook 收尾；每个分片醒来先检 EOF（离线档读尽即 close + 正常返回，
+     * exit 0）再打一行 {@link #logSmokeLine(WalSource)}。
      * 边界：主线程被中断（非 hook 路径）恢复中断位后主动 {@code source.close()} 兜底
      * （close 幂等——hook 再触发为 no-op）。</p>
      *
      * @param args 未用（配置：工作目录 walconfig.properties / -Dvb.config=<路径> /
-     *              -Dvb.wal.* 系统属性三层合并，见 {@link WalConfigFile}）
+     *              -Dvb.wal.* 系统属性三层合并，见 {@link WalConfigFile}；运行档
+     *              {@code -Dvb.wal.mode=online|offline} 为 -D 专属键）
      */
     public static void main(String[] args) {
         WalSource source = new WalSource(collectConfig(WalConfigFile.loadBase()), new OutputRenderer());
         try {
-            source.start();
+            dispatchMode(source);
         } catch (Exception e) {
             LOG.error("WalSource 启动失败，退出（exit 1）", e);
             source.close();
@@ -85,6 +111,14 @@ public final class Main {
         LOG.info("WAL 直解源冒烟运行中（{}ms 周期统计行，Ctrl-C 优雅退出）", STATS_INTERVAL_MS);
         try {
             while (!shutdown.await(STATS_INTERVAL_MS, TimeUnit.MILLISECONDS)) {
+                if (source.eofReached()) {
+                    // 离线回放静态目录读尽（确定性 EOF）——close 落最终检查点（同目录
+                    // 续写，离线/在线双向互通）后正常退出；在线档 eofReached 恒 false，
+                    // 本分支零变化
+                    LOG.info("离线回放 EOF，优雅退出");
+                    source.close();
+                    return;
+                }
                 Optional<Throwable> terminal = source.receiverTerminalFailure();
                 if (terminal.isPresent()) {
                     // 接收器终态死亡（5 次重连失败/解析 ISE 后线程已自行退出）——进程
@@ -105,8 +139,36 @@ public final class Main {
     }
 
     /**
+     * 按运行档分派启动入口（offline replay，2026-10-15 spec）：直读系统属性
+     * {@code vb.wal.mode}——缺省（含空白，与 collectConfig 的"空串视为未设"语义一致）
+     * {@code online} 走 {@link WalSource#start()}（在线档行为零变化）；{@code offline}
+     * 走 {@link WalSource#startOffline()}（离线回放档——离线两键由门面构造器解析）。
+     *
+     * <p>边界与异常语义：其他取值抛 ISE（启动期 fail-fast——静默按在线跑会让离线意图
+     * 落空且错连数据库），由 main 的启动失败面统一 ERROR + exit 1；两档启动异常
+     * （SQLException/ISE）原样上抛同面。</p>
+     *
+     * @param source 已构造未启动的门面
+     * @throws SQLException 在线档启动失败（连不上/版本不支持/权限不足）
+     * @throws IllegalStateException mode 非法值 / 离线档前置缺失（offline.dir/state/检查点）
+     */
+    private static void dispatchMode(WalSource source) throws SQLException {
+        String raw = System.getProperty(KEY_MODE, "");
+        String mode = raw.isBlank() ? MODE_ONLINE : raw.trim();
+        switch (mode) {
+            case MODE_ONLINE -> source.start();
+            case MODE_OFFLINE -> source.startOffline();
+            default -> throw new IllegalStateException(KEY_MODE + " 须为 " + MODE_ONLINE + "|"
+                    + MODE_OFFLINE + ": " + mode + "（offline = 离线回放档，需 "
+                    + WalSource.KEY_OFFLINE_DIR + " 与启用检查点）");
+        }
+    }
+
+    /**
      * 收集 {@code vb.wal.*} 六键 + state 三键 + v2 两键（tables/dml）+ openGauss 档五键
-     * （M1 Task 6，spec §7）配置：文件层基础值 + 系统属性覆盖。
+     * （M1 Task 6，spec §7）+ 离线回放两键（offline.dir/offline.endLsn，offline replay）
+     * 配置：文件层基础值 + 系统属性覆盖（{@code vb.wal.mode} 分派键不在此列——Main 层
+     * 直读，计划裁定不进门面配置）。
      *
      * <p>关键步骤：文件层（{@link WalConfigFile#loadBase()} 已过白名单）整体打底 →
      * 逐键 {@code System.getProperty} 覆盖（非 null 且非空串才入——空串视为未设，
@@ -135,6 +197,8 @@ public final class Main {
         copySysProp(WalSource.KEY_OG_RX_DIR, cfg);
         copySysProp(WalSource.KEY_OG_RX_BIN, cfg);
         copySysProp(WalSource.KEY_OG_JDBC_PREFIX, cfg);
+        copySysProp(WalSource.KEY_OFFLINE_DIR, cfg);
+        copySysProp(WalSource.KEY_OFFLINE_END_LSN, cfg);
         return cfg;
     }
 

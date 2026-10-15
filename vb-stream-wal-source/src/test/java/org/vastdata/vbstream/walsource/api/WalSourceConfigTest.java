@@ -3,11 +3,13 @@ package org.vastdata.vbstream.walsource.api;
 import org.junit.jupiter.api.Test;
 import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 
+import java.nio.file.Path;
 import java.util.Properties;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -15,7 +17,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link WalSource} 配置面新增两键（{@code vb.wal.tables} 白名单 / {@code vb.wal.dml}
  * DML 输出开关）的离线解析测试（Task 7）——纯构造期行为，不建连接：白名单逗号切分与
  * 空白容忍、dml 缺省 true、严格布尔解析（非法值构造期 IAE fail-fast）、无 listener 的
- * v1 单参构造器回落纯 catalog 形态。
+ * v1 单参构造器回落纯 catalog 形态。离线回放档两键（offline-replay Task 4）：offline.dir
+ * 缺省 null / 显式存档、offline.endLsn 非法 LSN 文本构造期 IAE、无 dir 时 startOffline
+ * 启动期 ISE（消息附键名）。
  */
 class WalSourceConfigTest {
 
@@ -53,6 +57,29 @@ class WalSourceConfigTest {
     void dmlNonBooleanValueFailsFast() {
         assertThrows(IllegalArgumentException.class,
                 () -> new WalSource(props("vb.wal.dml", "yes"), null));
+    }
+
+    /** offline.dir 键解析（缺省 null——startOffline 时 ISE；显式设置即存档）。 */
+    @Test
+    void offlineDirKeyParsed() {
+        WalSource s = new WalSource(props(WalSource.KEY_OFFLINE_DIR, "D:/wal"));
+        assertEquals(Path.of("D:/wal"), s.offlineDir());
+        assertNull(new WalSource(new Properties()).offlineDir());
+    }
+
+    /** offline.endLsn 非法十六进制 LSN 文本构造期 IAE（fail-fast 优于运行期跳错位）。 */
+    @Test
+    void offlineEndLsnRejectsGarbage() {
+        Properties p = props(WalSource.KEY_OFFLINE_END_LSN, "not-an-lsn");
+        assertThrows(IllegalArgumentException.class, () -> new WalSource(p));
+    }
+
+    /** mode=offline 而 offline.dir 缺失——startOffline 启动期 ISE（spec §5）。 */
+    @Test
+    void startOfflineWithoutDirFails() {
+        WalSource s = new WalSource(new Properties());   // 无 offline.dir
+        IllegalStateException e = assertThrows(IllegalStateException.class, s::startOffline);
+        assertTrue(e.getMessage().contains("vb.wal.offline.dir"));
     }
 
     /** 全空操作的 listener（配置面测试只关心装配开关，不消费事件）。 */
