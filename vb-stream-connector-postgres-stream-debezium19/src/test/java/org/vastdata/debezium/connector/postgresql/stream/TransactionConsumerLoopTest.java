@@ -81,7 +81,7 @@ class TransactionConsumerLoopTest {
         TxBuffer bucket = new TxBuffer(xid);
         bucket.hasPrefix = false;
         bucket.prefixKnown = true;
-        long index = pipe.append(PgWire.insert(OID, PgWire.tuple(Long.toString(xid), "v")));
+        long index = pipe.append(PgWire.insert(OID, PgWire.tuple(Long.toString(xid), "v")), 0L);
         bucket.segments.addLast(new long[]{ index, index });
         bucket.firstIndex = index;
         bucket.lastIndex = index;

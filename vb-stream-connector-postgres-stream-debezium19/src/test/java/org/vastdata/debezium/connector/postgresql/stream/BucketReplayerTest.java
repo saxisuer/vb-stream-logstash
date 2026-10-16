@@ -116,7 +116,7 @@ class BucketReplayerTest {
      * 返回 index(即该单元 seq,调用方作 registry 的 accept/require 锚点用)。
      */
     private static long appendUnit(MessagePipe pipe, TxBuffer bucket, byte[] payload) {
-        long index = pipe.append(payload);
+        long index = pipe.append(payload, 0L);
         bucket.segments.addLast(new long[]{ index, index });
         if (bucket.firstIndex < 0) {
             bucket.firstIndex = index;
@@ -233,7 +233,7 @@ class BucketReplayerTest {
         try (MessagePipe pipe = new MessagePipe(pipeDir, LegacyRollCycles.MINUTELY)) {
             TxBuffer bucket = plainBucket(1L);
             long u1 = appendUnit(pipe, bucket, insert("1", "a"));
-            long r2 = pipe.append(PgWire.relation(OID, "t_v2", "id", "v"));   // 间隔:v2 版本的 R
+            long r2 = pipe.append(PgWire.relation(OID, "t_v2", "id", "v"), 0L);   // 间隔:v2 版本的 R
             long u2 = appendUnit(pipe, bucket, insert("2", "b"));
             assertTrue(u1 < r2 && r2 < u2, "CQ index 应随追加单调递增");
             VersionedRelationRegistry registry = new VersionedRelationRegistry();

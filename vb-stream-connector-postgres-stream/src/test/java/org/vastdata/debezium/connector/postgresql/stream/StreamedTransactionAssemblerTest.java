@@ -136,7 +136,7 @@ class StreamedTransactionAssemblerTest {
         TransactionRecorder out = new TransactionRecorder();
         try (StreamedTransactionAssembler assembler = newAssembler(out)) {
             for (byte[] m : msgs) {
-                assembler.onRaw(m);
+                assembler.onRaw(m, 0L);
             }
         }
         return out.transactions();
@@ -456,12 +456,12 @@ class StreamedTransactionAssemblerTest {
                     PgWire.streamAbort(TOP_A, SUB),
                     PgWire.streamAbort(TOP_A, TOP_A)};
             for (byte[] m : seq) {
-                assembler.onRaw(m);
+                assembler.onRaw(m, 0L);
             }
             assertEquals(0, out.transactions().size());
             assertEquals(0, assembler.liveBucketsForTest());   // 整桶丢弃:退出 LIVE 记账
             // 同一实例:桶已被移除 → 后续同 xid StreamCommit fail-fast(非静默)
-            assertThrows(IllegalStateException.class, () -> assembler.onRaw(PgWire.streamCommit(TOP_A)));
+            assertThrows(IllegalStateException.class, () -> assembler.onRaw(PgWire.streamCommit(TOP_A), 0L));
         }
     }
 
@@ -551,11 +551,11 @@ class StreamedTransactionAssemblerTest {
     void rollbackPreparedDiscardsSilently() {
         TransactionRecorder out = new TransactionRecorder();
         try (StreamedTransactionAssembler assembler = newAssembler(out)) {
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.beginPrepare(601L, GID));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.prepare(601L, GID));
-            assembler.onRaw(PgWire.rollbackPrepared(601L, GID));
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.beginPrepare(601L, GID), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.prepare(601L, GID), 0L);
+            assembler.onRaw(PgWire.rollbackPrepared(601L, GID), 0L);
             assertEquals(0, out.transactions().size());   // 丢弃路径:不产生 Transaction
             assertEquals(0, assembler.liveBucketsForTest());   // 挂起桶被丢弃后 LIVE 清零
         }
@@ -688,21 +688,21 @@ class StreamedTransactionAssemblerTest {
         TransactionRecorder collector = new TransactionRecorder();
         try (StreamedTransactionAssembler assembler = new StreamedTransactionAssembler(
                 collector, StreamingMode.ON, registry, RESOLVER, PIPE_DIR, LegacyRollCycles.MINUTELY)) {
-            assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
-            assembler.onRaw(PgWire.begin(1L));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"), 0L);
+            assembler.onRaw(PgWire.begin(1L), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);
             long v1EraSeq = assembler.pipeWatermark() - 1L;   // == 完结点①前最近 append(首条 Commit)的 index
             assertEquals("t_v1", registry.require(OID, v1EraSeq).wire().table());   // 剪枝前该 asOf 可解析
-            assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"));
-            assembler.onRaw(PgWire.begin(2L));
-            assembler.onRaw(insert("2", "b"));
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"), 0L);
+            assembler.onRaw(PgWire.begin(2L), 0L);
+            assembler.onRaw(insert("2", "b"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);
             assertThrows(IllegalStateException.class, () -> registry.require(OID, v1EraSeq));   // v1 已剪
             assertEquals("t_v2", registry.find(OID).orElseThrow().wire().table());   // 最新视图仍可答(引擎单参 require 在 connector 由 find 承担)
-            assembler.onRaw(PgWire.begin(3L));
-            assembler.onRaw(insert("3", "c"));
-            assembler.onRaw(PgWire.commit());                                           // 剪枝后新查询仍正确
+            assembler.onRaw(PgWire.begin(3L), 0L);
+            assembler.onRaw(insert("3", "c"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);                                           // 剪枝后新查询仍正确
         }
         List<Transaction> out = collector.transactions();
         assertEquals(3, out.size());
@@ -728,17 +728,17 @@ class StreamedTransactionAssemblerTest {
         TransactionRecorder collector = new TransactionRecorder();
         try (StreamedTransactionAssembler assembler = new StreamedTransactionAssembler(
                 collector, StreamingMode.ON, registry, RESOLVER, PIPE_DIR, LegacyRollCycles.MINUTELY)) {
-            assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"));
-            assembler.onRaw(PgWire.beginPrepare(601L, GID));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.prepare(601L, GID));
-            assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"));
-            assembler.onRaw(PgWire.begin(99L));
-            assembler.onRaw(insert("9", "x"));
-            assembler.onRaw(PgWire.commit());                                    // 剪枝点:v1 必须存活
+            assembler.onRaw(PgWire.relation(OID, "t_v1", "id", "v"), 0L);
+            assembler.onRaw(PgWire.beginPrepare(601L, GID), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.prepare(601L, GID), 0L);
+            assembler.onRaw(PgWire.relation(OID, "t_v2", "id", "v"), 0L);
+            assembler.onRaw(PgWire.begin(99L), 0L);
+            assembler.onRaw(insert("9", "x"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);                                    // 剪枝点:v1 必须存活
             long pendingSeq = assembler.pipeWatermark();   // == 挂起桶 firstIndex(唯一带单元存活桶的 min)
             assertEquals("t_v1", registry.require(OID, pendingSeq).wire().table());     // 挂起桶依赖版本可答
-            assembler.onRaw(PgWire.commitPrepared(601L, GID));                   // 挂起桶回放:按 v1 渲染
+            assembler.onRaw(PgWire.commitPrepared(601L, GID), 0L);                   // 挂起桶回放:按 v1 渲染
             assertThrows(IllegalStateException.class, () -> registry.require(OID, pendingSeq));   // 完结后 v1 已剪
         }
         List<Transaction> out = collector.transactions();
@@ -769,10 +769,10 @@ class StreamedTransactionAssemblerTest {
             }
         })) {
             handle[0] = assembler;
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.begin(101L));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.commit());   // 交接 → 同步回放,Begin 回调处取景,End 后 DONE
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.begin(101L), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);   // 交接 → 同步回放,Begin 回调处取景,End 后 DONE
             assertEquals(bucketAtBegin[0].firstIndex, pinnedAtBegin[0],
                     "在途(OUTPUTTING)桶应钉住删除低水位");
             assertSame(BucketState.DONE, bucketAtBegin[0].state);
@@ -816,15 +816,15 @@ class StreamedTransactionAssemblerTest {
         }, StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER, PIPE_DIR, LegacyRollCycles.MINUTELY,
                 (msg, view) -> { }, frontier, () -> { });
         try {
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.begin(101L));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.commit());   // 第一个桶交接,consumer 进入回调并阻塞
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.begin(101L), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);   // 第一个桶交接,consumer 进入回调并阻塞
             assertTrue(inCallback.await(5, TimeUnit.SECONDS));
             long blockedFirst = assembler.handedOffForTest().get(0).firstIndex;
-            assembler.onRaw(PgWire.begin(102L));
-            assembler.onRaw(insert("2", "b"));
-            assembler.onRaw(PgWire.commit());   // 第二个桶交接(排队,同样非 DONE)
+            assembler.onRaw(PgWire.begin(102L), 0L);
+            assembler.onRaw(insert("2", "b"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);   // 第二个桶交接(排队,同样非 DONE)
             assertTrue(assembler.pipeWatermark() <= blockedFirst,
                     "在途桶应钉住删除低水位: wm=" + assembler.pipeWatermark() + " blockedFirst=" + blockedFirst);
         } finally {
@@ -938,7 +938,7 @@ class StreamedTransactionAssemblerTest {
             TransactionRecorder out = new TransactionRecorder();
             try (StreamedTransactionAssembler assembler = newAssembler(out)) {
                 assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "hb",
-                        "hello".getBytes(StandardCharsets.US_ASCII)));
+                        "hello".getBytes(StandardCharsets.US_ASCII)), 0L);
                 assertEquals(MSG_LSN, assembler.outputFrontierForTest(),
                         "无 pending 桶:护栏上限即消息自身 LSN");
             }
@@ -982,13 +982,13 @@ class StreamedTransactionAssemblerTest {
         }, StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER, PIPE_DIR, LegacyRollCycles.MINUTELY,
                 (msg, view) -> { }, frontier, () -> { });
         try {
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.begin(101L));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.commit());   // 首桶交接,consumer 进入 Begin 回调并阻塞 → OUTPUTTING(pending)
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.begin(101L), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);   // 首桶交接,consumer 进入 Begin 回调并阻塞 → OUTPUTTING(pending)
             assertTrue(inCallback.await(5, TimeUnit.SECONDS));
             long pendingCommitLsn = assembler.handedOffForTest().get(0).commitLsn;   // PgWire 占位 1(旧公式的钉点,现已不参与)
-            assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "hb", new byte[]{ 1 }));
+            assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "hb", new byte[]{ 1 }), 0L);
             assertEquals(0L, frontier.get(),
                     "存在 pending 桶:前沿完全静止在初始值(全有或全无,不推到 commitLsn=" + pendingCommitLsn + ")");
         } finally {
@@ -1007,12 +1007,12 @@ class StreamedTransactionAssemblerTest {
     void msgWithActiveBucketGoesToBucketWithoutImmediateAdvance() {
         TransactionRecorder out = new TransactionRecorder();
         try (StreamedTransactionAssembler assembler = newAssembler(out)) {
-            assembler.onRaw(PgWire.begin(1L));
-            assembler.onRaw(PgWire.logicalMsg(true, MSG_LSN, "p", new byte[]{ 1 }));
+            assembler.onRaw(PgWire.begin(1L), 0L);
+            assembler.onRaw(PgWire.logicalMsg(true, MSG_LSN, "p", new byte[]{ 1 }), 0L);
             assertEquals(0L, assembler.outputFrontierForTest(), "事务性 'M' 入桶:交接前不推进前沿");
-            assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "p", new byte[]{ 2 }));   // 有桶随桶走
+            assembler.onRaw(PgWire.logicalMsg(false, MSG_LSN, "p", new byte[]{ 2 }), 0L);   // 有桶随桶走
             assertEquals(0L, assembler.outputFrontierForTest(), "非事务 'M' 有桶随桶走:同样不即时推进");
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.commit(), 0L);
             assertEquals(2L, assembler.outputFrontierForTest(),
                     "End 路径写 endLsn(占位 2),消息 LSN 不越位(各用各的值)");
             assertEquals(2, out.transactions().get(0).changes().size(), "两条消息都入桶随事务输出");

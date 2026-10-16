@@ -22,26 +22,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 每条数据记录的 offset LSN 语义端到端实证(1.9.7 线;与 3.6.1 线 {@code PerRecordOffsetIT}
- * 断言面逐字同锚——两版唯一分叉 = source 块 {@code origin} 字段的版本际钉子,行内标注):
- * <b>事务内所有记录的 offset 恒为事务 commit LSN(endLsn),无行级 LSN</b>——
- * Begin 事件 {@code updateCommitPosition(endLsn, endLsn)} 双写锚定
- * ({@code DispatcherTransactionListener.onBegin}),其后本事务每条数据记录的
- * {@code updateWalPosition(currentEndLsn, currentEndLsn, ...)} 两 LSN 参依然是
- * 事务 endLsn(非该行的 WAL 位点)。根因是 pgoutput 的 I/U/D 行消息本身不携带 LSN
- * (仅 B 的 final_lsn / C 的 end_lsn 有),行级 LSN 协议层不可得;Debezium 的 offset
- * 原子单元就是事务,重启续传/去重的粒度亦如此。
+ * 断言面逐字同锚——两版分叉 = source 块 {@code origin} 字段与事务块 {@code id} 形态的
+ * 版本际钉子,行内标注)。<b>行级 LSN 链路(2026-10-16)</b>:reader 在消息 append 进管道时
+ * 逐帧记录 {@code stream.lastReceiveLSN()}(帧头 walStart = 产生该条输出的 WAL 记录位点,
+ * pgjdbc 逻辑流 'w' 帧处理时覆写为本帧 walStart,取后即读),经 [8B walStart][payload]
+ * 记录布局落盘,consumer 回放期把行级 lsn 接进 offset map 的 {@code lsn} 键与 source 块
+ * (与 vanilla wal2json/decoderbufs 的帧位点路径语义同源)——{@code lsn_proc}/
+ * {@code lsn_commit} 仍锚事务边界 endLsn(重启续传的事务原子单元不变)。
  *
  * <p>单用例双事务全证据面:
  * <ul>
  *   <li><b>事务一(3 行 INSERT)</b>:每条数据记录 {@code sourceOffset()} 的
- *       {@code lsn}/{@code lsn_proc}/{@code lsn_commit} 三键同值;三条记录行间
- *       互相同值(<b>无行级 LSN 的实证</b>);source 块 {@code lsn} 同值;
- *       source 块 {@code sequence}(JSON {@code "[X, X]"} 两元素)同源;
- *       事务块 BEGIN/END 记录的 offset 三键与数据记录同值(<b>事务 = offset
- *       原子单元</b>);数据记录 {@code source.txId} 与事务块 {@code id} 同源;
- *       该 LSN 被提交前后独立连接读的 {@code pg_current_wal_lsn()} 夹逼
- *       (证明三条记录同的确实是本事务的 commit LSN,而非其它公共值);</li>
- *   <li><b>事务二(1 行 INSERT)</b>:{@code lsn_commit} 跨事务严格单调递增。</li>
+ *       {@code lsn} 键为<b>行级真值</b>——行间严格递增、落在
+ *       [提交前位点, endLsn) 半开区间内(首行可恰等于提交前读数——该读数即写前沿);
+ *       {@code lsn_proc} == {@code lsn_commit} == 事务 endLsn(事务边界锚定);
+ *       source 块 {@code lsn} 同源、{@code sequence} = [endLsn, 行级 lsn];
+ *       事务块 BEGIN/END 记录的 lsn_proc/lsn_commit 锚 endLsn,lsn 亦恒 endLsn(onEnd 重锚),
+
+ *       数据记录 {@code source.txId} 与事务块 {@code id} 同源;endLsn 被提交前后
+ *       独立连接读的 {@code pg_current_wal_lsn()} 夹逼(确属本事务 commit LSN);</li>
+ *   <li><b>事务二(1 行 INSERT)</b>:{@code lsn_commit} 与行级 {@code lsn} 均跨事务
+ *       严格单调递增——行级严格递增断言同时是 pgjdbc 帧位点语义的驱动升级防回归锚。</li>
  * </ul>
  *
  * <p>版本际钉子(与 3.6.1 版的两处断言分叉):①vanilla 3.6.1 的
@@ -95,7 +96,7 @@ class PerRecordOffsetIT extends StreamITBase {
     }
 
     /**
-     * 责任:实证每条数据记录的 offset LSN 全部是事务 commit LSN(无行级 LSN)。
+     * 责任:实证行级 LSN 链路的端到端语义——offset 的 lsn 键/source 块为帧头 walStart 行级真值,lsn_proc/lsn_commit 锚事务 endLsn 不变。
      * 关键步骤:建夹具并起引擎 → 读事务前 WAL 位点 → 单事务 3 行 INSERT → 读事务后
      * WAL 位点(两读数夹逼本事务 commit LSN)→ 消费 5 条(BEGIN + 3 数据 + END)逐面
      * 断言(三键同值/行间同值/source 块 lsn 与 sequence/事务块 offset 同值/txId
@@ -120,26 +121,33 @@ class PerRecordOffsetIT extends StreamITBase {
         List<SourceRecord> dataRecords = recordsForTopic(tx1, TOPIC);
         assertEquals(3, dataRecords.size(), "事务一恰 3 条数据记录");
 
-        Long tx1Lsn = null;
+        Long tx1EndLsn = null;
         Long tx1SourceTxId = null;
+        long prevRowLsn = -1L;
+        long lastRowLsn = -1L;
         for (SourceRecord r : dataRecords) {
             Map<String, ?> offset = r.sourceOffset();
-            Long lsn = assertOffsetTripleUniform(offset, "事务一数据记录");
-            if (tx1Lsn == null) {
-                tx1Lsn = lsn;
+            long[] lsns = assertOffsetLsnRoles(offset, "事务一数据记录");   // [lsn, lsn_proc, lsn_commit]
+            long rowLsn = lsns[0];
+            if (tx1EndLsn == null) {
+                tx1EndLsn = lsns[2];
             }
-            else {
-                assertEquals(tx1Lsn, lsn, "行间 offset 同值(无行级 LSN——每行的 LSN 位不是自己的 WAL 位点)");
-            }
+            assertEquals(tx1EndLsn, lsns[1], "lsn_proc == lsn_commit == 事务 endLsn(事务边界锚定不变)");
+            assertEquals(tx1EndLsn, lsns[2], "lsn_commit == 事务 endLsn(Begin updateCommitPosition 双写)");
+            assertTrue(prevRowLsn < rowLsn, "行级 lsn 严格递增(各行帧头 walStart = 各自 change 的 WAL 位点): "
+                    + prevRowLsn + " -> " + rowLsn);
+            prevRowLsn = rowLsn;
+            assertTrue(before <= rowLsn && rowLsn < tx1EndLsn,
+                    "行级 lsn 落在本事务 WAL 区间内(提交前位点 <= 各行 change 位点 < commit 末位点;"
+                    + "首行可恰等于提交前读数——该读数即写前沿,事务首条 change 记录从此写入): "
+                            + before + " <= " + rowLsn + " < " + tx1EndLsn);
             Struct source = ((Struct) r.value()).getStruct("source");
             assertNotNull(source, "数据记录 source 块必在");
-            assertEquals(tx1Lsn, source.getInt64("lsn"), "source 块 lsn 与 offset map lsn 同源");
+            assertEquals(rowLsn, source.getInt64("lsn"), "source 块 lsn 与 offset map lsn 同源(行级)");
             String[] sequence = sequenceElements(source.getString("sequence"));
             assertEquals(2, sequence.length, "sequence 恒两元素 [lastCommitLsn, lsn]");
-            for (String element : sequence) {
-                assertEquals(Long.toString(tx1Lsn), element,
-                        "sequence 两元素与事务 endLsn 同值(Begin 双写后 lastCommitLsn 与 lsn 同源): " + source.getString("sequence"));
-            }
+            assertEquals(Long.toString(tx1EndLsn), sequence[0], "sequence 首元素 = 事务 endLsn(lastCommitLsn)");
+            assertEquals(Long.toString(rowLsn), sequence[1], "sequence 次元素 = 行级 lsn: " + source.getString("sequence"));
             if (tx1SourceTxId == null) {
                 tx1SourceTxId = source.getInt64("txId");
                 assertNotNull(tx1SourceTxId, "source.txId 必在(顶层 xid)");
@@ -147,18 +155,23 @@ class PerRecordOffsetIT extends StreamITBase {
             else {
                 assertEquals(tx1SourceTxId, source.getInt64("txId"), "同事务行间 txId 同值");
             }
-            assertTrue(before < lsn && lsn <= after,
-                    "offset LSN 被本事务提交前后的 pg_current_wal_lsn() 夹逼(证明是本事务 commit LSN): "
-                            + before + " < " + lsn + " <= " + after);
+            lastRowLsn = rowLsn;
         }
+        assertTrue(tx1EndLsn <= after,
+                "endLsn 被本事务提交前后的 pg_current_wal_lsn() 夹逼(证明确属本事务 commit LSN): "
+                        + before + " < 各行级 lsn < " + tx1EndLsn + " <= " + after);
 
-        // ---- 事务块 BEGIN/END 记录:offset 三键与数据记录同值(事务 = offset 原子单元) ----
+        // ---- 事务块 BEGIN/END 记录:三键均锚 endLsn(END 发出前 onEnd 重锚——BEGIN/END 对的 id 配对语义) ----
         List<SourceRecord> txBlocks = recordsForTopic(tx1, TX_TOPIC);
         assertEquals(2, txBlocks.size(), "事务一恰一对 BEGIN/END 事务块记录");
-        for (SourceRecord r : txBlocks) {
-            assertEquals(tx1Lsn, assertOffsetTripleUniform(r.sourceOffset(), "事务块记录"),
-                    "事务块记录 offset 与数据记录同值(事务 = offset 原子单元)");
-        }
+        long[] beginLsns = assertOffsetLsnRoles(txBlocks.get(0).sourceOffset(), "BEGIN 事务块记录");
+        assertEquals(tx1EndLsn, beginLsns[0], "BEGIN 块 lsn = endLsn(onBegin 双写后发出)");
+        assertEquals(tx1EndLsn, beginLsns[1], "BEGIN 块 lsn_proc = endLsn");
+        assertEquals(tx1EndLsn, beginLsns[2], "BEGIN 块 lsn_commit = endLsn");
+        long[] endLsns = assertOffsetLsnRoles(txBlocks.get(1).sourceOffset(), "END 事务块记录");
+        assertEquals(tx1EndLsn, endLsns[0], "END 块 lsn = endLsn(onEnd 发出前重锚——BEGIN/END 事务块对的 id 配对语义,vanilla commit 路径同款)");
+        assertEquals(tx1EndLsn, endLsns[1], "END 块 lsn_proc = endLsn(事务边界锚定)");
+        assertEquals(tx1EndLsn, endLsns[2], "END 块 lsn_commit = endLsn(重启续传锚,事务原子单元不变)");
         Struct beginBlock = (Struct) txBlocks.get(0).value();
         assertEquals("BEGIN", beginBlock.getString("status"), "首条事务块为 BEGIN");
         assertEquals(Long.toString(tx1SourceTxId), beginBlock.getString("id"),
@@ -167,14 +180,15 @@ class PerRecordOffsetIT extends StreamITBase {
         assertEquals("END", endBlock.getString("status"), "第二条事务块为 END");
         assertEquals(3L, endBlock.getInt64("event_count"), "事务一 END 计数 = 3 行");
 
-        // ---- 事务二:单行 INSERT,lsn_commit 跨事务严格单调递增 ----
+        // ---- 事务二:单行 INSERT,lsn_commit 与行级 lsn 均跨事务严格单调递增 ----
         StreamPgTestEnv.execSql("INSERT INTO " + TABLE + " VALUES (100, 'tx2')");
         List<SourceRecord> tx2 = consumeRecordsUnchecked(3);
         assertEquals(3, tx2.size(), "事务二 BEGIN + 1 数据 + END 共 3 条应到达: " + describe(tx2));
         List<SourceRecord> tx2Data = recordsForTopic(tx2, TOPIC);
         assertEquals(1, tx2Data.size(), "事务二恰 1 条数据记录");
-        Long tx2Lsn = assertOffsetTripleUniform(tx2Data.get(0).sourceOffset(), "事务二数据记录");
-        assertTrue(tx2Lsn > tx1Lsn, "跨事务 lsn_commit 单调递增: " + tx1Lsn + " -> " + tx2Lsn);
+        long[] tx2Lsns = assertOffsetLsnRoles(tx2Data.get(0).sourceOffset(), "事务二数据记录");
+        assertTrue(tx2Lsns[2] > tx1EndLsn, "跨事务 lsn_commit 单调递增: " + tx1EndLsn + " -> " + tx2Lsns[2]);
+        assertTrue(tx2Lsns[0] > lastRowLsn, "跨事务行级 lsn 单调递增: " + lastRowLsn + " -> " + tx2Lsns[0]);
 
         // ---- 版本际钉子(与 3.6.1 版唯一断言分叉):1.9.7 的 source 块无 origin 字段 ----
         Struct tx2Source = ((Struct) tx2Data.get(0).value()).getStruct("source");
@@ -220,25 +234,25 @@ class PerRecordOffsetIT extends StreamITBase {
     }
 
     /**
-     * 责任:断言一条记录的 offset map 三 LSN 键存在且同值,返回该公共值。
-     * 关键步骤:逐键取 Long 并断言非 null(Begin 双写后三键必在;缺键即 offset
-     * 语义回归)→ 两两断言相等。边界:任一键缺失或不同值即 AssertionError,
-     * 消息带调用方上下文(记录在事务中的角色)。
+     * 责任:断言一条记录的 offset map 三 LSN 键存在,返回三键值数组 [lsn, lsn_proc, lsn_commit]。
+     * 关键步骤:逐键取 Long 并断言非 null(Begin 双写后 lsn_proc/lsn_commit 必在,数据记录的
+     * lsn 键经行级 updateWalPosition 后亦必在;缺键即 offset 语义回归)。注意<b>不再断言三键
+     * 同值</b>——lsn 是行级真值(帧头 walStart,事务内逐行递增),lsn_proc/lsn_commit 锚事务
+     * 边界 endLsn,角色语义由调用方断言(行级 LSN 链路,2026-10-16)。
+     * 边界:任一键缺失即 AssertionError,消息带调用方上下文(记录在事务中的角色)。
      *
      * @param offset  记录的 sourceOffset() map
      * @param context 断言失败消息的上下文前缀(记录角色)
-     * @return 三键的公共 LSN 值
+     * @return [lsn, lsn_proc, lsn_commit] 三键值
      */
-    private static Long assertOffsetTripleUniform(Map<String, ?> offset, String context) {
+    private static long[] assertOffsetLsnRoles(Map<String, ?> offset, String context) {
         Long lsn = asLongOrNull(offset.get("lsn"));
         Long lsnProc = asLongOrNull(offset.get("lsn_proc"));
         Long lsnCommit = asLongOrNull(offset.get("lsn_commit"));
-        assertNotNull(lsn, context + ": offset 缺 lsn 键(Begin 双写后必在)");
+        assertNotNull(lsn, context + ": offset 缺 lsn 键");
         assertNotNull(lsnProc, context + ": offset 缺 lsn_proc 键(Begin 双写后必在)");
         assertNotNull(lsnCommit, context + ": offset 缺 lsn_commit 键(Begin 双写后必在)");
-        assertEquals(lsn, lsnProc, context + ": lsn == lsn_proc(每行 updateWalPosition 双参同为 endLsn)");
-        assertEquals(lsn, lsnCommit, context + ": lsn == lsn_commit(Begin updateCommitPosition 双写)");
-        return lsn;
+        return new long[]{ lsn, lsnProc, lsnCommit };
     }
 
     /**

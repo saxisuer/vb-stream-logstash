@@ -94,7 +94,8 @@ final class BucketReplayer {
      * 逐段 readRange(readRange 保证段内全部是本桶单元),逐单元三步——aborted 过滤
      * (hasPrefix 时重窥 raw[1..4] 得 streamXid,命中 abortedSubxids 跳过、不交付)→
      * decodeSingle(payload, bucket.hasPrefix) → 构造 TxChange(Relation 经桶快照
-     * require(oid, seq) 的 wire 形态,index 即单元 seq)即交 sink。空桶零交付。
+     * require(oid, seq) 的 wire 形态,index 即单元 seq;walStart 即单元行级 lsn)即交 sink。
+     * 空桶零交付。
      *
      * <p>边界:bucket/pipe/sink 为 null 抛 NPE;桶未交接(快照缺失)抛 ISE;Relation 查不到或
      * 字节与协议不符时抛 ISE/协议异常(经 sink 调用链原样上抛,已交付条目不撤回)。
@@ -115,7 +116,7 @@ final class BucketReplayer {
         }
         long[] emitted = {0L};
         for (long[] segment : bucket.segments) {
-            pipe.readRange(segment[0], segment[1], (index, payload) -> {
+            pipe.readRange(segment[0], segment[1], (index, walStart, payload) -> {
                 metrics.onReplayedUnit(payload.length);   // 回读即记(aborted 过滤前——被剔除单元的字节也确实从管道读回了)
                 OptionalLong streamXid = bucket.hasPrefix
                         ? OptionalLong.of(RawPeeks.unsignedInt(payload, 1))
@@ -123,7 +124,7 @@ final class BucketReplayer {
                 if (streamXid.isPresent() && bucket.abortedSubxids.contains(streamXid.getAsLong())) {
                     return;
                 }
-                sink.accept(replayUnit(payload, index, streamXid, snapshot));
+                sink.accept(replayUnit(payload, index, walStart, streamXid, snapshot));
                 emitted[0]++;
             });
         }
@@ -132,7 +133,8 @@ final class BucketReplayer {
 
     /**
      * 回放单个存储单元:先做类型守卫,再解码、回调 decodedObserver(第二参传桶快照作渲染视图),
-     * 最后按消息类型构造 TxChange(相对引擎多携带 seq 偏差组件——见 {@link TxChange#seq()})。
+     * 最后按消息类型构造 TxChange(相对引擎多携带 seq 与 lsn 偏差组件——见 {@link TxChange#seq()}
+     * 与 {@link TxChange#lsn()},walStart 来自管道记录头,reader 在 append 前取后即读)。
      *
      * <p>类型守卫:不是 I/U/D/T/M 就抛 ISE——组装器的路由保证不可达,属防御性检查。解码用
      * decodeSingle,inStream 由桶级 hasPrefix 决定(经 streamXid 的有无表达)。构造时 Relation
@@ -142,7 +144,7 @@ final class BucketReplayer {
      * <p>边界:payload 为空数组违反契约(首字节访问抛数组越界);守卫通过后 require 查不到或
      * 协议错位的异常原样上抛;instanceof 链末端保留一道 ISE(双保险)。
      */
-    private TxChange replayUnit(byte[] payload, long seq, OptionalLong streamXid, RelationSnapshot snapshot) {
+    private TxChange replayUnit(byte[] payload, long seq, long walStart, OptionalLong streamXid, RelationSnapshot snapshot) {
         char type = (char) payload[0];
         switch (type) {
             case 'I', 'U', 'D', 'T', 'M' -> { /* 可回放的数据消息——组装器路由只可能落这五类 */ }
@@ -153,24 +155,24 @@ final class BucketReplayer {
         decodedObserver.accept(msg, snapshot);
         if (msg instanceof PgOutputMessage.Insert m) {
             return new RowChange(DmlKind.INSERT, snapshot.require(m.relationOid(), seq).wire(),
-                    Optional.empty(), Optional.of(m.newTuple()), m.streamXid(), seq);
+                    Optional.empty(), Optional.of(m.newTuple()), m.streamXid(), seq, walStart);
         }
         if (msg instanceof PgOutputMessage.Update m) {
             return new RowChange(DmlKind.UPDATE, snapshot.require(m.relationOid(), seq).wire(),
-                    m.oldTuple(), Optional.of(m.newTuple()), m.streamXid(), seq);
+                    m.oldTuple(), Optional.of(m.newTuple()), m.streamXid(), seq, walStart);
         }
         if (msg instanceof PgOutputMessage.Delete m) {
             return new RowChange(DmlKind.DELETE, snapshot.require(m.relationOid(), seq).wire(),
-                    Optional.of(m.oldTuple()), Optional.empty(), m.streamXid(), seq);
+                    Optional.of(m.oldTuple()), Optional.empty(), m.streamXid(), seq, walStart);
         }
         if (msg instanceof PgOutputMessage.Truncate m) {
             List<PgOutputMessage.Relation> snapshots = Arrays.stream(m.relationOids())
                     .mapToObj(oid -> snapshot.require(oid, seq).wire())
                     .toList();
-            return new TruncateChange(snapshots, m.options(), m.streamXid(), seq);
+            return new TruncateChange(snapshots, m.options(), m.streamXid(), seq, walStart);
         }
         if (msg instanceof PgOutputMessage.LogicalMsg m) {
-            return new MsgChange(m.transactional(), m.prefix(), m.content(), m.streamXid(), seq);
+            return new MsgChange(m.transactional(), m.prefix(), m.content(), m.streamXid(), seq, walStart);
         }
         throw new IllegalStateException("桶内出现不可回放的消息类型: " + msg.getClass().getSimpleName());
     }

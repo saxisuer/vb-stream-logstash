@@ -156,10 +156,10 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
             // transactional || hasActiveBucket() 分支收入桶中,回放期以 transactional=false 到达,
             // 硬编码 true 会打错标记——终审修复);aborted 子事务的消息在回放过滤阶段已被剔除,
             // 天然不记(与 CDC 数据语义对齐)。仍不 dispatch、不计入 event_count——发射仍延期
-            // (dispatchLogicalDecodingMessage 的映射后续里程碑接)。lsn 位缺省:MsgChange 事件
-            // 不携带 lsn 组件(协议解码层有、事件面未带),日志形态对齐 reader 时点但无 lsn 位。
-            LOG.info("逻辑消息: prefix={}, 事务性={}, content={}", change.prefix(), change.transactional(),
-                    MessagePreview.preview(change.content()));
+            // (dispatchLogicalDecodingMessage 的映射后续里程碑接)。lsn 位为帧头 walStart 的
+            // 行级位点(事件组件已带,原"协议解码层有、事件面未带"欠账已清)。
+            LOG.info("逻辑消息: prefix={}, 事务性={}, lsn={}, content={}", change.prefix(), change.transactional(),
+                    Lsn.valueOf(change.lsn()), MessagePreview.preview(change.content()));
         }
         else if (event instanceof TransactionEvent.End end) {
             onEnd(end);
@@ -202,8 +202,12 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
         // aborted 过滤正依赖该语义区分):source 块 txId 必须与事务块 id(同为顶层 xid,
         // Long.toString 形态)同源,否则 SAVEPOINT 提交存活的子事务变更会让首条记录
         // source.txId ≠ 事务块 id,TransactionMonitor 按"事务变更"补发空 END+BEGIN,
-        // 事务元数据 topic 分裂(终审修复;offset 不受影响——锚 endLsn 恒定)
-        offsetContext.updateWalPosition(Lsn.valueOf(currentEndLsn), Lsn.valueOf(currentEndLsn),
+        // 事务元数据 topic 分裂(终审修复;offset 不受影响——锚 endLsn 恒定)。
+        // 第一 LSN 参为<b>行级</b>位点(change.lsn(),帧头 walStart——记录/排序面真值,
+        // 事务内逐条递增);第二参(lsn_proc)与 lsn_commit 仍锚事务 endLsn(重启续传的
+        // 原子单元不变,与 vanilla wal2json 帧位点路径语义同源;1.9.7 六参形态无
+        // messageType 位,见类 javadoc)
+        offsetContext.updateWalPosition(Lsn.valueOf(change.lsn()), Lsn.valueOf(currentEndLsn),
                 currentCommitTimestamp, currentXid, null, tableId);
         dispatch(() -> dispatcher.dispatchDataChangeEvent(partition, tableId,
                 new RowChangeEmitter(partition, offsetContext, clock, connectorConfig, valueMapper, table, change)));
@@ -232,7 +236,8 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
         for (var relation : change.relations()) {
             int relationOid = relation.relationOid();
             TableId tableId = resolveAndInstall(relationOid, change.seq()).id();
-            offsetContext.updateWalPosition(Lsn.valueOf(currentEndLsn), Lsn.valueOf(currentEndLsn),
+            // 同 RowChange:第一 LSN 参为行级位点(TRUNCATE 帧的 walStart),lsn_proc/lsn_commit 锚 endLsn 不变
+            offsetContext.updateWalPosition(Lsn.valueOf(change.lsn()), Lsn.valueOf(currentEndLsn),
                     currentCommitTimestamp, currentXid, null, tableId);
             dispatch(() -> dispatcher.dispatchDataChangeEvent(partition, tableId,
                     new TruncateEmitter(partition, offsetContext, clock, connectorConfig)));
@@ -264,6 +269,12 @@ final class DispatcherTransactionListener implements StreamingTransactionListene
      * 确认,前沿随后推进——见 TransactionConsumer.processBucket)。
      */
     private void onEnd(TransactionEvent.End end) {
+        // 事务尾重锚(行级 LSN 链路的收尾步):末行 updateWalPosition 已把 offset 的 lsn 推进到
+        // 行级位点,END 事务块发出前重锚 endLsn——保证 BEGIN/END 事务块对的 offset lsn 一致
+        // (1.9.7 的 TransactionMonitor 虽以传入 id 透传、不拼 lsn 后缀,offset 面的事务边界
+        // 语义仍与 3.6.1 线对齐;vanilla 的 commit 路径同款重锚语义)。幂等:与 Begin 的双写
+        // 同值,不改变 lsn_commit/lsn_proc 的事务边界语义。
+        offsetContext.updateCommitPosition(Lsn.valueOf(currentEndLsn), Lsn.valueOf(currentEndLsn));
         dispatch(() -> dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext));
     }
 

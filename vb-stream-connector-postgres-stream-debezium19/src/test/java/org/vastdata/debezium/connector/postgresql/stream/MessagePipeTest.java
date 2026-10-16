@@ -34,26 +34,33 @@ class MessagePipeTest {
     Path dir;
 
     /**
-     * append → readRange 往返且逐条回调真实 CQ index(seq ≡ CQ index 的核心契约):三条消息
-     * (I/I/C,载荷形态覆盖数据消息与控制消息)按 index 升序读回,回调首参恰为各自 append 的
-     * 返回值,payload 为与队列内存不共享的副本且内容保真。
-     * 关键步骤:append 三条记录各自返回 index → readRange(i0, i2) 收集回调的 (idx, payload) →
-     * 断言 index 序等于 append 返回序、载荷字节逐条对应。
-     * 边界:载荷最小化(1~2 字节);断言只依赖 append 返回值,不假设 index 从 0 起。
+     * append → readRange 往返且逐条回调真实 CQ index(seq ≡ CQ index 的核心契约)与嵌入的
+     * 行级 walStart([8B walStart][payload] 记录布局的核心契约):三条消息(I/I/C,载荷形态
+     * 覆盖数据消息与控制消息;walStart 取互异真值模拟行级位点)按 index 升序读回,回调首参
+     * 恰为各自 append 的返回值,次参恰为各自嵌入的 walStart,payload 为与队列内存不共享的
+     * 副本且内容保真。
+     * 关键步骤:append 三条记录(互异 walStart)各自返回 index → readRange(i0, i2) 收集回调的
+     * (idx, walStart, payload) → 断言 index 序等于 append 返回序、walStart 序逐条对应嵌入值、
+     * 载荷字节逐条对应。
+     * 边界:载荷最小化(1~2 字节);断言只依赖 append 返回值,不假设 index 从 0 起;walStart
+     * 含 0(合法位点值)与两个互异非零值,锚"原样回读、无重排无丢失"。
      */
     @Test
     void readRangeExposesRealIndexPerMessage() throws IOException {
         try (MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
-            long i0 = pipe.append(new byte[]{'I', 1});
-            long i1 = pipe.append(new byte[]{'I', 2});
-            long i2 = pipe.append(new byte[]{'C'});
+            long i0 = pipe.append(new byte[]{'I', 1}, 0L);
+            long i1 = pipe.append(new byte[]{'I', 2}, 0x1BD9CC0L);
+            long i2 = pipe.append(new byte[]{'C'}, 0x1BD9D10L);
             List<Long> indexes = new ArrayList<>();
+            List<Long> walStarts = new ArrayList<>();
             List<byte[]> payloads = new ArrayList<>();
-            pipe.readRange(i0, i2, (idx, payload) -> {
+            pipe.readRange(i0, i2, (idx, walStart, payload) -> {
                 indexes.add(idx);
+                walStarts.add(walStart);
                 payloads.add(payload);
             });
             assertEquals(List.of(i0, i1, i2), indexes);       // index 单调且即真实 CQ index
+            assertEquals(List.of(0L, 0x1BD9CC0L, 0x1BD9D10L), walStarts);   // walStart 原样回读、逐条对应
             assertEquals((byte) 1, payloads.get(0)[1]);       // payload 为副本、内容保真
             assertEquals((byte) 2, payloads.get(1)[1]);
             assertEquals((byte) 'C', payloads.get(2)[0]);
@@ -72,8 +79,8 @@ class MessagePipeTest {
             long before = pipe.diskUsageBytes();
             assertTrue(before >= 0, "空管道占用应非负(至少含队列元数据文件),实测 " + before);
 
-            pipe.append(new byte[]{'I', 1});
-            pipe.append(new byte[]{'C'});
+            pipe.append(new byte[]{'I', 1}, 0L);
+            pipe.append(new byte[]{'C'}, 0L);
             long after = pipe.diskUsageBytes();
             assertTrue(after > before, "append 后目录占用应单调增长: " + before + " → " + after);
 
@@ -123,11 +130,11 @@ class MessagePipeTest {
     @Test
     void singleMessageRangeYieldsExactlyOne() throws IOException {
         try (MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
-            long first = pipe.append(new byte[]{'B'});
-            pipe.append(new byte[]{'I', 9});
-            long second = pipe.append(new byte[]{'C'});
+            long first = pipe.append(new byte[]{'B'}, 0L);
+            pipe.append(new byte[]{'I', 9}, 0L);
+            long second = pipe.append(new byte[]{'C'}, 0L);
             List<Long> seen = new ArrayList<>();
-            pipe.readRange(second, second, (idx, p) -> seen.add(idx));
+            pipe.readRange(second, second, (idx, walStart, p) -> seen.add(idx));
             assertEquals(List.of(second), seen);
         }
     }
@@ -146,7 +153,7 @@ class MessagePipeTest {
     @Test
     void wipeOnOpenClearsStaleFiles() throws IOException, InterruptedException {
         try (MessagePipe first = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
-            first.append(new byte[]{'B'});
+            first.append(new byte[]{'B'}, 0L);
         }
         MessagePipe second = null;
         for (int attempt = 0; second == null; attempt++) {
@@ -162,7 +169,7 @@ class MessagePipeTest {
         }
         try (MessagePipe s = second) {
             List<byte[]> seen = new ArrayList<>();
-            s.readRange(0, 100, (idx, p) -> seen.add(p));
+            s.readRange(0, 100, (idx, walStart, p) -> seen.add(p));
             assertEquals(List.of(), seen);        // 旧数据整体抹掉,空手而归不抛
         }
     }
@@ -181,10 +188,10 @@ class MessagePipeTest {
     @Test
     void mismatchedStartIndexFailsFast() throws IOException {
         try (MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
-            long first = pipe.append(new byte[]{'B'});
-            pipe.append(new byte[]{'C'});
+            long first = pipe.append(new byte[]{'B'}, 0L);
+            pipe.append(new byte[]{'C'}, 0L);
             assertThrows(IllegalStateException.class,
-                    () -> pipe.readRange(first - 1, first + 1, (idx, p) -> { }));
+                    () -> pipe.readRange(first - 1, first + 1, (idx, walStart, p) -> { }));
         }
     }
 
@@ -203,7 +210,7 @@ class MessagePipeTest {
     void releaseBelowSkipsScanUntilNeededCycleAdvances() throws IOException {
         LegacyRollCycles cycle = LegacyRollCycles.MINUTELY;
         try (MessagePipe pipe = new MessagePipe(dir, cycle)) {
-            long realIndex = pipe.append(new byte[]{'B'});
+            long realIndex = pipe.append(new byte[]{'B'}, 0L);
             int needed = cycle.toCycle(realIndex);
             Path stale = dir.resolve("20200101-0000.cq4");
             Files.createFile(stale);
@@ -259,7 +266,7 @@ class MessagePipeTest {
     @Test
     void closeIsIdempotent() throws IOException {
         MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY);
-        pipe.append(new byte[]{'B'});
+        pipe.append(new byte[]{'B'}, 0L);
         pipe.close();
         pipe.close();                                      // 第二次:WARN 吸收,不上抛
     }
@@ -281,9 +288,9 @@ class MessagePipeTest {
         try (MessagePipe pipe = new MessagePipe(dir, LegacyRollCycles.MINUTELY)) {
             assertTrue(Files.notExists(dir.resolve("sub")), "嵌套残留目录树应被递归清空");
             assertTrue(Files.notExists(dir.resolve("orphan.cq4")), "孤立残留文件应被清空");
-            long idx = pipe.append(new byte[]{'B'});
+            long idx = pipe.append(new byte[]{'B'}, 0L);
             List<byte[]> seen = new ArrayList<>();
-            pipe.readRange(idx, idx, (i, p) -> seen.add(p));
+            pipe.readRange(idx, idx, (i, walStart, p) -> seen.add(p));
             assertEquals(1, seen.size(), "清空重建后的队列应可正常往返");
         }
     }

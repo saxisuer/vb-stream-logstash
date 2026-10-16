@@ -401,13 +401,14 @@ public final class StreamedTransactionAssembler implements RawMessageListener, A
      * {@link IllegalStateException};字节与协议不符经 decoder 抛协议异常——都原样上抛,
      * 终止读取线程。
      *
-     * @param raw 完整单条消息字节(含类型字节,流式块内还含 Int32 xid 前缀)
+     * @param raw      完整单条消息字节(含类型字节,流式块内还含 Int32 xid 前缀)
+     * @param walStart 本帧的行级 WAL 位点(帧头 walStart,随字节一并嵌入管道记录)
      */
     @Override
-    public void onRaw(byte[] raw) {
+    public void onRaw(byte[] raw, long walStart) {
         Objects.requireNonNull(raw, "raw");
         throughputMetrics.onSlotMessage(raw);   // slot 读取记账:收到即记(含控制消息与 'R',字节=raw.length)
-        long seq = pipe.append(raw);
+        long seq = pipe.append(raw, walStart);
         maxAppendedIndex = seq;
         char type = (char) raw[0];
         // 注:record pattern switch 是 Java 21 正式特性,本项目约束 Java 17;此处 switch 的是

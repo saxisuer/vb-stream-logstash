@@ -139,11 +139,11 @@ class RowChangeEmitterTest {
         RecordingMapper mapper = new RecordingMapper();
         Table table = table();
         assertEquals(Operation.CREATE, emitter(mapper, table,
-                new RowChange(DmlKind.INSERT, wire(), Optional.empty(), Optional.of(tuple("1")), OptionalLong.empty(), 1L)).getOperation());
+                new RowChange(DmlKind.INSERT, wire(), Optional.empty(), Optional.of(tuple("1")), OptionalLong.empty(), 1L, 0L)).getOperation());
         assertEquals(Operation.UPDATE, emitter(mapper, table,
-                new RowChange(DmlKind.UPDATE, wire(), Optional.empty(), Optional.of(tuple("1")), OptionalLong.empty(), 1L)).getOperation());
+                new RowChange(DmlKind.UPDATE, wire(), Optional.empty(), Optional.of(tuple("1")), OptionalLong.empty(), 1L, 0L)).getOperation());
         assertEquals(Operation.DELETE, emitter(mapper, table,
-                new RowChange(DmlKind.DELETE, wire(), Optional.of(tuple("1")), Optional.empty(), OptionalLong.empty(), 1L)).getOperation());
+                new RowChange(DmlKind.DELETE, wire(), Optional.of(tuple("1")), Optional.empty(), OptionalLong.empty(), 1L, 0L)).getOperation());
     }
 
     /**
@@ -156,7 +156,7 @@ class RowChangeEmitterTest {
         RecordingMapper mapper = new RecordingMapper();
         byte[] raw = { 1, 2, 3 };
         RowChange change = new RowChange(DmlKind.INSERT, wire(), Optional.empty(),
-                Optional.of(tuple("7", "x", raw, TupleValue.UNCHANGED_TOAST)), OptionalLong.empty(), 11L);
+                Optional.of(tuple("7", "x", raw, TupleValue.UNCHANGED_TOAST)), OptionalLong.empty(), 11L, 0L);
         RowChangeEmitter emitter = emitter(mapper, table(), change);
 
         assertNull(emitter.getOldColumnValues(), "INSERT 无 before 侧");
@@ -174,7 +174,7 @@ class RowChangeEmitterTest {
     void deleteMapsBeforeOnly() {
         RecordingMapper mapper = new RecordingMapper();
         RowChange change = new RowChange(DmlKind.DELETE, wire(), Optional.of(tuple("9", "y", null, "n")),
-                Optional.empty(), OptionalLong.empty(), 12L);
+                Optional.empty(), OptionalLong.empty(), 12L, 0L);
         RowChangeEmitter emitter = emitter(mapper, table(), change);
 
         assertNull(emitter.getNewColumnValues(), "DELETE 无 after 侧");
@@ -193,7 +193,7 @@ class RowChangeEmitterTest {
         RowChange change = new RowChange(DmlKind.UPDATE, wire(),
                 Optional.of(tuple("9", "old-v", null, "old-note")),
                 Optional.of(tuple("9", TupleValue.UNCHANGED_TOAST, null, "new-note")),
-                OptionalLong.empty(), 13L);
+                OptionalLong.empty(), 13L, 0L);
         RowChangeEmitter emitter = emitter(mapper, table(), change);
 
         // 调用序按基类契约:emitUpdateRecord 先取 old 再取 new(1.9.7 基类同序)——
@@ -211,7 +211,7 @@ class RowChangeEmitterTest {
         RecordingMapper mapper = new RecordingMapper();
         RowChange change = new RowChange(DmlKind.UPDATE, wire(), Optional.empty(),
                 Optional.of(tuple("9", TupleValue.UNCHANGED_TOAST, null, "new-note")),
-                OptionalLong.empty(), 14L);
+                OptionalLong.empty(), 14L, 0L);
         RowChangeEmitter emitter = emitter(mapper, table(), change);
 
         assertNull(emitter.getOldColumnValues(), "无 before 元组 → old 侧 null");

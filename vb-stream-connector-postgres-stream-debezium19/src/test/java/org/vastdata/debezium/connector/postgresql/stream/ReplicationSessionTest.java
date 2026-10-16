@@ -64,7 +64,7 @@ class ReplicationSessionTest {
         for (int i = 0; i < 500; i++) {
             stream.pending.add(ByteBuffer.wrap(("msg-" + i).getBytes(StandardCharsets.UTF_8)));
         }
-        boolean any = ReplicationSession.drainPending(stream, received::add);
+        boolean any = ReplicationSession.drainPending(stream, (raw, lsn) -> received.add(raw));
         assertTrue(any, "有缓冲消息时必须返回 true");
         assertEquals(500, received.size(), "一次调用必须取尽全部缓冲消息");
         for (int i = 0; i < 500; i++) {
@@ -77,7 +77,7 @@ class ReplicationSessionTest {
     void drainPendingReturnsFalseWhenNothingBuffered() throws Exception {
         FakeReplicationStream stream = new FakeReplicationStream();
         List<byte[]> received = new ArrayList<>();
-        assertFalse(ReplicationSession.drainPending(stream, received::add), "空缓冲必须返回 false");
+        assertFalse(ReplicationSession.drainPending(stream, (raw, lsn) -> received.add(raw)), "空缓冲必须返回 false");
         assertTrue(received.isEmpty(), "空缓冲不得回调");
     }
 
@@ -88,7 +88,7 @@ class ReplicationSessionTest {
         stream.pending.add(ByteBuffer.wrap(new byte[0]));
         stream.pending.add(ByteBuffer.wrap(new byte[] {1, 2}));
         List<byte[]> received = new ArrayList<>();
-        assertTrue(ReplicationSession.drainPending(stream, received::add));
+        assertTrue(ReplicationSession.drainPending(stream, (raw, lsn) -> received.add(raw)));
         assertEquals(1, received.size(), "零载荷必须被跳过、真实消息必须到达");
         assertTrue(Arrays.equals(new byte[] {1, 2}, received.get(0)), "真实消息内容应逐字节等值");
     }
@@ -230,7 +230,7 @@ class ReplicationSessionTest {
         long startedNanos = System.nanoTime();
         SQLException exited = assertThrows(SQLException.class,
                 () -> ReplicationSession.run(stream, parameters(StreamingMode.ON, true, 10),
-                        raw -> received.add(new String(raw, StandardCharsets.UTF_8)), () -> 300L));
+                        (raw, lsn) -> received.add(new String(raw, StandardCharsets.UTF_8)), () -> 300L));
         long elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000L;
 
         assertEquals("复制流已结束（连接断开）", exited.getMessage(), "①closed 后应经 isClosed 守卫以 SQLException 退出");
@@ -257,7 +257,7 @@ class ReplicationSessionTest {
 
         assertThrows(SQLException.class,
                 () -> ReplicationSession.run(stream, parameters(StreamingMode.ON, true, 10),
-                        raw -> { }, () -> 300L, sinkValues::add));
+                        (raw, lsn) -> { }, () -> 300L, sinkValues::add));
 
         assertEquals(2, sinkValues.size(), "两个循环轮(消息轮 + 触达 closed 的空轮)应各转发一次");
         sinkValues.forEach(v -> assertEquals(500L, v, "转发的应是 getLastReceiveLSN 原值(不封顶)"));

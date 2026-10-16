@@ -119,6 +119,7 @@ class EndToEndStreamedTxIT extends StreamITBase {
         assertEquals(6, data.size(), "流式大事务应产出恰 6 条 INSERT 记录: " + describe(all));
 
         Long txBoundaryLsn = null;
+        long prevRowLsn = -1L;
         Set<Integer> seenIds = new HashSet<>();
         for (SourceRecord r : data) {
             assertEquals(TOPIC, r.topic(), "记录 topic 应为数据表 topic");
@@ -134,13 +135,17 @@ class EndToEndStreamedTxIT extends StreamITBase {
 
             Long lsn = value.getStruct("source").getInt64("lsn");
             assertNotNull(lsn, "source 块应有 lsn");
+            long commitLsn = ((Number) r.sourceOffset().get("lsn_commit")).longValue();
             if (txBoundaryLsn == null) {
-                txBoundaryLsn = lsn;
+                txBoundaryLsn = commitLsn;
             }
-            assertEquals(txBoundaryLsn, lsn, "同一事务内 source.lsn 应恒为事务边界 endLsn");
+            assertTrue(prevRowLsn < lsn, "同一事务内 source.lsn 为行级真值(帧头 walStart),应严格递增: "
+                    + prevRowLsn + " -> " + lsn);
+            prevRowLsn = lsn;
+            assertTrue(lsn < commitLsn, "行级 lsn 应小于事务边界 endLsn: " + lsn + " < " + commitLsn);
             assertEquals(txBoundaryLsn.longValue(), ((Number) r.sourceOffset().get("lsn_proc")).longValue(),
-                    "per-record offset 的 lsn_proc 应=事务边界(source.lsn)");
-            assertEquals(txBoundaryLsn.longValue(), ((Number) r.sourceOffset().get("lsn_commit")).longValue(),
+                    "per-record offset 的 lsn_proc 应=事务边界(行级 LSN 链路下锚 endLsn 不变)");
+            assertEquals(txBoundaryLsn.longValue(), commitLsn,
                     "per-record offset 的 lsn_commit 应=事务边界(updateCommitPosition 双写)");
         }
         assertEquals(expected.keySet(), seenIds, "六条记录应恰好覆盖全部插入行");

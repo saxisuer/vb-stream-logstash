@@ -17,9 +17,10 @@ import java.util.Set;
  * @param options   TRUNCATE 选项(CASCADE / RESTART_IDENTITY)
  * @param streamXid 所属(子)事务 xid,见 {@link TxChange#streamXid()}
  * @param seq       消息序号(CQ index),见 {@link TxChange#seq()}——connector 偏差组件
+ * @param lsn       行级 WAL 位点(帧头 walStart),见 {@link TxChange#lsn()}
  */
 public record TruncateChange(List<PgOutputMessage.Relation> relations, Set<TruncateOption> options,
-                             OptionalLong streamXid, long seq) implements TxChange {
+                             OptionalLong streamXid, long seq, long lsn) implements TxChange {
 
     /** 防御性拷贝:options/relations 收集为不可变集合,保证值对象语义;relations/options 为 null 或含 null 元素时抛 NullPointerException(List.copyOf/Set.copyOf 行为)。 */
     public TruncateChange {

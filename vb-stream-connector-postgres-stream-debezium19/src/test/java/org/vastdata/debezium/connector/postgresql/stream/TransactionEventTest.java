@@ -46,9 +46,9 @@ class TransactionEventTest {
     void txChangesAreTransactionEventsWithSeq() {
         TransactionEvent e1 = new RowChange(DmlKind.INSERT, relation(),
                 Optional.empty(), Optional.of(new TupleData(List.of(new TupleValue.Text("1")))),
-                OptionalLong.empty(), 42L);
-        TransactionEvent e2 = new TruncateChange(List.of(relation()), java.util.Set.of(), OptionalLong.empty(), 43L);
-        TransactionEvent e3 = new MsgChange(true, "p", new byte[0], OptionalLong.empty(), 44L);
+                OptionalLong.empty(), 42L, 0L);
+        TransactionEvent e2 = new TruncateChange(List.of(relation()), java.util.Set.of(), OptionalLong.empty(), 43L, 0L);
+        TransactionEvent e3 = new MsgChange(true, "p", new byte[0], OptionalLong.empty(), 44L, 0L);
         assertTrue(e1 instanceof TxChange && e2 instanceof TxChange && e3 instanceof TxChange);
         assertEquals(42L, ((TxChange) e1).seq());
         assertEquals(43L, ((TxChange) e2).seq());
@@ -58,15 +58,15 @@ class TransactionEventTest {
     /** 责任:MsgChange 的数组组件值相等(content 与 seq 都参与 equals——偏差组件不得被遗漏)。 */
     @Test
     void msgChangeHasValueEqualityIncludingSeq() {
-        MsgChange a = new MsgChange(true, "p", new byte[]{1}, OptionalLong.empty(), 7L);
-        assertEquals(a, new MsgChange(true, "p", new byte[]{1}, OptionalLong.empty(), 7L));
-        assertNotEquals(a, new MsgChange(true, "p", new byte[]{1}, OptionalLong.empty(), 8L));
+        MsgChange a = new MsgChange(true, "p", new byte[]{1}, OptionalLong.empty(), 7L, 0L);
+        assertEquals(a, new MsgChange(true, "p", new byte[]{1}, OptionalLong.empty(), 7L, 0L));
+        assertNotEquals(a, new MsgChange(true, "p", new byte[]{1}, OptionalLong.empty(), 8L, 0L));
     }
 
     /** 责任:RowChange 的 null 宽容归一(before/after null 统一 empty,引擎同款)。 */
     @Test
     void rowChangeNormalizesNullTuples() {
-        RowChange c = new RowChange(DmlKind.INSERT, relation(), null, null, OptionalLong.empty(), 1L);
+        RowChange c = new RowChange(DmlKind.INSERT, relation(), null, null, OptionalLong.empty(), 1L, 0L);
         assertTrue(c.before().isEmpty() && c.after().isEmpty());
     }
 }

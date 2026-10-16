@@ -160,17 +160,17 @@ class DecoupledEquivalenceTest {
                 (msg, view) -> { }, frontier, () -> { });
         try {
             // 第一个小事务:consumer 取走即阻塞在 Begin 回调(此后交接的桶只能排队)
-            assembler.onRaw(PgWire.relation(OID, "t", "id", "v"));
-            assembler.onRaw(PgWire.begin(901));
-            assembler.onRaw(PgWire.insert(OID, PgWire.tuple("1", "a")));
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.relation(OID, "t", "id", "v"), 0L);
+            assembler.onRaw(PgWire.begin(901), 0L);
+            assembler.onRaw(PgWire.insert(OID, PgWire.tuple("1", "a")), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);
             assertTrue(firstBegin.await(5, TimeUnit.SECONDS), "5s 内未进入 Begin 回调——异步交付未发生");
             // 大桶:交接入队、永不被取出(consumer 阻塞在前一桶的回调里)
-            assembler.onRaw(PgWire.begin(902));
+            assembler.onRaw(PgWire.begin(902), 0L);
             for (int i = 1; i <= LARGE_ROWS; i++) {
-                assembler.onRaw(PgWire.insert(OID, PgWire.tuple(Integer.toString(i), "x")));
+                assembler.onRaw(PgWire.insert(OID, PgWire.tuple(Integer.toString(i), "x")), 0L);
             }
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.commit(), 0L);
 
             long startNanos = System.nanoTime();
             assembler.shutdownFast();   // 毒丸 + interrupt + 不 join + 关管道
@@ -207,7 +207,7 @@ class DecoupledEquivalenceTest {
      */
     private static void feed(StreamedTransactionAssembler assembler, byte[][] stream) {
         for (byte[] m : stream) {
-            assembler.onRaw(m);
+            assembler.onRaw(m, 0L);
         }
     }
 

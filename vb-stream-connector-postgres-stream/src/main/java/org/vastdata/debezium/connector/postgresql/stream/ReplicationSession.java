@@ -324,8 +324,12 @@ public final class ReplicationSession implements AutoCloseable {
     }
 
     /**
-     * 责任:非阻塞取尽复制流当前缓冲的全部消息并逐条回调 listener(drain 语义)。
-     * 关键步骤:循环 {@code readPending} 直到返回 null——每条消息拷入独占新建数组同步回调;
+     * 责任:非阻塞取尽复制流当前缓冲的全部消息并逐条回调 listener(drain 语义),每条
+     * 附带其行级 WAL 位点(帧头 walStart)。
+     * 关键步骤:循环 {@code readPending} 直到返回 null——每条消息拷入独占新建数组,
+     * 随即<b>取后即读</b> {@code stream.getLastReceiveLSN()} 得本帧 walStart 一并回调
+     * (逻辑流 'w' 帧处理时该值恰为本帧 walStart——pgjdbc 每次调用处理一帧且 'w' 帧将
+     * lastReceiveLSN 覆写为本帧 walStart,keepalive 只在空闲期出现不污染取后即读);
      * remaining()==0 的载荷防御性跳过(pgjdbc 实际不产生)但同样被消费,drain 自然终止于
      * null。存在动机(引擎 2026-08-31 吞吐冒烟实测踩坑,行为 1:1 保留):旧形态每轮取一条
      * 即固定 sleep 100ms,slot 读取上限被钉死在 ~10 msg/s——5 万行大事务需 90+ 分钟才收完;
@@ -343,7 +347,7 @@ public final class ReplicationSession implements AutoCloseable {
             if (payload.remaining() > 0) {
                 byte[] raw = new byte[payload.remaining()];
                 payload.get(raw);
-                listener.onRaw(raw);
+                listener.onRaw(raw, stream.getLastReceiveLSN().asLong());
                 receivedAny = true;
             }
         }

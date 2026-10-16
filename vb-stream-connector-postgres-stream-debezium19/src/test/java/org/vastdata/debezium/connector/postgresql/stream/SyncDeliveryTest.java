@@ -83,12 +83,12 @@ class SyncDeliveryTest {
             }
         })) {
             handle[0] = assembler;
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.begin(505L));
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.begin(505L), 0L);
             for (int i = 1; i <= 3; i++) {
-                assembler.onRaw(insert(Integer.toString(i), "v" + i));
+                assembler.onRaw(insert(Integer.toString(i), "v" + i), 0L);
             }
-            assembler.onRaw(PgWire.commit());   // 交接 → dispatchHandedOff → processBucket 同步内联
+            assembler.onRaw(PgWire.commit(), 0L);   // 交接 → dispatchHandedOff → processBucket 同步内联
 
             assertEquals(1, recorder.transactions().size());
             Transaction t = recorder.transactions().get(0);
@@ -113,8 +113,8 @@ class SyncDeliveryTest {
     void emptyBucketDeliversBeginAndEndZero() {
         TransactionRecorder recorder = new TransactionRecorder();
         try (StreamedTransactionAssembler assembler = newAssembler(recorder)) {
-            assembler.onRaw(PgWire.begin(1L));
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(PgWire.begin(1L), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);
 
             assertEquals(1, recorder.transactions().size());
             assertEquals(0, recorder.transactions().get(0).changes().size());
@@ -138,12 +138,12 @@ class SyncDeliveryTest {
             recorder.onEvent(event);
         });
         try {
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.begin(505L));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(insert("2", "b"));
-            assembler.onRaw(insert("3", "c"));
-            assertThrows(Boom.class, () -> assembler.onRaw(PgWire.commit()));
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.begin(505L), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(insert("2", "b"), 0L);
+            assembler.onRaw(insert("3", "c"), 0L);
+            assertThrows(Boom.class, () -> assembler.onRaw(PgWire.commit(), 0L));
             // End 未发:重组器停在开桶状态(1 条已交付变更,事务未封箱)
             assertEquals(0, recorder.transactions().size());
             assertEquals(0L, assembler.outputFrontierForTest(), "End 未达——前沿不得推进");
@@ -193,10 +193,10 @@ class SyncDeliveryTest {
                     recorder.onEvent(event);
                 }, StreamingMode.ON, new VersionedRelationRegistry(), RESOLVER,
                 PIPE_DIR, LegacyRollCycles.MINUTELY, (msg, view) -> { }, spy)) {
-            assembler.onRaw(relation());
-            assembler.onRaw(PgWire.begin(505L));
-            assembler.onRaw(insert("1", "a"));
-            assembler.onRaw(PgWire.commit());
+            assembler.onRaw(relation(), 0L);
+            assembler.onRaw(PgWire.begin(505L), 0L);
+            assembler.onRaw(insert("1", "a"), 0L);
+            assembler.onRaw(PgWire.commit(), 0L);
 
             assertEquals(List.of("bind", "begin", "change", "resolve", "end"), timeline,
                     "绑定先于 Begin,resolve 发生在 TxChange 回调内、End 之前");

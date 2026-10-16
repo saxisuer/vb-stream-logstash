@@ -67,10 +67,16 @@ TransactionConsumer(consumer 线程)
   └─ End 处理完毕 → 前沿 AtomicLong ← endLsn(reader 反馈封顶的读源)
 ```
 
-- **offset/LSN 语义(§5.6)**:per-record offset 统一事务边界——Begin 时
-  `updateCommitPosition(endLsn, endLsn)` 双写,此后本事务记录 `lsn`/`lsn_proc`/`lsn_commit`
-  同值;重启续传锚槽 confirmed_flush(输出前沿封顶),`WalPositionLocator` 搜索与
-  `lsn_events_processed` 计数跳过不复刻。
+- **offset/LSN 语义(§5.6,行级 LSN 链路 2026-10-16 起双面)**:数据记录的 `lsn` 键/source 块
+  `lsn`/`sequence` 次元素为**行级真值**——reader 在 `drainPending` 每帧载荷到手后取后即读
+  `getLastReceiveLSN()`(pgjdbc 逻辑流 'w' 帧处理时该值=本帧 walStart=产生该条输出的 WAL
+  记录位点,PG 内核 `change_cb_wrapper` 置 `ctx->write_location = change->lsn`),经管道记录
+  [8B walStart][payload] 布局落盘、回放期随 TxChange 的 `lsn()` 组件接进
+  `updateWalPosition` 第一参(与 vanilla wal2json/decoderbufs 帧位点路径语义同源;事务块
+  BEGIN 的 offset lsn=endLsn、END=末行行级——最后写入者语义)。事务边界面不变:Begin 时
+  `updateCommitPosition(endLsn, endLsn)` 双写锚 `lsn_commit`,`lsn_proc` 亦恒 endLsn——重启
+  续传的事务原子单元、槽 confirmed_flush 锚定(输出前沿封顶)照旧;`WalPositionLocator`
+  搜索与 `lsn_events_processed` 计数跳过不复刻。
 - **initialContext 读后必 commit**:`txid_current()` 给 autoCommit=false 的 main 连接分配
   XID,不收敛则另一连接上的 CREATE SLOT 等解码一致点等它——连接器自死锁
   (`SkippedSnapshotSource`/`initialOffsetWithCommit`,Task 8 IT 实测)。

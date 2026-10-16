@@ -69,11 +69,11 @@ class StreamThroughputMetricsWiringTest {
             byte[] ins1 = PgWire.insert(OID, PgWire.tuple("1", "a"));
             byte[] ins2 = PgWire.insert(OID, PgWire.tuple("2", "b"));
             byte[] commit = PgWire.commit();
-            assembler.onRaw(rel);
-            assembler.onRaw(begin);
-            assembler.onRaw(ins1);
-            assembler.onRaw(ins2);
-            assembler.onRaw(commit);
+            assembler.onRaw(rel, 0L);
+            assembler.onRaw(begin, 0L);
+            assembler.onRaw(ins1, 0L);
+            assembler.onRaw(ins2, 0L);
+            assembler.onRaw(commit, 0L);
 
             StreamThroughputMetrics.Totals t = metrics.totals();
             assertEquals(5, t.slotMessages(), "slot 应记全部 5 条消息(含 Relation 与控制消息)");
@@ -110,11 +110,11 @@ class StreamThroughputMetricsWiringTest {
             byte[] ins = PgWire.insert(OID, PgWire.tuple("1", "a"));
             byte[] prepare = PgWire.prepare(6001L, "gid-rollback");
             byte[] rollback = PgWire.rollbackPrepared(6001L, "gid-rollback");
-            assembler.onRaw(rel);
-            assembler.onRaw(beginPrepare);
-            assembler.onRaw(ins);
-            assembler.onRaw(prepare);
-            assembler.onRaw(rollback);
+            assembler.onRaw(rel, 0L);
+            assembler.onRaw(beginPrepare, 0L);
+            assembler.onRaw(ins, 0L);
+            assembler.onRaw(prepare, 0L);
+            assembler.onRaw(rollback, 0L);
 
             StreamThroughputMetrics.Totals t = metrics.totals();
             assertEquals(5, t.slotMessages(), "slot 照记 5 条消息(含 Relation)");

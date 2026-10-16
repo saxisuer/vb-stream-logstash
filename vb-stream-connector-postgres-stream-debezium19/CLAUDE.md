@@ -84,7 +84,7 @@ vanilla `debezium-connector-postgres` 1.9.7.Final 所用类的**裁剪复刻**�
 | 类别 | 数量 | 说明 |
 |---|---|---|
 | 离线单测（37 类） | 246 | 桶 A 复制件多数**字节等同直过**（`RelationTableFactoryTest` 仍整类零改；`TypeRegistryColumnValueMapperTest` 自含化起已分叉——import 切自有命名空间 + javadoc 措辞，测试文件不属双线同步面）；接缝类测试按 1.9.7 构造面翻译（配置基础面统一补 `database.server.name` + `snapshot.mode=never`）；含 `VanillaBoundaryTest` 1 例（扫 `target/classes` 字节码断言无 `io/debezium/connector/postgresql` 常量池引用，防 vanilla 手滑回流，2026-09-30 自含化） |
-| 语义 IT（15 类） | 28 | `SmokeIT` 冒烟 1 + Task 9 七组 12（流式大事务/回滚过滤/DDL asOf/重启三情况/解耦三件）+ Task 10 六组 14（Truncate/全串/逻辑消息/two_phase 四场景/槽预检/缺省指标）+ `PerRecordOffsetIT` 1（2026-10-16 每条数据记录 offset LSN 语义实证，与 3.6.1 版同锚互证——offset 三键同值=事务 endLsn 无行级 LSN + 事务块 offset 同值 + `pg_current_wal_lsn()` 夹逼；版本际钉子两处分叉：source 块 `origin`/`origin_lsn` 仅 3.6.1 有[本侧负断言]、事务块 `id` 本侧纯数字透传[3.6.1 被 vanilla `PostgresTransactionMonitor.adjustTxId` 重写为 `<xid>:<lsn>` 复合]）——断言面与 3.6.1 版逐字同锚 |
+| 语义 IT（15 类） | 28 | `SmokeIT` 冒烟 1 + Task 9 七组 12（流式大事务/回滚过滤/DDL asOf/重启三情况/解耦三件）+ Task 10 六组 14（Truncate/全串/逻辑消息/two_phase 四场景/槽预检/缺省指标）+ `PerRecordOffsetIT` 1（2026-10-16 每条数据记录 offset LSN 语义实证，同日落行级 LSN 链路并反转断言面，与 3.6.1 版同锚互证——offset `lsn` 键=**行级真值**[帧头 walStart，事务内严格递增] + `lsn_proc`==`lsn_commit`==endLsn 事务边界锚定 + 事务块最后写入者语义 + `pg_current_wal_lsn()` 夹逼；版本际钉子两处分叉：source 块 `origin`/`origin_lsn` 仅 3.6.1 有[本侧负断言]、事务块 `id` 本侧纯数字透传[3.6.1 被 vanilla `PostgresTransactionMonitor.adjustTxId` 重写为 `<xid>:<lsn>` 复合]）——断言面与 3.6.1 版逐字同锚 |
 | 基座契约 | 2 | `AbstractStreamITContractTest`（零 Docker） |
 | Connect 验收 | 1 | `ConnectPluginIT`（真 Kafka Connect 容器，@BeforeAll 产物结构断言前置，缺产物 fail-fast 提示先 `mvn -pl vb-stream-connector-postgres-stream-debezium19 package -DskipTests`） |
 

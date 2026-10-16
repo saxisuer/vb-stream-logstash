@@ -13,9 +13,10 @@ import java.util.OptionalLong;
  * @param content       消息字节内容
  * @param streamXid     所属(子)事务 xid,见 {@link TxChange#streamXid()}
  * @param seq           消息序号(CQ index),见 {@link TxChange#seq()}——connector 偏差组件
+ * @param lsn           行级 WAL 位点(帧头 walStart),见 {@link TxChange#lsn()}
  */
 public record MsgChange(boolean transactional, String prefix, byte[] content,
-                        OptionalLong streamXid, long seq) implements TxChange {
+                        OptionalLong streamXid, long seq, long lsn) implements TxChange {
 
     /** content 为 byte[] 组件,需值相等语义(record 默认对数组退化为引用相等),故显式 override。 */
     @Override
@@ -25,7 +26,8 @@ public record MsgChange(boolean transactional, String prefix, byte[] content,
                 && prefix.equals(other.prefix)
                 && Arrays.equals(content, other.content)
                 && streamXid.equals(other.streamXid)
-                && seq == other.seq;
+                && seq == other.seq
+                && lsn == other.lsn;
     }
 
     @Override
@@ -35,6 +37,7 @@ public record MsgChange(boolean transactional, String prefix, byte[] content,
         result = 31 * result + Arrays.hashCode(content);
         result = 31 * result + streamXid.hashCode();
         result = 31 * result + Long.hashCode(seq);
+        result = 31 * result + Long.hashCode(lsn);
         return result;
     }
 }

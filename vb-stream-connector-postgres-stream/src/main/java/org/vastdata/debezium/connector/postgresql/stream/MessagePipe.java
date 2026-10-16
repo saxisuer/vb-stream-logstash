@@ -25,7 +25,6 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 
 /**
@@ -97,43 +96,52 @@ final class MessagePipe implements AutoCloseable {
     }
 
     /**
-     * 追加一条完整消息字节,返回其 CQ index(单调递增,即该消息的 seq,可作回读区间端点与
-     * 低水位入参)。关键步骤:{@code appender.writeBytes(BytesStore.wrap(payload))} 原样落盘 →
-     * 以 {@code appender.lastIndexAppended()} 取刚写入条目的 index 返回。
+     * 追加一条完整消息字节与其行级 WAL 位点,返回其 CQ index(单调递增,即该消息的 seq,
+     * 可作回读区间端点与低水位入参)。记录布局:<b>[8B walStart][payload]</b>——单 excerpt
+     * 内先 {@code bytes.writeLong(walStart)}(Bytes 层定长 8B,与 wire 的可变长 long 编码无关)
+     * 再原样写载荷,readRange 两侧对称解出。walStart 由 reader 在拿到本帧载荷后<b>取后即读</b>
+     * {@code stream.getLastReceiveLSN()} 得来(逻辑流 'w' 帧处理时该值即本帧 walStart,
+     * pgjdbc 42.7.13 反汇编实证)——行级 LSN 随消息落盘,数据自包含。
      * 边界与异常语义:payload 为 null 抛 NPE;空数组合法(本类只搬字节);调用方保证字节构造
      * 后不变(本方法只搬字节,不复制);CQ 内部错误(磁盘满、映射失败)按 CQ 运行时异常上抛——
      * 写入失败必须让调用方感知,不能静默丢单元。
      *
-     * @param payload 一条完整 pgoutput 消息的字节(含类型字节与可选流式前缀,本类不解释内容)
+     * @param payload  一条完整 pgoutput 消息的字节(含类型字节与可选流式前缀,本类不解释内容)
+     * @param walStart 本帧的行级 WAL 位点(帧头 walStart;本类不解释,仅原样搬运与回读)
      * @return 本条在队列中的 index(含 cycle 与序号),即该消息的 seq
      */
-    long append(byte[] payload) {
+    long append(byte[] payload, long walStart) {
         Objects.requireNonNull(payload, "payload 不能为 null");
-        appender.writeBytes(BytesStore.wrap(payload));
+        try (DocumentContext dc = appender.writingDocument()) {
+            Bytes<?> bytes = dc.wire().bytes();
+            bytes.writeLong(walStart);
+            bytes.write(BytesStore.wrap(payload));
+        }
         return appender.lastIndexAppended();
     }
 
     /**
-     * 按 index 升序回读闭区间 [firstIndex..lastIndex] 的消息字节,每读出一条就回调
-     * {@code payloadConsumer.accept(idx, payload)}——idx 是该条自身的真实 CQ index(即 append
-     * 时的返回值,调用方作 seq 用,如 Relation 版本的 asOf 查询),payload 是与队列内存不共享
-     * 的副本。
+     * 按 index 升序回读闭区间 [firstIndex..lastIndex] 的消息,每读出一条就回调
+     * {@code frameConsumer.accept(idx, walStart, payload)}——idx 是该条自身的真实 CQ index
+     * (即 append 时的返回值,调用方作 seq 用,如 Relation 版本的 asOf 查询),walStart 是
+     * append 时嵌入的行级 WAL 位点(8B 前缀原样解出),payload 是与队列内存不共享的副本。
      *
      * <p>步骤:tailer 置为 FORWARD 方向,{@code moveToIndex(firstIndex)} 定位起步 → 循环读文档:
      * 读不到(到队尾)就结束;队列自己的元数据文档跳过;index 超过 lastIndex 就结束;index 还
      * 小于 firstIndex 就跳过(防御 moveToIndex 落点偏早,正常不会发生);读到的第一条 index
      * 必须恰好等于 firstIndex,否则抛 {@link IllegalStateException}——落点越过了区间起点,
-     * 说明起点已被删除或从未存在,属于错位,宁可报错也不猜。最后把文档剩余字节读成数组交给回调。
+     * 说明起点已被删除或从未存在,属于错位,宁可报错也不猜。最后按 [8B walStart][payload]
+     * 布局解出两段交给回调(载荷不足 8B 属记录格式错位,抛 ISE fail-fast)。
      *
      * <p>边界:区间不存在且队列后面也没有内容时(比如清空重开后 readRange(0,100)),读到队尾
      * 自然空手而归,不抛异常;lastIndex 小于 firstIndex 时同样空手而归。
      *
-     * @param firstIndex      区间起点 index(含)
-     * @param lastIndex       区间终点 index(含)
-     * @param payloadConsumer 逐条消费者(payload 副本 + 该条真实 CQ index,调用方作 seq 用)
+     * @param firstIndex    区间起点 index(含)
+     * @param lastIndex     区间终点 index(含)
+     * @param frameConsumer 逐条消费者(walStart + payload 副本 + 该条真实 CQ index,调用方作 seq 用)
      */
-    void readRange(long firstIndex, long lastIndex, BiConsumer<Long, byte[]> payloadConsumer) {
-        Objects.requireNonNull(payloadConsumer, "payloadConsumer 不能为 null");
+    void readRange(long firstIndex, long lastIndex, FrameConsumer frameConsumer) {
+        Objects.requireNonNull(frameConsumer, "frameConsumer 不能为 null");
         tailer.direction(TailerDirection.FORWARD);
         tailer.moveToIndex(firstIndex);
         boolean firstSeen = false;
@@ -160,9 +168,56 @@ final class MessagePipe implements AutoCloseable {
                     }
                     firstSeen = true;
                 }
-                payloadConsumer.accept(idx, readFrameBytes(dc));
+                frameConsumer.accept(idx, readWalStart(dc), readPayload(dc));
             }
         }
+    }
+
+    /**
+     * 逐帧消费者契约(readRange 的回调形态):一条管道记录 = [8B walStart][payload] 的一个
+     * 回读单元,walStart 与 payload 副本由 readRange 在回调前解出——回调方无解码顺序负担,
+     * 数组与队列内存不共享、可长期持有。
+     */
+    @FunctionalInterface
+    interface FrameConsumer {
+
+        /**
+         * 消费一条回读帧。
+         *
+         * @param index    该条自身的真实 CQ index(append 时的返回值,seq 语义)
+         * @param walStart 该条 append 时嵌入的行级 WAL 位点(帧头 walStart,原样回读)
+         * @param payload  消息字节副本(与队列内存不共享)
+         */
+        void accept(long index, long walStart, byte[] payload);
+    }
+
+    /**
+     * 从已定位的文档上下文解出行级 WAL 位点(记录头 8B,Bytes 层定长 long)。
+     * 边界:剩余字节不足 8B 抛 ISE——记录格式错位(非本类布局写入的文档),fail-fast 不猜。
+     *
+     * @param dc 已定位到数据文档的上下文
+     * @return 该条消息 append 时嵌入的 walStart
+     */
+    private static long readWalStart(DocumentContext dc) {
+        Bytes<?> bytes = dc.wire().bytes();
+        if (bytes.readRemaining() < Long.BYTES) {
+            throw new IllegalStateException("管道记录格式错位:载荷不足 8B 的 walStart 前缀(index=" + dc.index() + ")");
+        }
+        return bytes.readLong();
+    }
+
+    /**
+     * 从已定位的文档上下文解出消息字节副本(walStart 前缀已消费后的剩余字节)。
+     * 边界:剩余 0 字节合法(空载荷消息),返回空数组。
+     *
+     * @param dc 已定位且 walStart 前缀已读的上下文
+     * @return 载荷字节副本(与队列内存不共享)
+     */
+    private static byte[] readPayload(DocumentContext dc) {
+        Bytes<?> bytes = dc.wire().bytes();
+        byte[] framed = new byte[(int) bytes.readRemaining()];
+        bytes.read(framed);
+        return framed;
     }
 
     /**
@@ -379,17 +434,4 @@ final class MessagePipe implements AutoCloseable {
         }
     }
 
-    /**
-     * 读出当前文档的剩余字节为数组副本:readingDocument 定位后 wire 的 bytes 已指向
-     * 文档载荷起点,readRemaining 即载荷长度(writeBytes 写入的原样字节)。
-     *
-     * @param dc 已定位到数据文档的上下文
-     * @return 载荷字节副本(与队列内存不共享)
-     */
-    private static byte[] readFrameBytes(DocumentContext dc) {
-        Bytes<?> bytes = dc.wire().bytes();
-        byte[] framed = new byte[(int) bytes.readRemaining()];
-        bytes.read(framed);
-        return framed;
-    }
 }

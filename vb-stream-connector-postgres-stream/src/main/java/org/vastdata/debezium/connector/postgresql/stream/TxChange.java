@@ -39,4 +39,20 @@ public sealed interface TxChange extends TransactionEvent permits RowChange, Tru
      * @return 消息序号(单调,同一管道内与消息位置一一对应)
      */
     long seq();
+
+    /**
+     * 该变更消息的行级 WAL 位点(复制协议帧头 walStart——walsender 发送该帧时报告的
+     * 产生本条输出的 WAL 记录位点,即 PG 内核 {@code change_cb_wrapper} 置入的
+     * {@code ctx->write_location = change->lsn};pgjdbc 侧表现为 {@code 'w'} 帧处理后
+     * {@code getLastReceiveLSN()} 的即时值,reader 在 append 前取后即读、嵌入管道记录)。
+     *
+     * <p><b>行级真值</b>:同一事务内各变更的 lsn 严格递增且都小于事务 endLsn——与
+     * {@code lsn_commit}/{@code lsn_proc}(事务边界锚定,见
+     * {@code DispatcherTransactionListener})互补:后者保重启续传的事务原子性,前者供
+     * 下游按行排序/定位(vanilla wal2json/decoderbufs 路径的帧位点语义同源)。离线
+     * 单测以常量位点驱动(无真流),值面语义由 IT 锚定。
+     *
+     * @return 产生本条变更的 WAL 记录位点(字节偏移形态)
+     */
+    long lsn();
 }

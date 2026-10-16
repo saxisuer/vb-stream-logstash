@@ -20,10 +20,11 @@ import java.util.OptionalLong;
  * @param after     新元组:INSERT/UPDATE 必有;DELETE 恒 empty
  * @param streamXid 所属(子)事务 xid,见 {@link TxChange#streamXid()}
  * @param seq       消息序号(CQ index),见 {@link TxChange#seq()}——connector 偏差组件
+ * @param lsn       行级 WAL 位点(帧头 walStart),见 {@link TxChange#lsn()}
  */
 public record RowChange(DmlKind dml, PgOutputMessage.Relation relation,
                         Optional<TupleData> before, Optional<TupleData> after,
-                        OptionalLong streamXid, long seq) implements TxChange {
+                        OptionalLong streamXid, long seq, long lsn) implements TxChange {
 
     /** null 宽容归一:组装器可能传 null(如 Delete 的 after),统一归为 empty,避免 null 组件。 */
     public RowChange {

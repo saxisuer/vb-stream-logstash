@@ -81,12 +81,12 @@ class StreamingDeliveryTest {
         }, StreamingMode.ON, new VersionedRelationRegistry(),
                 RESOLVER, dir, LegacyRollCycles.MINUTELY)) {
             handle[0] = assembler;
-            assembler.onRaw(PgWire.relation(OID, "t", "id", "v"));
-            assembler.onRaw(PgWire.begin(301));
+            assembler.onRaw(PgWire.relation(OID, "t", "id", "v"), 0L);
+            assembler.onRaw(PgWire.begin(301), 0L);
             for (int i = 1; i <= 3; i++) {
-                assembler.onRaw(PgWire.insert(OID, PgWire.tuple(Integer.toString(i), "v" + i)));
+                assembler.onRaw(PgWire.insert(OID, PgWire.tuple(Integer.toString(i), "v" + i)), 0L);
             }
-            assembler.onRaw(PgWire.commit());   // 交接 → 同步回放:Begin 头 → 逐条 TxChange(首条处取景)→ End 尾
+            assembler.onRaw(PgWire.commit(), 0L);   // 交接 → 同步回放:Begin 头 → 逐条 TxChange(首条处取景)→ End 尾
 
             // 取景窗断言(回放进行中的"未完成"三件套)
             assertEquals(List.of("change"), eventsAtFirstChange,
@@ -143,12 +143,12 @@ class StreamingDeliveryTest {
                 new VersionedRelationRegistry(), RESOLVER, dir, LegacyRollCycles.MINUTELY,
                 (msg, view) -> { }, frontier, () -> { });
         try {
-            assembler.onRaw(PgWire.relation(OID, "t", "id", "v"));
-            assembler.onRaw(PgWire.begin(301));
+            assembler.onRaw(PgWire.relation(OID, "t", "id", "v"), 0L);
+            assembler.onRaw(PgWire.begin(301), 0L);
             for (int i = 1; i <= 3; i++) {
-                assembler.onRaw(PgWire.insert(OID, PgWire.tuple(Integer.toString(i), "v" + i)));
+                assembler.onRaw(PgWire.insert(OID, PgWire.tuple(Integer.toString(i), "v" + i)), 0L);
             }
-            assembler.onRaw(PgWire.commit());   // 交接 → consumer 线程回放:第 1 条 TxChange 即阻塞
+            assembler.onRaw(PgWire.commit(), 0L);   // 交接 → consumer 线程回放:第 1 条 TxChange 即阻塞
             assertTrue(firstChange.await(5, TimeUnit.SECONDS), "5s 内未收到第一条变更事件——流式交付未发生");
             // 三件套:变更已出(恰 1 条——consumer 仍卡在第 1 条回调内)
             assertEquals(1, changesSeen.get(), "变更事件应恰送达 1 条(后续 2 条被回调阻塞挡住)");

@@ -37,7 +37,7 @@ class TransactionRecorderTest {
 
     /** 构造极简行变更夹具(dml 与 seq 由参数给定,元组全空——重组测试只关心事件形态与计数)。 */
     private static RowChange row(DmlKind dml, long seq) {
-        return new RowChange(dml, rel(), Optional.empty(), Optional.empty(), OptionalLong.empty(), seq);
+        return new RowChange(dml, rel(), Optional.empty(), Optional.empty(), OptionalLong.empty(), seq, 0L);
     }
 
     /** 正常流:Begin(3) + 2 变更 + End(2)(aborted 过滤形态,emitted&lt;expected 合法)→ 重组出 1 个 2 变更事务。 */

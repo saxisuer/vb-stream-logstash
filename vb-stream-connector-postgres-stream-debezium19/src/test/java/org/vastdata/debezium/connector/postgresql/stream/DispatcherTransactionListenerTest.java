@@ -251,7 +251,7 @@ class DispatcherTransactionListenerTest {
                 new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
                         List.of(new RelationColumn("id", 25, -1, true), new RelationColumn("v", 25, -1, false))),
                 Optional.empty(), Optional.of(new TupleData(List.of(TupleValue.NULL, new TupleValue.Text("x")))),
-                OptionalLong.empty(), seq);
+                OptionalLong.empty(), seq, 0L);
     }
 
     /**
@@ -263,7 +263,7 @@ class DispatcherTransactionListenerTest {
                 new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
                         List.of(new RelationColumn("id", 25, -1, true), new RelationColumn("v", 25, -1, false))),
                 Optional.empty(), Optional.of(new TupleData(List.of(TupleValue.NULL, new TupleValue.Text("x")))),
-                OptionalLong.of(SUBXID), seq);
+                OptionalLong.of(SUBXID), seq, 0L);
     }
 
     /**
@@ -353,7 +353,7 @@ class DispatcherTransactionListenerTest {
         Fixture f = fixture("id", "v");
         f.listener().onEvent(begin());
         f.listener().onEvent(truncateChange());
-        f.listener().onEvent(new MsgChange(true, "pfx", new byte[0], OptionalLong.empty(), 12L));
+        f.listener().onEvent(new MsgChange(true, "pfx", new byte[0], OptionalLong.empty(), 12L, 0L));
 
         assertTrue(f.schema().installed.isEmpty(), "门控跳过的 Truncate/Msg 不触发版本安装");
         assertTrue(f.dispatcher().dataChangeArgs.isEmpty(), "默认配置下 Truncate 零 dispatch(MsgChange 仅留痕)");
@@ -379,7 +379,7 @@ class DispatcherTransactionListenerTest {
                                 List.of(new RelationColumn("id", 25, -1, true))),
                         new PgOutputMessage.Relation(OptionalLong.empty(), OID_B, "public", "t_l_b", 'd',
                                 List.of(new RelationColumn("id", 25, -1, true)))),
-                Set.of(), OptionalLong.empty(), 11L));
+                Set.of(), OptionalLong.empty(), 11L, 0L));
         f.listener().onEvent(new TransactionEvent.End(XID, 0L));
 
         assertEquals(2, f.dispatcher().dataChangeArgs.size(), "两表 TRUNCATE 应逐表各发一条数据事件");
@@ -403,7 +403,7 @@ class DispatcherTransactionListenerTest {
         return new TruncateChange(
                 List.of(new PgOutputMessage.Relation(OptionalLong.empty(), OID, "public", "t_l", 'd',
                         List.of(new RelationColumn("id", 25, -1, true)))),
-                Set.of(), OptionalLong.empty(), 11L);
+                Set.of(), OptionalLong.empty(), 11L, 0L);
     }
 
     /**
@@ -438,7 +438,7 @@ class DispatcherTransactionListenerTest {
             Fixture f = fixture("id", "v");
             f.listener().onEvent(begin());
             f.listener().onEvent(new MsgChange(true, "pfx",
-                    "y".repeat(100).getBytes(StandardCharsets.US_ASCII), OptionalLong.empty(), 12L));
+                    "y".repeat(100).getBytes(StandardCharsets.US_ASCII), OptionalLong.empty(), 12L, 0L));
             f.listener().onEvent(new TransactionEvent.End(XID, 0L));
 
             List<String> lines = appender.list.stream()
@@ -474,7 +474,7 @@ class DispatcherTransactionListenerTest {
             Fixture f = fixture("id", "v");
             f.listener().onEvent(begin());
             f.listener().onEvent(new MsgChange(false, "hb",
-                    "hello".getBytes(StandardCharsets.US_ASCII), OptionalLong.empty(), 12L));
+                    "hello".getBytes(StandardCharsets.US_ASCII), OptionalLong.empty(), 12L, 0L));
             f.listener().onEvent(new TransactionEvent.End(XID, 0L));
 
             List<String> lines = appender.list.stream()
