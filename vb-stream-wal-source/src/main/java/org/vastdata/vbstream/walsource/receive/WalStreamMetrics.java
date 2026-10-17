@@ -2,6 +2,7 @@ package org.vastdata.vbstream.walsource.receive;
 
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
@@ -16,7 +17,9 @@ import java.util.concurrent.atomic.LongAdder;
  * 分列：衔接层丢弃 vs 页头锚定层重锚）；{@code reconnects}=接收器断流重连次数（Task 8
  * 起——每次 SQLException 触发的重连调度自增 1，由 WalStreamReceiver 维护，walker 不写）。
  * census 以 {@code "rmid/" + hex(info&0xF0)} 为键记各形态条数，
- * 对齐 spike 的 record census 输出面（wal-direct-decode-spike.md 发现 10 的普查延续）。</p>
+ * 对齐 spike 的 record census 输出面（wal-direct-decode-spike.md 发现 10 的普查延续）
+ * ——2026-10-17 性能优化：键经懒填充键表（{@code censusKeys[256][16]}，封闭键空间）
+ * 预计算、值为 LongAdder，热路径零字符串拼接零装箱；键形与快照输出不变。</p>
  *
  * <p>线程约束：计数与 census 写入仅接收线程（Task 8 的 readPending 循环，单写者）；
  * {@link #censusSnapshot()} 自 Task 9 起被冒烟 Main 的周期行活轮询——快照与写入并发
@@ -62,10 +65,19 @@ public final class WalStreamMetrics {
      *  断流原地重连 IT 的行为证据面（重连后位点不回退须伴随本计数 &gt; 0）。 */
     public final LongAdder reconnects = new LongAdder();
 
-    /** rmid/info 形态普查：键 {@code "rmid/hex(info&0xF0)"}，值为条数。写入单写者（接收
-     *  线程），读取经 {@link #censusSnapshot()} 弱一致快照——多读单写下须并发安全载体
-     *  （HashMap 在并发遍历下会 CME 杀死读者，Task 9 审查 High 修复）。 */
-    private final ConcurrentHashMap<String, Long> census = new ConcurrentHashMap<>();
+    /** rmid/info 形态普查：键 {@code "rmid/hex(info&0xF0)"}，值为 LongAdder（增量无
+     *  装箱）。写入单写者（接收线程），读取经 {@link #censusSnapshot()} 弱一致快照
+     *  ——多读单写下须并发安全载体（HashMap 在并发遍历下会 CME 杀死读者，Task 9
+     *  审查 High 修复）。2026-10-17 性能优化：值从 {@code Long} 改 LongAdder，热路径
+     *  {@code computeIfAbsent(...).increment()} 零装箱。 */
+    private final ConcurrentHashMap<String, LongAdder> census = new ConcurrentHashMap<>();
+
+    /** census 懒填充键表 {@code [rmid][高 nibble]}——键空间封闭（rmid 是 u8 值域
+     *  0-255、{@code (info&0xF0)>>4} ∈ 0-15，恰 256×16 槽），由 {@link #countRecord}
+     *  单写者（接收线程）在首次命中时拼接填充，此后热路径命中槽位零字符串拼接。
+     *  数组界内保证来源：WalRecord.rmid/info 均由记录头 u8 解码而来，构造期越界值
+     *  不可达；非单写者并发填充会重复拼接（幂等同串）但本类不提供该契约。 */
+    private final String[][] censusKeys = new String[256][16];
 
     /**
      * 诊断用字符串形态（六计数概览）——IT/冒烟的指标行打印面（Task 13）。
@@ -85,13 +97,23 @@ public final class WalStreamMetrics {
      * 记一条已交付记录：records 计数并归入 census 形态桶。
      *
      * <p>关键步骤：records 自增后按 {@code info & 0xF0} 折叠操作码高半字节（低 nibble
-     * 保留位不参与分桶），与 spike census 键形一致。线程约束：仅接收线程调用。</p>
+     * 保留位不参与分桶），与 spike census 键形一致。热路径优化（2026-10-17）：先查
+     * {@code censusKeys[rmid][高nibble]} 懒填充键表，仅首次命中拼接字符串，此后零
+     * 拼接零装箱（LongAdder increment）。线程约束：仅接收线程调用（键表填充是单写者
+     * 前提——非本线程并发填充不在契约内）。</p>
      *
      * @param rec 已解析交付的记录
      */
     public void countRecord(WalRecord rec) {
         records.increment();
-        census.merge(rec.rmid() + "/" + Integer.toHexString(rec.info() & 0xF0), 1L, Long::sum);
+        int rmid = rec.rmid();
+        int nib = rec.info() & 0xF0;
+        String key = censusKeys[rmid][nib >> 4];
+        if (key == null) {
+            key = rmid + "/" + Integer.toHexString(nib);
+            censusKeys[rmid][nib >> 4] = key;
+        }
+        census.computeIfAbsent(key, k -> new LongAdder()).increment();
     }
 
     /**
@@ -99,12 +121,15 @@ public final class WalStreamMetrics {
      *
      * <p>返回不可变副本（{@code Map.copyOf}），后续写入不影响已取快照；快照与写入
      * <strong>可能并发</strong>（冒烟 Main 的周期统计行/IT 指标行在别的线程活轮询
-     * ——接收线程仍在写 census），CHM 载体 + 弱一致拷贝即线程安全，无需加锁；任意
-     * 线程可读。</p>
+     * ——接收线程仍在写 census），CHM 载体 + 弱一致遍历拷贝即线程安全，无需加锁；
+     * 任意线程可读。值语义：LongAdder 经 {@code sum()} 折叠为 Long，与改造前
+     * 装箱 Long 计数对外逐字同形（键形/值域/不可变性均不变）。</p>
      *
      * @return 键值不可变副本（键 {@code "rmid/hex(info&0xF0)"}，值条数）
      */
     public Map<String, Long> censusSnapshot() {
-        return Map.copyOf(census);
+        Map<String, Long> out = new HashMap<>(census.size());
+        census.forEach((k, v) -> out.put(k, v.sum()));
+        return Map.copyOf(out);
     }
 }
