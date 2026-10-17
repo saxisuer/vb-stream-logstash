@@ -145,9 +145,22 @@ public final class WalStreamWalker {
      * <p>关键步骤：① chunk 起点取<strong>自维护数据锚</strong>（已喂末位；未初始化时
      * 回落调用方游标 {@code chunkEndLsn - len}——两者差值即 keepalive 交错漂移，
      * DEBUG 记录）并做 carry 衔接校验——失配（重连续传重发覆盖 carry）WARN 后丢弃
-     * carry 从本 chunk 锚点重启；② carry 拼接为合并缓冲；③ 解析循环消费到"字节不足
-     * 需等待"为止，余量回填 carry，carryStartLsn 重置为停点 LSN（再同步重锚后该值
-     * 已切换到 pageaddr 权威空间），数据锚推进到已喂末位。</p>
+     * carry 从本 chunk 锚点重启；② 缓冲取材三分（接收零拷贝 #3b）：稳态（carry 空）
+     * <strong>直接解析调用方数组不合并</strong>；解析后整块未消费（首块即半记录等
+     * 形态）carry <strong>直接持有本缓冲免拷</strong>；仅余量场景（消费了一部分）才
+     * 把未消费段拷进新 carry 数组；③ 解析循环消费到"字节不足需等待"为止，余量回填
+     * carry，carryStartLsn 重置为停点 LSN（再同步重锚后该值已切换到 pageaddr 权威
+     * 空间），数据锚推进到已喂末位。</p>
+     *
+     * <p><strong>契约面（零拷贝化升级）</strong>：喂入的 data 数组 feed 返回后
+     * <strong>不得复用/改写</strong>——① 已交付 {@link WalRecord#raw()} 可能直接
+     * 引用其字节（单页完整记录偏移直读，见 parse 快路）；② walker 可能在其中原地
+     * 移位（resyncAt 的丢弃左移——目的地区间起点恒 ≥ 已发射记录末尾，宿主引用不被
+     * 破坏，但移位点之后的字节会被覆盖）；③ 解析未启动的整块可能被 carry 直接持有
+     * 到下一次 feed。三路调用方（WalStreamReceiver.drainLoop / FileWalSource.pumpOnce /
+     * DirectWalSource.streamLoop）已核实均为每 chunk 新建的一次性数组，契约天然满足。
+     * 整块未消费的免拷持有以 {@code consumed==0 && len==buf.length} 为门——resync
+     * 收缩（len &lt; 物理长度）形态陈旧尾不得进 carry，走拷贝分支以有效长度切齐。</p>
      *
      * <p>边界与异常语义：data 空数组仅推进数据锚；页头/记录头/记录体跨 chunk 分裂时
      * 留待后续 feed；pageaddr 失配超容差抛 ISE（feed 半途抛出时，此前已交付 sink 的
@@ -156,7 +169,7 @@ public final class WalStreamWalker {
      * @param chunkEndLsn 本 chunk 最后一个字节之后的 LSN（调用方游标，如
      *                    pgjdbc {@code getLastReceiveLSN()}；仅未初始化时的首块锚
      *                    与漂移 DEBUG 观测用——权威锚为自维护数据末位）
-     * @param data        chunk 字节
+     * @param data        chunk 字节（一次性数组——feed 后不得复用/改写，见契约面）
      */
     public void feed(long chunkEndLsn, byte[] data) {
         long chunkStart;
@@ -182,15 +195,30 @@ public final class WalStreamWalker {
         if (carry.length == 0) {
             carryStartLsn = chunkStart;
         }
-        byte[] merged = new byte[carry.length + data.length];
-        System.arraycopy(carry, 0, merged, 0, carry.length);
-        System.arraycopy(data, 0, merged, carry.length, data.length);
+        byte[] buf;
+        if (carry.length == 0) {
+            // 稳态零拷贝：直接解析调用方数组（契约：feed 后不得复用/改写 data）
+            buf = data;
+        } else {
+            buf = new byte[carry.length + data.length];
+            System.arraycopy(carry, 0, buf, 0, carry.length);
+            System.arraycopy(data, 0, buf, carry.length, data.length);
+        }
         sawAny = true;
-        ParseResult result = parse(merged, carryStartLsn);
-        // carry 切分以解析后的有效长度为准——非零丢弃再同步左移字节后，
-        // merged 尾部 (dropped) 字节是陈旧副本，不得回填 carry
-        carry = new byte[result.len() - result.consumed()];
-        System.arraycopy(merged, result.consumed(), carry, 0, carry.length);
+        ParseResult result = parse(buf, carryStartLsn);
+        // carry 切分三分：余量为零清空；整块未消费（consumed==0 且未收缩）直接持有
+        // 本缓冲免拷——resync 收缩（len < buf.length）形态陈旧尾不得进 carry；仅余量
+        // 场景才拷（切分以解析后的有效长度为准——非零丢弃再同步左移字节后，尾部
+        // (dropped) 字节是陈旧副本，不得回填 carry）
+        int leftover = result.len() - result.consumed();
+        if (leftover == 0) {
+            carry = EMPTY;
+        } else if (result.consumed() == 0 && result.len() == buf.length) {
+            carry = buf;
+        } else {
+            carry = new byte[leftover];
+            System.arraycopy(buf, result.consumed(), carry, 0, leftover);
+        }
         carryStartLsn = result.endLsn();
         dataEndLsn = carryStartLsn + carry.length;
     }
@@ -206,9 +234,12 @@ public final class WalStreamWalker {
      *
      * <p>边界与异常语义：totLen 小于记录头长（损坏）抛 ISE；跨页处无
      * XLP_FIRST_IS_CONTRECORD 标记、pageaddr 锚定丢失均按失配路径处理（再同步或
-     * ISE）。buf 为调用方（feed）私有的合并缓冲，再同步的原地丢弃可安全破坏其前缀。</p>
+     * ISE）。buf 是 feed 的解析缓冲——稳态（carry 空）下即调用方 chunk 数组本体，
+     * 否则为合并副本；再同步的原地丢弃左移只写 [dropFrom, len) 区间（起点恒 ≥ 已
+     * 发射记录末尾），已交付 WalRecord 引用的字节不被破坏，但该区间其余内容会被
+     * 覆盖（feed 契约面"喂后不复用/改写"的 walker 侧依据）。</p>
      *
-     * @param buf  合并缓冲（从 lsn0 起的字节流）
+     * @param buf  解析缓冲（从 lsn0 起的字节流——可能是调用方 chunk 本体或 carry 合并副本）
      * @param lsn0 buf[0] 的绝对 LSN
      * @return 消费字节数、停点 LSN（= 未消费首字节的绝对地址）与有效长度（非零丢弃
      *         再同步收缩后的缓冲界，feed 据此切 carry）
@@ -331,73 +362,91 @@ public final class WalStreamWalker {
                 throw new WalStreamParseException("corrupt record header: totLen=" + totLen
                         + " < header size " + recHdr + " at " + Lsn.format(cur));
             }
-            // 记录缝合：跨页按"当前页剩余"取数（发现 11 坐标系教训——pageEnd 相对 curL 自身）
-            long recLsn = cur;
-            byte[] rec = new byte[totLen];
-            int recPos = 0;
-            int src = pos;
-            long curL = cur;
-            boolean awaitMore = false;
-            boolean resynced = false;
-            while (recPos < totLen) {
-                int pageEnd = bs - (int) (curL & (bs - 1));
-                int take = Math.min(totLen - recPos, pageEnd);
-                if (len - src < take) {
-                    awaitMore = true;   // 记录体未到齐
-                    break;
-                }
-                System.arraycopy(buf, src, rec, recPos, take);
-                recPos += take;
-                src += take;
-                curL += take;
-                if (recPos < totLen) {
-                    // 越入续体页：整头到达前等待；页头三项全验（magic/标志/pageaddr 锚定）
-                    if (len - src < shortHdr) {
-                        awaitMore = true;
+            // 记录快慢两路分派（接收零拷贝 #3b）：单页完整记录（totLen 不越本页尾且
+            // 字节已在本缓冲内——绝大多数形态）走偏移直读零缝合，WalRecord.raw 直接
+            // 引用本缓冲（feed 稳态零拷贝下即调用方 chunk）；跨页/未到齐走原缝合路径。
+            // 等号归属：totLen == pageRemain（记录恰收在本页尾）仍属单页；越页一字节
+            // （totLen == pageRemain + 1）即 false 落缝合路。两路汇合到下方共享
+            // MAXALIGN 垫齐段——垫语义逐字等价。
+            if (totLen <= pageRemain && len - pos >= totLen) {
+                // 快路：单页完整记录——偏移直读（raw 即宿主缓冲，免 rec 拷贝）
+                WalRecord parsed = WalRecordParser.parse(buf, pos, cur, layout);
+                metrics.countRecord(parsed);
+                sink.accept(parsed);
+                pos += totLen;
+                cur += totLen;
+            } else {
+                // 慢路：跨页缝合——按"当前页剩余"取数（发现 11 坐标系教训——
+                // pageEnd 相对 curL 自身）；缝合缓冲逐次新建，绝不复用（raw 引用宿主
+                // 字节，复用会撞已交付记录）
+                long recLsn = cur;
+                byte[] rec = new byte[totLen];
+                int recPos = 0;
+                int src = pos;
+                long curL = cur;
+                boolean awaitMore = false;
+                boolean resynced = false;
+                while (recPos < totLen) {
+                    int pageEnd = bs - (int) (curL & (bs - 1));
+                    int take = Math.min(totLen - recPos, pageEnd);
+                    if (len - src < take) {
+                        awaitMore = true;   // 记录体未到齐
                         break;
                     }
-                    int cInfo = u16(buf, src + INFO_OFFSET);
-                    long cPageaddr = u64(buf, src + PAGEADDR_OFFSET);
-                    boolean cLong = (cInfo & XLP_LONG_HEADER) != 0;
-                    int cHdr = cLong ? layout.longPageHeaderSize() : shortHdr;
-                    if (len - src < cHdr) {
-                        awaitMore = true;
-                        break;
-                    }
-                    if (u16(buf, src) != layout.pageMagic()
-                            || (cInfo & XLP_FIRST_IS_CONTRECORD) == 0
-                            || cPageaddr != curL) {
-                        // 续体页头违约（缺 contrecord 标志或 pageaddr 锚定失配）：
-                        // 丢弃半条记录（含记录头），从下一个合法页头重锚
-                        Adoption adopted = resyncAt(buf, pos, len, recLsn, curL, cPageaddr);
-                        if (adopted == null) {
+                    System.arraycopy(buf, src, rec, recPos, take);
+                    recPos += take;
+                    src += take;
+                    curL += take;
+                    if (recPos < totLen) {
+                        // 越入续体页：整头到达前等待；页头三项全验（magic/标志/pageaddr 锚定）
+                        if (len - src < shortHdr) {
                             awaitMore = true;
                             break;
                         }
-                        resynced = true;
-                        pos = adopted.pos();
-                        len = adopted.len();
-                        cur = expectedPageAddr;
-                        break;
+                        int cInfo = u16(buf, src + INFO_OFFSET);
+                        long cPageaddr = u64(buf, src + PAGEADDR_OFFSET);
+                        boolean cLong = (cInfo & XLP_LONG_HEADER) != 0;
+                        int cHdr = cLong ? layout.longPageHeaderSize() : shortHdr;
+                        if (len - src < cHdr) {
+                            awaitMore = true;
+                            break;
+                        }
+                        if (u16(buf, src) != layout.pageMagic()
+                                || (cInfo & XLP_FIRST_IS_CONTRECORD) == 0
+                                || cPageaddr != curL) {
+                            // 续体页头违约（缺 contrecord 标志或 pageaddr 锚定失配）：
+                            // 丢弃半条记录（含记录头），从下一个合法页头重锚
+                            Adoption adopted = resyncAt(buf, pos, len, recLsn, curL, cPageaddr);
+                            if (adopted == null) {
+                                awaitMore = true;
+                                break;
+                            }
+                            resynced = true;
+                            pos = adopted.pos();
+                            len = adopted.len();
+                            cur = expectedPageAddr;
+                            break;
+                        }
+                        metrics.contrecords.increment();
+                        expectedPageAddr = cPageaddr + bs;   // 缝合越页：期望随之推进（否则后续页界必伪再同步）
+                        src += cHdr;
+                        curL += cHdr;
                     }
-                    metrics.contrecords.increment();
-                    expectedPageAddr = cPageaddr + bs;   // 缝合越页：期望随之推进（否则后续页界必伪再同步）
-                    src += cHdr;
-                    curL += cHdr;
                 }
+                if (awaitMore) {
+                    break;   // 等更多字节（半条记录留在缓冲）
+                }
+                if (resynced) {
+                    continue;   // 已重锚到合法页头，回外层页边界分支
+                }
+                WalRecord parsed = WalRecordParser.parse(rec, recLsn, layout);
+                metrics.countRecord(parsed);
+                sink.accept(parsed);
+                pos = src;
+                cur = curL;
             }
-            if (awaitMore) {
-                break;   // 等更多字节（半条记录留在缓冲）
-            }
-            if (resynced) {
-                continue;   // 已重锚到合法页头，回外层页边界分支
-            }
-            WalRecord parsed = WalRecordParser.parse(rec, recLsn, layout);
-            metrics.countRecord(parsed);
-            sink.accept(parsed);
-            pos = src;
-            cur = curL;
-            // 记录起点 MAXALIGN 垫齐（下一条记录/页尾零垫的边界）；垫长至多 7
+            // 记录起点 MAXALIGN 垫齐（下一条记录/页尾零垫的边界）；垫长至多 7——
+            // 快慢两路共享（快路 pos/cur 推进到记录尾后落回本段，与慢路同判据）
             int pad = (int) (((cur + 7) & ~7L) - cur);
             if (pad > 0) {
                 if (len - pos < pad) {

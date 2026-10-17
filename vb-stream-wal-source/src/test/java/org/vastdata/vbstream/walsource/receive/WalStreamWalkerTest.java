@@ -13,6 +13,8 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -172,7 +174,9 @@ class WalStreamWalkerTest {
         for (int i = 0; i < oneShot.size(); i++) {
             assertEquals(oneShot.get(i).lsn(), sliced.get(i).lsn());
             assertEquals(oneShot.get(i).totLen(), sliced.get(i).totLen());
-            assertArrayEquals(oneShot.get(i).raw(), sliced.get(i).raw());
+            // raw 契约放宽（零拷贝 #3b）：raw 是宿主缓冲（整 feed/合并 carry），记录
+            // 字节经偏移不变量截取——比较记录本体而非宿主数组
+            assertArrayEquals(recordBytes(oneShot.get(i)), recordBytes(sliced.get(i)));
         }
         assertEquals(whole.consumedLsn(), piecewise.consumedLsn());
     }
@@ -470,6 +474,56 @@ class WalStreamWalkerTest {
     }
 
     /**
+     * 零拷贝契约锚（接收零拷贝 #3b）：稳态 feed（carry 空）下 walker 直接解析调用方
+     * 数组、单页完整记录经偏移直读免缝合——已交付 {@code WalRecord.raw()} 与喂入
+     * chunk 是<strong>同一数组</strong>。这是 feed 契约面（喂后数组不得复用/改写）的
+     * 直接锚：任何回退到"合并副本/缝合副本"的形态本锚即红。
+     */
+    @Test
+    void steadyStateFeedIsZeroCopyAndRecordReferencesHostChunk() {
+        long pageAddr = 0x88000L;
+        byte[] r1 = smallRec(RM_HEAP_ID, 0x00, 11);
+        byte[] r2 = smallRec(RM_XACT_ID, 0x20, 22);
+        byte[] page = WalBytes.page(pageAddr, r1, r2);
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamWalker walker = new WalStreamWalker(layout, new WalStreamMetrics(), out::add);
+        walker.feed(pageAddr + page.length, page);
+
+        assertFalse(out.isEmpty(), "单页两记录须正常产出");
+        assertSame(page, out.get(0).raw(), "稳态零拷贝：单页记录直接引用宿主 chunk");
+        assertSame(page, out.get(1).raw(), "同 chunk 后续记录同样引用宿主 chunk");
+    }
+
+    /**
+     * 零拷贝行为不变锚（接收零拷贝 #3b）：半条记录（页头 + 记录头截断）作首 chunk、
+     * 补齐作次 chunk——余量经 carry 跨 chunk 缝合后记录仍完整交付（字段/字节全等）。
+     * 与 {@link #arbitraryChunkSplittingYieldsIdenticalOutput} 的 piecewise 形态同构，
+     * 钉死 feed 零拷贝化不改变跨 chunk 补齐语义。
+     */
+    @Test
+    void leftoverOnlyChunkIsHeldWithoutCopy() {
+        long p = 0x8A000L;
+        byte[] rec = smallRec(RM_HEAP_ID, 0x00, 42);
+        byte[] page = WalBytes.page(p, rec);
+        // 首 chunk：页头 24B + 记录前 10B（totLen 已可读但记录体未到齐 → 余量进 carry）
+        int firstLen = 24 + 10;
+
+        List<WalRecord> out = new ArrayList<>();
+        WalStreamWalker walker = new WalStreamWalker(layout, new WalStreamMetrics(), out::add);
+        walker.feed(p + firstLen, Arrays.copyOfRange(page, 0, firstLen));
+        assertTrue(out.isEmpty(), "半条记录不得提前产出");
+
+        walker.feed(p + page.length, Arrays.copyOfRange(page, firstLen, page.length));
+
+        assertEquals(1, out.size());
+        assertEquals(p + 24, out.get(0).lsn());
+        assertEquals(rec.length, out.get(0).totLen());
+        assertArrayEquals(rec, recordBytes(out.get(0)), "跨 chunk 补齐后与原记录逐字节全等");
+        assertEquals(p + page.length, walker.consumedLsn(), "页尾零垫随整页消费，游标落页尾");
+    }
+
+    /**
      * 拼 OG 魔数页头的全零体整页（0xD074 + info 0 + pageaddr，页体零——走页内零垫
      * 路径消费；与整零页[无头]形态互为对照）。
      *
@@ -507,6 +561,20 @@ class WalStreamWalkerTest {
         for (int i = 0; i < 8; i++) {
             target[offset + i] = (byte) ((v >>> (8 * i)) & 0xFF);
         }
+    }
+
+    /**
+     * 截取 WalRecord 的记录本体字节（宿主缓冲 raw 的 {@code [recOff, recOff+totLen)}
+     * 段）——raw 契约放宽（零拷贝 #3b：raw 是宿主缓冲、记录可位于任意偏移）后"记录
+     * 字节"的正确取法；recOff 经解析器钉死的不变量
+     * {@code mainOff + mainLen == recOff + totLen} 推导（无 main 记录 mainLen=0 同式成立）。
+     *
+     * @param rec 走读结果
+     * @return 记录本体字节副本（恰 totLen 长）
+     */
+    private static byte[] recordBytes(WalRecord rec) {
+        int recOff = rec.mainOff() + rec.mainLen() - rec.totLen();
+        return Arrays.copyOfRange(rec.raw(), recOff, recOff + rec.totLen());
     }
 
     /**
