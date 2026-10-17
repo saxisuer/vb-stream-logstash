@@ -1224,7 +1224,13 @@ public final class XactGrouper {
             if (b.abortedSubxids.contains(e.originXid())) {
                 continue;
             }
-            out.onRow(e.row());
+            // 位址三字段发射期重建（2026-10-17 契约扩展）：到达期 commitLsn 未知（提交
+            // 记录未到），桶内行占位 0；此处从 RowEntry 的记账面（recLsn）+ 桶/终态
+            // 位址（b.xid/commitLsn）重建全参 record——table/dml/before/after 均为已
+            // 渲染引用，重建是纯 record 拷贝零重算
+            ChangeOutputListener.RowChange r = e.row();
+            out.onRow(new ChangeOutputListener.RowChange(b.xid, commitLsn, e.recLsn(),
+                    r.table(), r.dml(), r.before(), r.after()));
             emitted++;
         }
         out.onEnd(new ChangeOutputListener.BatchEnd(b.xid, emitted, expected));

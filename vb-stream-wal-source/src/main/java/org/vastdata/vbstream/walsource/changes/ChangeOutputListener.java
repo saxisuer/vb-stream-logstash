@@ -44,16 +44,38 @@ public interface ChangeOutputListener {
     /**
      * 单行变更（值 = 磁盘格式解码后的可读对象）。
      *
-     * <p><strong>本 record 刻意无 originXid 字段</strong>（预检 #5 裁定）：桶内流式
-     * 大事务的归属记账是发射层（Grouper）的私有面，不泄漏进输出契约——同一笔 Begin/
-     * End 序列内的 RowChange 天然同源。</p>
+     * <p><strong>位址三字段（2026-10-17 契约扩展）</strong>——END 发射时由发射层
+     * （Grouper）填充：{@code xid} 与 {@link BatchBegin#xid()} 同源（桶 xid——存活
+     * 子事务行归并到顶层身份）、{@code commitLsn} 与 {@link BatchBegin#commitLsn()}
+     * 同值（普通=COMMIT 记录 lsn / 2PC=COMMIT PREPARED 记录 lsn）、{@code lsn} = 该行
+     * 所在 heap 记录的起始 LSN（到达期记账——TOAST chunk 是独立记录不占行 lsn；
+     * MULTI_INSERT 多条目共享同一条记录 lsn）。v2 "桶内归属是私有面"的预检 #5 裁定
+     * 就此收窄为 <b>originXid 不外泄</b>（子事务真源 id）；顶层位址三字段按 2026-10-17
+     * 需求进入契约。</p>
      *
-     * @param table  表身份 + 列序（as-of 快照解析，行自描述）
-     * @param dml    行操作种类（wal-source 自有枚举，不 import 引擎）
-     * @param before 前像（UPDATE/DELETE 的 replica identity 列或全列；INSERT 为 null）
-     * @param after  后像（INSERT/UPDATE；DELETE 为 null）
+     * @param xid        事务归属 id（与 Begin/End 同源；发射时填充）
+     * @param commitLsn  提交记录 lsn（与 BatchBegin.commitLsn 同值；发射时填充）
+     * @param lsn        行所在 heap 记录起始 LSN（到达期已知；发射时填充）
+     * @param table      表身份 + 列序（as-of 快照解析，行自描述）
+     * @param dml        行操作种类（wal-source 自有枚举，不 import 引擎）
+     * @param before     前像（UPDATE/DELETE 的 replica identity 列或全列；INSERT 为 null）
+     * @param after      后像（INSERT/UPDATE；DELETE 为 null）
      */
-    record RowChange(TableMeta table, DmlKind dml, Map<String, Object> before, Map<String, Object> after) {
+    record RowChange(long xid, long commitLsn, long lsn, TableMeta table, DmlKind dml,
+                     Map<String, Object> before, Map<String, Object> after) {
+
+        /**
+         * 四参便捷构造（位址三字段占位 0）：手造行事件的单测/宿主装配面——真实发射
+         * 路径（Grouper）走全参构造，位址字段由发射层保证非零。
+         *
+         * @param table  表身份 + 列序
+         * @param dml    行操作种类
+         * @param before 前像（可 null）
+         * @param after  后像（可 null）
+         */
+        RowChange(TableMeta table, DmlKind dml, Map<String, Object> before, Map<String, Object> after) {
+            this(0L, 0L, 0L, table, dml, before, after);
+        }
     }
 
     /**

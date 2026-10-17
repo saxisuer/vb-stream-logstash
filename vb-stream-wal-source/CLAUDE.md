@@ -115,7 +115,7 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | `RenderOptions` | **渲染面四键载体（2026-10-17 配置化）**：`vb.wal.render.float.style/date.format/time.format/truncate` 四键解析（缺省 pg 档 + 64——对拍锚）与穿线（门面 → ChangeStream → XactGrouper → DiskValueRenderer；OutputRenderer 消费 truncateLimit）；`default` 内建档 date=`yyyy-MM-dd HH:mm:ss`/time=`HH:mm:ss`；非法档位/pattern/负阈值构造期 IAE 附键名 |
 | `PgFloatFormat` | PG 风格浮点格式化器（Ryū 最短往返 + %g 定点门限——`1e+20`/`0.0001`/`-0`，补 `Double.toString` 的 `1.0E20` 分叉；前提会话 `extra_float_digits=1` 缺省档） |
 | `OutputRenderer` | pending 缓冲 + TXN-BEGIN/逐行/TXN-END 输出（**engine `ConsoleRenderer` 格式复刻契约**——头行 changes 终值在 End 组装、值截 64 附 `...(NB)`、dropped ∅/NULL 字面同形）；onAborted 丢桶零输出 |
-| `ChangeOutputListener` | 中立事件接口：`BatchBegin`/`RowChange`/`BatchEnd`(expectedChanges)/`BatchAborted` |
+| `ChangeOutputListener` | 中立事件接口：`BatchBegin`/`RowChange`/`BatchEnd`(expectedChanges)/`BatchAborted`；**2026-10-17 RowChange 增位址三字段**（xid/commitLsn/lsn——END 发射期由 Grouper 重建填充，行级 heap 记录位址；originXid 仍私有） |
 
 **双路对拍契约与执行机制**：输出格式以 engine `ConsoleRenderer` 为**契约源**（streaming
 形态的 TXN-BEGIN/逐行/TXN-END 三段样板 + 行值截断规则），改动需双端同步（debezium19
@@ -775,11 +775,12 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**560 用例 = 离线 437 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+**561 用例 = 离线 438 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
 VastBase 手动档真库 IT 24（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
 超时]——pg_receivexlog 文件通道族在 Windows 的已知限制，非回归）**
+（2026-10-17 RowChange 位址三字段 +1：ChangeStreamTest 发射面断言[xid 与 Begin 同源/commitLsn 同值/行 lsn 严格递增先于提交]——离线 437→438）
 （2026-10-17 渲染面四键配置化 +22：RenderOptionsTest 新 6[缺省/显式 pg 等价/全开档/
 default 内建档/非法值附键名/空串未设] + PgFloatFormatTest +4[plain float8 展开锚/定点
 区段同串/float4 展开与极大值/特值不变] + DiskValueRendererTest +5[plain 档/date pattern
@@ -846,7 +847,7 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
   双匹配含分区名不外溢负例/链断 WARN 恰一次+计数/vanilla 无视分区链] + EXCHANGE 换绑
   段号 oid 碰撞属主优先双向锚，T5 修复**）/
   PgFloatFormatTest 11（2026-10-17 +4 plain 档展开锚）/ PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
-  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 8（2026-10-17 +1 RenderOptions 穿线 seam）；**渲染面：RenderOptionsTest 6（2026-10-17 四键解析矩阵）；OG 档（M2）**：
+  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 9（2026-10-17 +1 RenderOptions 穿线 seam +1 RowChange 位址三字段）；**渲染面：RenderOptionsTest 6（2026-10-17 四键解析矩阵）；OG 档（M2）**：
   OgXactGrouperSeamTest 7（OG XACT 接缝——终态 subxacts 归并/COMMIT_COMPACT/2PC 面，
   T2；**+2 INIT_PAGE + CONTAINS_OLD 的 UPDATE/DELETE 旧元组偏移角落——OG 13/11+8 与
   VastBase 21/19 常态 + INIT_PAGE 29/27 双档，`ogInitShift` 的 +8 面（vastbase T7 补钉，

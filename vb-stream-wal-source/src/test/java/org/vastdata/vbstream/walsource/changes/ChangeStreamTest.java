@@ -210,6 +210,62 @@ class ChangeStreamTest {
      * XactGrouper → renderRow → DiskValueRenderer 全链生效——date 列按自定义 pattern
      * 出值（到达期渲染面是 RowChange 值的产源）。
      */
+    /**
+     * 行级位址字段（2026-10-17 契约扩展）：END 发射时每行带 xid / commitLsn / 行自身
+     * lsn——xid 与 Begin/End 同源、commitLsn 与 BatchBegin.commitLsn 同值、事务内多行
+     * lsn 严格递增且均小于 commitLsn（行记录先于提交记录到达）。
+     */
+    @Test
+    void rowChangeCarriesPositionFieldsAtEmission() {
+        StubSnapshot snapshot = new StubSnapshot();
+        snapshot.table(USER_REL, "public", "t_stream", "r",
+                new CatalogSnapshot.Column(1, "id", 23, false),
+                new CatalogSnapshot.Column(2, "big", 25, false));
+        snapshot.table(PG_ATTRIBUTE_RELNODE, "pg_catalog", "pg_attribute", "r");
+        List<ChangeOutputListener.BatchBegin> begins = new ArrayList<>();
+        List<ChangeOutputListener.RowChange> rows = new ArrayList<>();
+        ChangeStream stream = new ChangeStream(snapshot, null, layout, null, new ChangeOutputListener() {
+            @Override
+            public void onBegin(BatchBegin begin) {
+                begins.add(begin);
+            }
+
+            @Override
+            public void onRow(RowChange row) {
+                rows.add(row);
+            }
+
+            @Override
+            public void onEnd(BatchEnd end) {
+            }
+
+            @Override
+            public void onAborted(BatchAborted aborted) {
+            }
+        });
+        Fixture fx = new Fixture(snapshot, stream, null);
+        fx.insert(100, 1, "a");
+        fx.insert(100, 2, "b");
+        fx.commit(100);
+
+        assertEquals(1, begins.size());
+        long commitLsn = begins.get(0).commitLsn();
+        assertEquals(2, rows.size());
+        long prev = 0;
+        for (ChangeOutputListener.RowChange row : rows) {
+            assertEquals(100L, row.xid(), "行 xid 与 Begin/End 同源（桶 xid）");
+            assertEquals(commitLsn, row.commitLsn(), "行 commitLsn 与 BatchBegin.commitLsn 同值");
+            assertTrue(row.lsn() > prev, "事务内行 lsn 严格递增: " + row.lsn() + " vs " + prev);
+            assertTrue(row.lsn() < commitLsn, "行 lsn 先于提交记录");
+            prev = row.lsn();
+        }
+    }
+
+    /**
+     * 渲染选项穿线（{@code vb.wal.render.*}，2026-10-17 配置化）：ChangeStream →
+     * XactGrouper → renderRow → DiskValueRenderer 全链生效——date 列按自定义 pattern
+     * 出值（到达期渲染面是 RowChange 值的产源）。
+     */
     @Test
     void renderOptionsFlowThroughToRowValues() {
         StubSnapshot snapshot = new StubSnapshot();
