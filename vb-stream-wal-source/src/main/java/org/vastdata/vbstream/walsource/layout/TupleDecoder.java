@@ -173,12 +173,14 @@ public final class TupleDecoder {
     /**
      * 三入口共享的核心走读：自 tupleStart 起按 kinds 逐列解码。
      *
-     * <p>关键步骤：natts = infomask2 &amp; 0x07FF；HASNULL 时拷出 tuple offset 23 起的
-     * 位图（(natts+7)/8 字节）；游标自 tupleStart+t_hoff 起，逐列——位图 null 位为 0
-     * 即 null 跳过，否则按 kind 分支：定宽类型先按类型对齐（对齐相对 tupleStart，
-     * spike 发现 7——tuple 可坐在缓冲任意偏移）再取宽序小端值；varlena 类（text/
-     * bytea/skip）经 varlenaStart 落位（当前字节非零即 1B 头未对齐起点、为零按 4
-     * 对齐——Task 8 实测钉）再走双头读长；dropped 零消耗、值恒 null（发现 26）。
+     * <p>关键步骤：natts = infomask2 &amp; 0x07FF；HASNULL 时 null 位图不拷出——
+     * 记 t_bits 起点（tupleStart+23），逐列在 src 原地判位（热路径免每行一次位图
+     * 拷贝）；游标自 tupleStart+t_hoff 起，逐列——位图 null 位为 0 即 null 跳过，
+     * 否则按 kind 分支：定宽类型先按类型对齐（对齐相对 tupleStart，spike 发现 7——
+     * tuple 可坐在缓冲任意偏移）再取宽序小端值；varlena 类（text/bytea/numeric/skip）
+     * 经 varlenaStart 落位（当前字节非零即 1B 头未对齐起点、为零按 4 对齐——
+     * Task 8 实测钉）再由 varlenaEnd 一次头走读前置算出终点（游标推进与值读取
+     * 同源）；dropped 零消耗、值恒 null（发现 26）。
      * 边界与异常语义：natts &gt; kinds.length 抛 ISE（消息含两侧计数）、未注册 kind
      * 抛 ISE、raw 过短裸抛越界；线程约束：纯读 + 无实例可变状态参与，并发安全。</p>
      *
@@ -204,11 +206,8 @@ public final class TupleDecoder {
         if (natts > dictCols) {
             throw new IllegalStateException("tuple has " + natts + " atts but dictionary has " + dictCols);
         }
-        byte[] bitmap = null;
-        if (hasNull) {
-            bitmap = new byte[(natts + 7) / 8];
-            System.arraycopy(src, tupleStart + TUPLE_BITS_OFFSET, bitmap, 0, bitmap.length);
-        }
+        // null 位图不拷出：直接在 src 的 t_bits 区原地判位（热路径免每 HASNULL 行一次堆分配）
+        int bitsOff = hasNull ? tupleStart + TUPLE_BITS_OFFSET : -1;
         Object[] vals = new Object[natts + base];
         if (hdrOid) {
             // 元组头 oid：t_hoff-4 起 u32（9.2 式 HeapTupleHeader 末成员——垫区内，
@@ -217,7 +216,7 @@ public final class TupleDecoder {
         }
         int c = tupleStart + tHoff;
         for (int i = 0; i < natts; i++) {
-            if (bitmap != null && (bitmap[i / 8] & (1 << (i % 8))) == 0) {
+            if (hasNull && (src[bitsOff + (i >> 3)] & (1 << (i & 7))) == 0) {
                 vals[i + base] = null;
                 continue;
             }
@@ -261,8 +260,8 @@ public final class TupleDecoder {
                     vals[i + base] = renderTimestamp(u64(src, c));
                     c += 8;
                 }
-                case "text" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i + base] = readTextDatum(src, c, next); c = next[0]; }
-                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; vals[i + base] = readDatumBytes(src, c, next); c = next[0]; }
+                case "text" -> { c = varlenaStart(src, c, tupleStart); int end = varlenaEnd(src, c, externalResolver); vals[i + base] = readTextDatum(src, c, end); c = end; }
+                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int end = varlenaEnd(src, c, externalResolver); vals[i + base] = readDatumBytes(src, c, end); c = end; }
                 case "date" -> {   // i32 天（epoch 2000-01-01）——datum 原始字节，解读在渲染矩阵
                     c = tupleStart + align(c - tupleStart, 4);
                     vals[i + base] = slice(src, c, 4);
@@ -282,7 +281,7 @@ public final class TupleDecoder {
                     vals[i + base] = slice(src, c, 16);
                     c += 16;
                 }
-                case "skip" -> { c = varlenaStart(src, c, tupleStart); int[] next = {c}; skipVarlena(src, c, next); c = next[0]; }
+                case "skip" -> { c = varlenaStart(src, c, tupleStart); c = varlenaEnd(src, c, externalResolver); }
                 case "dropped" -> { /* attisdropped 列存储恒 NULL：零字节消耗（发现 26） */ }
                 default -> throw new IllegalStateException("unregistered kind " + kinds[i]);
             }
@@ -311,26 +310,59 @@ public final class TupleDecoder {
     }
 
     /**
+     * 一次 varlena 头走读，前置算出整个 varlena 之后的首偏移（终点）——热路径免每列
+     * 一次 {@code int[]} 游标分配：调用方先经本方法取得终点再取值，游标推进与各值
+     * 读取器的内部几何恒等（同源头走读）。
+     *
+     * <p>四形态终点推导（varlena.h）：①首字节 bit0 置位即 1B 头短 varlena，总长
+     * {@code (b0>>1)&0x7F}；②其中首字节恰 0x01 是 external 短指针（VARATT_IS_1B_E）
+     * ——1B 头的长度位恒零，几何上恒定长 18B（1B 头 + 1B vartag + 4×u32）；③tag 位
+     * 00 是 4B 头未压缩 plain，总长 {@code u32le>>>2}；④tag 位 0x02 是 4B 头行内压缩
+     * ——长度位与 plain 同面（压缩后总长仍记在 30 位长度段），总长同为
+     * {@code u32le>>>2}。边界与异常语义：本方法<b>只算几何不抛</b>——resolver 为
+     * null（v1 档）时的 0x01/tag 0x02 拒绝由值读取器的既有拒绝面
+     * （{@link #rejectNonPlainVarlena}）兜住，skip 列无值读取故不拒绝（只消耗几何）。
+     * 线程约束：纯读，并发安全。</p>
+     *
+     * @param src      源缓冲
+     * @param c        varlena 起点（经 varlenaStart 落位）
+     * @param resolver 非 plain varlena 重建面（当前不影响几何——四形态终点均由头字节
+     *                 自描述；参数在位以保持与值读取面的调用同形）
+     * @return 整个 varlena（含头）之后的首偏移
+     */
+    private static int varlenaEnd(byte[] src, int c, VarlenaResolver resolver) {
+        int b0 = src[c] & 0xFF;
+        if ((b0 & VARLENA_TAG_1B) != 0) {
+            return c + (b0 == VARLENA_TAG_1B_EXTERNAL ? EXTERNAL_POINTER_SIZE : (b0 >> 1) & 0x7F);
+        }
+        return c + (u32(src, c) >>> 2);
+    }
+
+    /**
      * 读一个文本 datum（text kind）——external 短指针先走 resolver 重组（返回字节经
      * UTF-8 解码——文本族的解释在此、且仅在此发生，Task 8 保真裁定），其余经
      * plain varlena 读文本。
      *
-     * <p>边界与异常语义：external 且未注入 resolver 抛 ISE（v1 拒绝面）；
+     * <p>关键步骤：值形态分支判断仍在本方法内做（external / 行内压缩 / plain 三分）；
+     * 游标推进不在此——调用方持 {@code varlenaEnd} 前置算出的终点（end 与三分支
+     * 的内部推进量恒等：external 恒 18B、压缩 total=u32&gt;&gt;&gt;2、plain 同源双头）。
+     * 边界与异常语义：external 且未注入 resolver 抛 ISE（v1 拒绝面）；
      * compressed varlena 恒 ISE。线程约束：纯读（resolver 的线程语义由注入方保证）。</p>
      *
-     * @param src  源缓冲
-     * @param c    datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param next 单元素游标：返回值 = 整个 datum 之后的首偏移
+     * @param src 源缓冲
+     * @param c   datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
+     * @param end 整个 datum 之后的首偏移（varlenaEnd 产物——本方法不消费，仅契约
+     *            载明终点与内部分支几何同源）
      * @return 文本（external 形态为重组后的原值字符串）
      */
-    private String readTextDatum(byte[] src, int c, int[] next) {
+    private String readTextDatum(byte[] src, int c, int end) {
         if (isExternalPointer(src, c)) {
-            return new String(resolveExternalBytes(src, c, next), StandardCharsets.UTF_8);
+            return new String(resolveExternalBytes(src, c), StandardCharsets.UTF_8);
         }
         if (isInlineCompressed(src, c)) {
-            return decompressInlineString(src, c, next);
+            return new String(decompressInlineBytes(src, c), StandardCharsets.UTF_8);
         }
-        return readVarlenaText(src, c, next);
+        return readVarlenaText(src, c);
     }
 
     /**
@@ -339,22 +371,24 @@ public final class TupleDecoder {
      * 二进制载荷无损），其余经 plain varlena 取<b>已剥头的载荷</b>（numeric 的渲染
      * 矩阵输入契约即此形态）。
      *
-     * <p>边界与异常语义：external 且未注入 resolver 抛 ISE；compressed varlena 恒 ISE。
-     * 线程约束：纯读。</p>
+     * <p>关键步骤：值形态分支判断仍在本方法内做（external / 行内压缩 / plain 三分）；
+     * 游标推进交给调用方的 end（与 {@link #readTextDatum} 同形）。边界与异常语义：
+     * external 且未注入 resolver 抛 ISE；compressed varlena 恒 ISE。线程约束：纯读。</p>
      *
-     * @param src  源缓冲
-     * @param c    datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param next 单元素游标：返回值 = 整个 datum 之后的首偏移
+     * @param src 源缓冲
+     * @param c   datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
+     * @param end 整个 datum 之后的首偏移（varlenaEnd 产物——本方法不消费，仅契约
+     *            载明终点与内部分支几何同源）
      * @return 载荷字节（external 形态为重组后的原值字节）
      */
-    private byte[] readDatumBytes(byte[] src, int c, int[] next) {
+    private byte[] readDatumBytes(byte[] src, int c, int end) {
         if (isExternalPointer(src, c)) {
-            return resolveExternalBytes(src, c, next);
+            return resolveExternalBytes(src, c);
         }
         if (isInlineCompressed(src, c)) {
-            return decompressInlineBytes(src, c, next);
+            return decompressInlineBytes(src, c);
         }
-        return readVarlenaBytes(src, c, next);
+        return readVarlenaBytes(src, c);
     }
 
     /**
@@ -374,40 +408,29 @@ public final class TupleDecoder {
     }
 
     /**
-     * 委派行内压缩解压（文本形态）并推进游标越过整个 varlena——总长在 4B 头上
-     * 30 位（含头，与未压缩 4B 头同式）。
+     * 委派行内压缩解压（字节形态）——总长在 4B 头上 30 位（含头，与未压缩 4B 头
+     * 同式，即 {@code varlenaEnd} 的终点几何）。游标推进交给调用方的 end（total
+     * 与 end 同源，本方法不再回写游标）。
      *
      * @throws IllegalStateException lz4 方法码 / tcinfo/pglz 数据不符（resolver 契约）
      */
-    private String decompressInlineString(byte[] src, int c, int[] next) {
-        return new String(decompressInlineBytes(src, c, next), StandardCharsets.UTF_8);
-    }
-
-    /**
-     * 委派行内压缩解压（字节形态——bytea/numeric kind）并推进游标（同
-     * {@link #decompressInlineString}）。
-     *
-     * @throws IllegalStateException lz4 方法码 / tcinfo/pglz 数据不符（resolver 契约）
-     */
-    private byte[] decompressInlineBytes(byte[] src, int c, int[] next) {
+    private byte[] decompressInlineBytes(byte[] src, int c) {
         int total = u32(src, c) >>> 2;
         byte[] payload = new byte[total - 4];
         System.arraycopy(src, c + 4, payload, 0, payload.length);
-        next[0] = c + total;
         return externalResolver.decompressInlineCompressed(payload);
     }
 
     /**
-     * 委派 external 重组（字节形态，Task 8 保真裁定）并推进游标越过 18B 指针（指针
-     * datum 定长 18B，后续列的对齐由各 kind 的相对 tupleStart 对齐承担）。
+     * 委派 external 重组（字节形态，Task 8 保真裁定）——指针 datum 定长 18B（即
+     * {@code varlenaEnd} 对 0x01 首字节的终点几何），游标推进交给调用方的 end；
+     * 后续列的对齐由各 kind 的相对 tupleStart 对齐承担。
      *
      * @throws IllegalStateException 指针形态不符 / lz4 / chunk 不齐时降级——由
      *                               resolver 契约决定（ToastAssembler：形态 ISE、缺值降级字节）
      */
-    private byte[] resolveExternalBytes(byte[] src, int c, int[] next) {
-        byte[] resolved = externalResolver.resolveExternal(src, c);
-        next[0] = c + EXTERNAL_POINTER_SIZE;
-        return resolved;
+    private byte[] resolveExternalBytes(byte[] src, int c) {
+        return externalResolver.resolveExternal(src, c);
     }
 
     /**
@@ -421,7 +444,7 @@ public final class TupleDecoder {
     }
 
     /**
-     * 读一个未压缩 varlena 为文本并推进游标。
+     * 读一个未压缩 varlena 为文本（游标推进交给调用方的 end——本方法只取值）。
      *
      * <p>关键步骤：判头——首字节 0x01（短外部 TOAST 指针）或 tag 位 0x02（4B 压缩
      * 形态）一律 ISE（v1 不支持 external/compressed；拒绝面按位精确裁定——1B 头奇
@@ -430,13 +453,12 @@ public final class TupleDecoder {
      * {@code u32le>>>2}，含头 4B——小端是 spike 实测锚，发现 21）。载荷按 UTF-8
      * 解码。边界与异常语义：非 plain varlena 抛 ISE；线程约束：纯读，并发安全。</p>
      *
-     * @param src  源缓冲
-     * @param c    varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param next 单元素游标：返回值 = 整个 varlena 之后的首偏移
+     * @param src 源缓冲
+     * @param c   varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @return UTF-8 文本
      * @throws IllegalStateException external/compressed varlena（v1 不支持）
      */
-    private static String readVarlenaText(byte[] src, int c, int[] next) {
+    private static String readVarlenaText(byte[] src, int c) {
         int b0 = src[c] & 0xFF;
         rejectNonPlainVarlena(src, c);
         int len;
@@ -448,24 +470,23 @@ public final class TupleDecoder {
             len = u32(src, c) >>> 2;
             dataOff = 4;
         }
-        next[0] = c + len;
         return new String(src, c + dataOff, Math.max(0, len - dataOff), StandardCharsets.UTF_8);
     }
 
     /**
-     * 读一个未压缩 varlena 为原始字节并推进游标（bytea 面）。
+     * 读一个未压缩 varlena 为原始字节（bytea 面；游标推进交给调用方的 end——本方法
+     * 只取值）。
      *
      * <p>头判读与 {@link #readVarlenaText} 同源（发现 21），载荷不解码直接拷出。
      * 边界与异常语义：非 plain varlena（0x01 外部指针 / tag 0x02 压缩——按位精确
      * 裁定，见 {@link #rejectNonPlainVarlena}）抛 ISE；线程约束：纯读，并发安全。</p>
      *
-     * @param src  源缓冲
-     * @param c    varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param next 单元素游标：返回值 = 整个 varlena 之后的首偏移
+     * @param src 源缓冲
+     * @param c   varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
      * @return 载荷字节副本
      * @throws IllegalStateException external/compressed varlena（v1 不支持）
      */
-    private static byte[] readVarlenaBytes(byte[] src, int c, int[] next) {
+    private static byte[] readVarlenaBytes(byte[] src, int c) {
         int b0 = src[c] & 0xFF;
         rejectNonPlainVarlena(src, c);
         int len;
@@ -477,26 +498,9 @@ public final class TupleDecoder {
             len = u32(src, c) >>> 2;
             dataOff = 4;
         }
-        next[0] = c + len;
         byte[] out = new byte[Math.max(0, len - dataOff)];
         System.arraycopy(src, c + dataOff, out, 0, out.length);
         return out;
-    }
-
-    /**
-     * 走读跳过一个 varlena（值不物化）——词典外列（skip kind）的消耗面。
-     *
-     * <p>关键步骤：与 {@link #readVarlenaText} 同一头走读，仅推进游标。边界与异常
-     * 语义：非 plain varlena 抛 ISE（跳列同样要读准头才能消耗恰准）；线程约束：
-     * 纯读，并发安全。</p>
-     *
-     * @param src  源缓冲
-     * @param c    varlena 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param next 单元素游标：返回值 = 整个 varlena 之后的首偏移
-     * @throws IllegalStateException external/compressed varlena（v1 不支持）
-     */
-    private static void skipVarlena(byte[] src, int c, int[] next) {
-        readVarlenaText(src, c, next);   // 同一头走读，载荷丢弃
     }
 
     /**
