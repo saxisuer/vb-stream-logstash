@@ -132,6 +132,22 @@ public interface CatalogSnapshot {
     }
 
     /**
+     * 字典形态代际戳（catalog 字典行变更/索引重建时自增的代际计数）——消费方按
+     * <b>"值变即全清缓存"</b>语义使用：相邻两次调用间值不等即字典形态可能已变，
+     * 由字典形态派生的缓存（如表身份/列词典、toast 关系判定）应整体失效再重建。
+     *
+     * <p>缺省 0 = 恒不过期：不感知代际的实现（测试替身/轻量实现）返回常量，消费方
+     * 的代际失效面天然关闭、行为与无本方法时一致——既有实现零改动兼容。生产实现
+     * （{@code CatalogSynchronizer.SnapshotView}）透传 {@code CatalogStores} 的
+     * 代际戳真值。</p>
+     *
+     * @return 字典形态代际戳（单调不减；缺省 0 = 恒不过期）
+     */
+    default long shapeEpoch() {
+        return 0L;
+    }
+
+    /**
      * 分区身份链的最小投影（pg_partition 'p' 行的路由面五字段之三元——消费面
      * 恰需分区名与母表 oid；relfilenode 即查询键、reltoastrelid 归 TOAST 挂靠面
      * 不进本投影）。

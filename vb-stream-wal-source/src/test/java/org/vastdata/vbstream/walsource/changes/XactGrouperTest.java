@@ -534,6 +534,36 @@ class XactGrouperTest {
     }
 
     /**
+     * 代际戳变化的懒全清（性能优化 #2 的离线锚）：先解析一张表使 TableMeta 进入
+     * 缓存，随后 {@code bumpShapeEpoch()} + 改写 stub 列集（模拟<b>不经 shape-oid
+     * 记录</b>的字典形态变更——bootstrap/restore/PRUNE/INPLACE 等，shape-oid 直接
+     * 信号在此形态缺席），再喂同表行——断言行按<b>新列集</b>渲染（旧缓存若未清则
+     * 仍按旧两列词典渲染、note 列缺席）。toastRels 与 metaCache 同块全清（本用例
+     * 经 metaCache 面观测；stub 未登记 toast 关系分叉，判定缓存无独立观测面）。
+     */
+    @Test
+    void staleEpochClearsMetaCacheAndToastRelsLazily() {
+        Fixture fx = fixture();
+        fx.insert(100, 0, 1, "two-cols");
+        fx.commit(100);
+        assertEquals(1, fx.listener.begins.size(), "前置：表已解析一次（缓存已填充）");
+
+        fx.snapshot.bumpShapeEpoch();
+        fx.snapshot.columnsByOid.put(USER_REL, List.of(
+                new CatalogSnapshot.Column(1, "id", 23, false),
+                new CatalogSnapshot.Column(2, "name", 25, false),
+                new CatalogSnapshot.Column(3, "note", 25, false)));   // 字典已变：三列形态
+
+        fx.insert(200, 0, 2, "three-cols");                     // 同表行——旧缓存若未被清则按两列渲染
+        fx.commit(200);
+
+        assertEquals("ROW INSERT public.t_stream before=null after={id=2, name=three-cols, note=null}",
+                fx.listener.events.stream().filter(e -> e.startsWith("ROW") && e.contains("three-cols"))
+                        .findFirst().orElseThrow(),
+                "代际戳变化后旧 TableMeta 缓存已清，行按新三列集渲染（note 补 null）");
+    }
+
+    /**
      * 字典 miss 痕迹锚：未登记 relfilenode 的 heap 行留下 <b>DEBUG 痕迹</b>：首次
      * miss 恰一条（含 relfilenode 上下文），同 relfilenode 第二条记录走 TableMeta
      * 缓存不再重复打；miss 行不发射。M2 终审 I1 曾以"OG 分区 DML 落 pg_partition
@@ -923,13 +953,15 @@ class XactGrouperTest {
     /**
      * 最小 catalog 快照 stub——四查询 + 归一入口按三张 map 应答（oid 即键，relfilenode
      * 缺省身份映射，可经 {@code relnodeToOid} 显式分叉）；列字典可变（DDL 失效用例
-     * 中途改写）。
+     * 中途改写）；代际戳可变（{@code bumpShapeEpoch} 模拟不经 shape-oid 记录的字典
+     * 形态变更——bootstrap/restore/PRUNE 等路径）。
      */
     private static final class StubSnapshot implements CatalogSnapshot {
         final Map<Long, String> relkindByOid = new HashMap<>();
         final Map<Long, String> schemaByOid = new HashMap<>();
         final Map<Long, String> nameByOid = new HashMap<>();
         final Map<Long, List<Column>> columnsByOid = new HashMap<>();
+        private long shapeEpoch;
 
         /** 登记一张表（relfilenode 取身份映射）。 */
         void table(long oid, String schema, String name, String relkind, Column... cols) {
@@ -980,6 +1012,16 @@ class XactGrouperTest {
                 return OptionalLong.of(relNodeOrOid);           // oid 直认
             }
             return OptionalLong.empty();                        // 无 relfilenode 分叉登记
+        }
+
+        @Override
+        public long shapeEpoch() {
+            return shapeEpoch;
+        }
+
+        /** 代际戳自增——模拟不经 shape-oid 记录的字典形态变更（bootstrap/restore/PRUNE 等路径）。 */
+        void bumpShapeEpoch() {
+            shapeEpoch++;
         }
     }
 

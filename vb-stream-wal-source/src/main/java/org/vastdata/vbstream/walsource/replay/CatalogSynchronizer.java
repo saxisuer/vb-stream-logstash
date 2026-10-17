@@ -1336,6 +1336,19 @@ public final class CatalogSynchronizer {
         }
 
         /**
+         * 字典形态代际戳透传：{@code CatalogStores} 的 volatile 代际戳（行变更/索引
+         * 重建自增）——消费方（{@code XactGrouper} 的 TableMeta/toast 缓存）按"值变
+         * 即全清"语义使用（性能优化 #2）。线程约束：volatile 弱一致读（与类 javadoc
+         * 同口径——单写者自增、读线程迟到一代至多延迟一次懒失效，不破坏正确性）。
+         *
+         * @return 代际戳真值
+         */
+        @Override
+        public long shapeEpoch() {
+            return stores.shapeEpoch();
+        }
+
+        /**
          * 列字典查询：attrRelIndex（attrelid 键 → COW 行列表）取行后按 attnum 升序
          * 投影——含 dropped 占位行（发现 26），未知关系空表。索引面（性能优化 #1，
          * 2026-10-17）替代 attrRows 值域线性扫；同 attrelid 陈旧副本窗口内索引收

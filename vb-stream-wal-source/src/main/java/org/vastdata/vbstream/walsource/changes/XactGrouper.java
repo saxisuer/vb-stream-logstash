@@ -88,13 +88,18 @@ import java.util.Set;
  * （&lt;2^32）下恒等）。</p>
  *
  * <p><b>TableMeta 缓存</b>（控制器裁定，Task 4 提醒）：{@link TableFilter#resolve}
- * 每行 7 趟线性扫——本层按 relfilenode 缓存解析结果；失效策略取最简可靠形态：
- * <b>字典 watched 表上的 heap 记录到达即全清缓存</b>——pg_class/pg_attribute/
+ * 每行 7 趟线性扫——本层按 relfilenode 缓存解析结果；失效策略取最简可靠形态，
+ * <b>全清触发键两条</b>（2026-10-17 性能优化 #2）：①<b>字典 watched 表上的 heap
+ * 记录到达即全清缓存</b>（直接信号，双保险保留）——pg_class/pg_attribute/
  * pg_namespace 三表（固定 oid 1259/1249/2615）恒在，openGauss 档（M3 T2）叠第四表
  * pg_partition（oid 9016，经 {@code relOidOf} watched 段号直认——ADD/DROP/MERGE/
  * SPLIT/EXCHANGE 分区 DDL 使分区路由链即时失效，EXCHANGE 换挂母表后的首行即按新
- * 身份渲染；vanilla 档无该表零侵入）。toast chunk 与索引记录不清——高频且不影响
- * 形态。oid 计数器 wraparound 使 relfilenode 撞键的理论残留与 v1 块匹配同口径。
+ * 身份渲染；vanilla 档无该表零侵入；toast chunk 与索引记录不清该触发键——高频且
+ * 不影响形态）。②<b>快照 shapeEpoch 代际戳变化即全清</b>（{@link
+ * CatalogSnapshot#shapeEpoch}——兜底全覆盖：bootstrap/restore/PRUNE/INPLACE 等
+ * 不经 shape-oid 记录的字典变更；<b>toastRels 判定缓存亦随本键清理</b>——此前无
+ * 失效钩子、长会话单调增长，TRUNCATE/重写换段号后的旧映射与 miss-亦-缓存条目由此
+ * 收敛）。oid 计数器 wraparound 使 relfilenode 撞键的理论残留与 v1 块匹配同口径。
  * 缺省身份映射（relfilenode==oid）下三表可直认。</p>
  *
  * <p><b>TOAST 接线</b>：toast 关系（relkind 't'）上的 INSERT/MULTI_INSERT 解码为
@@ -213,8 +218,15 @@ public final class XactGrouper {
     /** TableFilter 解析缓存：relfilenode → 解析结果（miss 亦缓存；字典表 heap 记录全清）。 */
     private final Map<Long, Resolved> metaCache = new HashMap<>();
 
-    /** toast 关系判定缓存：relfilenode → 是否 relkind 't'。 */
+    /** toast 关系判定缓存：relfilenode → 是否 relkind 't'（字典代际戳变化时随 metaCache 同步全清）。 */
     private final Map<Long, Boolean> toastRels = new HashMap<>();
+
+    /**
+     * 已见字典形态代际戳（{@link #resolveCached} 入口与 {@link CatalogSnapshot#shapeEpoch}
+     * 比对——不等即 metaCache/toastRels 懒全清并同步）。初始 {@code Long.MIN_VALUE}
+     * 保证首调用必同步一次（空 clear 无害）。单写者线程内使用。
+     */
+    private long seenShapeEpoch = Long.MIN_VALUE;
 
     /** 未决 2PC 挂起桶计数（PREPARE 递增、终态弃桶递减——WARN 护栏的观测面）。 */
     private int preparedPending;
@@ -900,10 +912,13 @@ public final class XactGrouper {
     }
 
     /**
-     * 解析关系到表身份 + 列词典（缓存面）——命中直接应答；miss 时先探字典 watched
+     * 解析关系到表身份 + 列词典（缓存面）——入口先比对快照 {@link
+     * CatalogSnapshot#shapeEpoch} 代际戳与 {@link #seenShapeEpoch}：不等即
+     * <b>metaCache/toastRels 懒全清</b>并同步（兜底触发键②，见类 javadoc；miss 才
+     * 促发——字典静默期零开销）。命中直接应答；miss 时先探字典 watched
      * 表（pg_class/pg_attribute/pg_namespace 三表恒在、openGauss 档叠 pg_partition
-     * 第四表——其上的 heap 记录 = DDL 类变更信号 → <b>全清缓存</b>，策略依据见类
-     * javadoc），再走 {@link TableFilter} 完整解析（miss 亦缓存，防 toast/索引关系
+     * 第四表——其上的 heap 记录 = DDL 类变更信号 → <b>全清缓存</b>，直接触发键①），
+     * 再走 {@link TableFilter} 完整解析（miss 亦缓存，防 toast/索引关系
      * 逐记录重扫；OG 档分区 relfilenode 经 TableFilter 的第四字典身份链解析为母表
      * 身份——M3 T2）。首次 miss 打一条 <b>DEBUG 痕迹</b>（relfilenode 级，缓存后
      * 不重复；miss 是噪声表常态故仅 DEBUG——分区链断的 WARN/计数面在
@@ -916,6 +931,13 @@ public final class XactGrouper {
      * @return 解析结果（meta=null 表示非用户表）；字典 watched 表命中为 null
      */
     private Resolved resolveCached(long relNode) {
+        long epoch = snapshot.shapeEpoch();
+        if (epoch != seenShapeEpoch) {
+            metaCache.clear();
+            toastRels.clear();   // 今日无失效钩子的补面：TRUNCATE/重写换段号后旧映射与 miss-亦-缓存条目随之清理
+            seenShapeEpoch = epoch;
+            LOG.debug("字典代际变化（epoch {}），TableMeta/toast 缓存全清", epoch);
+        }
         Resolved hit = metaCache.get(relNode);
         if (hit != null) {
             return hit;
