@@ -1123,7 +1123,7 @@ public final class XactGrouper {
      * 行入桶：值渲染（静态 {@link DiskValueRenderer}）+ RowChange 组装 + 桶记账
      * expectedChanges++（aborted 过滤前口径）。
      *
-     * <p>关键步骤：前/后像按 dml 裁剪（INSERT 前 null / DELETE 后 null / UPDATE
+     * <p>关键步骤：前/后像按 op 裁剪（INSERT 前 null / DELETE 后 null / UPDATE
      * 双像——replica identity 面由 flags 已定）；旧元组 atts 少于列词典时尾列补
      * null（ADD COLUMN 前的存量形态）；桶新建时记 <b>firstLsn = 本行记录 lsn</b>
      * （{@link #pendingFloorLsn} 的重放下界源——Task 11）。线程约束：单写者。</p>
@@ -1132,12 +1132,12 @@ public final class XactGrouper {
      * @param origin 行来源 xid（记录头 xid——aborted 过滤键）
      * @param res    表解析结果（meta + kinds）
      * @param recLsn 本行所在记录的 lsn（桶新建时作 firstLsn——重放下界）
-     * @param dml    行操作种类
+     * @param op     行操作种类
      * @param before 前像值数组（无为 null）
      * @param after  后像值数组（无为 null）
      */
     private void appendRow(long top, long origin, Resolved res, long recLsn,
-                           ChangeOutputListener.DmlKind dml, Object[] before, Object[] after) {
+                           ChangeOutputListener.DmlKind op, Object[] before, Object[] after) {
         TableMeta meta = res.meta();
         Map<String, Object> beforeMap = before == null ? null : renderRow(meta, before);
         Map<String, Object> afterMap = after == null ? null : renderRow(meta, after);
@@ -1146,7 +1146,7 @@ public final class XactGrouper {
             b = new Bucket(top, recLsn);
             buckets.put(top, b);
         }
-        b.rows.add(new RowEntry(origin, recLsn, new ChangeOutputListener.RowChange(meta, dml, beforeMap, afterMap)));
+        b.rows.add(new RowEntry(origin, recLsn, new ChangeOutputListener.RowChange(meta, op, beforeMap, afterMap)));
     }
 
     /**
@@ -1226,11 +1226,11 @@ public final class XactGrouper {
             }
             // 位址三字段发射期重建（2026-10-17 契约扩展）：到达期 commitLsn 未知（提交
             // 记录未到），桶内行占位 0；此处从 RowEntry 的记账面（recLsn）+ 桶/终态
-            // 位址（b.xid/commitLsn）重建全参 record——table/dml/before/after 均为已
+            // 位址（b.xid/commitLsn）重建全参 record——table/op/before/after 均为已
             // 渲染引用，重建是纯 record 拷贝零重算
             ChangeOutputListener.RowChange r = e.row();
             out.onRow(new ChangeOutputListener.RowChange(b.xid, commitLsn, e.recLsn(),
-                    r.table(), r.dml(), r.before(), r.after()));
+                    r.table(), r.op(), r.before(), r.after()));
             emitted++;
         }
         out.onEnd(new ChangeOutputListener.BatchEnd(b.xid, emitted, expected));

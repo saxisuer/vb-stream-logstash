@@ -904,7 +904,7 @@ class XactGrouperTest {
 
         @Override
         public void onRow(RowChange row) {
-            events.add("ROW " + row.dml() + " " + row.table().schema() + "." + row.table().table()
+            events.add("ROW " + row.op() + " " + row.table().schema() + "." + row.table().table()
                     + " before=" + row.before() + " after=" + row.after());
         }
 

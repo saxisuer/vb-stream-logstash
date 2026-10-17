@@ -57,11 +57,11 @@ public interface ChangeOutputListener {
      * @param commitLsn  提交记录 lsn（与 BatchBegin.commitLsn 同值；发射时填充）
      * @param lsn        行所在 heap 记录起始 LSN（到达期已知；发射时填充）
      * @param table      表身份 + 列序（as-of 快照解析，行自描述）
-     * @param dml        行操作种类（wal-source 自有枚举，不 import 引擎）
+     * @param op         行操作种类（wal-source 自有枚举，不 import 引擎）
      * @param before     前像（UPDATE/DELETE 的 replica identity 列或全列；INSERT 为 null）
      * @param after      后像（INSERT/UPDATE；DELETE 为 null）
      */
-    record RowChange(long xid, long commitLsn, long lsn, TableMeta table, DmlKind dml,
+    record RowChange(long xid, long commitLsn, long lsn, TableMeta table, DmlKind op,
                      Map<String, Object> before, Map<String, Object> after) {
 
         /**
@@ -69,12 +69,12 @@ public interface ChangeOutputListener {
          * 路径（Grouper）走全参构造，位址字段由发射层保证非零。
          *
          * @param table  表身份 + 列序
-         * @param dml    行操作种类
+         * @param op     行操作种类
          * @param before 前像（可 null）
          * @param after  后像（可 null）
          */
-        RowChange(TableMeta table, DmlKind dml, Map<String, Object> before, Map<String, Object> after) {
-            this(0L, 0L, 0L, table, dml, before, after);
+        RowChange(TableMeta table, DmlKind op, Map<String, Object> before, Map<String, Object> after) {
+            this(0L, 0L, 0L, table, op, before, after);
         }
     }
 

@@ -706,7 +706,7 @@ public final class OgParityBaseline {
         @Override
         public void onRow(RowChange row) {
             assertTrue(cur != null, "onRow 先于 onBegin（契约违背）");
-            cur.rows.add("%s %s.%s BEFORE=%s AFTER=%s".formatted(row.dml(),
+            cur.rows.add("%s %s.%s BEFORE=%s AFTER=%s".formatted(row.op(),
                     row.table().schema(), row.table().table(),
                     tupleOf(row.before(), row.table()), tupleOf(row.after(), row.table())));
         }

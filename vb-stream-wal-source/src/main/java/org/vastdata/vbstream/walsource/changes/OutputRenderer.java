@@ -195,7 +195,7 @@ public final class OutputRenderer implements ChangeOutputListener {
      * @return 行文本（不含 {@code "  [seq] "} 前缀——行号 flush 期分配）
      */
     private String renderChange(RowChange row) {
-        return "%s %s.%s BEFORE=%s AFTER=%s".formatted(row.dml(), row.table().schema(),
+        return "%s %s.%s BEFORE=%s AFTER=%s".formatted(row.op(), row.table().schema(),
                 row.table().table(), tupleOf(row.before(), row.table()),
                 tupleOf(row.after(), row.table()));
     }
