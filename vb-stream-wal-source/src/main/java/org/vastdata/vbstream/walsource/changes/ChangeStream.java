@@ -45,8 +45,28 @@ public final class ChangeStream {
      */
     public ChangeStream(CatalogSnapshot snapshot, Connection sqlConn, WalLayout layout,
                         Set<String> whitelist, ChangeOutputListener out) {
+        this(snapshot, sqlConn, layout, whitelist, out, RenderOptions.PG);
+    }
+
+    /**
+     * 装配变更流门面（渲染选项档，2026-10-17 渲染面配置化）：{@code renderOptions}
+     * 透传 {@link XactGrouper} 六参构造器（{@code vb.wal.render.*} 四键的门面穿线
+     * 终点）——缺省 {@link RenderOptions#PG} 与五参版逐字节同形（对拍锚）。
+     *
+     * <p>其余参数语义与五参版一致（见其 javadoc）。</p>
+     *
+     * @param snapshot     catalog as-of 快照（活引用视图——查询随字典重放推进）
+     * @param sqlConn      普通 SQL 会话（null = probe 禁用）
+     * @param layout       版本布局描述符（heap 视图解析用）
+     * @param whitelist    表白名单（null/空 = 全放行）
+     * @param out          变更事件输出契约实现
+     * @param renderOptions 渲染选项（null 视为 {@link RenderOptions#PG}）
+     */
+    public ChangeStream(CatalogSnapshot snapshot, Connection sqlConn, WalLayout layout,
+                        Set<String> whitelist, ChangeOutputListener out, RenderOptions renderOptions) {
         ToastProbe probe = sqlConn == null ? null : new JdbcToastProbe(sqlConn);
-        this.grouper = new XactGrouper(snapshot, whitelist, layout, new ToastAssembler(probe), out);
+        this.grouper = new XactGrouper(snapshot, whitelist, layout, new ToastAssembler(probe), out,
+                renderOptions);
     }
 
     /**

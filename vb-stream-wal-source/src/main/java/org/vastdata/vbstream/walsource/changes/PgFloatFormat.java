@@ -85,7 +85,39 @@ public final class PgFloatFormat {
         boolean negative = v < 0;
         double abs = Math.abs(v);
         return formatUnsigned(shortestDigits(abs, MAX_DOUBLE_DIGITS, false),
-                negative, FLOAT8_FIXED_HIGH);
+                negative, FLOAT8_FIXED_HIGH, false);
+    }
+
+    /**
+     * float8（double）→ <b>plain 档</b>定点数字串（{@code vb.wal.render.float.style=plain}，
+     * 2026-10-17 渲染面配置化）：数字位与 {@link #format(double)} 同源（最短往返——无假
+     * 精度长尾），仅去指数记法展开（{@code 1e+20} → {@code 100000000000000000000}、
+     * {@code 4.5e-08} → {@code 0.000000045}）。
+     *
+     * <p>关键步骤：特值/零分支与 {@link #format(double)} 共用；排版恒走定点分支（门限
+     * 判定跳过）。边界与异常语义：无。线程约束：纯函数。<b>有意分叉记档</b>：本形态与
+     * 服务端 float8out 不同形（对拍契约只锚缺省 pg 档）。</p>
+     *
+     * @param v 双精度值
+     * @return 定点数字串（特值仍为 {@code NaN}/{@code ±Infinity}/{@code ±0}）
+     */
+    public static String formatPlain(double v) {
+        if (Double.isNaN(v)) {
+            return "NaN";
+        }
+        if (v == Double.POSITIVE_INFINITY) {
+            return "Infinity";
+        }
+        if (v == Double.NEGATIVE_INFINITY) {
+            return "-Infinity";
+        }
+        if (v == 0d) {
+            return Double.doubleToRawLongBits(v) < 0 ? "-0" : "0";
+        }
+        boolean negative = v < 0;
+        double abs = Math.abs(v);
+        return formatUnsigned(shortestDigits(abs, MAX_DOUBLE_DIGITS, false),
+                negative, FLOAT8_FIXED_HIGH, true);
     }
 
     /**
@@ -113,7 +145,32 @@ public final class PgFloatFormat {
         }
         boolean negative = v < 0;
         float abs = Math.abs(v);
-        return formatUnsigned(shortestDigits(abs, 9, true), negative, FLOAT4_FIXED_HIGH);
+        return formatUnsigned(shortestDigits(abs, 9, true), negative, FLOAT4_FIXED_HIGH, false);
+    }
+
+    /**
+     * float4（float）→ <b>plain 档</b>定点数字串（语义同 {@link #formatPlain(double)}
+     * 的 float 面——float4 门限 6 以下即科学的区段在此全数展开）。
+     *
+     * @param v 单精度值
+     * @return 定点数字串（特值仍为 {@code NaN}/{@code ±Infinity}/{@code ±0}）
+     */
+    public static String formatPlain(float v) {
+        if (Float.isNaN(v)) {
+            return "NaN";
+        }
+        if (v == Float.POSITIVE_INFINITY) {
+            return "Infinity";
+        }
+        if (v == Float.NEGATIVE_INFINITY) {
+            return "-Infinity";
+        }
+        if (v == 0f) {
+            return Float.floatToRawIntBits(v) < 0 ? "-0" : "0";
+        }
+        boolean negative = v < 0;
+        float abs = Math.abs(v);
+        return formatUnsigned(shortestDigits(abs, 9, true), negative, FLOAT4_FIXED_HIGH, true);
     }
 
     /**
@@ -142,18 +199,21 @@ public final class PgFloatFormat {
     }
 
     /**
-     * 最短位串 → PG 文本排版：display exponent（= precision - 1 - scale）落在
+     * 最短位串 → 文本排版：display exponent（= precision - 1 - scale）落在
      * {@code [FIXED_LOW, fixedHigh)} 内打定点（整数尾随零/纯小数前置 {@code 0.}），
-     * 否则科学计数法（首位 + {@code .ddd} + {@code e±XX}）。
+     * 否则科学计数法（首位 + {@code .ddd} + {@code e±XX}）；{@code plain} 档恒走定点
+     * 分支（门限判定短路——{@code formatPlain} 面，2026-10-17 渲染面配置化）。
      *
      * <p>线程约束：纯函数。</p>
      *
      * @param shortest  最短往返十进制（正值）
-     * @param negative 负号标记
+     * @param negative  负号标记
      * @param fixedHigh 定点门限上限（float8 15 / float4 6）
-     * @return PG 文本形态
+     * @param plain     true = 恒定点（去指数展开）
+     * @return 文本形态
      */
-    private static String formatUnsigned(BigDecimal shortest, boolean negative, int fixedHigh) {
+    private static String formatUnsigned(BigDecimal shortest, boolean negative, int fixedHigh,
+            boolean plain) {
         BigInteger unscaled = shortest.unscaledValue();
         String digits = unscaled.toString();
         int scale = shortest.scale();
@@ -162,7 +222,7 @@ public final class PgFloatFormat {
         if (negative) {
             out.append('-');
         }
-        if (exp >= FIXED_LOW && exp < fixedHigh) {
+        if (plain || (exp >= FIXED_LOW && exp < fixedHigh)) {
             int point = exp + 1;                   // 小数点前的数字位数
             if (point <= 0) {
                 out.append("0.").append("0".repeat(-point)).append(digits);

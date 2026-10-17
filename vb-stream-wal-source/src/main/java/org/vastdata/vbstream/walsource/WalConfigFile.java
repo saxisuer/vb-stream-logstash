@@ -3,6 +3,7 @@ package org.vastdata.vbstream.walsource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.WalSource;
+import org.vastdata.vbstream.walsource.changes.RenderOptions;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -18,7 +19,8 @@ import java.util.Set;
  * {@code -Dvb.config=<路径>} 显式指定外部文件）为三层合并的文件层——系统属性
  * {@code -Dvb.wal.*} 同键覆盖（Main 层），缺键由 {@link WalSource} 构造器默认值兜底
  * （单一默认值来源不变）。文件键与 {@code -D} 参数完全同形（全 {@code vb.wal.*} 形态，
- * 文档键表直接照抄），按门面十八键白名单过滤——白名单外键 WARN 一行并忽略（wal-source
+ * 文档键表直接照抄），按门面十八键 + 渲染面四键（{@code vb.wal.render.*}）白名单
+ * 过滤——白名单外键 WARN 一行并忽略（wal-source
  * 键面封闭，未知键按拼写错处理不静默吞；{@code vb.wal.mode} 是 Main 层直读分派键，
  * 计划裁定不进白名单——文件里写它同按白名单外键忽略，离线档切换只走
  * {@code -Dvb.wal.mode=offline}）。
@@ -43,9 +45,10 @@ final class WalConfigFile {
     static final String CONFIG_FILE_KEY = "vb.config";
 
     /**
-     * 白名单：冒烟面全部合法键（{@link WalSource} 十八键——门面 KEY_* 常量单一来源，
-     * 本类不复刻字面量；含离线回放两键 offline.dir/offline.endLsn，offline replay）。
-     * 文件中出现在此集合外的键 WARN 并忽略。
+     * 白名单：冒烟面全部合法键（{@link WalSource} 十八键 + {@link RenderOptions}
+     * 渲染面四键 {@code vb.wal.render.*}——键常量单一来源，本类不复刻字面量；含
+     * 离线回放两键 offline.dir/offline.endLsn，offline replay）。文件中出现在此
+     * 集合外的键 WARN 并忽略。
      */
     private static final Set<String> KNOWN_KEYS = Set.of(
             WalSource.KEY_HOST,
@@ -65,7 +68,11 @@ final class WalConfigFile {
             WalSource.KEY_OG_RX_BIN,
             WalSource.KEY_OG_JDBC_PREFIX,
             WalSource.KEY_OFFLINE_DIR,
-            WalSource.KEY_OFFLINE_END_LSN);
+            WalSource.KEY_OFFLINE_END_LSN,
+            RenderOptions.KEY_FLOAT_STYLE,
+            RenderOptions.KEY_DATE_FORMAT,
+            RenderOptions.KEY_TIME_FORMAT,
+            RenderOptions.KEY_TRUNCATE);
 
     /** 私有构造器：纯静态工具类不可实例。 */
     private WalConfigFile() {
@@ -127,7 +134,7 @@ final class WalConfigFile {
         Properties out = new Properties();
         for (String key : raw.stringPropertyNames()) {
             if (!KNOWN_KEYS.contains(key)) {
-                LOG.warn("配置文件忽略白名单外键 {}（合法键即 vb.wal.* 十八键，拼写错不静默吞；vb.wal.mode 是 -D 专属分派键）", key);
+                LOG.warn("配置文件忽略白名单外键 {}（合法键即 vb.wal.* 二十二键，拼写错不静默吞；vb.wal.mode 是 -D 专属分派键）", key);
                 continue;
             }
             String value = raw.getProperty(key, "");

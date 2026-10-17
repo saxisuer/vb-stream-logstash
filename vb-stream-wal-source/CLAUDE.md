@@ -111,7 +111,8 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz/lz4 双方法解压（`inflate` 分派面）+ 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵 + **INSERT 新元组空面回查视图**（`insertTupleResolver`——重放窗口切断 chunk 的补全通道，2026-10-13 flake 根因修复）；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
 | `Pglz` | PG pglz 解压纯移植（`pg_lzcompress.c` 主循环逐行转录，control byte 分组 + match 回拷，L705-790 源码锚） |
 | `Lz4` | lz4 裸 block 解压（lz4-java safeDecompressor 定长目标形态；PG `toast_decompress_datum`→`LZ4_decompress_safe` 同格式，JNI 优先纯 Java回落；2026-10-07 随 lz4 值面支持引入） |
-| `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `0x` + WARN 一次、dropped 列 ∅） |
+| `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `0x` + WARN 一次、dropped 列 ∅；**2026-10-17 三参版 `render(decoded, oid, RenderOptions)`**——float plain 定点展开 + date/time 自定义 pattern 三族分支，两参版委托 `RenderOptions.PG` 逐字节不变） |
+| `RenderOptions` | **渲染面四键载体（2026-10-17 配置化）**：`vb.wal.render.float.style/date.format/time.format/truncate` 四键解析（缺省 pg 档 + 64——对拍锚）与穿线（门面 → ChangeStream → XactGrouper → DiskValueRenderer；OutputRenderer 消费 truncateLimit）；`default` 内建档 date=`yyyy-MM-dd HH:mm:ss`/time=`HH:mm:ss`；非法档位/pattern/负阈值构造期 IAE 附键名 |
 | `PgFloatFormat` | PG 风格浮点格式化器（Ryū 最短往返 + %g 定点门限——`1e+20`/`0.0001`/`-0`，补 `Double.toString` 的 `1.0E20` 分叉；前提会话 `extra_float_digits=1` 缺省档） |
 | `OutputRenderer` | pending 缓冲 + TXN-BEGIN/逐行/TXN-END 输出（**engine `ConsoleRenderer` 格式复刻契约**——头行 changes 终值在 End 组装、值截 64 附 `...(NB)`、dropped ∅/NULL 字面同形）；onAborted 丢桶零输出 |
 | `ChangeOutputListener` | 中立事件接口：`BatchBegin`/`RowChange`/`BatchEnd`(expectedChanges)/`BatchAborted` |
@@ -710,12 +711,12 @@ WalConfigFileTest +1 白名单含离线两键而 mode 排除）；真库手动�
   stored，不二次施加字典）——重放段重建桶后终态补发；对拍验收
   `DualPathParityIT` 2PC 四形态（挂起零输出/弃桶/COMMIT PREPARED/挂起重启续传）。
 
-## 配置面（`vb.wal.*` 十一基础键 + openGauss 档五键 + 离线回放两键，`WalSource`/`StateConfig` 单一来源；`vb.wal.mode` 是 Main 层分派键不进门面）
+## 配置面（`vb.wal.*` 十一基础键 + openGauss 档五键 + 离线回放两键 + 渲染面四键，`WalSource`/`StateConfig`/`RenderOptions` 单一来源；`vb.wal.mode` 是 Main 层分派键不进门面）
 
 **冒烟面三层合并**（2026-10-12 起，仅宿主层——`WalSource` 库 API 不动）：工作目录
-`walconfig.properties` 基础值（键名与 `-D` 参数完全同形；按**十八键白名单**过滤——含
-离线回放两键 `offline.dir`/`offline.endLsn`，白名单外键 WARN 忽略；文件/系统属性空串
-值均视为未设）→ `-Dvb.wal.*` 系统属性同键覆盖 → 门面
+`walconfig.properties` 基础值（键名与 `-D` 参数完全同形；按**二十二键白名单**过滤——含
+离线回放两键 `offline.dir`/`offline.endLsn` 与渲染面四键 `vb.wal.render.*`，白名单外键
+WARN 忽略；文件/系统属性空串值均视为未设）→ `-Dvb.wal.*` 系统属性同键覆盖 → 门面
 构造器默认值兜底。默认文件不存在即纯 `-D` 形态（与文件支持前行为一致）；`-Dvb.config=
 <路径>` 整份替换默认查找（指向不存在/不可读/内容坏启动期 ISE fail-fast；该键是保留键
 不进门面配置）。实现在 `WalConfigFile`（顶层，与 `Main` 平级，模板
@@ -741,6 +742,18 @@ WalConfigFileTest +1 白名单含离线两键而 mode 排除）；真库手动�
 | `vb.wal.og.jdbc.prefix` | `jdbc:postgresql:` | OG 档 SQL 会话驱动 URL 前缀：`jdbc:opengauss:`=opengauss-jdbc（sha256，OG 部署**显式设置**）；缺省保 `jdbc:postgresql:`=vanilla pgjdbc（+md5，须 pg_hba 预埋 md5 行）——**缺省不换前缀的理由**：是否 OG 档在建连后才知道，默认换前缀会让 PG 17/18 档零配置变化下改走 opengauss-jdbc（违反 PG 档零回归）。非法值 IAE |
 | `vb.wal.offline.dir` | 缺省 = 在线档 | **离线回放档**段快照目录（拷 pg_xlog / recorder 落段；`startOffline` 的字节源——`vb.wal.mode=offline` 时必填，缺失启动期 ISE；缺省 null = 在线档）。显式空白构造期 IAE |
 | `vb.wal.offline.endLsn` | 缺省 = 无上界 | 离线回放可选交付上界（十六进制 LSN 文本，如 `2/071BF288`——交付前沿到达即截停提前 EOF；缺省 0 = 清单读尽即 EOF）。非法 LSN 文本构造期 IAE |
+| `vb.wal.render.float.style` | `pg` | **渲染面（2026-10-17）**浮点文本样式：`pg`=服务端 float8out/float4out 同形（`1e+20` 科学计数——对拍锚）；`plain`=最短往返数字位**去指数定点展开**（`1e+20`→`100000000000000000000`、`4.5e-08`→`0.000000045`——数字位与 pg 档同源无假精度长尾；`PgFloatFormat.formatPlain`）。非法值构造期 IAE；**有意分叉记档**（非 pg 档与服务器文本形态分叉，对拍契约只锚缺省档） |
+| `vb.wal.render.date.format` | `pg` | 日期时间族格式（date/timestamp/timestamptz——VastBase A 档 oradate→1114 重映射后天然覆盖）：`pg`=服务器同形；`default`=内建推荐 pattern `yyyy-MM-dd HH:mm:ss`；否则 Java `DateTimeFormatter` pattern 文本（date 值按当日零点格式化——pattern 含时分字母取零值段；timestamptz 折 JVM 默认时区，pattern 可用 XXX 等时区字母）。非法 pattern 构造期 IAE |
+| `vb.wal.render.time.format` | `pg` | 时间族格式（time/timetz；date 与 time 的 pattern 几何不同故分两键）：`pg`/`default`（`HH:mm:ss`）/自定义 pattern 同上；timetz 偏移保留原值（西正秒反号）。**24:00:00 域闭上端特判值在自定义档保持 PG 字面**（java.time 无 24 点表示）。非法 pattern 构造期 IAE |
+| `vb.wal.render.truncate` | `64` | 值截断阈值（`OutputRenderer` 面——`RowChange` 事件值恒全量不截断，截断只在控制台 TXN 行文本层）：`0` = 不截断全量输出；正值 = 截 N 字符附 `...(原长B)` 尾注（尾注形态与缺省档同规则，契约源 engine ConsoleRenderer）。负数/非数字构造期 IAE |
+
+**渲染面穿线（2026-10-17，`RenderOptions`[changes] 单一载体）**：门面构造期
+`RenderOptions.fromProperties` 解析四键（观测 getter `WalSource.renderOptions()`）→
+`ChangeStream` 六参构造器 → `XactGrouper.renderRow` → `DiskValueRenderer.render` 三参版
+（float/date/time 三族分支，两参静态版委托 `RenderOptions.PG` 逐字节不变——存量调用零
+改动）；`OutputRenderer(RenderOptions)` 只消费 truncateLimit；在线惰性装配/离线
+`startOffline` 六参版两腿同穿线。缺省档 = 全 pg + 64，既有输出与全部 parity IT 逐字节
+不变（对拍锚）；Main 冒烟路径 OutputRenderer 与门面共用同一解析产物（同一配置源）。
 
 **`vb.wal.mode`（Main 层直读分派键，2026-10-15）**：`online`（缺省——在线档行为零
 变化）| `offline`（离线回放档——见"离线回放档"节）；非法值启动期 ISE。计划裁定不进
@@ -762,11 +775,18 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**538 用例 = 离线 415 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+**560 用例 = 离线 437 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
 VastBase 手动档真库 IT 24（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
 超时]——pg_receivexlog 文件通道族在 Windows 的已知限制，非回归）**
+（2026-10-17 渲染面四键配置化 +22：RenderOptionsTest 新 6[缺省/显式 pg 等价/全开档/
+default 内建档/非法值附键名/空串未设] + PgFloatFormatTest +4[plain float8 展开锚/定点
+区段同串/float4 展开与极大值/特值不变] + DiskValueRendererTest +5[plain 档/date pattern
+三族/timestamptz 时区字母 OffsetDateTime/time pattern 与 timetz 偏移/24:00:00 特判
+保 PG 字面] + OutputRendererTest +2[阈值 0 全量/阈值 5 尾注] + ChangeStreamTest +1
+[穿线 seam] + WalSourceConfigTest +3[缺省/全开档/非法 IAE] + WalConfigFileTest +1
+[render 四键白名单]——离线 415→437）
 （2026-10-13 双 flake 根因修复 +3：ToastAssemblerTest INSERT 视图空面回查三用例）
 （2026-10-13 M3 收口 surefire 逐类对账口径；2026-10-13 vastbase T7 收口同口径重对——
 离线 377→396 净增 19：vastbase 线 18[TupleDecoder +2 name128 / TableFilter +1 /
@@ -819,14 +839,14 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
   往返 + OG 档 majorVersion=5；**M3：formatVersion 4 第四字典序列化往返 + v3 检查点
   拒载回落全新引导**；**2026-10-15：`StoredState.pgVersion` 回读往返——离线档位判定的
   供数面，decode 自 header 填充不改 VBWS 格式**）/ StateConfigTest 5；`changes`（v2 DML 面：
-  DiskValueRendererTest 18 / XactGrouperTest 22（含 M2 T7 修复 A 的 MULTI_INSERT
+  DiskValueRendererTest 23（2026-10-17 +5 渲染选项档：plain float/date pattern 三族/timestamptz 时区字母/time 与 timetz 偏移/24:00:00 特判）/ XactGrouperTest 22（含 M2 T7 修复 A 的 MULTI_INSERT
   SHORTALIGN 真几何锚）/ ToastAssemblerTest 16（含 lz4 双形态
-  解压往返与未知方法码 ISE）/ OutputRendererTest 7 / TableFilterTest 17（M2 T5 OG 档
+  解压往返与未知方法码 ISE）/ OutputRendererTest 9（2026-10-17 +2 截断阈值 0/自定义）/ TableFilterTest 17（M2 T5 OG 档
   parttype 判别闸——V17/V18 用例零改动零回归；**M3：分区身份链四用例[母表身份/白名单
   双匹配含分区名不外溢负例/链断 WARN 恰一次+计数/vanilla 无视分区链] + EXCHANGE 换绑
   段号 oid 碰撞属主优先双向锚，T5 修复**）/
-  PgFloatFormatTest 7 / PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
-  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 7；**OG 档（M2）**：
+  PgFloatFormatTest 11（2026-10-17 +4 plain 档展开锚）/ PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
+  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 8（2026-10-17 +1 RenderOptions 穿线 seam）；**渲染面：RenderOptionsTest 6（2026-10-17 四键解析矩阵）；OG 档（M2）**：
   OgXactGrouperSeamTest 7（OG XACT 接缝——终态 subxacts 归并/COMMIT_COMPACT/2PC 面，
   T2；**+2 INIT_PAGE + CONTAINS_OLD 的 UPDATE/DELETE 旧元组偏移角落——OG 13/11+8 与
   VastBase 21/19 常态 + INIT_PAGE 29/27 双档，`ogInitShift` 的 +8 面（vastbase T7 补钉，
@@ -836,13 +856,14 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
   身份发射/第四字典 heap 记录全清缓存/分区自有 toast chunk 重组[ToastAssembler 零改动
   锚]/链断 fail-safe/partitionOf 缺省 empty[vanilla no-op 锚]）**）；
   `api` WalSourceConfigTest
-  8（+2026-10-15 离线回放三用例：offline.dir 缺省 null/显式空白 IAE、offline.endLsn
-  非法 LSN 文本 IAE、startOffline 缺 dir 启动期 ISE） / OgWalSourceConfigTest 14（OG 五键解析/缺省值/IAE 面 + 全装配门面 README/Main
+  11（+2026-10-15 离线回放三用例：offline.dir 缺省 null/显式空白 IAE、offline.endLsn
+  非法 LSN 文本 IAE、startOffline 缺 dir 启动期 ISE；+2026-10-17 渲染三用例：缺省档
+  PG 等值/全开档解析/非法值 IAE——门面 renderOptions() 观测面） / OgWalSourceConfigTest 14（OG 五键解析/缺省值/IAE 面 + 全装配门面 README/Main
   形态 DML listener 装配锚[伪 Driver 顶替 DriverManager 驱动 start() 全路径，M2 T1
   反转 M1 的 WARN 降级断言——PG 档库 dmlEnabled 保持 true]）/ OgCompatModeGuardTest 4
   （兼容模式护栏：档位判定面 PG/A/B/C——**M3 起 'A' 白名单内**[原 'A' ISE 用例换 'B'
   输入 + M4 指引连动] + 不可判定 fail-open + 全路径白名单外档位 ISE 先于槽副作用 +
-  'A' 档伪 Driver 全路径 DML 装配放行）；顶层 WalConfigFileTest 8（2026-10-12 配置文件层——白名单过滤/空串
+  'A' 档伪 Driver 全路径 DML 装配放行）；顶层 WalConfigFileTest 9（2026-10-12 配置文件层——白名单过滤/空串
   未设/缺文件空集与 vb.config fail-fast/保留键不入 props/Main 三层合并次序；**2026-10-15
   +1：十八键白名单含离线回放两键而 `vb.wal.mode` 排除——mode 是 -D 专属分派键**）；
   ModuleBuildTest 1。

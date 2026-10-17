@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.CatalogSnapshot;
 import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.changes.ChangeStream;
+import org.vastdata.vbstream.walsource.changes.RenderOptions;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.layout.TupleDecoder;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
@@ -600,6 +601,25 @@ public final class CatalogSynchronizer {
      */
     public static CatalogSynchronizer startOffline(StateConfig state, Path walDir,
             long endLsn, Set<String> tables, ChangeOutputListener out) {
+        return startOffline(state, walDir, endLsn, tables, out, RenderOptions.PG);
+    }
+
+    /**
+     * 六参版（渲染选项档，2026-10-17 配置化）：{@code renderOptions} 经离线装配的
+     * {@code ChangeStream} 进 {@code XactGrouper}（{@code vb.wal.render.*} 门面穿线
+     * 的离线腿）；缺省 {@link RenderOptions#PG} 与五参版逐字节同形。其余参数语义
+     * 与五参版一致（见其 javadoc）。
+     *
+     * @param state        检查点配置（必须启用——离线入口凭证）
+     * @param walDir       段快照目录
+     * @param endLsn       可选交付上界（0 = 读尽即 EOF）
+     * @param tables       DML 白名单
+     * @param out          DML 输出契约（null = DML 面禁用）
+     * @param renderOptions 渲染选项（null 视为 {@link RenderOptions#PG}）
+     * @return 已装配并已启动接收线程的同步器
+     */
+    public static CatalogSynchronizer startOffline(StateConfig state, Path walDir,
+            long endLsn, Set<String> tables, ChangeOutputListener out, RenderOptions renderOptions) {
         if (state == null || !state.enabled()) {
             throw new IllegalStateException("离线回放必须启用检查点（vb.wal.state.dir）——"
                     + "检查点是离线档的唯一状态源与入口凭证");
@@ -632,7 +652,8 @@ public final class CatalogSynchronizer {
         // DML 面（out 非 null）：sqlConn=null → TOAST probe 禁用（纯回放禁回查档）；
         // pendingFloor 接 ChangeStream（floor 含本记录新建的待决桶）。赋值先于
         // source.start——Thread.start 的 happens-before 覆盖静态线程可见性
-        ChangeStream changes = out == null ? null : new ChangeStream(sync.snapshot(), null, layout, tables, out);
+        ChangeStream changes = out == null ? null
+                : new ChangeStream(sync.snapshot(), null, layout, tables, out, renderOptions);
         if (changes != null) {
             sync.pendingFloor = changes::pendingFloorLsn;
         }

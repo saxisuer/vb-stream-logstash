@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.changes.ChangeStream;
+import org.vastdata.vbstream.walsource.changes.RenderOptions;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
@@ -253,6 +254,9 @@ public final class WalSource implements AutoCloseable {
     private boolean started;
     private boolean closed;
 
+    /** 渲染面四键（vb.wal.render.*）的解析产物——ChangeStream 装配与宿主 OutputRenderer 共用。 */
+    private final RenderOptions renderOptions;
+
     /**
      * v1 单参构造（纯 catalog 形态）：无 DML 输出 listener——{@code vb.wal.dml} 配置
      * 不复活 DML 面（无输出契约消费者，装配即浪费）。委派
@@ -322,6 +326,20 @@ public final class WalSource implements AutoCloseable {
                         + " 须为十六进制 LSN 文本（如 2/071BF288）: " + endLsnCfg, e);
             }
         }
+        // 渲染面四键（vb.wal.render.*，2026-10-17 配置化）：构造期解析 fail-fast，
+        // 穿线 ChangeStream → XactGrouper → DiskValueRenderer（值面）；OutputRenderer
+        // 的截断面由宿主经 renderOptions() 自行构造（Main 冒烟路径已接）
+        this.renderOptions = RenderOptions.fromProperties(cfg);
+    }
+
+    /**
+     * 渲染选项观测面（{@code vb.wal.render.*} 四键的解析产物——宿主构造
+     * {@code OutputRenderer} 复用同一实例，保证截断阈值与门面值面档位一致）。
+     *
+     * @return 渲染选项（缺省档 = {@link RenderOptions#PG}）
+     */
+    public RenderOptions renderOptions() {
+        return renderOptions;
     }
 
     /**
@@ -592,7 +610,7 @@ public final class WalSource implements AutoCloseable {
                     + "（vb.wal.mode=offline 而 offline.dir 未设是配置面残缺，spec §5）");
         }
         sync = CatalogSynchronizer.startOffline(state, offlineDir, offlineEndLsn,
-                tables, dmlEnabled() ? dmlOut : null);
+                tables, dmlEnabled() ? dmlOut : null, renderOptions);
         // 终审 F1：把离线装配的 ChangeStream 接进 changeStream 字段——dml* 发射计数观测面
         // （含 Main 周期行 dml=[buckets=.. rows=..]）零新观测面即离线复用（spec §3.4）。
         // DML 禁用档 getter 回 null，字段保持 null 与"面未装配"同语义；装配线程写先于
@@ -719,7 +737,8 @@ public final class WalSource implements AutoCloseable {
     private ChangeStream changeStreamOrInit(WalLayout layout) {
         ChangeStream cs = changeStream;
         if (cs == null) {
-            cs = new ChangeStream(awaitSync().snapshot(), sqlConnection, layout, tables, dmlOut);
+            cs = new ChangeStream(awaitSync().snapshot(), sqlConnection, layout, tables, dmlOut,
+                    renderOptions);
             changeStream = cs;
         }
         return cs;

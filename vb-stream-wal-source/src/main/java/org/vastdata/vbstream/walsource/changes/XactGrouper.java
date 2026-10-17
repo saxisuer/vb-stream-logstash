@@ -201,6 +201,9 @@ public final class XactGrouper {
     private final ToastAssembler toast;
     private final ChangeOutputListener out;
 
+    /** 渲染选项（2026-10-17 配置化）：float/日期/时间族的非 PG 档分支——renderRow 供数。 */
+    private final RenderOptions renderOptions;
+
     /** 待决桶：顶层事务 id → 桶（行到达期累积，终态记录发射/弃）。 */
     private final Map<Long, Bucket> buckets = new HashMap<>();
 
@@ -240,9 +243,10 @@ public final class XactGrouper {
     /**
      * 装配组装器。
      *
-     * <p>注意 {@link DiskValueRenderer} 是静态形态（Task 2 交付，控制器裁定）——不经
-     * 构造参注入，渲染经静态调用发生。whitelist 语义透传 {@link TableFilter}（null =
-     * 用户表全放行）。</p>
+     * <p>注意 {@link DiskValueRenderer} 仍是静态调用形态（Task 2 交付，控制器裁定）
+     * ——2026-10-17 渲染面配置化起经 {@link RenderOptions} 构造参携带渲染档（缺省
+     * {@link RenderOptions#PG} 与历史行为逐字节同形）。whitelist 语义透传
+     * {@link TableFilter}（null = 用户表全放行）。</p>
      *
      * @param snapshot  catalog as-of 快照（表身份/列序查询面）
      * @param whitelist 表白名单（{@code schema.table} 全名集；null/空 = 全放行）
@@ -253,6 +257,25 @@ public final class XactGrouper {
      */
     public XactGrouper(CatalogSnapshot snapshot, Set<String> whitelist, WalLayout layout,
                        ToastAssembler toast, ChangeOutputListener out) {
+        this(snapshot, whitelist, layout, toast, out, RenderOptions.PG);
+    }
+
+    /**
+     * 装配组装器（渲染选项档，2026-10-17 渲染面配置化）：{@code renderOptions} 经
+     * {@link #renderRow} 进 {@code DiskValueRenderer} 三参版（float/日期/时间族的
+     * 非 PG 档分支）；缺省 {@link RenderOptions#PG} 与五参版逐字节同形。
+     *
+     * <p>其余参数语义与五参版一致（见其 javadoc）。线程约束：单写者。</p>
+     *
+     * @param snapshot     catalog as-of 快照（表身份/列序查询面）
+     * @param whitelist    表白名单（null/空 = 全放行）
+     * @param layout       版本布局描述符
+     * @param toast        TOAST 重组器（null = 采集禁用）
+     * @param out          变更事件输出契约实现
+     * @param renderOptions 渲染选项（null 视为 {@link RenderOptions#PG}）
+     */
+    public XactGrouper(CatalogSnapshot snapshot, Set<String> whitelist, WalLayout layout,
+                       ToastAssembler toast, ChangeOutputListener out, RenderOptions renderOptions) {
         this.snapshot = snapshot;
         this.filter = new TableFilter(snapshot, whitelist, layout);
         this.layout = layout;
@@ -265,6 +288,7 @@ public final class XactGrouper {
                 : new TupleDecoder(layout, toast.insertTupleResolver());
         this.toast = toast;
         this.out = out;
+        this.renderOptions = renderOptions == null ? RenderOptions.PG : renderOptions;
     }
 
     /**
@@ -1142,7 +1166,7 @@ public final class XactGrouper {
      * @param vals 解码值数组（可短于列数——仅 ADD COLUMN 前存量元组合法，见上）
      * @return 有序值 map
      */
-    private static Map<String, Object> renderRow(TableMeta meta, Object[] vals) {
+    private Map<String, Object> renderRow(TableMeta meta, Object[] vals) {
         Map<String, Object> m = new LinkedHashMap<>();
         List<ColumnMeta> cols = meta.columns();
         for (int i = 0; i < cols.size(); i++) {
@@ -1150,7 +1174,7 @@ public final class XactGrouper {
             Object decoded = i < vals.length ? vals[i] : null;
             Object rendered = decoded == ToastAssembler.UNCHANGED_TOAST_MARKER
                     ? ToastAssembler.UNCHANGED_TOAST_TEXT
-                    : col.dropped() ? null : DiskValueRenderer.render(decoded, col.typeOid());
+                    : col.dropped() ? null : DiskValueRenderer.render(decoded, col.typeOid(), renderOptions);
             m.put(col.name(), rendered);
         }
         return m;

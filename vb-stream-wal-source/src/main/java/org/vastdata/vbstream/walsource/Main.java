@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vastdata.vbstream.walsource.api.WalSource;
 import org.vastdata.vbstream.walsource.changes.OutputRenderer;
+import org.vastdata.vbstream.walsource.changes.RenderOptions;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.receive.WalStreamMetrics;
 
@@ -94,7 +95,10 @@ public final class Main {
      *              {@code -Dvb.wal.mode=online|offline} 为 -D 专属键）
      */
     public static void main(String[] args) {
-        WalSource source = new WalSource(collectConfig(WalConfigFile.loadBase()), new OutputRenderer());
+        Properties cfg = collectConfig(WalConfigFile.loadBase());
+        // 渲染面四键（vb.wal.render.*）：OutputRenderer 与门面共用同一解析产物——截断
+        // 阈值与值面档位（float/日期/时间）出自同一配置源保证一致（门面内部再解析一次同值）
+        WalSource source = new WalSource(cfg, new OutputRenderer(RenderOptions.fromProperties(cfg)));
         try {
             dispatchMode(source);
         } catch (Exception e) {

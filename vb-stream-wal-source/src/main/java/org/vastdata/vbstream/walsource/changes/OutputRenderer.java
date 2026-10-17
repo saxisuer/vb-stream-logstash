@@ -38,8 +38,10 @@ import java.util.Map;
  * <p><b>值面前提</b>：RowChange 的 before/after 值已是 {@code XactGrouper.renderRow}
  * 经 {@link DiskValueRenderer} 渲染后的 PG text 形态 String——本层只做占位与截断：
  * dropped 列恒 {@code ∅}（值不消费的占位语义，同 {@code DiskValueRenderer.renderColumn}
- * 惯例）、NULL 值字面 {@code NULL}（engine 的 TupleValue.Null 同形）、超 64 字符截断
- * 附原长（{@code ...(<原长>B)} 后缀，engine 的 truncate 同规则）；前像子集（replica
+ * 惯例）、NULL 值字面 {@code NULL}（engine 的 TupleValue.Null 同形）、超阈值截断
+ * 附原长（{@code ...(<原长>B)} 后缀，engine 的 truncate 同规则；缺省 64，
+ * {@code vb.wal.render.truncate} 可调/0 不截断——2026-10-17 配置化，经
+ * {@link RenderOptions} 构造参携带）；前像子集（replica
  * identity 只带键列）按 {@link TableMeta} 列序渲染 map 中<b>存在的列</b>——列序权威
  * 是 TableMeta，不从 map 迭代序取。</p>
  *
@@ -56,8 +58,11 @@ public final class OutputRenderer implements ChangeOutputListener {
     /** 诊断 logger（契约违背类 WARN——不混入 CDC 数据通道）。 */
     private static final Logger LOG = LoggerFactory.getLogger(OutputRenderer.class);
 
-    /** 值渲染截断阈值（超出截 64 字符并附原长字节数——engine ConsoleRenderer 同规则）。 */
-    private static final int VALUE_TRUNCATE_LIMIT = 64;
+    /** 值渲染截断阈值缺省（超出截 64 字符并附原长字节数——engine ConsoleRenderer 同规则）。 */
+    private static final int DEFAULT_TRUNCATE_LIMIT = 64;
+
+    /** 值渲染截断阈值（2026-10-17 配置化：{@code vb.wal.render.truncate}——0 = 不截断）。 */
+    private final int truncateLimit;
 
     /** NORMAL 形态的 kind 头行值（枚举名形态，与 engine Transaction.Kind 对齐）。 */
     private static final String KIND_NORMAL = "NORMAL";
@@ -70,6 +75,25 @@ public final class OutputRenderer implements ChangeOutputListener {
 
     /** 当前开桶（最近一次 onBegin；RowChange 无 xid，onRow 的行归属锚）。 */
     private Pending current;
+
+    /**
+     * 缺省构造：截断阈值 64（engine {@code ConsoleRenderer} 契约——对拍锚，既有行为
+     * 逐字节不变）。
+     */
+    public OutputRenderer() {
+        this(RenderOptions.PG);
+    }
+
+    /**
+     * 渲染选项档构造（2026-10-17 配置化）：本层只消费 {@link RenderOptions#truncateLimit()}
+     * （0 = 不截断全量输出；正值 = 截 N 字符附 {@code ...(<原长>B)} 尾注，尾注形态与
+     * 缺省档同规则）——float/日期/时间样式属 {@code DiskValueRenderer} 值面，不经本层。
+     *
+     * @param options 渲染选项（null 视为 {@link RenderOptions#PG}）
+     */
+    public OutputRenderer(RenderOptions options) {
+        this.truncateLimit = options == null ? DEFAULT_TRUNCATE_LIMIT : options.truncateLimit();
+    }
 
     /**
      * 批量回放开始（契约源：engine ConsoleRenderer onEvent 的 Begin 分支 L129-132——
@@ -165,12 +189,12 @@ public final class OutputRenderer implements ChangeOutputListener {
      * engine ConsoleRenderer renderChange 的 RowChange 分支 L142-146——BEFORE/AFTER
      * 缺位渲染 {@code -}）。值已是渲染后 String，本层只占位与截断。
      *
-     * <p>线程约束：静态纯函数。</p>
+     * <p>线程约束：单写者线程（消费实例的 {@link #truncateLimit}）。</p>
      *
      * @param row 行变更事件
      * @return 行文本（不含 {@code "  [seq] "} 前缀——行号 flush 期分配）
      */
-    private static String renderChange(RowChange row) {
+    private String renderChange(RowChange row) {
         return "%s %s.%s BEFORE=%s AFTER=%s".formatted(row.dml(), row.table().schema(),
                 row.table().table(), tupleOf(row.before(), row.table()),
                 tupleOf(row.after(), row.table()));
@@ -184,13 +208,13 @@ public final class OutputRenderer implements ChangeOutputListener {
      * <p>关键步骤：null 元组（INSERT 前 / DELETE 后）返回 {@code -}；map 缺键的列
      * 跳过（前像 replica identity 子集）；dropped 列恒 {@code ∅}、null 值字面
      * {@code NULL}、其余截断 64。边界：空 map 渲染 {@code []}（与 null 的 {@code -}
-     * 区分——空像与无像语义不同）。线程约束：静态纯函数。</p>
+     * 区分——空像与无像语义不同）。线程约束：单写者线程（消费实例的 {@link #truncateLimit}）。</p>
      *
      * @param tuple 列名→渲染值 map（可为 null；值 String 或 null）
      * @param table 表身份 + 列序（列序权威）
      * @return tuple 文本或 {@code -}
      */
-    private static String tupleOf(Map<String, Object> tuple, TableMeta table) {
+    private String tupleOf(Map<String, Object> tuple, TableMeta table) {
         if (tuple == null) {
             return "-";
         }
@@ -206,18 +230,19 @@ public final class OutputRenderer implements ChangeOutputListener {
 
     /**
      * 单列值文本：dropped 恒 {@code ∅}（占位语义，值不消费）、null 恒 {@code NULL}
-     * （与空串区分）、超 {@link #VALUE_TRUNCATE_LIMIT} 字符截断附原长（契约源：
-     * engine ConsoleRenderer truncate L200-203 的 {@code ...(<原长>B)} 后缀）。
+     * （与空串区分）、超 {@link #truncateLimit} 字符截断附原长（尾注契约源：engine
+     * ConsoleRenderer truncate L200-203 的 {@code ...(<原长>B)} 后缀；0 = 不截断——
+     * 2026-10-17 配置化）。
      *
      * <p>非 String 对象兜底 String.valueOf（RowChange 值面契约是 String/null，
      * 兜底仅为防御面——不 fail-fast：值面形态错误不应吞掉整事务输出）。
-     * 线程约束：静态纯函数。</p>
+     * 线程约束：单写者线程（构造后阈值不可变，多实例隔离）。</p>
      *
      * @param col   列元数据（dropped 判定）
      * @param value 渲染后值（String 或 null）
      * @return 列值文本
      */
-    private static String valueOf(ColumnMeta col, Object value) {
+    private String valueOf(ColumnMeta col, Object value) {
         if (col.dropped()) {
             return "∅";
         }
@@ -225,8 +250,8 @@ public final class OutputRenderer implements ChangeOutputListener {
             return "NULL";
         }
         String s = value.toString();
-        return s.length() > VALUE_TRUNCATE_LIMIT
-                ? s.substring(0, VALUE_TRUNCATE_LIMIT) + "...(" + s.length() + "B)"
+        return truncateLimit > 0 && s.length() > truncateLimit
+                ? s.substring(0, truncateLimit) + "...(" + s.length() + "B)"
                 : s;
     }
 

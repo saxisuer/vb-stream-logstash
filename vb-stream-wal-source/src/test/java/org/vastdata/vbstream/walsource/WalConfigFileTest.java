@@ -158,4 +158,23 @@ class WalConfigFileTest {
         assertEquals("2/071BF288", props.getProperty(WalSource.KEY_OFFLINE_END_LSN));
         assertNull(props.getProperty("vb.wal.mode"), "vb.wal.mode 是 Main 层分派键，不进门面白名单");
     }
+
+    /**
+     * 渲染面四键（{@code vb.wal.render.*}，2026-10-17 配置化）在白名单内（十八→二十二键）
+     * ——文件层可配置渲染档，与 -D 同键。
+     */
+    @Test
+    void loadFileKeepsRenderNamespaceKeys(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("walconfig.properties");
+        Files.writeString(file, """
+                vb.wal.render.float.style=plain
+                vb.wal.render.date.format=default
+                vb.wal.render.time.format=HH:mm:ss
+                vb.wal.render.truncate=0
+                """);
+        Properties props = WalConfigFile.loadFile(file);
+        assertEquals(4, props.size(), "渲染四键全在白名单");
+        assertEquals("plain", props.getProperty("vb.wal.render.float.style"));
+        assertEquals("0", props.getProperty("vb.wal.render.truncate"));
+    }
 }

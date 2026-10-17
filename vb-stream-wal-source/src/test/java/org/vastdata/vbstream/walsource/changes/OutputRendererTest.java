@@ -206,4 +206,34 @@ class OutputRendererTest {
     private static List<String> capturedMessages() {
         return appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
     }
+
+    // ---- 截断阈值配置化（vb.wal.render.truncate，2026-10-17 渲染面配置化）----
+
+    /** 阈值 0 = 不截断：70 字符宽值全量输出、无 {@code ...} 尾注。 */
+    @Test
+    void unlimitedTruncateLimitRendersFullWideValue() {
+        OutputRenderer renderer = new OutputRenderer(
+                new RenderOptions(RenderOptions.FloatStyle.PG, null, null, 0));
+        renderer.onBegin(beginOf(40L));
+        renderer.onRow(new ChangeOutputListener.RowChange(t1Meta(), ChangeOutputListener.DmlKind.INSERT,
+                null, Map.of("id", "1", "s", "x".repeat(70))));
+        renderer.onEnd(new ChangeOutputListener.BatchEnd(40L, 1L, 1L));
+
+        assertTrue(capturedMessages().get(1).contains("s=" + "x".repeat(70)),
+                "70 字符全量无截断尾注:\n" + capturedMessages().get(1));
+    }
+
+    /** 自定义阈值 5：截 5 字符并附原长尾注（{@code xxxxx...(10B)}——尾注形态与缺省档同规则）。 */
+    @Test
+    void customTruncateLimitShortensWithOriginalLengthSuffix() {
+        OutputRenderer renderer = new OutputRenderer(
+                new RenderOptions(RenderOptions.FloatStyle.PG, null, null, 5));
+        renderer.onBegin(beginOf(50L));
+        renderer.onRow(new ChangeOutputListener.RowChange(t1Meta(), ChangeOutputListener.DmlKind.INSERT,
+                null, Map.of("id", "1", "s", "0123456789")));
+        renderer.onEnd(new ChangeOutputListener.BatchEnd(50L, 1L, 1L));
+
+        assertTrue(capturedMessages().get(1).contains("s=01234...(10B)"),
+                "截 5 字符 + 原长尾注:\n" + capturedMessages().get(1));
+    }
 }

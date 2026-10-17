@@ -2,8 +2,10 @@ package org.vastdata.vbstream.walsource.api;
 
 import org.junit.jupiter.api.Test;
 import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
+import org.vastdata.vbstream.walsource.changes.RenderOptions;
 
 import java.nio.file.Path;
+import java.time.LocalDateTime;
 import java.util.Properties;
 import java.util.Set;
 
@@ -108,5 +110,40 @@ class WalSourceConfigTest {
     void legacyConstructorWithoutListenerStaysPureCatalogForm() {
         WalSource source = new WalSource(props("vb.wal.dml", "true"));
         assertFalse(source.dmlEnabled(), "无输出 listener 时 DML 面不装配");
+    }
+
+    /**
+     * 渲染面四键（{@code vb.wal.render.*}，2026-10-17 配置化）：门面构造期解析为
+     * {@link RenderOptions}（观测 getter 供宿主核对），缺省档逐字段等于 {@link RenderOptions#PG}
+     * ——对拍锚不动。
+     */
+    @Test
+    void renderOptionsParsedWithPgDefaults() {
+        assertEquals(RenderOptions.PG, new WalSource(new Properties()).renderOptions(),
+                "四键全缺 = PG 缺省档");
+    }
+
+    /** 渲染键全开档解析：plain 浮点 + default 内建 date 格式 + 阈值 0（不截断）。 */
+    @Test
+    void renderOptionsFullCustomProfileParsed() {
+        Properties cfg = new Properties();
+        cfg.setProperty("vb.wal.render.float.style", "plain");
+        cfg.setProperty("vb.wal.render.date.format", "default");
+        cfg.setProperty("vb.wal.render.truncate", "0");
+        RenderOptions opts = new WalSource(cfg).renderOptions();
+        assertEquals(RenderOptions.FloatStyle.PLAIN, opts.floatStyle());
+        assertEquals("2026-10-07 12:34:56",
+                opts.dateFormat().format(LocalDateTime.of(2026, 10, 7, 12, 34, 56)),
+                "default 内建档 = yyyy-MM-dd HH:mm:ss");
+        assertEquals(0, opts.truncateLimit(), "0 = 不截断");
+    }
+
+    /** 渲染键非法值：门面构造期 IAE（与其余配置键同族 fail-fast，消息附键名）。 */
+    @Test
+    void renderOptionsInvalidValueFailsFast() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new WalSource(props("vb.wal.render.float.style", "sci")));
+        assertThrows(IllegalArgumentException.class,
+                () -> new WalSource(props("vb.wal.render.date.format", "not-a-pattern?")));
     }
 }

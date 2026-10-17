@@ -8,8 +8,11 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.HexFormat;
 import java.util.Set;
@@ -154,21 +157,47 @@ public final class DiskValueRenderer {
      * @throws IllegalStateException 载荷长度/输入类型与 oid 格式不符
      */
     public static String render(Object decoded, long typeOid) {
+        return render(decoded, typeOid, RenderOptions.PG);
+    }
+
+    /**
+     * 解码值 → 文本表示（渲染选项档，2026-10-17 配置化）：缺省 {@link RenderOptions#PG}
+     * 与双参版逐字节同形（对拍锚）；非缺省档仅影响三族——float4/float8（plain 定点
+     * 展开）、date/timestamp/timestamptz（自定义 pattern）、time/timetz（自定义
+     * pattern），其余类型分支对选项无感。
+     *
+     * <p>关键步骤/边界与异常语义：同 {@link #render(Object, long)}（分派矩阵共用）；
+     * 时间族特判值 24:00:00 在自定义 pattern 档保持 PG 字面（java.time 无 24 点表示，
+     * pattern 无法作用于该值）。线程约束：静态纯函数，并发安全。</p>
+     *
+     * @param decoded 解码值（TupleDecoder 对象或磁盘 datum 字节，契约见类 javadoc）
+     * @param typeOid 列类型 oid（分派键）
+     * @param options 渲染选项（null 视为 {@link RenderOptions#PG}）
+     * @return 文本形态字符串；decoded == null 时返回 null
+     * @throws IllegalStateException 载荷长度/输入类型与 oid 格式不符
+     */
+    public static String render(Object decoded, long typeOid, RenderOptions options) {
         if (decoded == null) {
             return null;
         }
+        RenderOptions opts = options == null ? RenderOptions.PG : options;
+        boolean plain = opts.floatStyle() == RenderOptions.FloatStyle.PLAIN;
         return switch ((int) typeOid) {
             case OID_BOOL -> renderBool(decoded);
             case OID_INT2, OID_INT4, OID_INT8, OID_OID, OID_XID, OID_CID -> renderInt(decoded);
-            case OID_FLOAT4 -> PgFloatFormat.format(expectNumber(decoded, typeOid).floatValue());
-            case OID_FLOAT8 -> PgFloatFormat.format(expectNumber(decoded, typeOid).doubleValue());
+            case OID_FLOAT4 -> plain
+                    ? PgFloatFormat.formatPlain(expectNumber(decoded, typeOid).floatValue())
+                    : PgFloatFormat.format(expectNumber(decoded, typeOid).floatValue());
+            case OID_FLOAT8 -> plain
+                    ? PgFloatFormat.formatPlain(expectNumber(decoded, typeOid).doubleValue())
+                    : PgFloatFormat.format(expectNumber(decoded, typeOid).doubleValue());
             case OID_TEXT, OID_VARCHAR, OID_BPCHAR, OID_NAME, OID_CHAR, OID_JSON -> renderTextFamily(decoded);
             case OID_BYTEA -> "\\x" + HexFormat.of().formatHex(expectBytes(decoded, typeOid));
-            case OID_DATE -> renderDate(expectBytes(decoded, typeOid));
-            case OID_TIME -> renderTime(expectBytes(decoded, typeOid));
-            case OID_TIMETZ -> renderTimetz(expectBytes(decoded, typeOid));
-            case OID_TIMESTAMP -> renderTimestamp(decoded);
-            case OID_TIMESTAMPTZ -> renderTimestamptz(expectBytes(decoded, typeOid));
+            case OID_DATE -> renderDate(expectBytes(decoded, typeOid), opts.dateFormat());
+            case OID_TIME -> renderTime(expectBytes(decoded, typeOid), opts.timeFormat());
+            case OID_TIMETZ -> renderTimetz(expectBytes(decoded, typeOid), opts.timeFormat());
+            case OID_TIMESTAMP -> renderTimestamp(decoded, opts.dateFormat());
+            case OID_TIMESTAMPTZ -> renderTimestamptz(expectBytes(decoded, typeOid), opts.dateFormat());
             case OID_NUMERIC -> renderNumeric(expectBytes(decoded, typeOid));
             case OID_UUID -> renderUuid(expectBytes(decoded, typeOid));
             default -> unknown(typeOid, decoded);
@@ -272,12 +301,15 @@ public final class DiskValueRenderer {
      * @return yyyy-MM-dd
      * @throws IllegalStateException 长度不符
      */
-    private static String renderDate(byte[] raw) {
+    private static String renderDate(byte[] raw, DateTimeFormatter fmt) {
         if (raw.length != 4) {
             throw malformed(OID_DATE, raw.length, "4 字节");
         }
         int days = (int) u32le(raw, 0);
-        return LocalDate.ofEpochDay(PG_EPOCH_DAY + days).toString();
+        LocalDate date = LocalDate.ofEpochDay(PG_EPOCH_DAY + days);
+        // 自定义档按"当日零点"的 LocalDateTime 格式化——date 族与 timestamp 族共用同一
+        // pattern 键（pattern 含时分字母时 date 值取零值段；纯日期字母同样正确）
+        return fmt == null ? date.toString() : date.atStartOfDay().format(fmt);
     }
 
     /**
@@ -294,11 +326,16 @@ public final class DiskValueRenderer {
      * @return HH:mm:ss[.frac] / 24:00:00
      * @throws IllegalStateException 长度不符
      */
-    private static String renderTime(byte[] raw) {
+    private static String renderTime(byte[] raw, DateTimeFormatter fmt) {
         if (raw.length != 8) {
             throw malformed(OID_TIME, raw.length, "8 字节");
         }
-        return pgTimeOfDay(u64le(raw, 0));
+        long micros = u64le(raw, 0);
+        if (fmt == null || micros == END_OF_DAY_MICROS) {
+            // 缺省档 = PG 同形；24:00:00 特判值无 java.time 表示——两档都直出 PG 字面
+            return pgTimeOfDay(micros);
+        }
+        return LocalTime.ofNanoOfDay(micros * 1_000L).format(fmt);
     }
 
     /**
@@ -319,12 +356,19 @@ public final class DiskValueRenderer {
      * @return 时间 + 区偏移文本
      * @throws IllegalStateException 长度不符
      */
-    private static String renderTimetz(byte[] raw) {
+    private static String renderTimetz(byte[] raw, DateTimeFormatter fmt) {
         if (raw.length != 12) {
             throw malformed(OID_TIMETZ, raw.length, "12 字节");
         }
+        long micros = u64le(raw, 0);
         int zone = (int) u32le(raw, 8);
-        return pgTimeOfDay(u64le(raw, 0)) + pgZoneText(zone);
+        if (fmt == null || micros == END_OF_DAY_MICROS) {
+            // 缺省档 = PG 同形；24:00:00 特判值无 java.time 表示——时段+偏移整串直出
+            return pgTimeOfDay(micros) + pgZoneText(zone);
+        }
+        // 西正秒存储 → 东正 ISO 偏移（显示反号），pattern 可经 XXX 等字母取到偏移
+        return OffsetTime.of(LocalTime.ofNanoOfDay(micros * 1_000L),
+                ZoneOffset.ofTotalSeconds(-zone)).format(fmt);
     }
 
     /**
@@ -379,7 +423,7 @@ public final class DiskValueRenderer {
      * @return PG 文本形态
      * @throws IllegalStateException 输入形态不符或 ISO 解析失败
      */
-    private static String renderTimestamp(Object decoded) {
+    private static String renderTimestamp(Object decoded, DateTimeFormatter fmt) {
         LocalDateTime ldt;
         if (decoded instanceof String iso) {
             try {
@@ -392,7 +436,7 @@ public final class DiskValueRenderer {
         } else {
             throw malformed(OID_TIMESTAMP, decoded);
         }
-        return pgTimestamp(ldt);
+        return fmt == null ? pgTimestamp(ldt) : ldt.format(fmt);
     }
 
     /**
@@ -412,13 +456,17 @@ public final class DiskValueRenderer {
      * @return yyyy-MM-dd HH:mm:ss[.frac]±HH[:MM]
      * @throws IllegalStateException 长度不符
      */
-    private static String renderTimestamptz(byte[] raw) {
+    private static String renderTimestamptz(byte[] raw, DateTimeFormatter fmt) {
         if (raw.length != 8) {
             throw malformed(OID_TIMESTAMPTZ, raw.length, "8 字节");
         }
         long micros = u64le(raw, 0);
         LocalDateTime ldt = microsToLocalDateTime(micros, ZoneId.systemDefault());
-        return pgTimestamp(ldt) + pgOffsetText(offsetAt(micros));
+        if (fmt == null) {
+            return pgTimestamp(ldt) + pgOffsetText(offsetAt(micros));
+        }
+        // OffsetDateTime 载体：pattern 无时区字母走本地段、含 XXX/ZZZ 等字母可取到偏移
+        return OffsetDateTime.of(ldt, offsetAt(micros)).format(fmt);
     }
 
     /**

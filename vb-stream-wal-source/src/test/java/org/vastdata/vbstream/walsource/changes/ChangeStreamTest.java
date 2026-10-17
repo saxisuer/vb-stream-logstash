@@ -18,6 +18,7 @@ import org.vastdata.vbstream.walsource.layout.WalRecordParser;
 
 import java.io.ByteArrayOutputStream;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -202,6 +203,34 @@ class ChangeStreamTest {
         fx.insert(100, 1, "alice");
         fx.commit(100);
         assertEquals(List.of(), fx.listener.events, "白名单外表零事件");
+    }
+
+    /**
+     * 渲染选项穿线（{@code vb.wal.render.*}，2026-10-17 配置化）：ChangeStream →
+     * XactGrouper → renderRow → DiskValueRenderer 全链生效——date 列按自定义 pattern
+     * 出值（到达期渲染面是 RowChange 值的产源）。
+     */
+    @Test
+    void renderOptionsFlowThroughToRowValues() {
+        StubSnapshot snapshot = new StubSnapshot();
+        snapshot.table(TYPED_REL, "public", "t_typed", "r",
+                new CatalogSnapshot.Column(1, "id", 23, false),
+                new CatalogSnapshot.Column(2, "d", 1082, false));
+        snapshot.table(PG_ATTRIBUTE_RELNODE, "pg_catalog", "pg_attribute", "r");
+        RecordingListener listener = new RecordingListener();
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+        ChangeStream stream = new ChangeStream(snapshot, null, layout, null, listener,
+                new RenderOptions(RenderOptions.FloatStyle.PG, fmt, null, 64));
+        Fixture fx = new Fixture(snapshot, stream, listener);
+        int days = (int) (LocalDate.of(2026, 10, 7).toEpochDay() - 10_957L);
+        byte[] payload = TupleBytes.of("int4", "date").i32(7).date(days).payload();
+        fx.feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, 100)
+                .block(0, SPC, DB, TYPED_REL, 0).data(payload).main(new byte[3]).build());
+        fx.commit(100);
+
+        ChangeOutputListener.RowChange row = fx.listener.rows.get(0);
+        assertEquals("2026/10/07", row.after().get("d"),
+                "自定义 date pattern 经全链穿线生效（缺省档应仍为 2026-10-07）");
     }
 
     // ---- 测试基建 ----

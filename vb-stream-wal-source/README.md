@@ -181,8 +181,8 @@ java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/
 能力/限制（仅 VastBase 档；TOAST INSERT 空面窄缝渲哨兵等已知限制）详见模块
 `CLAUDE.md`"离线回放档"节。
 
-配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键 + 离线回放两键，默认值即下表；
-单一来源 `WalSource`/`StateConfig`；`vb.wal.mode` 是 Main 层分派键不入本表）：
+配置键全表（`-Dvb.wal.*` 十一基础键 + openGauss 档五键 + 离线回放两键 + 渲染面四键，默认值即下表；
+单一来源 `WalSource`/`StateConfig`/`RenderOptions`；`vb.wal.mode` 是 Main 层分派键不入本表）：
 
 | 键 | 默认 | 语义 |
 |---|---|---|
@@ -204,6 +204,14 @@ java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/
 | `vb.wal.og.jdbc.prefix` | `jdbc:postgresql:` | OG 档 SQL 会话驱动前缀（`jdbc:opengauss:`=sha256 推荐；缺省保 pgjdbc 防 PG 档反噬，见上文认证二选一） |
 | `vb.wal.offline.dir` | 缺省 = 在线档 | **离线回放档**段快照目录（`vb.wal.mode=offline` 时必填，缺失启动期 ISE；见上文"离线回放模式"） |
 | `vb.wal.offline.endLsn` | 缺省 = 无上界 | 离线回放可选交付上界（十六进制 LSN 文本如 `2/071BF288`，到达即提前 EOF；非法文本启动期 fail-fast） |
+| `vb.wal.render.float.style` | `pg` | **渲染面**浮点样式：pg=服务端同形（`1e+20`）/ plain=最短往返位去指数定点展开（`100000000000000000000`） |
+| `vb.wal.render.date.format` | `pg` | 日期时间族格式（date/timestamp/timestamptz）：pg / `default`（=`yyyy-MM-dd HH:mm:ss`）/ Java `DateTimeFormatter` pattern |
+| `vb.wal.render.time.format` | `pg` | 时间族格式（time/timetz）：pg / `default`（=`HH:mm:ss`）/ 自定义 pattern（24:00:00 上端特判值保持 PG 字面） |
+| `vb.wal.render.truncate` | `64` | 控制台值截断阈值（`0` = 不截断全量输出；事件接口 `RowChange` 值恒全量） |
+
+> **渲染面语义**：缺省 `pg` 档输出与服务器文本输出逐字节同形（双路对拍锚）；非缺省档是
+> **有意分叉**（下游依赖 PG text 语义须自知）。`RowChange` 事件值只有 float/时间族受
+> `render.*` 影响，text 截断仅发生在控制台 TXN 行文本层。
 
 ## 架构
 

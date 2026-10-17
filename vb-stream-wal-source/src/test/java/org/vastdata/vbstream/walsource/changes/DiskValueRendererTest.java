@@ -13,6 +13,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -528,5 +529,72 @@ class DiskValueRendererTest {
                 ? String.format("%s%02d", total < 0 ? "-" : "+", hours)
                 : String.format("%s%02d:%02d", total < 0 ? "-" : "+", hours, minutes);
         return base + frac + offText;
+    }
+
+    // ---- 渲染选项档（vb.wal.render.*，2026-10-17 渲染面配置化）----
+
+    /** plain 浮点档：科学计数区段定点展开；缺省档 PG 同形不动（对拍锚）。 */
+    @Test
+    void plainFloatStyleRendersPositionalDigits() {
+        RenderOptions plain = new RenderOptions(RenderOptions.FloatStyle.PLAIN, null, null, 64);
+        assertEquals("100000000000000000000", DiskValueRenderer.render(1e20, OID_FLOAT8, plain),
+                "float8 plain 档定点展开");
+        assertEquals("1000000", DiskValueRenderer.render(1e6f, OID_FLOAT4, plain),
+                "float4 plain 档定点展开（门限 6 以下即科学的区段）");
+        assertEquals("1e+20", DiskValueRenderer.render(1e20, OID_FLOAT8, RenderOptions.PG),
+                "缺省档 PG 同形（服务器对拍锚）");
+    }
+
+    /** 自定义 date pattern：date/timestamp/timestamptz 三族同键格式化（timestamptz 按本机时区本地段）。 */
+    @Test
+    void customDatePatternFormatsDateAndTimestampFamilies() {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm");
+        RenderOptions opts = new RenderOptions(RenderOptions.FloatStyle.PG, fmt, null, 64);
+        assertEquals("2026/10/06 00:00", DiskValueRenderer.render(
+                daysSinceEpoch2000(LocalDate.of(2026, 10, 6)), OID_DATE, opts),
+                "date 无时分段——pattern 的 HH:mm 取零值");
+        assertEquals("2026/10/06 12:34", DiskValueRenderer.render(
+                tsMicros(LocalDateTime.of(2026, 10, 6, 12, 34, 0)), OID_TIMESTAMP, opts));
+        Instant inst = Instant.parse("2026-10-06T04:34:56.123456Z");
+        String expectedTz = LocalDateTime.ofInstant(inst, ZoneId.systemDefault()).format(fmt);
+        assertEquals(expectedTz, DiskValueRenderer.render(tsMicrosUtc(inst), OID_TIMESTAMPTZ, opts),
+                "timestamptz 折本机时区后按 pattern 格式化（pattern 无时区字母走本地段）");
+    }
+
+    /** timestamptz 的 pattern 含时区字母（XXX）：以 OffsetDateTime 格式化（偏移可用）。 */
+    @Test
+    void timestamptzPatternWithZoneLettersUsesOffset() {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss XXX");
+        RenderOptions opts = new RenderOptions(RenderOptions.FloatStyle.PG, fmt, null, 64);
+        Instant inst = Instant.parse("2026-10-06T04:34:56.789012Z");
+        String expected = OffsetDateTime.ofInstant(inst, ZoneId.systemDefault()).format(fmt);
+        assertEquals(expected, DiskValueRenderer.render(tsMicrosUtc(inst), OID_TIMESTAMPTZ, opts));
+    }
+
+    /** 自定义 time pattern：time/timetz 格式化；timetz 的偏移可经 XXX 取到。 */
+    @Test
+    void customTimePatternFormatsTimeAndTimetz() {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS");
+        RenderOptions opts = new RenderOptions(RenderOptions.FloatStyle.PG, null, fmt, 64);
+        assertEquals("12:34:56.123456", DiskValueRenderer.render(
+                timeMicros(LocalTime.of(12, 34, 56, 123_456_000)), OID_TIME, opts),
+                "微秒全量六位（pattern 显式控制精度——与 PG 尾零截断形态有意分叉）");
+        DateTimeFormatter withZone = DateTimeFormatter.ofPattern("HHmmss XXX");
+        RenderOptions tzOpts = new RenderOptions(RenderOptions.FloatStyle.PG, null, withZone, 64);
+        assertEquals("123456 +05:30", DiskValueRenderer.render(
+                timetzBytes(12, 34, 56, 0, -19_800), OID_TIMETZ, tzOpts),
+                "timetz 偏移保留原值（西正秒 -19800 = +05:30 显示）");
+    }
+
+    /** time 域闭上端 24:00:00（java.time 无 24 点特判值）：自定义 pattern 档保持 PG 字面。 */
+    @Test
+    void endTimeOfDaySpecialValueKeepsPgLiteralUnderCustomPattern() {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HHmmss");
+        RenderOptions opts = new RenderOptions(RenderOptions.FloatStyle.PG, null, fmt, 64);
+        assertEquals("24:00:00", DiskValueRenderer.render(i64le(86_400_000_000L), OID_TIME, opts),
+                "24:00:00 无 java.time 表示——PG 字面直出");
+        assertEquals("24:00:00+00", DiskValueRenderer.render(
+                timetzBytes(24, 0, 0, 0, 0), OID_TIMETZ, opts),
+                "timetz 上端同保 PG 字面（时段 + 偏移整串）");
     }
 }

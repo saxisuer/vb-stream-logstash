@@ -126,4 +126,52 @@ class PgFloatFormatTest {
         assertEquals("Infinity", PgFloatFormat.format(Float.POSITIVE_INFINITY));
         assertEquals("-Infinity", PgFloatFormat.format(Float.NEGATIVE_INFINITY));
     }
+
+    // ---- plain 档（vb.wal.render.float.style=plain，2026-10-17 渲染面配置化）----
+
+    /**
+     * plain 档 float8：科学计数法区段的值展开为<b>定点数字串</b>——数字位仍取最短往返
+     * （与 {@link PgFloatFormat#format(double)} 同源），仅去指数记法（无假精度长尾：
+     * 0.1 的 plain 是 {@code 0.1} 而非其二进制精确展开）。
+     */
+    @Test
+    void plainStyleFloat8ExpandsScientificRegionPositionally() {
+        assertEquals("100000000000000000000", PgFloatFormat.formatPlain(1e20d));
+        assertEquals("0.000000045", PgFloatFormat.formatPlain(4.5e-8d));
+        assertEquals("-2500000000000000", PgFloatFormat.formatPlain(-2.5e15d));
+        assertEquals("0.00001", PgFloatFormat.formatPlain(1e-5d));
+        assertEquals("602214076000000000000000", PgFloatFormat.formatPlain(6.02214076e23d));
+        assertEquals("1" + "0".repeat(308), PgFloatFormat.formatPlain(1e308d),
+                "指数 308 的极端值 = 1 后 308 个零");
+        assertEquals("0." + "0".repeat(323) + "5", PgFloatFormat.formatPlain(5e-324d),
+                "最小次正规 = 323 个前置零后一个 5");
+    }
+
+    /** plain 档 float8：定点门限内的值与 {@code format} 同串（本就无指数）。 */
+    @Test
+    void plainStyleFloat8FixedRegionIdenticalToFormat() {
+        assertEquals(PgFloatFormat.format(1e14d), PgFloatFormat.formatPlain(1e14d));
+        assertEquals(PgFloatFormat.format(0.0001d), PgFloatFormat.formatPlain(0.0001d));
+        assertEquals(PgFloatFormat.format(3.25d), PgFloatFormat.formatPlain(3.25d));
+    }
+
+    /** plain 档 float4：门限 6 以下即科学计数的 float 值同样定点展开。 */
+    @Test
+    void plainStyleFloat4ExpandsExpBelowSix() {
+        assertEquals("1000000", PgFloatFormat.formatPlain(1e6f));
+        assertEquals("100000000000000000000", PgFloatFormat.formatPlain(1e20f));
+        assertEquals("34028235" + "0".repeat(31), PgFloatFormat.formatPlain(3.4028235e38f),
+                "float4 极大值 = 8 位有效数字 + 31 个零（共 39 位）");
+        assertEquals("0.000000045", PgFloatFormat.formatPlain(4.5e-8f));
+    }
+
+    /** plain 档特值/零与 format 同串（无指数面，特值分支共用）。 */
+    @Test
+    void plainStyleSpecialValuesAndZeroUnchanged() {
+        assertEquals("NaN", PgFloatFormat.formatPlain(Double.NaN));
+        assertEquals("Infinity", PgFloatFormat.formatPlain(Double.POSITIVE_INFINITY));
+        assertEquals("-Infinity", PgFloatFormat.formatPlain(Double.NEGATIVE_INFINITY));
+        assertEquals("0", PgFloatFormat.formatPlain(0d));
+        assertEquals("-0", PgFloatFormat.formatPlain(-0d));
+    }
 }
