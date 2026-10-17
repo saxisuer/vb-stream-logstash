@@ -14,11 +14,18 @@ import java.util.List;
  * @param toplevelXid 顶层事务 id（头区 252 标记读出，spike 发现 25）；无标记为 0
  * @param rmid        资源管理器 id（u8@17，rmgrlist.h 0-based 枚举序）
  * @param info        记录 info 字节（u8@16，低 nibble 保留、高位为操作码/标志）
- * @param blocks      block 引用链（头区出现序 = 块 id 序），载荷偏移已回填
- * @param mainOff     main data 在 raw 中的起始偏移（块载荷之后）；不变量
- *                    {@code mainOff + mainLen == totLen}（spike 发现 6）
+ * @param blocks      block 引用链（头区出现序 = 块 id 序），载荷偏移已回填——
+ *                    imageOff/dataOff 为 raw 内**绝对偏移**（记录位于宿主缓冲
+ *                    任意偏移时由 {@link WalRecordParser#parse(byte[], int, long, WalLayout)}
+ *                    偏移重载产出；无对应载荷为 -1）
+ * @param mainOff     main data 在 raw 中的起始**绝对偏移**（块载荷之后）；记录
+ *                    位于宿主缓冲 recOff 偏移时不变量为
+ *                    {@code mainOff + mainLen == recOff + totLen}（记录独占数组
+ *                    即 recOff=0 退化形态；spike 发现 6）
  * @param mainLen     main data 字节数（终止头 DATA_SHORT/LONG 声明；无 main 为 0）
- * @param raw         完整记录字节（含头；数组由调用方持有，本类不拷贝、约定只读）
+ * @param raw         宿主缓冲（记录可位于任意偏移——walker 零拷贝优化引入的契约
+ *                    放宽；记录字节为 {@code raw[<记录自带偏移> .. +totLen)}，
+ *                    独占数组形态下偏移即 0；数组由调用方持有，本类不拷贝、约定只读）
  */
 public record WalRecord(
         long lsn,

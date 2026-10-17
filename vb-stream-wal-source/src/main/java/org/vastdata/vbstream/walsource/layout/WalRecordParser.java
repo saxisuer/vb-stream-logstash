@@ -78,53 +78,74 @@ public final class WalRecordParser {
     }
 
     /**
-     * 走读一条完整 WAL 记录。
+     * 走读一条完整 WAL 记录（记录独占一个数组、起点即下标 0 的便捷形态）。
      *
-     * <p>关键分支：头区循环按 id 分派（block 头内嵌 data_length、可选镜像头与
-     * SAME_REL 省定位器、252/253 标记跳读、255/254 终止头定 mainLen）；openGauss
-     * 档先于块分派校验 id 高位扩展位（0x80/0x40——bucket/段页与 TDE 形态的块
-     * 定位器结构不同，按普通块头走读会静默错位，故 fail-fast）；终止判据双通道
-     * （终止头 break / 剩余==datatotal break，spike 发现 2）；载荷区按块序
-     * [image][data] 回填偏移后以 {@code mainOff+mainLen==totLen} 不变量收口。
-     * 头字段（xid/info/rmid）偏移、定位器伴随区宽、blkno 后尾随宽与镜像头形制
-     * 全部经 layout 注入——V17/V18 取值与历史内联常量逐字节相等。</p>
+     * <p>实现为 {@link #parse(byte[], int, long, WalLayout)} 四参偏移重载的
+     * off=0 委托——坐标系语义、走读分支与异常面完全同源（详见四参版 javadoc）；
+     * recOff=0 时返回结果的 mainOff/imageOff/dataOff 即 rec 内偏移、raw 即 rec，
+     * 与历史行为逐字节一致。</p>
      *
-     * <p>边界与异常语义：前置约定 {@code rec.length >= totLen}（不足时数组越界裸抛）；
-     * 未知 block id、扩展位命中（OG）、SAME_REL 无前定位器、不变量破坏均抛 ISE
-     * （消息带定位上下文）。线程约束：静态纯函数、零共享状态，任意线程并发安全。</p>
-     *
-     * @param rec    记录字节（含记录头——V17/V18 24B / OG 32B；尾部允许 MAXALIGN 垫字节）
+     * @param rec    记录字节（含记录头——V17/V18 24B / OG 32B；记录可短于数组
+     *               长度——尾部允许 MAXALIGN 垫字节，走读只认 totLen）
      * @param lsn    记录起始 LSN（透传进结果，供游标/确认位关联；异常消息引用）
      * @param layout 版本布局描述符（注入头偏移/定位器几何/镜像头形制/页大小）
      * @return 走读结果（blocks 已不可变化、载荷偏移已回填）
-     * @throws IllegalStateException 布局错配或协议违约（见上）
+     * @throws IllegalStateException 布局错配或协议违约（见四参版）
      */
     public static WalRecord parse(byte[] rec, long lsn, WalLayout layout) {
-        int totLen = u32(rec, TOTLEN_OFFSET);
-        int xidOff = layout.recordXidOffset();
-        int infoOff = layout.recordInfoOffset();
-        int rmidOff = layout.recordRmidOffset();
+        return parse(rec, 0, lsn, layout);
+    }
+
+    /**
+     * 走读一条完整 WAL 记录——记录位于宿主缓冲 {@code buf} 的 {@code recOff} 偏移处。
+     *
+     * <p>关键分支与三参版完全同构（头区循环按 id 分派、OG 扩展位 fail-fast、终止判据
+     * 双通道、[image][data] 载荷回填、不变量收口），区别仅在坐标系：头区与载荷区的
+     * 全部读点以 {@code recOff} 为基准换算，返回结果中的 {@code mainOff} 与各
+     * BlockRef 的 {@code imageOff()/dataOff()} 均为 **buf 内绝对偏移**、{@code raw()}
+     * 即 buf 本身——消费方按记录自带偏移直接索引宿主缓冲，免缝合拷贝（walker 零拷贝
+     * 优化引入）。</p>
+     *
+     * <p>边界与异常语义：前置约定 {@code buf.length >= recOff + totLen}（不足时数组
+     * 越界裸抛）；未知 block id、扩展位命中（OG）、SAME_REL 无前定位器、不变量破坏
+     * 均抛 ISE（消息带定位上下文，offset 字段为 buf 内绝对偏移）。线程约束：静态
+     * 纯函数、零共享状态，任意线程并发安全。</p>
+     *
+     * @param buf    宿主缓冲（记录可位于任意偏移；调用方持有、约定只读）
+     * @param recOff 记录头在 buf 中的起始偏移（非负；记录字节即
+     *               {@code buf[recOff .. recOff + totLen)}）
+     * @param lsn    记录起始 LSN（透传进结果，供游标/确认位关联；异常消息引用）
+     * @param layout 版本布局描述符（注入头偏移/定位器几何/镜像头形制/页大小）
+     * @return 走读结果（blocks 已不可变化、载荷偏移已回填为 buf 内绝对偏移、raw 即 buf）
+     * @throws IllegalStateException 布局错配或协议违约（见上）
+     */
+    public static WalRecord parse(byte[] buf, int recOff, long lsn, WalLayout layout) {
+        int base = recOff;
+        int totLen = u32(buf, base + TOTLEN_OFFSET);
+        int xidOff = base + layout.recordXidOffset();
+        int infoOff = base + layout.recordInfoOffset();
+        int rmidOff = base + layout.recordRmidOffset();
         int relSize = layout.relNodeEncodedSize();
         int lastLsnBytes = layout.blockRefLastLsnBytes();
-        int pos = layout.recordHeaderSize();
+        int pos = base + layout.recordHeaderSize();
         List<BlockRef> blocks = new ArrayList<>();
         long[] lastLoc = null;   // 最近一次完整定位器 (spc, db, relNode)——SAME_REL 复用源
         int mainLen = 0;
         int toplevelXid = 0;
         int datatotal = 0;       // 头区已声明的 image+data 载荷字节合计
-        while (pos < totLen) {
+        while (pos < base + totLen) {
             // 头区终点判据之一：剩余字节恰为已声明载荷——无 main data 的记录
             // 没有终止头（spike 发现 2，如 XLOG_FPI）
-            if (totLen - pos == datatotal) {
+            if (base + totLen - pos == datatotal) {
                 break;
             }
-            int id = rec[pos] & 0xFF;
+            int id = buf[pos] & 0xFF;
             if (id == XLR_BLOCK_ID_DATA_SHORT) {
-                mainLen = rec[pos + 1] & 0xFF;
+                mainLen = buf[pos + 1] & 0xFF;
                 pos += 2;
                 break;
             } else if (id == XLR_BLOCK_ID_DATA_LONG) {
-                mainLen = u32(rec, pos + 1);
+                mainLen = u32(buf, pos + 1);
                 pos += 5;
                 break;
             } else if (id == XLR_BLOCK_ID_ORIGIN) {
@@ -132,7 +153,7 @@ public final class WalRecordParser {
                 continue;
             } else if (id == XLR_BLOCK_ID_TOPLEVEL_XID) {
                 // 子事务记录在此携带顶层 xid（spike 发现 25）——effXid 归并依据
-                toplevelXid = u32(rec, pos + 1);
+                toplevelXid = u32(buf, pos + 1);
                 pos += 5;
                 continue;
             } else if (layout.rejectBlockIdExtensionBits()
@@ -144,8 +165,8 @@ public final class WalRecordParser {
                                 + "(0x80=bucket/segpage, 0x40=TDE page) at lsn=%d offset=%d",
                         id, lsn, pos));
             } else if (id <= MAX_BLOCK_ID) {
-                int forkFlags = rec[pos + 1] & 0xFF;
-                int dataLen = u16(rec, pos + 2);
+                int forkFlags = buf[pos + 1] & 0xFF;
+                int dataLen = u16(buf, pos + 2);
                 pos += 4;
                 boolean hasImage = (forkFlags & BKPBLOCK_HAS_IMAGE) != 0;
                 boolean hasData = (forkFlags & BKPBLOCK_HAS_DATA) != 0;
@@ -157,18 +178,18 @@ public final class WalRecordParser {
                     if (layout.imageHeaderIsHoleOnly()) {
                         // openGauss 形制：镜像头仅 hole_offset/hole_length 两 u16，
                         // 无 bimg_info 与压缩面——镜像恒为整页去洞
-                        holeOffset = u16(rec, pos);
-                        holeLen = u16(rec, pos + 2);
+                        holeOffset = u16(buf, pos);
+                        holeLen = u16(buf, pos + 2);
                         pos += 4;
                         imageLen = layout.walBlockSize() - holeLen;
                     } else {
-                        imageLen = u16(rec, pos);
-                        holeOffset = u16(rec, pos + 2);
-                        bimgInfo = rec[pos + 4] & 0xFF;
+                        imageLen = u16(buf, pos);
+                        holeOffset = u16(buf, pos + 2);
+                        bimgInfo = buf[pos + 4] & 0xFF;
                         pos += 5;
                         boolean compressed = (bimgInfo & BKPIMAGE_COMPRESS_MASK) != 0;
                         if ((bimgInfo & BKPIMAGE_HAS_HOLE) != 0 && compressed) {
-                            holeLen = u16(rec, pos);   // 压缩镜像的洞长不可推导，显式 u16
+                            holeLen = u16(buf, pos);   // 压缩镜像的洞长不可推导，显式 u16
                             pos += 2;
                         } else if ((bimgInfo & BKPIMAGE_HAS_HOLE) != 0) {
                             // 未压缩时镜像存的就是去洞后的长度，洞长可由页大小反推
@@ -180,9 +201,9 @@ public final class WalRecordParser {
                 long db;
                 long relNode;
                 if ((forkFlags & BKPBLOCK_SAME_REL) == 0) {
-                    spc = u32(rec, pos) & 0xFFFFFFFFL;
-                    db = u32(rec, pos + 4) & 0xFFFFFFFFL;
-                    relNode = u32(rec, pos + 8) & 0xFFFFFFFFL;
+                    spc = u32(buf, pos) & 0xFFFFFFFFL;
+                    db = u32(buf, pos + 4) & 0xFFFFFFFFL;
+                    relNode = u32(buf, pos + 8) & 0xFFFFFFFFL;
                     // 定位器伴随区整体跳过：V17/V18 止于 12B 三 u32；OG 再含
                     // extra_flag u16（12+2）——伴随字段不参与 watched 匹配判据
                     pos += relSize;
@@ -196,7 +217,7 @@ public final class WalRecordParser {
                     db = lastLoc[1];
                     relNode = lastLoc[2];
                 }
-                int blockNo = u32(rec, pos);
+                int blockNo = u32(buf, pos);
                 pos += 4;
                 // OG 每块引用 blkno 后恒随 last_lsn u64（页 LSN 链回溯），当前不
                 // 消费——按 layout 声明宽度跳过（V17/V18 为 0，字节行为不变）
@@ -224,13 +245,13 @@ public final class WalRecordParser {
                     b.hasData(), dataOff, b.dataLen()));
         }
         int mainOff = cur;
-        if (mainOff + mainLen != totLen) {
+        if (mainOff + mainLen != base + totLen) {
             throw new IllegalStateException(String.format(
                     "layout mismatch: mainOff=%d mainLen=%d totLen=%d rmid=%d info=%x",
-                    mainOff, mainLen, totLen, rec[rmidOff] & 0xFF, rec[infoOff] & 0xFF));
+                    mainOff, mainLen, totLen, buf[rmidOff] & 0xFF, buf[infoOff] & 0xFF));
         }
-        return new WalRecord(lsn, totLen, u32(rec, xidOff), toplevelXid,
-                rec[rmidOff] & 0xFF, rec[infoOff] & 0xFF, patched, mainOff, mainLen, rec);
+        return new WalRecord(lsn, totLen, u32(buf, xidOff), toplevelXid,
+                buf[rmidOff] & 0xFF, buf[infoOff] & 0xFF, patched, mainOff, mainLen, buf);
     }
 
     /**

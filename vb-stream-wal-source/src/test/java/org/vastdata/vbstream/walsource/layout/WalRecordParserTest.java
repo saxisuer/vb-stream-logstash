@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -182,6 +183,43 @@ class WalRecordParserTest {
         WalRecord r = WalRecordParser.parse(padded, 0, layout);
         assertEquals(built.length, r.totLen());
         assertEquals(built.length, r.mainOff() + r.mainLen());
+    }
+
+    /**
+     * 四参偏移重载：记录位于宿主缓冲任意 recOff 时，头区身份字段等价读出，
+     * 而 mainOff 与 blocks 的 imageOff/dataOff 全部换算为宿主缓冲内**绝对偏移**、
+     * raw 即宿主缓冲本身——免缝合拷贝消费（walker 零拷贝）的契约锚。
+     *
+     * <p>关键步骤：构造含镜像与块 data 的最小合法记录（既有用例 1 的形态再加 image
+     * 覆盖 imageOff 面），拷入 64B 偏移的宿主缓冲；同记录分别走旧三参签名（off=0
+     * 基准）与新四参重载解析，断言身份字段全等、载荷偏移恰差 recOff、raw 引用即
+     * 宿主缓冲。</p>
+     */
+    @Test
+    void offsetOverloadYieldsAbsoluteOffsetsIntoHostBuffer() {
+        byte[] rec = WalBytes.record(RM_HEAP_ID, 0x00, 4242)
+                .block(0, 1663L, 16385L, 24600L, 7)
+                .image(new byte[10], 0, 0x00)
+                .data(new byte[6])
+                .main(new byte[8])
+                .build();
+        byte[] host = new byte[rec.length + 64];
+        System.arraycopy(rec, 0, host, 64, rec.length);
+        WalRecord base = WalRecordParser.parse(rec, 100L, layout);
+        WalRecord off = WalRecordParser.parse(host, 64, 100L, layout);
+        assertEquals(base.totLen(), off.totLen());
+        assertEquals(base.xid(), off.xid());
+        assertEquals(base.rmid(), off.rmid());
+        assertEquals(base.info(), off.info());
+        assertEquals(base.mainOff() + 64, off.mainOff());
+        assertSame(host, off.raw());
+        assertEquals(base.blocks().size(), off.blocks().size());
+        for (int i = 0; i < base.blocks().size(); i++) {
+            BlockRef b = base.blocks().get(i);
+            BlockRef o = off.blocks().get(i);
+            assertEquals(b.dataOff() < 0 ? -1 : b.dataOff() + 64, o.dataOff());
+            assertEquals(b.imageOff() < 0 ? -1 : b.imageOff() + 64, o.imageOff());
+        }
     }
 
     /** SAME_REL 前无任何完整定位器：走读 fail-fast 抛 ISE，消息点明根因。 */
