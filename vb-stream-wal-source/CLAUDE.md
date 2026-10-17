@@ -55,10 +55,10 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | 组件 | 位置 | 职责要点 |
 |---|---|---|
 | `WalLayout`/`WalLayouts` | `layout` | 版本化布局常量（`WalLayoutV17`/`WalLayoutV18`/`WalLayoutVOpenGauss`/`WalLayoutVVastbase`，逐常量标注 REL_STABLE/og-plan/真库实测出处）；`forServerVersion` 按 `server_version_num` 分发，未注册版本/显式错配布局启动期 ISE fail-fast；OG 档 90204 与 vanilla 9.2 撞号，经 `forServer(int, String)` 以 version() 文本判别；VastBase 档再撞号（无 branding），经 `forServer(int, String, int)` 三参版以 relname attlen 探测判别（见"VastBase G100 档"节） |
-| `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**）；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立；OG 变体 `ensureSlotOg`：第二参 dummy_standby） |
+| `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**；**稳态零拷贝（2026-10-17）**——feed 契约：喂后数组不得复用（walker 可能原地移位且 `WalRecord.raw` 引用其字节；三路字节源均为一次性数组））；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立；OG 变体 `ensureSlotOg`：第二参 dummy_standby） |
 | `WalByteSource` + `FileWalSource`/`ReceivexlogProcess`/`DirectWalSource`（+ direct 子包 `V3ProtocolChannel`/`OgAuth`） | `receive` | **OG 档双通道字节源（M1，详见"openGauss 5.0.0 档"节）**——推模式字节源接口（`start(LongConsumer, BiConsumer<Long,byte[]>)`）；file 通道=sidecar pg_receivexlog 落目录 + FileWalSource tail（managed 自管子进程 / external 只读既有目录）；direct 通道=裸 v3 协议客户端直连收流；**`FileWalSource.staticDirectory` 静态目录档**（离线回放 2026-10-15——启动期审计三项 fail-fast + 清单读尽确定性 EOF + 可选 endLsn 上界，tail 档行为零改动，见"离线回放档"节） |
-| `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码） |
-| `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件；**`startOffline` 无库装配档**（离线回放 2026-10-15——检查点入口凭证 + 复用运行期管线零复制，见"离线回放档"节） |
+| `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码）；**2026-10-17 热路径两接缝**——`WalRecordParser` 增 (buf,recOff) 偏移重载（`WalRecord.raw` 契约放宽为宿主缓冲+绝对偏移，单页记录免缝合拷贝的前置）与 `TupleDecoder` varlenaEnd 终点前置（每 text/numeric/bytea/skip 列的逐列 int[] 分配与每 HASNULL 行位图拷贝归零） |
+| `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件；**CatalogStores 五二级索引（2026-10-17 热路径：oid/filenode/attrelid/nspOid/partitionFilenode，0 键不入 + 同键最后-put-者胜）+ 写点包装方法 + shapeEpoch 代际戳**（SnapshotView 六查询自字典值域线性扫降 O(1)，shapeEpoch 随行变更自增供消费端懒失效比对）；**`startOffline` 无库装配档**（离线回放 2026-10-15——检查点入口凭证 + 复用运行期管线零复制，见"离线回放档"节） |
 | `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验；formatVersion 3 增 `dmlFloorLsn`——DML 待决桶重放下界，Task 11），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
 | `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面；**OG 档（M1）**判别命中 `instanceof WalLayoutVOpenGauss`（VastBase 子类同命中，vastbase T4）时转 `startOpenGauss`（`vb.wal.og.*` 五键——见"openGauss 5.0.0 档"节）；**离线回放档（2026-10-15）**`startOffline()`（与 start 互斥——`vb.wal.offline.dir/endLsn` 两键 + `eofReached()` 终态位，见"离线回放档"节） |
 | `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`Lz4`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/lz4/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger |
@@ -106,7 +106,7 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | 类 | 职责 |
 |---|---|
 | `ChangeStream` | DML 门面：单入口 `onRecord(WalRecord)`，WalSource sink 分发的第二消费者（catalog 同步器之后）；内建组装三件套装配（ToastAssembler probe 取 SQL 会话建 JdbcToastProbe，null 连接 = 纯回放禁回查档） |
-| `XactGrouper` | 事务组装状态机：heap I/U/D 行入桶累积（到达期解码 + 渲染），XACT 终态驱动发射/弃桶/挂起；子事务归并双通道（TOPLEVEL_XID 收割优先 + ASSIGNMENT 兜底）；TableMeta 按 relfilenode 缓存、字典三表 heap 记录到达即全清失效 |
+| `XactGrouper` | 事务组装状态机：heap I/U/D 行入桶累积（到达期解码 + 渲染），XACT 终态驱动发射/弃桶/挂起；子事务归并双通道（TOPLEVEL_XID 收割优先 + ASSIGNMENT 兜底）；TableMeta 按 relfilenode 缓存（2026-10-17 起失效两条触发键：shape-oid 字典记录到达即清 + `shapeEpoch` 代际戳变化时 `resolveCached` 入口懒全清[bootstrap/PRUNE/INPLACE 等不经 shape-oid 的字典变更兜底全覆盖]，toastRels 判定缓存随同清理——长会话单调增长关闭） |
 | `TableFilter` | relkind 'r'/'p' + `vb.wal.tables` 白名单（`schema.table` 逗号分隔，空 = 全放行）；从 v1 三表字典 as-of 解析表身份与列序 |
 | `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz/lz4 双方法解压（`inflate` 分派面）+ 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵 + **INSERT 新元组空面回查视图**（`insertTupleResolver`——重放窗口切断 chunk 的补全通道，2026-10-13 flake 根因修复）；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
 | `Pglz` | PG pglz 解压纯移植（`pg_lzcompress.c` 主循环逐行转录，control byte 分组 + match 回拷，L705-790 源码锚） |
@@ -775,7 +775,7 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**561 用例 = 离线 438 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
+**569 用例 = 离线 446 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
 VastBase 手动档真库 IT 24（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
@@ -800,16 +800,21 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
 供给面 + 门面 dml* 观测面]；F2 审计失败重试断言并入 FileWalSourceTest 既有用例不加数
 ——离线 412→413、总 535→536）
 （2026-10-15 末段解析边界软 EOF +2：FileWalSourceTest 末段软 EOF/非末段仍终态——离线 413→415、总 536→538）
+（2026-10-17 热路径五项 +8：WalStreamMetricsTest 新 2[census 键表懒填充——键形与快照输出不变锚] +
+WalStreamWalkerTest +2[feed 稳态零拷贝/单页记录偏移直读免缝合] + WalRecordParserTest +1
+[(buf,recOff) 偏移重载绝对偏移契约] + CatalogStoresIndexTest 新 2[五二级索引 O(1) 命中 +
+同键最后-put-者胜与 0 键不入语义] + XactGrouperTest +1[shapeEpoch 代际戳变化懒全清锚]——
+离线 438→446、总 561→569）
 
-- **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 12 / TupleDecoderTest 17
+- **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 13（2026-10-17 +1 (buf,recOff) 偏移重载绝对偏移契约）/ TupleDecoderTest 17
   / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
   "两版 toast 偏移差恰 4B"自检锚；**OG 档**：OgWalRecordParserTest 4（真实语料 283 条
   全窗走读 + 四锚记录 + prev 链自洽）/ OgPruneViewTest 6（9.2 系 CLEAN 老格式 + 撞号
   门控）/ WalLayoutVOpenGaussTest 5 / WalLayoutsOgDiscriminatorTest 6（90204 撞号
   文本判别 + vastbase T4 三参探测）/ **OgXactViewTest 6（M2 T2：XACT 四记录族手造 + 语料锚——含无 252
   TOPLEVEL_XID 的终态 subxacts 归并面）/ OgMultiInsertViewTest 4（M2 T3：九条真 COPY
-  语料收口 + 手造变体）**）；`receive` WalStreamWalkerTest 14（锚定协议含 mid-stream 漂移免疫 +
-  OG 整零页容忍）/ FileWalSourceTest 18（目录 tail + .partial 预分配全零的前向扫描
+  语料收口 + 手造变体）**）；`receive` WalStreamWalkerTest 16（锚定协议含 mid-stream 漂移免疫 +
+  OG 整零页容忍；**2026-10-17 +2 feed 稳态零拷贝与单页记录偏移直读免缝合**）/ WalStreamMetricsTest 2（2026-10-17 census 键表懒填充——键形与快照输出不变）/ FileWalSourceTest 18（目录 tail + .partial 预分配全零的前向扫描
   交付上限 + **log/seg 段名语义锚——4GB 边界标准名寻址与续传选段两用例[2026-10-15
   修复 `parseSegNo` 直拼 bug：段号 = log × (0x100000000/段尺寸) + seg，seg 字段值域
   校验越界跳过；spike 第三轮真库 pg_xlog 实证 M1 以来全部 OG 测试在 log=0 区间从未
@@ -822,7 +827,7 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
   DirectWalSourceFeedbackTest 2（65B 'r' 反馈 + 心跳））；`replay` CatalogReplayTest
   16（含 attnum 下界 vanilla 零回归锚）/ CatalogSynchronizerTest 10（含引导前沿种子
   过滤线——种子 lsn 不吞引导窗口记录，终审 C1 离线锚 + M2 T7 修复 C 映射目录段号直认
-  接缝锚）/ **CatalogOfflineTest 4（2026-10-15 离线回放档无库装配——无检查点 ISE 附
+  接缝锚）/ **CatalogStoresIndexTest 2（2026-10-17 热路径：五二级索引 O(1) 命中——oid/filenode/attrelid/nspOid/partitionFilenode + 同键最后-put-者胜与 0 键不入语义）** / **CatalogOfflineTest 4（2026-10-15 离线回放档无库装配——无检查点 ISE 附
   "先在线运行"指引 / 非 VastBase 档检查点 ISE 附档位指引 / 手造检查点 + 手造段目录
   全链冒烟：记录送达 + 确定性 EOF + 最终检查点落盘断言 / 终审 F1 离线 DML 发射计数
   接线：offlineChangeStream 供给面非 null·禁用档 null·门面 dml* 观测面冒烟）** /
@@ -840,8 +845,8 @@ CatalogOffline 新 3 / WalSourceConfig +3 / WalConfigFile +1] + 手动档 +4[Vas
   往返 + OG 档 majorVersion=5；**M3：formatVersion 4 第四字典序列化往返 + v3 检查点
   拒载回落全新引导**；**2026-10-15：`StoredState.pgVersion` 回读往返——离线档位判定的
   供数面，decode 自 header 填充不改 VBWS 格式**）/ StateConfigTest 5；`changes`（v2 DML 面：
-  DiskValueRendererTest 23（2026-10-17 +5 渲染选项档：plain float/date pattern 三族/timestamptz 时区字母/time 与 timetz 偏移/24:00:00 特判）/ XactGrouperTest 22（含 M2 T7 修复 A 的 MULTI_INSERT
-  SHORTALIGN 真几何锚）/ ToastAssemblerTest 16（含 lz4 双形态
+  DiskValueRendererTest 23（2026-10-17 +5 渲染选项档：plain float/date pattern 三族/timestamptz 时区字母/time 与 timetz 偏移/24:00:00 特判）/ XactGrouperTest 23（含 M2 T7 修复 A 的 MULTI_INSERT
+  SHORTALIGN 真几何锚；2026-10-17 +1 shapeEpoch 代际戳变化懒全清锚）/ ToastAssemblerTest 16（含 lz4 双形态
   解压往返与未知方法码 ISE）/ OutputRendererTest 9（2026-10-17 +2 截断阈值 0/自定义）/ TableFilterTest 17（M2 T5 OG 档
   parttype 判别闸——V17/V18 用例零改动零回归；**M3：分区身份链四用例[母表身份/白名单
   双匹配含分区名不外溢负例/链断 WARN 恰一次+计数/vanilla 无视分区链] + EXCHANGE 换绑
