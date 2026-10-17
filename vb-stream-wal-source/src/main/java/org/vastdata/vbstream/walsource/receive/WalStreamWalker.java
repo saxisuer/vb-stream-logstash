@@ -36,6 +36,11 @@ import java.util.function.Consumer;
  * "当前页剩余"取数——累计消耗与页内偏移严禁混用同一坐标系）→ emit。页尾零垫不
  * 预消费（无法区分"已到页尾"与"字节未到"），待下页字节到达后跳页。</p>
  *
+ * <p><strong>输入契约（类级）</strong>：{@link #feed(long, byte[])} 喂入的字节数组在
+ * feed 返回后<strong>不得复用/改写</strong>——walker 可能原地移位且已交付记录的
+ * {@link WalRecord#raw()} 直接引用其字节（详见 feed 的契约面）——宿主复用喂入数组会
+ * 静默损坏已交付记录；既有三路字节源均为每 chunk 新建的一次性数组，契约天然满足。</p>
+ *
  * <p>线程约束：单写者——feed/consumedLsn 限定接收线程（Task 8 的 readPending 循环）
  * 调用；sink 回调在 feed 调用线程内同步执行。</p>
  *

@@ -36,7 +36,10 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * 索引 <b>0 键不入</b>（映射目录行 relfilenode 列值恒 0，入表会把 relOidOf(0) 从
  * "任意命中"变"恒命中"）；③ 同 oid/relfilenode 陈旧 ctid 副本共存窗口内，线性扫
  * 返回"CHM 迭代序任意首配"、索引返回"最后 put 者"——后者即最新代际，是更正确的
- * 选择（<b>记档的语义收紧</b>）；repairTracked/PRUNE 收敛后两者一致，parity IT 钉
+ * 选择（<b>记档的语义收紧</b>）；"最后-put-者胜"的另一面：共存窗口内若先删除的是
+ * <b>最后 put 的行</b>（索引当前指向者），该 oid/relfilenode 的索引条目随之摘除、
+ * 查询暂缺——即使陈旧副本仍在主 map（线性扫形态仍可命中）——与查询歧义同属收敛前
+ * 瞬态，repairTracked/PRUNE 收敛后消除；收敛后两者一致，parity IT 钉
  * 行为不变；④ 索引与 epoch 均为<strong>单写者维护 + 弱一致读</strong>（与主 map 同
  * 口径，不抛 CME）；attrRelIndex 的值是 {@link CopyOnWriteArrayList}——DDL 稀有故
  * 写侧拷贝可接受，读侧对快照迭代无 CME。</p>
@@ -177,8 +180,8 @@ public final class CatalogStores {
      * 索引登记 + 代际戳自增；同 ctid 覆写旧行时先摘旧行的索引条目（值不同则列表去
      * 一，值相等则摘旧登新计数不变）。
      *
-     * <p>边界与异常语义：row 为 null 时主 map 落 null 键值（与裸 put 同口径，调用方
-     * 契约保证非 null）。线程约束：<strong>单写者</strong>（重放线程）维护；读侧
+     * <p>边界与异常语义：row 为 null 抛 NullPointerException（CHM 不容 null 值；
+     * 调用方契约保证非 null）。线程约束：<strong>单写者</strong>（重放线程）维护；读侧
      * （COW 列表快照迭代）弱一致不抛 CME。</p>
      *
      * @param ctid 行位键

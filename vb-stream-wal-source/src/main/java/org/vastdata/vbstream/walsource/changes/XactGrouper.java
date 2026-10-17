@@ -914,8 +914,9 @@ public final class XactGrouper {
     /**
      * 解析关系到表身份 + 列词典（缓存面）——入口先比对快照 {@link
      * CatalogSnapshot#shapeEpoch} 代际戳与 {@link #seenShapeEpoch}：不等即
-     * <b>metaCache/toastRels 懒全清</b>并同步（兜底触发键②，见类 javadoc；miss 才
-     * 促发——字典静默期零开销）。命中直接应答；miss 时先探字典 watched
+     * <b>metaCache/toastRels 懒全清</b>并同步（兜底触发键②，见类 javadoc；比对
+     * 每次入口执行——一次 volatile 读，全清只在代际变化后的下一次 resolve 时发生，
+     * 字典静默期即零清理开销）。命中直接应答；miss 时先探字典 watched
      * 表（pg_class/pg_attribute/pg_namespace 三表恒在、openGauss 档叠 pg_partition
      * 第四表——其上的 heap 记录 = DDL 类变更信号 → <b>全清缓存</b>，直接触发键①），
      * 再走 {@link TableFilter} 完整解析（miss 亦缓存，防 toast/索引关系

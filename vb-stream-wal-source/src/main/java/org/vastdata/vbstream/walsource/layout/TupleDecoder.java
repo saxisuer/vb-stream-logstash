@@ -260,8 +260,8 @@ public final class TupleDecoder {
                     vals[i + base] = renderTimestamp(u64(src, c));
                     c += 8;
                 }
-                case "text" -> { c = varlenaStart(src, c, tupleStart); int end = varlenaEnd(src, c, externalResolver); vals[i + base] = readTextDatum(src, c, end); c = end; }
-                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int end = varlenaEnd(src, c, externalResolver); vals[i + base] = readDatumBytes(src, c, end); c = end; }
+                case "text" -> { c = varlenaStart(src, c, tupleStart); int end = varlenaEnd(src, c); vals[i + base] = readTextDatum(src, c); c = end; }
+                case "bytea", "numeric" -> { c = varlenaStart(src, c, tupleStart); int end = varlenaEnd(src, c); vals[i + base] = readDatumBytes(src, c); c = end; }
                 case "date" -> {   // i32 天（epoch 2000-01-01）——datum 原始字节，解读在渲染矩阵
                     c = tupleStart + align(c - tupleStart, 4);
                     vals[i + base] = slice(src, c, 4);
@@ -281,7 +281,7 @@ public final class TupleDecoder {
                     vals[i + base] = slice(src, c, 16);
                     c += 16;
                 }
-                case "skip" -> { c = varlenaStart(src, c, tupleStart); c = varlenaEnd(src, c, externalResolver); }
+                case "skip" -> { c = varlenaStart(src, c, tupleStart); c = varlenaEnd(src, c); }
                 case "dropped" -> { /* attisdropped 列存储恒 NULL：零字节消耗（发现 26） */ }
                 default -> throw new IllegalStateException("unregistered kind " + kinds[i]);
             }
@@ -324,13 +324,11 @@ public final class TupleDecoder {
      * （{@link #rejectNonPlainVarlena}）兜住，skip 列无值读取故不拒绝（只消耗几何）。
      * 线程约束：纯读，并发安全。</p>
      *
-     * @param src      源缓冲
-     * @param c        varlena 起点（经 varlenaStart 落位）
-     * @param resolver 非 plain varlena 重建面（当前不影响几何——四形态终点均由头字节
-     *                 自描述；参数在位以保持与值读取面的调用同形）
+     * @param src 源缓冲
+     * @param c   varlena 起点（经 varlenaStart 落位）
      * @return 整个 varlena（含头）之后的首偏移
      */
-    private static int varlenaEnd(byte[] src, int c, VarlenaResolver resolver) {
+    private static int varlenaEnd(byte[] src, int c) {
         int b0 = src[c] & 0xFF;
         if ((b0 & VARLENA_TAG_1B) != 0) {
             return c + (b0 == VARLENA_TAG_1B_EXTERNAL ? EXTERNAL_POINTER_SIZE : (b0 >> 1) & 0x7F);
@@ -344,18 +342,16 @@ public final class TupleDecoder {
      * plain varlena 读文本。
      *
      * <p>关键步骤：值形态分支判断仍在本方法内做（external / 行内压缩 / plain 三分）；
-     * 游标推进不在此——调用方持 {@code varlenaEnd} 前置算出的终点（end 与三分支
+     * 游标推进不在此——调用方持 {@code varlenaEnd} 前置算出的终点（与三分支
      * 的内部推进量恒等：external 恒 18B、压缩 total=u32&gt;&gt;&gt;2、plain 同源双头）。
      * 边界与异常语义：external 且未注入 resolver 抛 ISE（v1 拒绝面）；
      * compressed varlena 恒 ISE。线程约束：纯读（resolver 的线程语义由注入方保证）。</p>
      *
      * @param src 源缓冲
      * @param c   datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param end 整个 datum 之后的首偏移（varlenaEnd 产物——本方法不消费，仅契约
-     *            载明终点与内部分支几何同源）
      * @return 文本（external 形态为重组后的原值字符串）
      */
-    private String readTextDatum(byte[] src, int c, int end) {
+    private String readTextDatum(byte[] src, int c) {
         if (isExternalPointer(src, c)) {
             return new String(resolveExternalBytes(src, c), StandardCharsets.UTF_8);
         }
@@ -372,16 +368,15 @@ public final class TupleDecoder {
      * 矩阵输入契约即此形态）。
      *
      * <p>关键步骤：值形态分支判断仍在本方法内做（external / 行内压缩 / plain 三分）；
-     * 游标推进交给调用方的 end（与 {@link #readTextDatum} 同形）。边界与异常语义：
-     * external 且未注入 resolver 抛 ISE；compressed varlena 恒 ISE。线程约束：纯读。</p>
+     * 游标推进交给调用方（{@code varlenaEnd} 终点，与 {@link #readTextDatum} 同形）。
+     * 边界与异常语义：external 且未注入 resolver 抛 ISE；compressed varlena 恒
+     * ISE。线程约束：纯读。</p>
      *
      * @param src 源缓冲
      * @param c   datum 起点（经 varlenaStart 落位——1B 头短 varlena 可未 4 对齐）
-     * @param end 整个 datum 之后的首偏移（varlenaEnd 产物——本方法不消费，仅契约
-     *            载明终点与内部分支几何同源）
      * @return 载荷字节（external 形态为重组后的原值字节）
      */
-    private byte[] readDatumBytes(byte[] src, int c, int end) {
+    private byte[] readDatumBytes(byte[] src, int c) {
         if (isExternalPointer(src, c)) {
             return resolveExternalBytes(src, c);
         }

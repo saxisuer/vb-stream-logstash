@@ -1447,8 +1447,9 @@ public final class CatalogSynchronizer {
          * <p><b>openGauss 映射目录接缝（M2 T7 修复 C + M3 第四腿）</b>：OG 的
          * pg_attribute/pg_class 两目录是 relation-mapped——pg_class 行的 relfilenode <b>列值为 0</b>，
          * 物理段号只经 {@code pg_relation_filenode()} 可得（og-plan 实测锚：oid 1249/1259
-         * 行 relfilenode=0、filenode()=14294/14313），反查腿（含索引化前的值域扫描）对这两目录的物理段号恒
-         * miss——字典三表的 heap 记录在 {@code XactGrouper} 解析为未知关系且 miss 被缓存，
+         * 行 relfilenode=0、filenode()=14294/14313），filenode 反查腿对这两目录的物理段号恒
+         * miss——映射目录行 relfilenode 列值恒 0、0 键不入索引（索引化前的值域扫描同因
+         * miss），这两段号由此走 watched 段号直认——字典三表的 heap 记录在 {@code XactGrouper} 解析为未知关系且 miss 被缓存，
          * 字典形态变更信号（如事务内 ADD COLUMN 的 attr 行）失效 TableMeta 缓存的面被
          * 关死。故反查前先与引导期回填的两 watched 段号比对，命中直认固定 oid——vanilla
          * 侧两目录同为映射目录（relfilenode 列值同为 0，引导回填值同经
