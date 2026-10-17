@@ -29,7 +29,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * attnum 序、relfilenodeOf 取 tracked 链当前值（PRUNE redirect → UPD 跨记录链条）。
  *
  * <p>记录拼装与 CatalogReplayTest 互为双源转录（WalBytes DSL 之上的 heap 家族便捷
- * 档）；种子行经行模型直接落 stores（引导后形态），不依赖 JDBC。</p>
+ * 档）；种子行经行模型 + stores 写点包装方法落字典（引导后形态，主 map 与二级索引
+ * 同步维护——性能优化 #1），不依赖 JDBC。</p>
  */
 class CatalogSynchronizerTest {
 
@@ -61,7 +62,7 @@ class CatalogSynchronizerTest {
         long oldKey = CatalogReplay.ctidKey(0, 1);
         long newKey = CatalogReplay.ctidKey(2, 3);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
+        stores.putClassRow(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
         stores.rawClassTails().put(oldKey, tailOf(oldTuple));
         stores.trackedTableCtid(oldKey);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
@@ -99,7 +100,7 @@ class CatalogSynchronizerTest {
         long afterPrune = CatalogReplay.ctidKey(7, 5);
         long afterUpdate = CatalogReplay.ctidKey(8, 2);
         TupleBytes seed = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(start, CatalogRow.ClassRow.fromDecoded(decode(seed), layout));
+        stores.putClassRow(start, CatalogRow.ClassRow.fromDecoded(decode(seed), layout));
         stores.rawClassTails().put(start, tailOf(seed));
         stores.trackedTableCtid(start);
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
@@ -138,13 +139,13 @@ class CatalogSynchronizerTest {
     @Test
     void columnsOfReturnsDroppedPlaceholderInAttnumOrder() {
         CatalogStores stores = freshStores();
-        stores.attrRows().put(CatalogReplay.ctidKey(0, 3),
+        stores.putAttrRow(CatalogReplay.ctidKey(0, 3),
                 new CatalogRow.AttrRow(42, "........pg.dropped.3........", 23, 3, true));
-        stores.attrRows().put(CatalogReplay.ctidKey(0, 1),
+        stores.putAttrRow(CatalogReplay.ctidKey(0, 1),
                 new CatalogRow.AttrRow(42, "id", 23, 1, false));
-        stores.attrRows().put(CatalogReplay.ctidKey(0, 2),
+        stores.putAttrRow(CatalogReplay.ctidKey(0, 2),
                 new CatalogRow.AttrRow(42, "s", 25, 2, false));
-        stores.attrRows().put(CatalogReplay.ctidKey(1, 1),
+        stores.putAttrRow(CatalogReplay.ctidKey(1, 1),
                 new CatalogRow.AttrRow(43, "other", 23, 1, false));
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout)));
@@ -165,7 +166,7 @@ class CatalogSynchronizerTest {
     @Test
     void relfilenodeAndToastOfUnknownOidReturnEmpty() {
         CatalogStores stores = freshStores();
-        stores.classRows().put(CatalogReplay.ctidKey(0, 1), new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 0, "r"));
+        stores.putClassRow(CatalogReplay.ctidKey(0, 1), new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 0, "r"));
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout)));
 
@@ -253,7 +254,7 @@ class CatalogSynchronizerTest {
         long oldKey = CatalogReplay.ctidKey(0, 1);
         long newKey = CatalogReplay.ctidKey(2, 3);
         TupleBytes oldTuple = classTuple(100, "t1", 200, 0, 1);
-        stores.classRows().put(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
+        stores.putClassRow(oldKey, CatalogRow.ClassRow.fromDecoded(decode(oldTuple), layout));
         stores.rawClassTails().put(oldKey, tailOf(oldTuple));
         stores.trackedTableCtid(oldKey);
 
@@ -288,14 +289,14 @@ class CatalogSynchronizerTest {
     @Test
     void snapshotResolvesSchemaRelkindNameAndOidAcrossNamespaceJoin() {
         CatalogStores stores = freshStores();
-        stores.classRows().put(CatalogReplay.ctidKey(0, 1),
+        stores.putClassRow(CatalogReplay.ctidKey(0, 1),
                 new CatalogRow.ClassRow(100, "t1", 11, 12, 0, 10, 0, 200, 0, "r"));
-        stores.classRows().put(CatalogReplay.ctidKey(0, 2),
+        stores.putClassRow(CatalogReplay.ctidKey(0, 2),
                 new CatalogRow.ClassRow(101, "t_part", 11, 13, 0, 10, 0, 201, 0, "p"));
         // relnamespace 99 无对应 nsp 行（nspRows 缺行形态）——schemaOf 须 empty 而非臆造
-        stores.classRows().put(CatalogReplay.ctidKey(0, 3),
+        stores.putClassRow(CatalogReplay.ctidKey(0, 3),
                 new CatalogRow.ClassRow(102, "t_orphan", 99, 14, 0, 10, 0, 202, 0, "r"));
-        stores.nspRows().put(CatalogReplay.ctidKey(1, 1), new CatalogRow.NspRow(11, "public"));
+        stores.putNspRow(CatalogReplay.ctidKey(1, 1), new CatalogRow.NspRow(11, "public"));
         CatalogSynchronizer sync = new CatalogSynchronizer(stores,
                 new CatalogReplay(layout, new TupleDecoder(layout)));
 
@@ -327,11 +328,11 @@ class CatalogSynchronizerTest {
     void relOidOfResolvesMappedCatalogRelfilenodesViaWatchedSeam() {
         CatalogStores stores = new CatalogStores();
         // OG 形态：pg_attribute/pg_class 自身的 ClassRow relfilenode 列值 0（映射目录）
-        stores.classRows().put(CatalogReplay.ctidKey(0, 1),
+        stores.putClassRow(CatalogReplay.ctidKey(0, 1),
                 new CatalogRow.ClassRow(1249, "pg_attribute", 11, 12, 0, 10, 0, 0, 0, "r"));
-        stores.classRows().put(CatalogReplay.ctidKey(0, 2),
+        stores.putClassRow(CatalogReplay.ctidKey(0, 2),
                 new CatalogRow.ClassRow(1259, "pg_class", 11, 13, 0, 10, 0, 0, 0, "r"));
-        stores.classRows().put(CatalogReplay.ctidKey(0, 3),
+        stores.putClassRow(CatalogReplay.ctidKey(0, 3),
                 new CatalogRow.ClassRow(100, "t1", 11, 14, 0, 10, 0, 200, 0, "r"));
         stores.pgAttrRelfilenode(14294);
         stores.pgClassRelfilenode(14313);

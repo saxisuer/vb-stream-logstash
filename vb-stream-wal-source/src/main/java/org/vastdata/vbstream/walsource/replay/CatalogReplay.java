@@ -18,6 +18,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
+import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
 
 /**
@@ -601,11 +603,16 @@ public final class CatalogReplay {
             return;
         }
         HeapViews.PruneView view = HeapViews.PruneView.parse(r, layout);
-        pruneCatalog(view, stores.pgAttrRelfilenode(), stores.attrRows(), stores.rawAttrTails(), stores, WatchedLeg.ATTR);
-        pruneCatalog(view, stores.pgClassRelfilenode(), stores.classRows(), stores.rawClassTails(), stores, WatchedLeg.CLASS);
-        pruneCatalog(view, stores.pgNspRelnode(), stores.nspRows(), stores.rawNspTails(), stores, WatchedLeg.NSP);
-        pruneCatalog(view, stores.pgPartitionRelfilenode(), stores.partitionRows(), stores.rawPartitionTails(),
-                stores, WatchedLeg.PARTITION);
+        // 行字典写点走包装方法（getter/putter/remover 三函数面）——主 map 与二级索引
+        // 同步维护（性能优化 #1）；raw tail 仍直接操作（tail 无索引面）
+        pruneCatalog(view, stores.pgAttrRelfilenode(), stores.attrRows()::get, stores::putAttrRow,
+                stores::removeAttrRow, stores.rawAttrTails(), stores, WatchedLeg.ATTR);
+        pruneCatalog(view, stores.pgClassRelfilenode(), stores.classRows()::get, stores::putClassRow,
+                stores::removeClassRow, stores.rawClassTails(), stores, WatchedLeg.CLASS);
+        pruneCatalog(view, stores.pgNspRelnode(), stores.nspRows()::get, stores::putNspRow,
+                stores::removeNspRow, stores.rawNspTails(), stores, WatchedLeg.NSP);
+        pruneCatalog(view, stores.pgPartitionRelfilenode(), stores.partitionRows()::get, stores::putPartitionRow,
+                stores::removePartitionRow, stores.rawPartitionTails(), stores, WatchedLeg.PARTITION);
     }
 
     /**
@@ -655,7 +662,7 @@ public final class CatalogReplay {
         }
         long newFileno = u32(r.raw(), b0.dataOff() + layout.pgClassRelfilenodeDataOffset()) & 0xFFFFFFFFL;
         long newToast = u32(r.raw(), b0.dataOff() + layout.pgClassReltoastrelidDataOffset()) & 0xFFFFFFFFL;
-        stores.classRows().put(key, new CatalogRow.ClassRow(cr.relOid(), cr.relname(), cr.relnamespace(),
+        stores.putClassRow(key, new CatalogRow.ClassRow(cr.relOid(), cr.relname(), cr.relnamespace(),
                 cr.reltype(), cr.reloftype(), cr.relowner(), cr.relam(), newFileno, newToast, cr.relkind()));
         stores.rawClassTails().remove(key);    // tail 已陈旧：置失效
         stores.metrics().inc(CatalogStores.CatalogMetrics.INPLACE_UPDATES);
@@ -691,7 +698,7 @@ public final class CatalogReplay {
         }
         long newFileno = u32(r.raw(), b0.dataOff() + layout.pgClassRelfilenodeDataOffset()) & 0xFFFFFFFFL;
         long newToast = u32(r.raw(), b0.dataOff() + layout.pgClassReltoastrelidDataOffset()) & 0xFFFFFFFFL;
-        stores.partitionRows().put(key, new CatalogRow.PartitionRow(pr.partOid(), pr.relname(), pr.parttype(),
+        stores.putPartitionRow(key, new CatalogRow.PartitionRow(pr.partOid(), pr.relname(), pr.parttype(),
                 pr.parentid(), newFileno, newToast));
         stores.rawPartitionTails().remove(key);    // tail 已陈旧：置失效
         stores.metrics().inc(CatalogStores.CatalogMetrics.INPLACE_UPDATES);
@@ -725,17 +732,17 @@ public final class CatalogReplay {
                 layout.pgAttributeKinds(), stores.rawAttrTails(), null, stores.metrics());
         for (HeapEvent ev : attrEvents) {
             if (ev.op() == HeapEvent.DEL) {
-                stores.attrRows().remove(ev.oldCtid());
+                stores.removeAttrRow(ev.oldCtid());
                 stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
             } else {
                 if (ev.op() == HeapEvent.UPD) {
-                    stores.attrRows().remove(ev.oldCtid());
+                    stores.removeAttrRow(ev.oldCtid());
                 }
                 CatalogRow.AttrRow row = CatalogRow.AttrRow.fromDecoded(ev.row(), layout);
                 if (row.attnum() > 0) {
                     // 字典面契约与引导同源：attnum>0（系统列行不进字典——流内建表时
                     // pg_attribute 的负 attnum INS 与种子查询的过滤口径一致，Task 13）
-                    stores.attrRows().put(ev.newCtid(), row);
+                    stores.putAttrRow(ev.newCtid(), row);
                     stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
                 } else if (row.attnum() == 0 || row.attnum() < layout.attrMinSystemAttnum()) {
                     // 解码异常指示：合法系统列 attnum ∈ [下界,-1]（vanilla -6 / OG -8，经
@@ -751,16 +758,16 @@ public final class CatalogReplay {
                 stores.metrics(), stores);
         for (HeapEvent ev : classEvents) {
             if (ev.op() == HeapEvent.DEL) {
-                stores.classRows().remove(ev.oldCtid());
+                stores.removeClassRow(ev.oldCtid());
             } else {
                 // 存储引擎护栏（Task 7 OG 适配）：INS/UPD 的 pg_class 行施加面判别
                 // 列存/分区/段页式/bucket/UStore——识别即 ISE（vanilla 档槽位缺席不激活）
                 guardOgStorageEngine(ev.row());
                 if (ev.op() == HeapEvent.UPD) {
-                    stores.classRows().remove(ev.oldCtid());
+                    stores.removeClassRow(ev.oldCtid());
                 }
                 CatalogRow.ClassRow cr = CatalogRow.ClassRow.fromDecoded(ev.row(), layout);
-                stores.classRows().put(ev.newCtid(), cr);
+                stores.putClassRow(ev.newCtid(), cr);
                 if (ev.op() == HeapEvent.UPD) {
                     stores.followTracked(ev.oldCtid(), ev.newCtid());
                 }
@@ -794,12 +801,12 @@ public final class CatalogReplay {
                 stores.rawNspTails(), null, stores.nspRows()::get, null, stores.metrics(), null);
         for (HeapEvent ev : nspEvents) {
             if (ev.op() == HeapEvent.DEL) {
-                stores.nspRows().remove(ev.oldCtid());
+                stores.removeNspRow(ev.oldCtid());
             } else {
                 if (ev.op() == HeapEvent.UPD) {
-                    stores.nspRows().remove(ev.oldCtid());
+                    stores.removeNspRow(ev.oldCtid());
                 }
-                stores.nspRows().put(ev.newCtid(), CatalogRow.NspRow.fromDecoded(ev.row()));
+                stores.putNspRow(ev.newCtid(), CatalogRow.NspRow.fromDecoded(ev.row()));
             }
             stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
         }
@@ -812,12 +819,12 @@ public final class CatalogReplay {
                 stores.rawPartitionTails(), null, null, stores.partitionRows()::get, stores.metrics(), null);
         for (HeapEvent ev : partEvents) {
             if (ev.op() == HeapEvent.DEL) {
-                stores.partitionRows().remove(ev.oldCtid());
+                stores.removePartitionRow(ev.oldCtid());
             } else {
                 if (ev.op() == HeapEvent.UPD) {
-                    stores.partitionRows().remove(ev.oldCtid());
+                    stores.removePartitionRow(ev.oldCtid());
                 }
-                stores.partitionRows().put(ev.newCtid(), CatalogRow.PartitionRow.fromDecoded(ev.row()));
+                stores.putPartitionRow(ev.newCtid(), CatalogRow.PartitionRow.fromDecoded(ev.row()));
             }
             stores.metrics().inc(CatalogStores.CatalogMetrics.REPLAYED);
         }
@@ -1334,7 +1341,7 @@ public final class CatalogReplay {
             }
         });
         for (long k : staleCtids) {
-            stores.classRows().remove(k);
+            stores.removeClassRow(k);
             stores.rawClassTails().remove(k);
         }
         stores.staleOids().remove(oid);    // 链已修复：撤回既往 stale 标记（下轮引导不再被裁剪面引用）
@@ -1437,14 +1444,17 @@ public final class CatalogReplay {
      *
      * @param view        prune 视图（freeze 段已跳过）
      * @param relfilenode 目录 relfilenode（0 不匹配）
-     * @param rows        行字典（ctid 键控）
+     * @param getter      行字典读取（ctid 键 → 行；弱一致读）
+     * @param putter      行字典增量写点（主 map + 二级索引同步维护——stores 包装方法）
+     * @param remover     行字典增量删点（同上）
      * @param tails       raw tail 存储
      * @param stores      状态容器（tracked 跟随 + 指标）
      * @param leg         watched 目录判别（tracked/采纳面的施加分派）
-     * @param <T>         行模型类型（AttrRow / ClassRow / NspRow）
+     * @param <T>         行模型类型（AttrRow / ClassRow / NspRow / PartitionRow）
      */
     private <T> void pruneCatalog(HeapViews.PruneView view, long relfilenode,
-            Map<Long, T> rows, Map<Long, byte[]> tails, CatalogStores stores, WatchedLeg leg) {
+            LongFunction<T> getter, BiConsumer<Long, T> putter, LongConsumer remover,
+            Map<Long, byte[]> tails, CatalogStores stores, WatchedLeg leg) {
         BlockRef b = findHeapBlock(view.rec(), relfilenode);
         if (b == null) {
             return;
@@ -1454,8 +1464,10 @@ public final class CatalogReplay {
         for (int i = 0; i + 1 < pairs.size(); i += 2) {
             long from = ctidKey(blockNo, pairs.get(i));
             long to = ctidKey(blockNo, pairs.get(i + 1));
-            T row = rows.remove(from);
-            if (row == null) {
+            T row = getter.apply(from);
+            if (row != null) {
+                remover.accept(from);
+            } else {
                 // 终审收敛洞修复：from 位无行 = 链已断（典型路径：先前截断更新的精确采纳
                 // 因行已再迁移被拒——行现居位恰是本 redirect 的 to 位）——旧形态此处
                 // no-op 使该行永久丢失（redirect 无法物化缺行）。按 to 位做 ctid 寻址
@@ -1463,7 +1475,7 @@ public final class CatalogReplay {
                 row = adoptRedirectTarget(view.rec(), to, stores, leg);
             }
             if (row != null) {
-                rows.put(to, row);
+                putter.accept(to, row);
                 stores.metrics().inc(CatalogStores.CatalogMetrics.PRUNE_REDIRECTS);
             }
             byte[] tail = tails.remove(from);
@@ -1475,10 +1487,10 @@ public final class CatalogReplay {
             }
         }
         for (int off : view.nowdead()) {
-            dropPruned(blockNo, off, rows, tails, stores, leg);
+            dropPruned(blockNo, off, getter, remover, tails, stores, leg);
         }
         for (int off : view.nowunused()) {
-            dropPruned(blockNo, off, rows, tails, stores, leg);
+            dropPruned(blockNo, off, getter, remover, tails, stores, leg);
         }
     }
 
@@ -1539,23 +1551,26 @@ public final class CatalogReplay {
     }
 
     /**
-     * PRUNE dead/unused 段的单行移除：行与 tail 删键；pg_class 分支且 tracked 命中
-     * （行位被物理删除，链断）打 WARN——attr/nsp 分支数值命中不告警（键空间重叠，
-     * 见 {@link #pruneCatalog}）。
+     * PRUNE dead/unused 段的单行移除：行与 tail 删键（行走 remover 包装方法——主
+     * map 与二级索引同步维护，性能优化 #1；tail 无索引面直接删）；pg_class 分支且
+     * tracked 命中（行位被物理删除，链断）打 WARN——attr/nsp 分支数值命中不告警
+     * （键空间重叠，见 {@link #pruneCatalog}）。
      *
      * @param blockNo 块号
      * @param offnum  行号
-     * @param rows    行字典
+     * @param getter  行字典读取（判"有行"供指标计数）
+     * @param remover 行字典增量删点（主 map + 二级索引同步维护）
      * @param tails   raw tail 存储
      * @param stores  状态容器（tracked + 指标）
      * @param leg     watched 目录判别（tracked 告警仅 CLASS）
      * @param <T>     行模型类型
      */
-    private <T> void dropPruned(int blockNo, int offnum, Map<Long, T> rows,
+    private <T> void dropPruned(int blockNo, int offnum, LongFunction<T> getter, LongConsumer remover,
             Map<Long, byte[]> tails, CatalogStores stores, WatchedLeg leg) {
         long key = ctidKey(blockNo, offnum);
-        T row = rows.remove(key);
+        T row = getter.apply(key);
         if (row != null) {
+            remover.accept(key);
             stores.metrics().inc(CatalogStores.CatalogMetrics.PRUNE_DROPPED);
         }
         tails.remove(key);

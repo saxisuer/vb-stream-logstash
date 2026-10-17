@@ -1336,17 +1336,20 @@ public final class CatalogSynchronizer {
         }
 
         /**
-         * 列字典查询：attrRows 值域过滤 attrelid 后按 attnum 升序投影——含 dropped
-         * 占位行（发现 26），未知关系空表。
+         * 列字典查询：attrRelIndex（attrelid 键 → COW 行列表）取行后按 attnum 升序
+         * 投影——含 dropped 占位行（发现 26），未知关系空表。索引面（性能优化 #1，
+         * 2026-10-17）替代 attrRows 值域线性扫；同 attrelid 陈旧副本窗口内索引收
+         * 全部副本（与线性扫同口径，副本经 repairTracked/PRUNE 收敛后一致）。
          *
          * @param relOid 关系 oid
          * @return 列列表（attnum 升序）
          */
         @Override
         public List<Column> columnsOf(long relOid) {
-            List<Column> out = new ArrayList<>();
-            for (CatalogRow.AttrRow row : stores.attrRows().values()) {
-                if (row.attrelid() == relOid) {
+            List<CatalogRow.AttrRow> rows = stores.attrsByRel(relOid);
+            List<Column> out = new ArrayList<>(rows == null ? 0 : rows.size());
+            if (rows != null) {
+                for (CatalogRow.AttrRow row : rows) {
                     out.add(new Column(row.attnum(), row.attname(), row.atttypid(), row.attisdropped()));
                 }
             }
@@ -1355,101 +1358,83 @@ public final class CatalogSynchronizer {
         }
 
         /**
-         * relfilenode 查询：classRows 值域首配 relOid（oid 目录内唯一，首配即全配）。
+         * relfilenode 查询：classOidIndex O(1) 取行（替代 classRows 值域线性扫——
+         * 性能优化 #1；同 oid 陈旧副本窗口内索引取最后 put 者，记档的语义收紧）。
          *
          * @param relOid 关系 oid
          * @return 当前 relfilenode；不在字典 empty
          */
         @Override
         public OptionalLong relfilenodeOf(long relOid) {
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relOid() == relOid) {
-                    return OptionalLong.of(row.relfilenode());
-                }
-            }
-            return OptionalLong.empty();
+            CatalogRow.ClassRow row = stores.classByOid(relOid);
+            return row == null ? OptionalLong.empty() : OptionalLong.of(row.relfilenode());
         }
 
         /**
-         * toast 关系查询：与 {@link #relfilenodeOf(long)} 同源行取 reltoastrelid。
+         * toast 关系查询：与 {@link #relfilenodeOf(long)} 同源行（classOidIndex）取
+         * reltoastrelid。
          *
          * @param relOid 关系 oid
          * @return toast 关系 oid（无 toast 为 of(0)）；不在字典 empty
          */
         @Override
         public OptionalLong toastOf(long relOid) {
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relOid() == relOid) {
-                    return OptionalLong.of(row.reltoastrelid());
-                }
-            }
-            return OptionalLong.empty();
+            CatalogRow.ClassRow row = stores.classByOid(relOid);
+            return row == null ? OptionalLong.empty() : OptionalLong.of(row.reltoastrelid());
         }
 
         /**
-         * 模式名查询（v2 扩链面）：class 行取 relnamespace，再经 nsp 行字典值域解析
-         * nspname——两段线性扫描（字典规模 pg_namespace 恒几十行，class 行首配即止，
-         * 与 {@link #columnsOf} 的 attr 值域扫描同口径）。
+         * 模式名查询（v2 扩链面）：classOidIndex 取 class 行的 relnamespace，再经
+         * nspOidIndex O(1) 解析 nspname——两段索引查询（性能优化 #1，替代两段值域
+         * 线性扫）。
          *
          * @param relOid 关系 oid
          * @return 模式名；关系不在字典、或其 relnamespace 无对应 nsp 行（字典半损）empty
          */
         @Override
         public Optional<String> schemaOf(long relOid) {
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relOid() == relOid) {
-                    for (CatalogRow.NspRow nsp : stores.nspRows().values()) {
-                        if (nsp.nspOid() == row.relnamespace()) {
-                            return Optional.of(nsp.nspname());
-                        }
-                    }
-                    return Optional.empty();
-                }
+            CatalogRow.ClassRow row = stores.classByOid(relOid);
+            if (row == null) {
+                return Optional.empty();
             }
-            return Optional.empty();
+            CatalogRow.NspRow nsp = stores.nspByOid(row.relnamespace());
+            return nsp == null ? Optional.empty() : Optional.of(nsp.nspname());
         }
 
         /**
-         * relkind 查询（v2 扩链面）：class 行投影直供（裸单字符，如 "r"）。
+         * relkind 查询（v2 扩链面）：classOidIndex 取行后投影直供（裸单字符，如 "r"）。
          *
          * @param relOid 关系 oid
          * @return relkind 单字符；不在字典 empty
          */
         @Override
         public Optional<String> relkindOf(long relOid) {
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relOid() == relOid) {
-                    return Optional.ofNullable(row.relkind());
-                }
-            }
-            return Optional.empty();
+            CatalogRow.ClassRow row = stores.classByOid(relOid);
+            return row == null ? Optional.empty() : Optional.ofNullable(row.relkind());
         }
 
         /**
-         * 表名查询（v2 扩链面）：class 行投影直供。
+         * 表名查询（v2 扩链面）：classOidIndex 取行后投影直供。
          *
          * @param relOid 关系 oid
          * @return relname；不在字典 empty
          */
         @Override
         public Optional<String> nameOf(long relOid) {
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relOid() == relOid) {
-                    return Optional.of(row.relname());
-                }
-            }
-            return Optional.empty();
+            CatalogRow.ClassRow row = stores.classByOid(relOid);
+            return row == null ? Optional.empty() : Optional.of(row.relname());
         }
 
         /**
          * relfilenode/oid 双入口归一（v2 扩链面）：先按 relfilenode 反查（heap 块
-         * 形态），miss 再按 oid 直认（元数据形态）——两遍线性扫描，relfilenode 命中
+         * 形态，classFilenodeIndex O(1)——性能优化 #1），miss 再按 oid 直认
+         * （元数据形态，classOidIndex O(1)）——两段索引查询，relfilenode 命中
          * 即止（同库引导下唯一，v1 块匹配同口径）。
          *
          * <p><b>openGauss 映射目录接缝（M2 T7 修复 C + M3 第四腿）</b>：OG 的
          * pg_attribute/pg_class 两目录是 relation-mapped——pg_class 行的 relfilenode <b>列值为 0</b>，
          * 物理段号只经 {@code pg_relation_filenode()} 可得（og-plan 实测锚：oid 1249/1259
-         * 行 relfilenode=0、filenode()=14294/14313），线性扫描对这两目录的物理段号恒
+         * 行 relfilenode=0、filenode()=14294/14313），反查腿（含索引化前的值域扫描）对这两目录的物理段号恒
          * miss——字典三表的 heap 记录在 {@code XactGrouper} 解析为未知关系且 miss 被缓存，
          * 字典形态变更信号（如事务内 ADD COLUMN 的 attr 行）失效 TableMeta 缓存的面被
          * 关死。故反查前先与引导期回填的两 watched 段号比对，命中直认固定 oid——vanilla
@@ -1478,39 +1463,37 @@ public final class CatalogSynchronizer {
                     return OptionalLong.of(PG_PARTITION_OID);
                 }
             }
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relfilenode() == relNodeOrOid) {
-                    return OptionalLong.of(row.relOid());
-                }
+            // 索引面（性能优化 #1）：classFilenodeIndex 0 键不入——relOidOf(0) 自"线性扫
+            // 任意命中"收紧为恒 empty（映射目录行 relfilenode 列值恒 0，记档的语义收紧）
+            CatalogRow.ClassRow byFilenode = stores.classByFilenode(relNodeOrOid);
+            if (byFilenode != null) {
+                return OptionalLong.of(byFilenode.relOid());
             }
-            for (CatalogRow.ClassRow row : stores.classRows().values()) {
-                if (row.relOid() == relNodeOrOid) {
-                    return OptionalLong.of(relNodeOrOid);
-                }
-            }
-            return OptionalLong.empty();
+            return stores.classByOid(relNodeOrOid) != null
+                    ? OptionalLong.of(relNodeOrOid)
+                    : OptionalLong.empty();
         }
 
         /**
-         * 分区身份链查询（openGauss M3 第四字典面）：partitionRows 值域首配
-         * relfilenode 且行身份为 'p'（分区行——母表 'r' 行 relfilenode 恒 0 不入
-         * 路由面），命中投影为分区名 + parentid（消费方经 parentid 取母表身份/列集，
-         * 锚② {@code PARTITION_NAME=mother}）。
+         * 分区身份链查询（openGauss M3 第四字典面）：partitionFilenodeIndex O(1)
+         * 首配 relfilenode 且行身份为 'p'（分区行——母表 'r' 行 relfilenode 恒 0
+         * 不入索引，'p' 判定保留在查询侧），命中投影为分区名 + parentid（消费方经
+         * parentid 取母表身份/列集，锚② {@code PARTITION_NAME=mother}）。索引面
+         * （性能优化 #1）替代 partitionRows 值域线性扫。
          *
          * <p>vanilla 档 partitionRows 恒空（引导不回填第四腿）——天然 empty，与
-         * 接口缺省同果。线程约束：ConcurrentHashMap 弱一致迭代（与类 javadoc 同口径）。</p>
+         * 接口缺省同果。线程约束：ConcurrentHashMap 弱一致读（与类 javadoc 同口径）。</p>
          *
          * @param relfilenode 分区物理段号（heap 记录路由锚）
          * @return 分区身份；第四字典无 'p' 行匹配为 empty
          */
         @Override
         public Optional<PartitionIdentity> partitionOf(long relfilenode) {
-            for (CatalogRow.PartitionRow row : stores.partitionRows().values()) {
-                if (row.relfilenode() == relfilenode && "p".equals(row.parttype())) {
-                    return Optional.of(new PartitionIdentity(row.relname(), row.parentid()));
-                }
+            CatalogRow.PartitionRow row = stores.partitionByFilenode(relfilenode);
+            if (row == null || !"p".equals(row.parttype())) {
+                return Optional.empty();
             }
-            return Optional.empty();
+            return Optional.of(new PartitionIdentity(row.relname(), row.parentid()));
         }
 
         /**

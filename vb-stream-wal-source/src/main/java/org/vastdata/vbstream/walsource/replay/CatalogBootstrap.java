@@ -169,6 +169,9 @@ public final class CatalogBootstrap {
             int classCount = seedClassRows(stores);
             int nspCount = seedNspRows(stores);
             int partCount = seedPartitionRows(stores);
+            // 种子完成点恰一次全量重建二级索引（bulk 装载纪律——种子循环直接 put 主
+            // map 不逐行维护索引，性能优化 #1）
+            stores.rebuildIndexes();
             locateTracked(stores);
             connection.commit();
             if (layout.openGaussDialect()) {

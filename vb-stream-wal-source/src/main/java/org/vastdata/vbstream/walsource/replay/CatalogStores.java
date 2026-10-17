@@ -1,9 +1,11 @@
 package org.vastdata.vbstream.walsource.replay;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * catalog ctid 重放的状态容器——pg_attribute / pg_class / pg_namespace 三张 watched
@@ -22,6 +24,22 @@ import java.util.concurrent.ConcurrentHashMap;
  * 迭代、不抛 CME；tracked 双 ctid/interest/stale 等标量与小集合仅装配/引导线程
  * 触碰，保持普通字段/HashSet；持久化与指标快照走 {@link CatalogMetrics#snapshot()}
  * 的防御拷贝。</p>
+ *
+ * <p><strong>二级索引面（性能优化 #1，2026-10-17）</strong>：五张 CHM 索引
+ * （{@code classOidIndex}/{@code classFilenodeIndex}/{@code nspOidIndex}/
+ * {@code attrRelIndex}/{@code partitionFilenodeIndex}）把 as-of 查询从行字典值域
+ * 线性扫（宽 schema 万级行）降 O(1)。<b>维护纪律</b>：① 运行期增量写点一律走
+ * {@link #putAttrRow}/{@link #removeAttrRow} 等八包装方法（主 map + 索引 +
+ * {@link #shapeEpoch()} 同步维护）——直接操作 {@link #attrRows()} 等主 map 会留下
+ * 陈旧索引；bulk 装载（引导种子/{@code StoredState#restoreInto}）例外——种子循环
+ * 直接 put 主 map、完成后恰一次 {@link #rebuildIndexes()} 全量重建；② 两 filenode
+ * 索引 <b>0 键不入</b>（映射目录行 relfilenode 列值恒 0，入表会把 relOidOf(0) 从
+ * "任意命中"变"恒命中"）；③ 同 oid/relfilenode 陈旧 ctid 副本共存窗口内，线性扫
+ * 返回"CHM 迭代序任意首配"、索引返回"最后 put 者"——后者即最新代际，是更正确的
+ * 选择（<b>记档的语义收紧</b>）；repairTracked/PRUNE 收敛后两者一致，parity IT 钉
+ * 行为不变；④ 索引与 epoch 均为<strong>单写者维护 + 弱一致读</strong>（与主 map 同
+ * 口径，不抛 CME）；attrRelIndex 的值是 {@link CopyOnWriteArrayList}——DDL 稀有故
+ * 写侧拷贝可接受，读侧对快照迭代无 CME。</p>
  */
 public final class CatalogStores {
 
@@ -37,6 +55,34 @@ public final class CatalogStores {
     private final Set<Long> interestRelOids = ConcurrentHashMap.newKeySet();
     private final Set<Long> staleOids = new HashSet<>();
     private final CatalogMetrics metrics = new CatalogMetrics();
+
+    // ---- 五二级索引（性能优化 #1，2026-10-17；维护纪律与多行同键语义见类 javadoc 索引节） ----
+
+    /** pg_class 按关系 oid 的索引（键 relOid → 行模型）——relfilenodeOf/toastOf/
+     *  relkindOf/nameOf/schemaOf 首段与 relOidOf 的 oid 直认腿；CHM 弱一致读。 */
+    private final Map<Long, CatalogRow.ClassRow> classOidIndex = new ConcurrentHashMap<>();
+
+    /** pg_class 按物理段号的索引（键 relfilenode → 行模型，<b>0 键不入</b>——映射目录
+     *  行 relfilenode 列值恒 0）——relOidOf 反查腿。 */
+    private final Map<Long, CatalogRow.ClassRow> classFilenodeIndex = new ConcurrentHashMap<>();
+
+    /** pg_namespace 按模式 oid 的索引（键 nspOid → 行模型）——schemaOf 第二段。 */
+    private final Map<Long, CatalogRow.NspRow> nspOidIndex = new ConcurrentHashMap<>();
+
+    /** pg_attribute 按所属关系 oid 的索引（键 attrelid → 行列表，含 dropped 占位行与
+     *  同键陈旧副本）——columnsOf；值 COW 列表：DDL 稀有故写侧拷贝可接受，读侧快照
+     *  迭代无 CME。 */
+    private final Map<Long, CopyOnWriteArrayList<CatalogRow.AttrRow>> attrRelIndex = new ConcurrentHashMap<>();
+
+    /** pg_partition 按分区物理段号的索引（键 relfilenode → 行模型，<b>0 键不入</b>——
+     *  母表 'r' 行 relfilenode 恒 0）——partitionOf（'p' 判定保留在查询侧）。 */
+    private final Map<Long, CatalogRow.PartitionRow> partitionFilenodeIndex = new ConcurrentHashMap<>();
+
+    /** 字典形态代际戳（volatile 弱一致读）：每次行变更（put/remove 命中）与每次
+     *  {@link #rebuildIndexes()} 自增——Task 6 以它作消费方缓存的代际键（本字段先行
+     *  落地，暂无消费方）。 */
+    private volatile long shapeEpoch;
+
     private long trackedTableCtid;
     private long trackedToastCtid;
     private long pgAttrRelfilenode;
@@ -122,6 +168,280 @@ public final class CatalogStores {
      */
     public Map<Long, byte[]> rawPartitionTails() {
         return rawPartitionTails;
+    }
+
+    // ---- 二级索引维护面（八包装方法 + bulk 重建 + 五查询；单写者维护，弱一致读） ----
+
+    /**
+     * pg_attribute 行的增量写点（重放引擎 attr 族的唯一正门）：主 map put + attrelid
+     * 索引登记 + 代际戳自增；同 ctid 覆写旧行时先摘旧行的索引条目（值不同则列表去
+     * 一，值相等则摘旧登新计数不变）。
+     *
+     * <p>边界与异常语义：row 为 null 时主 map 落 null 键值（与裸 put 同口径，调用方
+     * 契约保证非 null）。线程约束：<strong>单写者</strong>（重放线程）维护；读侧
+     * （COW 列表快照迭代）弱一致不抛 CME。</p>
+     *
+     * @param ctid 行位键
+     * @param row  行模型
+     */
+    public void putAttrRow(long ctid, CatalogRow.AttrRow row) {
+        CatalogRow.AttrRow old = attrRows.put(ctid, row);
+        if (old != null) {
+            removeAttrIndexEntry(old);
+        }
+        attrRelIndex.computeIfAbsent(row.attrelid(), k -> new CopyOnWriteArrayList<>()).add(row);
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_attribute 行的增量删点：主 map remove + 旧行的 attrelid 索引条目摘除
+     * （无行 no-op——不动索引与代际戳）。
+     *
+     * <p>线程约束：单写者维护；读侧弱一致。</p>
+     *
+     * @param ctid 行位键
+     */
+    public void removeAttrRow(long ctid) {
+        CatalogRow.AttrRow old = attrRows.remove(ctid);
+        if (old == null) {
+            return;
+        }
+        removeAttrIndexEntry(old);
+        shapeEpoch++;
+    }
+
+    /**
+     * attrelid 索引的条目摘除（put 覆写/remove 共用）：列表按值去一（record equals），
+     * 摘空后连键回收。
+     *
+     * @param old 离场行模型
+     */
+    private void removeAttrIndexEntry(CatalogRow.AttrRow old) {
+        CopyOnWriteArrayList<CatalogRow.AttrRow> list = attrRelIndex.get(old.attrelid());
+        if (list == null) {
+            return;
+        }
+        list.remove(old);
+        if (list.isEmpty()) {
+            attrRelIndex.remove(old.attrelid(), list);
+        }
+    }
+
+    /**
+     * pg_class 行的增量写点（重放引擎 class 族含 INPLACE/PRUNE redirect 的唯一正门）：
+     * 主 map put + oid/filenode 两索引 upsert（<b>最后 put 者胜</b>——同 oid 陈旧副本
+     * 共存窗口内索引取最新代际，记档的语义收紧）+ 旧行与新行键不重叠的旧索引条目
+     * 条件移除 + 代际戳自增。
+     *
+     * <p>关键步骤：先登记新行（relfilenode 0 不入 filenode 索引），再对旧行非重叠键
+     * 做"索引现值 == old 才移除"的条件删除（两参 remove）——防误删同键后写行。
+     * 边界与异常语义：row 非 null 由调用方契约保证。线程约束：单写者维护；读侧弱一致。</p>
+     *
+     * @param ctid 行位键
+     * @param row  行模型
+     */
+    public void putClassRow(long ctid, CatalogRow.ClassRow row) {
+        CatalogRow.ClassRow old = classRows.put(ctid, row);
+        classOidIndex.put(row.relOid(), row);
+        if (row.relfilenode() != 0) {
+            classFilenodeIndex.put(row.relfilenode(), row);
+        }
+        if (old != null) {
+            if (old.relOid() != row.relOid()) {
+                classOidIndex.remove(old.relOid(), old);
+            }
+            if (old.relfilenode() != 0 && old.relfilenode() != row.relfilenode()) {
+                classFilenodeIndex.remove(old.relfilenode(), old);
+            }
+        }
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_class 行的增量删点：主 map remove + 两索引按"索引现值 == old 才移除"条件
+     * 删除（同 oid/relfilenode 的后写行在场时不误删）+ 代际戳自增（无行 no-op）。
+     *
+     * <p>线程约束：单写者维护；读侧弱一致。</p>
+     *
+     * @param ctid 行位键
+     */
+    public void removeClassRow(long ctid) {
+        CatalogRow.ClassRow old = classRows.remove(ctid);
+        if (old == null) {
+            return;
+        }
+        classOidIndex.remove(old.relOid(), old);
+        if (old.relfilenode() != 0) {
+            classFilenodeIndex.remove(old.relfilenode(), old);
+        }
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_namespace 行的增量写点：主 map put + nspOid 索引 upsert（最后 put 者胜）+
+     * 旧行非重叠键条件移除 + 代际戳自增。线程约束：单写者维护；读侧弱一致。
+     *
+     * @param ctid 行位键
+     * @param row  行模型
+     */
+    public void putNspRow(long ctid, CatalogRow.NspRow row) {
+        CatalogRow.NspRow old = nspRows.put(ctid, row);
+        nspOidIndex.put(row.nspOid(), row);
+        if (old != null && old.nspOid() != row.nspOid()) {
+            nspOidIndex.remove(old.nspOid(), old);
+        }
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_namespace 行的增量删点：主 map remove + nspOid 索引条件删除（现值 == old
+     * 才移除）+ 代际戳自增（无行 no-op）。线程约束：单写者维护；读侧弱一致。
+     *
+     * @param ctid 行位键
+     */
+    public void removeNspRow(long ctid) {
+        CatalogRow.NspRow old = nspRows.remove(ctid);
+        if (old == null) {
+            return;
+        }
+        nspOidIndex.remove(old.nspOid(), old);
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_partition 行的增量写点（重放引擎 partition 族含 INPLACE 的唯一正门）：主
+     * map put + filenode 索引 upsert（<b>0 键不入</b>——母表 'r' 行 relfilenode 恒 0）
+     * + 旧行非重叠键条件移除 + 代际戳自增。线程约束：单写者维护；读侧弱一致。
+     *
+     * @param ctid 行位键
+     * @param row  行模型
+     */
+    public void putPartitionRow(long ctid, CatalogRow.PartitionRow row) {
+        CatalogRow.PartitionRow old = partitionRows.put(ctid, row);
+        if (row.relfilenode() != 0) {
+            partitionFilenodeIndex.put(row.relfilenode(), row);
+        }
+        if (old != null && old.relfilenode() != 0 && old.relfilenode() != row.relfilenode()) {
+            partitionFilenodeIndex.remove(old.relfilenode(), old);
+        }
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_partition 行的增量删点：主 map remove + filenode 索引条件删除（现值 == old
+     * 才移除）+ 代际戳自增（无行 no-op）。线程约束：单写者维护；读侧弱一致。
+     *
+     * @param ctid 行位键
+     */
+    public void removePartitionRow(long ctid) {
+        CatalogRow.PartitionRow old = partitionRows.remove(ctid);
+        if (old == null) {
+            return;
+        }
+        if (old.relfilenode() != 0) {
+            partitionFilenodeIndex.remove(old.relfilenode(), old);
+        }
+        shapeEpoch++;
+    }
+
+    /**
+     * 五索引清空并自四张主字典全量重建 + 代际戳自增——bulk 装载（{@code
+     * CatalogBootstrap} 种子完成点 / {@code StoredState#restoreInto} 四 putAll 后）
+     * 恰一次调用；重建走主 map 迭代，同 oid/relfilenode 多副本时"最后 put 者胜"由
+     * 迭代次序承载（CHM 迭代序不定，副本间任取其一——与增量维护的语义收紧同向，
+     * parity 面两者收敛后一致）。
+     *
+     * <p>边界与异常语义：filenode 0 行不入两 filenode 索引（与增量纪律一致）；attr
+     * 行按 attrelid 分组进 COW 列表。线程约束：<strong>单写者</strong>（装配/重放
+     * 线程）调用；重建窗口内读侧弱一致（可能读到部分重建的索引——"尽力一致"口径）。</p>
+     */
+    public void rebuildIndexes() {
+        classOidIndex.clear();
+        classFilenodeIndex.clear();
+        nspOidIndex.clear();
+        attrRelIndex.clear();
+        partitionFilenodeIndex.clear();
+        for (CatalogRow.ClassRow row : classRows.values()) {
+            classOidIndex.put(row.relOid(), row);
+            if (row.relfilenode() != 0) {
+                classFilenodeIndex.put(row.relfilenode(), row);
+            }
+        }
+        for (CatalogRow.NspRow row : nspRows.values()) {
+            nspOidIndex.put(row.nspOid(), row);
+        }
+        for (CatalogRow.AttrRow row : attrRows.values()) {
+            attrRelIndex.computeIfAbsent(row.attrelid(), k -> new CopyOnWriteArrayList<>()).add(row);
+        }
+        for (CatalogRow.PartitionRow row : partitionRows.values()) {
+            if (row.relfilenode() != 0) {
+                partitionFilenodeIndex.put(row.relfilenode(), row);
+            }
+        }
+        shapeEpoch++;
+    }
+
+    /**
+     * pg_class 按关系 oid 的索引查询——relfilenodeOf/toastOf/relkindOf/nameOf/
+     * schemaOf 首段与 relOidOf 的 oid 直认腿。
+     *
+     * @param relOid 关系 oid
+     * @return 行模型；不在字典 null（同 oid 陈旧副本窗口内取最后 put 者）
+     */
+    public CatalogRow.ClassRow classByOid(long relOid) {
+        return classOidIndex.get(relOid);
+    }
+
+    /**
+     * pg_class 按物理段号的索引查询——relOidOf 反查腿（0 键不入索引，恒 null）。
+     *
+     * @param relfilenode 物理段号
+     * @return 行模型；无匹配 null
+     */
+    public CatalogRow.ClassRow classByFilenode(long relfilenode) {
+        return classFilenodeIndex.get(relfilenode);
+    }
+
+    /**
+     * pg_attribute 按所属关系 oid 的索引查询——columnsOf 源（含 dropped 占位行；
+     * 排序保留在查询侧）。
+     *
+     * @param relOid 关系 oid
+     * @return 行列表（COW 快照语义，弱一致迭代不抛 CME）；无列关系 null
+     */
+    public List<CatalogRow.AttrRow> attrsByRel(long relOid) {
+        return attrRelIndex.get(relOid);
+    }
+
+    /**
+     * pg_namespace 按模式 oid 的索引查询——schemaOf 第二段。
+     *
+     * @param nspOid 模式 oid
+     * @return 行模型；不在字典 null
+     */
+    public CatalogRow.NspRow nspByOid(long nspOid) {
+        return nspOidIndex.get(nspOid);
+    }
+
+    /**
+     * pg_partition 按分区物理段号的索引查询——partitionOf 源（'p' 判定保留在查询侧；
+     * 母表 'r' 行 relfilenode 0 不入索引）。
+     *
+     * @param relfilenode 分区物理段号
+     * @return 行模型（母表/分区行皆可能）；无匹配 null
+     */
+    public CatalogRow.PartitionRow partitionByFilenode(long relfilenode) {
+        return partitionFilenodeIndex.get(relfilenode);
+    }
+
+    /**
+     * 字典形态代际戳——每次行变更（put/remove 命中行）与每次 {@link #rebuildIndexes()}
+     * 单调自增；Task 6 以它作消费方缓存的代际键（本方法先行落地，暂无消费方）。
+     *
+     * @return 当前代际（初始 0，单调不减；volatile 弱一致读）
+     */
+    public long shapeEpoch() {
+        return shapeEpoch;
     }
 
     /**

@@ -77,7 +77,9 @@ public record StoredState(long lsn,
     /**
      * 把本状态灌回目标 stores（Task 15 续传路径）：先清空八 map 与 interest/stale
      * 两集（确定性重建——目标 stores 既有内容不保留），再逐面回填行字典/tail 存储/
-     * tracked 双 ctid/四 relfilenode/两 oid 集。
+     * tracked 双 ctid/四 relfilenode/两 oid 集；四行字典 putAll 后恰一次
+     * {@link CatalogStores#rebuildIndexes()} 全量重建二级索引（bulk 装载纪律——
+     * putAll 直写主 map 不维护索引，性能优化 #1）。
      *
      * <p>边界与异常语义：metrics 不在持久化面、保持目标 stores 原值（重建会话的
      * 计数从 0 起）；tail 的 byte[] 为引用共享（load 产物归调用方独享，灌回后两处
@@ -95,6 +97,7 @@ public record StoredState(long lsn,
         stores.nspRows().putAll(nspRows);
         stores.partitionRows().clear();
         stores.partitionRows().putAll(partitionRows);
+        stores.rebuildIndexes();
         stores.rawAttrTails().clear();
         stores.rawAttrTails().putAll(rawAttrTails);
         stores.rawClassTails().clear();
