@@ -499,7 +499,8 @@ watched 注册按物理段号（`relOidOf` 第三直认，沿 M2 修复 C 映射
 
 **A 档（Oracle 风格兼容库）能力**（T3/T5）：
 
-- 护栏白名单 {'PG','A'}（`isDmlSupportedCompatMode`）；A 档 v2 全场景复验 = `OgDmlParityIT`
+- 护栏白名单 {'PG','A'}（`isDmlSupportedCompatMode`——M4 起按 layout 分档并增双参重载，
+  见"VastBase G100 档 M4"节；本节为 M3 时点历史口径）；A 档 v2 全场景复验 = `OgDmlParityIT`
   13 场景参数化 PG/A 双库同套（场景体收成单方法双档委派，**场景代码零复制**、PG 档
   方法名与断言逐字节不变；槽名 A 档附 `_a` 后缀防跨库同名互踩）；A 档基准路
   （opengauss-jdbc 逻辑流收帧 + 归一化）端到端可用——认证/pgoutput 帧面/逻辑槽建删
@@ -610,7 +611,9 @@ CREATE TABLE 的"疑似词典错位"假阳性 WARN，A/B 档同受益；OG 5.0.0
 词典几何/XACT/分区/TOAST 面零改动（spike 实证同构）。`vb.wal.tables`/`vb.wal.dml` 在
 B 档库直接生效（M3 同构，配置零新增）。
 
-**类型表**（`DecodeKinds` +3 新 kind +10 oid 复用映射，oid 键控、**档位无关**——A 档
+**类型表**（`DecodeKinds` **+5 新 kind**[uint1/uint2/uint4/uint8/year] **+ 8 oid 复用映射**
+[5545→既有 `int1` kind 解锁；88/95/9779/17757/86→`bytea`；90/3969→`text`]——5+8=13 oid
+全集，oid 键控、**档位无关**——A 档
 DDL 可达的 int1/blob/raw/clob/nvarchar2 同批受益；磁盘编码/渲染锚 = spike 二轮黄金字节）：
 
 | oid | 类型 | kind | 磁盘编码 | 渲染 |
