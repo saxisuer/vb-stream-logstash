@@ -72,3 +72,29 @@
 - a) OG 5.0.0 容器的 B 档是否纳入 M4 验证面（建议：否，记未验证）
 - b) 矩阵外 VastBase 系类型（int1/blob/raw/clob/nvarchar2）同批支持 or 维持 ISE（建议：uint/tinyblob 三 oid 必做——DDL 语法档位差使它们是 B 档独有高频面；其余记矩阵外降级面）
 - c) test_b 连接抖动：M4 前是否先请服务端排查（建议：IT 侧重试环 + 服务端排查并行）
+
+**裁定（2026-10-18）**：a) 不支持 OG 5.0.0 B 档（仅 VastBase 档）；b) 矩阵外 VastBase 系类型全部支持；c) test_b 改善后仍有 ~10-20% 握手读超时（vanilla 8/10、opengauss 9/10，connectTimeout 加长无效——服务端认证应答间歇挂起；另注意**快速连续建连（每语句一连接）会触发连片失败**，单持久连接 5/6 稳定——IT 按单连接 + 重试环设计）。
+
+## 编码锚（第二轮 spike，`BModeEncodingSpike`——M4 实施的黄金字节来源）
+
+**扩展类型面（B 档 DDL 全谱）**：unsigned 全家桶 uint1(15705,1B)/uint2(15712,2B)/uint4(15719,4B)/uint8(15726,8B)；year(17851,2B)；binary(9779,varlena)/varbinary(95,varlena)；`float(N)`→float4、`double(M,D)`→numeric、`serial`→int8、`mediumint`→int4；tinyint(1)/int3/numeric unsigned 语法面（后者拒绝）；enum/set 匿名 oid（动态格式，与 vanilla enum 同性质维持矩阵外）。
+
+**磁盘编码（逐类型单列表 + 已知值 + WAL 块 data hex 三方锚）**：
+
+| 类型 | 磁盘编码（实证） | 服务端 text 输出（对拍锚） |
+|---|---|---|
+| int1(5545) | 1B 有符号补码（127→7F、-128→80） | `127` / `-128` |
+| uint1(15705) | 1B 无符号（255→FF） | `255` / `0` |
+| uint2(15712) | 2B 小端无符号 | `65535` / `1` |
+| uint4(15719) | 4B 小端无符号 | `4294967295` / `1` |
+| uint8(15726) | 8B 小端无符号（8B 对齐规则同 int8） | `18446744073709551615` / `1` |
+| year(17851) | **u16 = 年-1900**（2026→7E00h=126、1901→1） | `2026` / `1901` |
+| clob(90)/nvarchar2(3969) | varlena（与 text 同构） | 原文（`中文CLOB值`；'' 保留） |
+| blob(88)/tinyblob(17757)/binary(9779)/varbinary(95) | varlena 字节流（与 bytea 同构） | **裸字节**（非 \x hex——`DEADBEEF` 以 Latin 字符直出） |
+| raw(86) | varlena 字节流 | **大写 hex 无前缀**（`010203...0F10`、`FF`——Oracle RAW 风格） |
+
+黄金 hex（两列 `(id int, c <type>)`，t_hoff=0x18、datum 基 off+6、id@6-9 LE）：`int1/127`=020000081800010000007F；`uint4/max`=02000008180001000000FFFFFFFF；`uint8/max`=02000008180001000000 000000 FFFFFFFFFFFFFFFF（8B 对齐垫 3 零）；`year/2026`=020000081800010000007E00；varlena 族见下节 6B 头。
+
+**B 档 varlena 元组的 6B xl 头（记录层接缝，A/B 对照实证）**：同值同几何（两列 id+c）下——A 档 text 行 = `[02 00][02 08][18]`（5B 头：infomask2=2/infomask=0x0802/hoff=0x18，datum@off+6）；**B 档 clob 行 = `[02 00][00 02 08][18]`（多 1 字节 0x00 插在 infomask2 后，datum@off+7）**——固定宽元组两档同 5B 头。实证：剥掉该字节后现有 `TupleDecoder` 对 B 档 clob/nvarchar2/blob 行（kinds=text/bytea）**零改动解码正确**（'hello clob'/'中文CLOB值'/byte[] 全中）。触发面初判 = 元组含 varlena 列（clob/nvarchar2/blob/tinyblob/raw/binary/varbinary 及 text/varchar 待复验——**text 列在 B 档是否也 6B 头未单独对照**，M4 实施期补锚钉死；text 本身 A 档 5B 头在 B 档库上的形态是首个待验点）。该字节语义（新标记位/压缩提示）未考——按"多一字节"几何接缝处理即可。
+
+**A 档对照副产品**：A 档 `''` 入库即 NULL（varchar row2 渲 `null`）vs B 档保留 `''`——对拍场景设计须知；A 档 int1 值域与 B 档不同（127 插入报 tinyint out of range——A 档 int1 为 0..? 待考，非 M4 范围）。
