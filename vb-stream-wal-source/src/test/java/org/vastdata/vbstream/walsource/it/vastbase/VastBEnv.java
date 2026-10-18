@@ -23,7 +23,9 @@ import java.util.stream.Stream;
  * {@code 172.16.107.133:55443/test_b}——与 A 档（{@link VastTestEnv}，55433/test_a）
  * 同真库集群不同实例不同库，test_b 是 {@code DBCOMPATIBILITY 'B'}（MySQL 风格）库，
  * 即 M4 的适配对象。静态单例——<b>非 Testcontainers</b>，库是长活真环境；手动档
- * {@code -Dvb.it.vastb=true} 由各 IT 自行门控（本类只提供连接面）。
+ * {@code -Dvb.it.vastbase=true} 由各 IT 自行门控（gate 键与 A 档族共用——B 档 IT
+ * {@code VastBModeIT} 的 {@code @EnabledIfSystemProperty} 即此键；本类连接覆盖键是
+ * 独立的 {@code vb.it.vastb.*} 五键，仅提供连接面）。
  *
  * <p><strong>连接纪律（M4，test_b 抖动实测）</strong>：单持久连接 + 建连重试环
  * （{@link #openConnection()}——Task 8 起委托 {@link VastTestEnv#openConnectionWithRetry}

@@ -93,7 +93,7 @@
 | blob(88)/tinyblob(17757)/binary(9779)/varbinary(95) | varlena 字节流（与 bytea 同构） | **裸字节**（非 \x hex——`DEADBEEF` 以 Latin 字符直出） |
 | raw(86) | varlena 字节流 | **大写 hex 无前缀**（`010203...0F10`、`FF`——Oracle RAW 风格） |
 
-黄金 hex（两列 `(id int, c <type>)`，t_hoff=0x18、datum 基 off+6、id@6-9 LE）：`int1/127`=020000081800010000007F；`uint4/max`=02000008180001000000FFFFFFFF；`uint8/max`=02000008180001000000 000000 FFFFFFFFFFFFFFFF（8B 对齐垫 3 零）；`year/2026`=020000081800010000007E00；varlena 族见下节 6B 头。
+黄金 hex（两列 `(id int, c <type>)`，t_hoff=0x18、datum 基 off+6、id@6-9 LE）：`int1/127`=020000081800010000007F；`uint4/max`=02000008180001000000FFFFFFFF；`uint8/max`=02000008180001000000 00000000 FFFFFFFFFFFFFFFF（8B 对齐垫 4 零——int4 后相对 datum 基垫 [4,8) 共 4B 到 8B 边界；原稿"垫 3 零"与缺一零字节的 hex 转录同源误记，测试黄金字节以 4 零为准）；`year/2026`=020000081800010000007E00；varlena 族见下节 6B 头。
 
 **B 档 varlena 元组的 6B xl 头（记录层接缝，A/B 对照实证）**：同值同几何（两列 id+c）下——A 档 text 行 = `[02 00][02 08][18]`（5B 头：infomask2=2/infomask=0x0802/hoff=0x18，datum@off+6）；**B 档 clob 行 = `[02 00][00 02 08][18]`（多 1 字节 0x00 插在 infomask2 后，datum@off+7）**——固定宽元组两档同 5B 头。实证：剥掉该字节后现有 `TupleDecoder` 对 B 档 clob/nvarchar2/blob 行（kinds=text/bytea）**零改动解码正确**（'hello clob'/'中文CLOB值'/byte[] 全中）。触发面初判 = 元组含 varlena 列（clob/nvarchar2/blob/tinyblob/raw/binary/varbinary 及 text/varchar 待复验——**text 列在 B 档是否也 6B 头未单独对照**，M4 实施期补锚钉死；text 本身 A 档 5B 头在 B 档库上的形态是首个待验点）。该字节语义（新标记位/压缩提示）未考——按"多一字节"几何接缝处理即可。**⚠ 本段括注已被第三轮补锚推翻（A/B 同形、无多字节）——见文末「第三轮补锚（M4 Task 1）」勘误项。**
 
@@ -112,7 +112,7 @@ HEX [nvarchar2(32)] lsn=0/1DC79ED8 data=020002081800010000001FE4BDA0E5A5BD6E7661
 HEX [blob]          lsn=0/1DC6B398 data=020002081800010000000BDEADBEEF...
 ```
 
-判读：`[02 00]`=infomask2（natts=2）、`[02 08]`=infomask（HASVARWIDTH|XMAX_INVALID）、`[18]`=t_hoff=24、**byte@5=垫零**（见勘误）、id@6-9 LE（=1）、varlena@10（1B 头 0x17/0x1F/0x0B 反推总长 12/16/6B——'hello clob' 10B/‘你好nvarchar’ 15B/'DEADBEEF' 4B + 头 + 偶数对齐，全自洽）。
+判读：`[02 00]`=infomask2（natts=2）、`[02 08]`=infomask（HASVARWIDTH|XMAX_INVALID）、`[18]`=t_hoff=24、**byte@5=垫零**（见勘误）、id@6-9 LE（=1）、varlena@10（1B 头 0x17/0x1F/0x0B 经 (b>>1)&0x7F 反推总长 11/15/5B——数据 10/14/4B：'hello clob' 10B/'你好nvarchar' 14B/'DEADBEEF' 4B，各 +1B 头自洽。原稿"总长 12/16/6B"系长度口径误记——1B varlena 头的总长 = 头字节>>1，含 1B 头自身，勿再另加头或对齐）。
 
 **② NULL 行（HASNULL）锚**：四类型行2 同构：
 

@@ -373,7 +373,8 @@ class TupleDecoderTest {
 
     /**
      * M4 新 kind 黄金字节矩阵：uint1/uint2/uint4/uint8/year 五定宽类型 + int1 oid
-     * 解锁——值与对齐（'c'/'s'/'d'）按 spike 二轮实采锚（uint8 的 8B 对齐垫 3 零）。
+     * 解锁——值与对齐（'c'/'s'/'d'）按 spike 二轮实采锚（uint8 的 8B 对齐垫 4 零——
+     * int4 后相对 datum 基垫 [4,8) 共 4B 到 8B 边界）。
      */
     @Test
     void m4FixedWidthKindsDecodeAgainstGoldenBytes() {

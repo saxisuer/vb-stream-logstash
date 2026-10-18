@@ -662,7 +662,7 @@ public final class WalSource implements AutoCloseable {
             String compat = queryDbCompatMode(sqlConnection);
             boolean vastbase = layout instanceof WalLayoutVVastbase;
             if (compat != null && !dmlCompatModes(layout).contains(compat)) {
-                throw new IllegalStateException("openGauss 档 DML 面仅支持 PG/A"
+                throw new IllegalStateException((vastbase ? "VastBase" : "openGauss") + " 档 DML 面仅支持 PG/A"
                         + (vastbase ? "/B" : "") + " 兼容模式库: 当前库 datcompatibility=" + compat
                         + (vastbase
                                 ? "（'C' 为 PG 兼容历史别名未验证——请以 DBCOMPATIBILITY 'PG'/'A'/'B' 建库）"
@@ -1015,8 +1015,9 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * 当前库是否 DML 面支持的兼容档（{@link #queryDbCompatMode} 的判定面，供护栏与
-     * 离线测试；M2 Task 1 落地，M3 Task 3 白名单放宽，M4 Task 6 起按 layout 分档）：
+     * 当前库是否 DML 面支持的兼容档（{@link #queryDbCompatMode} 的判定面，离线测试
+     * 消费——护栏本体内联 queryDbCompatMode + dmlCompatModes 直接判定不经本方法；
+     * M2 Task 1 落地，M3 Task 3 白名单放宽，M4 Task 6 起按 layout 分档）：
      * 白名单 {@link #dmlCompatModes}（VastBase 档 {'PG','A','B'} / 其余 {'PG','A'}）
      * 放行；可判定的白名单外档位（VastBase 档仅 'C' / OG 档 'B'/'C'）false；不可判定
      * （探测失败/空值）true——fail-open 语义，与 startOpenGauss 护栏分支一致。

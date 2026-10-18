@@ -107,8 +107,9 @@ dummy_standby 非 immediately_reserve）；收流通道 `-Dvb.wal.og.source=file
   attcmprmode∈{0,127}）——DELTA/DICT/PREFIX/NUMSTR 四算法解压纯函数已备（零接线）；
   列存/段页式/bucket/UStore 长期非目标（ASTORE 限定——A 档列存表 ORIENTATION=COLUMN
   启动期 ISE）。
-- ❌ **B/C 兼容档库整库不支持**（启动期 ISE 附档位与 M4 指引——DML 面仅
-  DBCOMPATIBILITY 'PG'/'A' 库）；MultiXactId 变体未锚（到达即错位 ISE）；页字典压缩表
+- ❌ **OG 5.0.0 容器的 B/C 兼容档库不支持**（启动期 ISE 附档位与指引——DML 面仅
+  DBCOMPATIBILITY 'PG'/'A' 库；B 档支持面在 **VastBase 档**落地，见下文 M4 条目）；
+  MultiXactId 变体未锚（到达即错位 ISE）；页字典压缩表
   （MULTI_INSERT isCompressed≠0）ISE。
 
 ## VastBase G100 快速开始（V3.0 / OG 6.0.0 内核——第四布局档）
@@ -136,12 +137,30 @@ java -cp "vb-stream-wal-source/target/classes;$(cat vb-stream-wal-source/target/
 #  方言是记档差异面）
 ```
 
-手动档真库 IT（`VastCatalogSyncIT`/`VastDmlParityIT`/`VastLifecycleIT`，常规 `mvn test`
-全 skip；连接参数 `-Dvb.it.vastbase.{host,port,db,user,pass}` 可覆盖）：
+手动档真库 IT（`VastCatalogSyncIT`/`VastDmlParityIT`/`VastLifecycleIT`/`VastBModeIT`，
+常规 `mvn test`
+全 skip；连接参数 `-Dvb.it.vastbase.{host,port,db,user,pass}` 可覆盖——B 档实例连接
+覆盖键独立为 `-Dvb.it.vastb.{host,port,db,user,pass}`，缺省 55443/test_b）：
 
 ```bash
 mvn test -pl vb-stream-wal-source -Dtest='Vast*IT' -Dvb.it.vastbase=true
 ```
+
+**B 兼容模式（MySQL 风格）DML 面已支持（M4，2026-10-18——仅 VastBase 档，配置零新增）**：
+护栏白名单按布局分档——VastBase 档 `DBCOMPATIBILITY 'PG'/'A'/'B'` 均放行（OG 5.0.0
+容器维持 'PG'/'A'，B 档未验证 ISE；'C' 两档均拒）。**13 个 B 档/VastBase 系类型**全
+支持：`tinyint`(int1)/`tinyint unsigned`(uint1)/`smallint unsigned`(uint2)/
+`int unsigned`(uint4)/`bigint unsigned`(uint8)/`year`/`clob`/`nvarchar2`/`raw`/`blob`/
+`tinyblob`/`binary(N)`/`varbinary(N)`——uint 族无符号十进制（uint8 u64 顶值
+18446744073709551615）、year 解码归一年值、clob/nvarchar2 文本透传、raw 大写 hex 无
+前缀。**blob 族四型（blob/tinyblob/binary/varbinary）渲染与服务器 text 输出有意分叉**：
+本模块渲 `\x`+小写 hex（CDC 下游可用性优先——服务器输出是裸字节/MySQL 风格 hex 前缀
+混形）；`''` 空串在 B 档保留（vs A 档入库即 NULL）、`datetime` 微秒截断存整秒（typmod=0，
+服务端 MySQL DATETIME 精度 0 语义——渲染忠实转储）。enum/set/jsonb/money/varbit 等
+动态格式维持矩阵外语义（含 enum 列的表 DML 流 fail-fast）。**连接抖动重试纪律**（B 档
+实例实测 ~10-20% 握手读超时且快速连续建连触发连片失败）：测试/装配面按**单持久连接 +
+建连重试环**（8 次指数退避 1s→15s，~75s 坏窗覆盖）设计；直连收流（direct 通道）实测
+不受抖动影响。详版见模块 `CLAUDE.md`"VastBase G100 档 M4"节。
 
 ## 离线回放模式（VastBase 档，2026-10-15）
 

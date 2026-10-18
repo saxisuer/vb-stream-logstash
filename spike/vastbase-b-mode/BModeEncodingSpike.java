@@ -138,11 +138,14 @@ public final class BModeEncodingSpike {
     }
 
     /**
-     * COPY 批量面锚：MULTI_INSERT entry 的 xl 头形态（6B 头是否同样适用）。
-     * 建 (id int, c clob) 表后经 {@code INSERT ... SELECT} 批量灌 5 行——普通批量插入在
-     * WAL 侧走 XLOG_HEAP2_MULTI_INSERT（opcode 0x50，rmid 9）路径，比 COPY 协议更稳（B 档
-     * COPY 语法面不必引入）；登记 filenode 供 phase2Dump 的 copy-multi 分支命中打印块 data
-     * hex（MULTI_INSERT 的块 data 为 offsets 数组 + entries，dump 出来供判读 entry 头形态）。
+     * COPY 批量面锚：MULTI_INSERT entry 的 xl 头形态探察（本 spike 时点预期批量插入会走
+     * MULTI_INSERT）。建 (id int, c clob) 表后经 {@code INSERT ... SELECT} 批量灌 5 行——
+     * <b>第三轮实测软化：该规模（5 行）实际产出 5 条独立单 INSERT 记录（rmid 10/opcode
+     * 0x00），窗口内 MULTI_INSERT 零命中</b>（见 spike 报告「第三轮补锚」③——真 COPY
+     * FROM / 更大批量才走 MULTI_INSERT，entry 头形态归 M4 Task 3 的 decodeEntry 路径锚）；
+     * 登记 filenode 供 phase2Dump 的 copy-multi 分支命中打印块 data hex（MULTI_INSERT 的
+     * 块 data 为 offsets 数组 + entries，dump 出来供判读 entry 头形态）。原括注"6B 头"
+     * 已被第三轮勘误推翻（A/B 同 5B 头）。
      */
     private void copyProbe(Connection c) throws SQLException {
         try (Statement s = c.createStatement()) {
