@@ -96,7 +96,9 @@ spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_he
 
 ### 2.5 对拍与验收（手动档真库 IT）
 
-- **`VastDmlParityIT` 增 B 档参数化**：沿 M3 "场景体单方法双档委派零复制"先例扩展为三档（PG 库参数化跑法在 OG 容器，A/B 在真库——A/B 双档共用 `VastTestEnv`，B 档经 `-Dvb.it.vastbase.port=55443 -Dvb.it.vastbase.db=test_b` 或测试内第二 env 实例化，取舍实施期定）。**连接纪律（spike 教训）**：单持久连接 + acquire 重试环（≤15 次）进 `VastTestEnv`
+> **勘误（M4 终审，2026-10-18）**：本条"VastDmlParityIT 增 B 档参数化（三档）"的实际交付形态改为**新类 `VastBModeIT`**——连接面独立 `VastBEnv`（不复用/不参数化 `VastTestEnv`），场景面为 B 专形四场景（下方 ①-④ 照交付）；`VastDmlParityIT` 维持 M3 的 A 档 15 用例形态未动。B 档未复验面记档见 §8 追加行。
+
+- **~~`VastDmlParityIT` 增 B 档参数化~~**（勘误——交付形态为 `VastBModeIT`，见上）：沿 M3 "场景体单方法双档委派零复制"先例扩展为三档（PG 库参数化跑法在 OG 容器，A/B 在真库——A/B 双档共用 `VastTestEnv`，B 档经 `-Dvb.it.vastbase.port=55443 -Dvb.it.vastbase.db=test_b` 或测试内第二 env 实例化，取舍实施期定）。**连接纪律（spike 教训）**：单持久连接 + acquire 重试环（≤15 次）进 `VastTestEnv`
 - **B 专形场景**（新增，值面按 §2.1 锚）：
   - ①13 类型全矩阵（uint 边界值 0/max、int1 ±128、year 1901/2026、clob 中文、blob/tinyblob/raw/binary/varbinary 十六进制载荷、nvarchar2）
   - ②B 档语义面：'' 保留（vs A 档 NULL——A 档不跑同断言）、datetime 微秒截断（typmod=0 存整秒）
@@ -144,3 +146,4 @@ spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_he
 - blob 族渲染与服务器 text 输出有意分叉（`\x` vs 裸字节）——对拍归一化承载，方言渲染分支记后续
 - 6B 头的语义成因（服务端标记位）未考——按几何接缝处理，升级内核版本时需复验
 - test_b 连接抖动的服务端根因未消——IT 重试环承载，非本 spec 范围
+- **B 档 2PC/事务内 DDL as-of/MULTI_INSERT 真几何/中途停续四面未在 B 档专项复验**——M3 全场景对拍面在 A/PG 档承载；B 档记录层已证同构（§2.2 的 6B 头勘误后 WAL 面零分叉），风险低（终审记档，2026-10-18）
