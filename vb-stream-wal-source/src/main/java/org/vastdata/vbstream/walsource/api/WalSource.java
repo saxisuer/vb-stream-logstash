@@ -8,6 +8,7 @@ import org.vastdata.vbstream.walsource.changes.RenderOptions;
 import org.vastdata.vbstream.walsource.layout.Lsn;
 import org.vastdata.vbstream.walsource.layout.WalLayout;
 import org.vastdata.vbstream.walsource.layout.WalLayoutVOpenGauss;
+import org.vastdata.vbstream.walsource.layout.WalLayoutVVastbase;
 import org.vastdata.vbstream.walsource.layout.WalLayouts;
 import org.vastdata.vbstream.walsource.layout.WalRecord;
 import org.vastdata.vbstream.walsource.receive.DirectWalSource;
@@ -625,16 +626,18 @@ public final class WalSource implements AutoCloseable {
 
     /**
      * openGauss 5.0.0 档装配分支（M1 Task 6 落地，M2 Task 1 增 DML 面装配 + 兼容模式
-     * 护栏，M3 Task 3 白名单放宽 {'PG'} → {'PG','A'}）：判别命中 OG 布局后由
+     * 护栏，M3 Task 3 白名单放宽 {'PG'} → {'PG','A'}，M4 Task 6 白名单按 layout 分档）：
+     * 判别命中 OG 布局后由
      * {@link #start()} 转入——SQL 会话已建（URL 前缀按 {@code vb.wal.og.jdbc.prefix}
      * 分流），此后委派 {@link CatalogSynchronizer#startOg}（槽 OG 变体 → state 决策
      * → bootstrap → 字节源装配）。
      *
-     * <p>关键步骤：①<strong>兼容模式护栏（M2 Task 1，M3 Task 3 放宽）</strong>——DML
-     * 面请求在场（{@link #dmlEnabled()}：listener + vb.wal.dml=true）时先探测库级
+     * <p>关键步骤：①<strong>兼容模式护栏（M2 Task 1，M3 Task 3 放宽，M4 Task 6 分档）</strong>
+     * ——DML 面请求在场（{@link #dmlEnabled()}：listener + vb.wal.dml=true）时先探测库级
      * {@code pg_database.datcompatibility}（{@link #queryDbCompatMode}），可判定的
-     * 白名单外档位（'B'/'C'）启动期 ISE（附档位值与 M4 里程碑指引——白名单
-     * {@link #OG_DML_COMPAT_MODES} = {'PG','A'}）；不可判定（无行/空白值/探测
+     * 白名单外档位启动期 ISE（附档位值与分档指引——白名单 {@link #dmlCompatModes}：
+     * VastBase 档 {'PG','A','B'}[B=MySQL 风格，M4 开门] / OG 5.0.0 档 {'PG','A'}[B 档
+     * 未验证]，'C' 两档均拒）；不可判定（无行/空白值/探测
      * SQLException）WARN 放行。护栏只在 DML 面请求时探测的依据：不兼容面是 DML 解码
      * 语义（三档分区表实现不同，spec §0——'A' 档原生分区已随 M3 pg_partition 第四
      * 字典捕获），catalog 同步面与兼容模式无关——M1 全部 OG IT 即跑在 'A' 档的
@@ -649,19 +652,22 @@ public final class WalSource implements AutoCloseable {
      * 由本类持有、调用方 close 释放），护栏先于槽副作用。线程约束：装配线程（start
      * 调用线程）单次执行。</p>
      *
-     * @param layout 判别出的 openGauss 布局描述符
+     * @param layout 判别出的 openGauss 布局描述符（VastBase 子类同走本分支——护栏白名单按其分档）
      * @throws SQLException 槽管理/引导查询失败
-     * @throws IllegalStateException DML 面请求在场且库级兼容模式可判定为白名单外档位（'B'/'C'）
+     * @throws IllegalStateException DML 面请求在场且库级兼容模式可判定为白名单外档位
+     *         （VastBase 档仅 'C' / OG 5.0.0 档 'B'/'C'，M4 Task 6 分档）
      */
     private void startOpenGauss(WalLayout layout) throws SQLException {
         if (dmlEnabled()) {
             String compat = queryDbCompatMode(sqlConnection);
-            if (compat != null && !OG_DML_COMPAT_MODES.contains(compat)) {
-                throw new IllegalStateException("openGauss 档 DML 面仅支持 PG/A 兼容模式库: 当前库 "
-                        + "datcompatibility=" + compat
-                        + "（B 档=MySQL 风格支持属 M4、C 档为 PG 兼容历史别名未验证——请以 "
-                        + "DBCOMPATIBILITY 'PG' 或 'A' 建库；仅需 catalog 同步面可 "
-                        + "-Dvb.wal.dml=false 显式声明，catalog 面与兼容模式无关）");
+            boolean vastbase = layout instanceof WalLayoutVVastbase;
+            if (compat != null && !dmlCompatModes(layout).contains(compat)) {
+                throw new IllegalStateException("openGauss 档 DML 面仅支持 PG/A"
+                        + (vastbase ? "/B" : "") + " 兼容模式库: 当前库 datcompatibility=" + compat
+                        + (vastbase
+                                ? "（'C' 为 PG 兼容历史别名未验证——请以 DBCOMPATIBILITY 'PG'/'A'/'B' 建库）"
+                                : "（B 档=MySQL 风格支持属 VastBase 档 M4——OG 5.0.0 未验证，请以 DBCOMPATIBILITY 'PG' 或 'A' 建库）")
+                        + "；仅需 catalog 同步面可 -Dvb.wal.dml=false 显式声明，catalog 面与兼容模式无关）");
             }
             if (compat == null) {
                 LOG.warn("openGauss 库级兼容模式探测不可判定（无行/空值/探测失败）——护栏按放行处理"
@@ -963,21 +969,27 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
-     * openGauss DML 面兼容模式白名单（M2 Task 1 落地 {'PG'}，M3 Task 3 放宽为
-     * {'PG','A'}；档位值域 og-plan 容器 2026-10-12 实测钉死）：{@code CREATE
-     * DATABASE ... DBCOMPATIBILITY 'PG'} 库的 {@code pg_database.datcompatibility}
-     * 列恰回 {@code "PG"} 单值；'A'=Oracle 风格（postgres 缺省库即此档，M3 起支持
-     * ——A 档原生分区的 DML 捕获经 pg_partition 第四字典落地）；'B'=MySQL 风格
-     * （M4）；'C'=PG 兼容历史别名（5.0.0 仍接受建库且存储值与 'PG' 相异，未验证
-     * ——维持白名单外，ISE 附 M4 指引）。
+     * DML 面兼容模式白名单（M2 Task 1 落地 {'PG'}，M3 Task 3 放宽 {'PG','A'}，M4
+     * Task 6 起按 layout 分档）：VastBase 档 {'PG','A','B'}（B=MySQL 风格，M4 开门）；
+     * OG 5.0.0 档 {'PG','A'} 不变（B 档 typemap 未验证，spec §0 裁定 a）；'C' 两档均拒
+     * （PG 兼容历史别名未验证——5.0.0 仍接受建库且存储值与 'PG' 相异）。档位值域
+     * og-plan 容器 2026-10-12 实测钉死：{@code CREATE DATABASE ... DBCOMPATIBILITY
+     * 'PG'} 库的 {@code pg_database.datcompatibility} 列恰回 {@code "PG"} 单值；
+     * 'A'=Oracle 风格（postgres 缺省库即此档，M3 起支持——A 档原生分区的 DML 捕获经
+     * pg_partition 第四字典落地）；'B'=MySQL 风格（M4 起 VastBase 档支持）。
+     *
+     * @param layout 判别出的布局描述符（null 视为非 VastBase 档——旧单参调用面的 OG 语义）
+     * @return 该 layout 的 DML 面兼容模式白名单
      */
-    static final Set<String> OG_DML_COMPAT_MODES = Set.of("PG", "A");
+    static Set<String> dmlCompatModes(WalLayout layout) {
+        return layout instanceof WalLayoutVVastbase ? Set.of("PG", "A", "B") : Set.of("PG", "A");
+    }
 
     /**
      * 查当前库的 openGauss 兼容模式档位（护栏的探测面，M2 Task 1）。
      *
      * <p>关键步骤：单行查询 {@code pg_database.datcompatibility}（探测 SQL 以 og-plan
-     * 实测钉死——见 {@link #OG_DML_COMPAT_MODES} javadoc 的档位值域）；无行、null 或
+     * 实测钉死——见 {@link #dmlCompatModes} javadoc 的档位值域）；无行、null 或
      * 空白值归一化为 null（不可判定面——OG 对各档的表示形态已实测，空/NULL 不是
      * PG 档表示）；SQLException 捕获后 WARN 并归 null（护栏是兼容性预检不是正确性
      * 锚，探测瞬断静默砖死启动不如放行可观测）。边界：连接须已建立（start 装配线程
@@ -1004,17 +1016,29 @@ public final class WalSource implements AutoCloseable {
 
     /**
      * 当前库是否 DML 面支持的兼容档（{@link #queryDbCompatMode} 的判定面，供护栏与
-     * 离线测试；M2 Task 1 落地，M3 Task 3 白名单放宽）：白名单
-     * {@link #OG_DML_COMPAT_MODES} = {'PG','A'} 放行；可判定的白名单外档位
-     * （'B'/'C'）false；不可判定（探测失败/空值）true——fail-open 语义，与
-     * startOpenGauss 护栏分支一致。
+     * 离线测试；M2 Task 1 落地，M3 Task 3 白名单放宽，M4 Task 6 起按 layout 分档）：
+     * 白名单 {@link #dmlCompatModes}（VastBase 档 {'PG','A','B'} / 其余 {'PG','A'}）
+     * 放行；可判定的白名单外档位（VastBase 档仅 'C' / OG 档 'B'/'C'）false；不可判定
+     * （探测失败/空值）true——fail-open 语义，与 startOpenGauss 护栏分支一致。
      *
      * @param connection 已建立的 SQL 会话
-     * @return true = 白名单档（'PG'/'A'）或不可判定（放行）；false = 可判定的白名单外档位
+     * @param layout     判别出的布局描述符；null 视为非 VastBase 档（旧调用面的 OG 语义）
+     * @return true = 白名单档或不可判定（放行）；false = 可判定的白名单外档位
+     */
+    static boolean isDmlSupportedCompatMode(Connection connection, WalLayout layout) {
+        String mode = queryDbCompatMode(connection);
+        return mode == null || dmlCompatModes(layout).contains(mode);
+    }
+
+    /**
+     * 单参 OG 档委托（M4 前旧调用面）：layout 缺省 null 走非 VastBase 白名单
+     * {'PG','A'}——既有离线测试断言的语义不变。
+     *
+     * @param connection 已建立的 SQL 会话
+     * @return true = OG 白名单档（'PG'/'A'）或不可判定（放行）；false = 可判定的白名单外档位
      */
     static boolean isDmlSupportedCompatMode(Connection connection) {
-        String mode = queryDbCompatMode(connection);
-        return mode == null || OG_DML_COMPAT_MODES.contains(mode);
+        return isDmlSupportedCompatMode(connection, null);
     }
 
     /**
