@@ -393,7 +393,54 @@ class DiskValueRendererTest {
         assertEquals(1, warns.size(), "矩阵外 oid 两次渲染应恰 WARN 一次，实际 " + warns.size());
     }
 
+    // ---- M4 VastBase B 档新类型（13 oid）----
+
+    /**
+     * M4 新类型渲染锚（服务端 text 输出同形，spike 二轮实采）：uint 族十进制无符号
+     * （uint8 超 Long.MAX 走 toUnsignedString）、year 十进制、int1 有符号、
+     * clob/nvarchar2 文本原样、raw 大写 hex 无前缀。
+     */
+    @Test
+    void m4VastbaseTypesRenderServerTextForm() {
+        assertEquals("127", DiskValueRenderer.render((byte) 127, 5545));
+        assertEquals("-128", DiskValueRenderer.render((byte) -128, 5545));
+        assertEquals("255", DiskValueRenderer.render(255, 15705));
+        assertEquals("65535", DiskValueRenderer.render(65535, 15712));
+        assertEquals("4294967295", DiskValueRenderer.render(4294967295L, 15719));
+        assertEquals("18446744073709551615", DiskValueRenderer.render(-1L, 15726));
+        assertEquals("2026", DiskValueRenderer.render(2026, 17851));
+        assertEquals("1901", DiskValueRenderer.render(1901, 17851));
+        assertEquals("hello clob", DiskValueRenderer.render("hello clob", 90));
+        assertEquals("你好nvarchar", DiskValueRenderer.render("你好nvarchar", 3969));
+        assertEquals("0102030405060708090A0B0C0D0E0F10",
+                DiskValueRenderer.render(hexBytes("0102030405060708090A0B0C0D0E0F10"), 86));
+        assertEquals("FF", DiskValueRenderer.render(hexBytes("FF"), 86));
+    }
+
+    /**
+     * M4 blob 族渲染有意分叉记档锚：服务端 text 输出是裸字节（乱码形），本渲染取
+     * \x hex（CDC 下游可用性优先——与矩阵外 0x 降级同族保守选择，spec §2.1 裁定）。
+     */
+    @Test
+    void m4BlobFamilyRendersHexFormByDesign() {
+        assertEquals("\\xdeadbeef", DiskValueRenderer.render(hexBytes("DEADBEEF"), 88));
+        assertEquals("\\xdeadbeef", DiskValueRenderer.render(hexBytes("DEADBEEF"), 17757));
+        assertEquals("\\xdeadbeef", DiskValueRenderer.render(hexBytes("DEADBEEF"), 9779));
+        assertEquals("\\xdeadbeef", DiskValueRenderer.render(hexBytes("DEADBEEF"), 95));
+    }
+
     // ---- 手造字节辅助（小端，对齐 TupleDecoder 的读取风格）----
+
+    /**
+     * 十六进制文本 → 字节数组（大/小写 hex 均可）——M4 新类型 byte[] 载荷（raw/blob 族）
+     * 的手造面。
+     *
+     * @param hex 十六进制文本（偶数长度）
+     * @return 对应字节
+     */
+    private static byte[] hexBytes(String hex) {
+        return HexFormat.of().parseHex(hex);
+    }
 
     /**
      * 把一串 u16 值按小端拼成磁盘字节序列——numeric 头与 digits 的手造面。
