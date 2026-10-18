@@ -95,6 +95,43 @@
 
 黄金 hex（两列 `(id int, c <type>)`，t_hoff=0x18、datum 基 off+6、id@6-9 LE）：`int1/127`=020000081800010000007F；`uint4/max`=02000008180001000000FFFFFFFF；`uint8/max`=02000008180001000000 000000 FFFFFFFFFFFFFFFF（8B 对齐垫 3 零）；`year/2026`=020000081800010000007E00；varlena 族见下节 6B 头。
 
-**B 档 varlena 元组的 6B xl 头（记录层接缝，A/B 对照实证）**：同值同几何（两列 id+c）下——A 档 text 行 = `[02 00][02 08][18]`（5B 头：infomask2=2/infomask=0x0802/hoff=0x18，datum@off+6）；**B 档 clob 行 = `[02 00][00 02 08][18]`（多 1 字节 0x00 插在 infomask2 后，datum@off+7）**——固定宽元组两档同 5B 头。实证：剥掉该字节后现有 `TupleDecoder` 对 B 档 clob/nvarchar2/blob 行（kinds=text/bytea）**零改动解码正确**（'hello clob'/'中文CLOB值'/byte[] 全中）。触发面初判 = 元组含 varlena 列（clob/nvarchar2/blob/tinyblob/raw/binary/varbinary 及 text/varchar 待复验——**text 列在 B 档是否也 6B 头未单独对照**，M4 实施期补锚钉死；text 本身 A 档 5B 头在 B 档库上的形态是首个待验点）。该字节语义（新标记位/压缩提示）未考——按"多一字节"几何接缝处理即可。
+**B 档 varlena 元组的 6B xl 头（记录层接缝，A/B 对照实证）**：同值同几何（两列 id+c）下——A 档 text 行 = `[02 00][02 08][18]`（5B 头：infomask2=2/infomask=0x0802/hoff=0x18，datum@off+6）；**B 档 clob 行 = `[02 00][00 02 08][18]`（多 1 字节 0x00 插在 infomask2 后，datum@off+7）**——固定宽元组两档同 5B 头。实证：剥掉该字节后现有 `TupleDecoder` 对 B 档 clob/nvarchar2/blob 行（kinds=text/bytea）**零改动解码正确**（'hello clob'/'中文CLOB值'/byte[] 全中）。触发面初判 = 元组含 varlena 列（clob/nvarchar2/blob/tinyblob/raw/binary/varbinary 及 text/varchar 待复验——**text 列在 B 档是否也 6B 头未单独对照**，M4 实施期补锚钉死；text 本身 A 档 5B 头在 B 档库上的形态是首个待验点）。该字节语义（新标记位/压缩提示）未考——按"多一字节"几何接缝处理即可。**⚠ 本段括注已被第三轮补锚推翻（A/B 同形、无多字节）——见文末「第三轮补锚（M4 Task 1）」勘误项。**
 
 **A 档对照副产品**：A 档 `''` 入库即 NULL（varchar row2 渲 `null`）vs B 档保留 `''`——对拍场景设计须知；A 档 int1 值域与 B 档不同（127 插入报 tinyint out of range——A 档 int1 为 0..? 待考，非 M4 范围）。
+
+### 第三轮补锚（M4 Task 1）
+
+背景：text/clob/nvarchar2(32)/blob 四类型第二行值改 NULL（HASNULL 位图锚）+ `vb_wal_enc_copy` 5 行 `INSERT...SELECT` COPY 探针（phase2Dump 增 rmid∈{9,10} 且 opcode=0x50 的 copy-multi dump 分支——本窗口零命中）。锚跑目录 `/tmp/vb-spike-b-anch`，运行全窗零异常（census 键数 34）、探针 finally 自清（真库 `vb_wal_enc_%` 残留核查 = 0）。**本轮实测推翻第二轮「B 档 6B xl 头」括注——勘误见本节末项，Task 2 依 brief 预置回到 spec §2.2 修订接缝设计后再继续。**
+
+**① text 列锚（与 clob 族完全同形，无独立头形态）**：B 档 text 行1 与 clob 行1（同值 'hello clob'）逐字节相同：
+
+```
+HEX [text]          lsn=0/1DC64028 data=020002081800010000001768656C6C6F20636C6F62...
+HEX [clob]          lsn=0/1DC72BC0 data=020002081800010000001768656C6C6F20636C6F62...
+HEX [nvarchar2(32)] lsn=0/1DC79ED8 data=020002081800010000001FE4BDA0E5A5BD6E76617263686172...
+HEX [blob]          lsn=0/1DC6B398 data=020002081800010000000BDEADBEEF...
+```
+
+判读：`[02 00]`=infomask2（natts=2）、`[02 08]`=infomask（HASVARWIDTH|XMAX_INVALID）、`[18]`=t_hoff=24、**byte@5=垫零**（见勘误）、id@6-9 LE（=1）、varlena@10（1B 头 0x17/0x1F/0x0B 反推总长 12/16/6B——'hello clob' 10B/‘你好nvarchar’ 15B/'DEADBEEF' 4B + 头 + 偶数对齐，全自洽）。
+
+**② NULL 行（HASNULL）锚**：四类型行2 同构：
+
+```
+HEX [text] row2 lsn=0/1DC64138 data=0200010818010200000002...
+```
+
+判读：infomask 0x0802→**0x0801**（HEAP_HASNULL 顶入、HASVARWIDTH 消失——唯一 varlena 列 NULL，自洽）；**byte@5=0x01 即 t_bits null 位图**（两列表 bit1=第二列 NULL）；datums@6 仅 id（=2 LE），NULL 列无 datum。几何 = vanilla「HASNULL 时位图自 tuple offset 23 起」——既有 `TupleDecoder.decodePayload` 的 HASNULL 路径零改动覆盖。
+
+**③ COPY/MULTI_INSERT 锚**：`vb_wal_enc_copy` 5 行 `INSERT...SELECT` 产出 **5 条独立单 INSERT 记录**（rmid=10/opcode 0x00，rel=24251），窗口内 MULTI_INSERT（rmid 9/0x50）零命中：
+
+```
+INSERT lsn=0/1DC81248 head=020002081800010000000B726F7731   ('row1')
+INSERT lsn=0/1DC812B8 head=020002081800020000000B726F7732   ('row2')
+INSERT lsn=0/1DC81320 head=020002081800030000000B726F7733
+INSERT lsn=0/1DC81388 head=020002081800040000000B726F7734
+INSERT lsn=0/1DC813F0 head=020002081800050000000B726F7735   ('row5')
+```
+
+即该规模批量插入未走 MULTI_INSERT——clob 批量行走的是已覆盖的单 INSERT 路径（几何同 ①）。**MULTI_INSERT entry 头形态仍未采样**（真 COPY FROM / 更大批量待验）：按裁定记「clob MULTI_INSERT 需 Task 3 的 decodeEntry 路径锚、Task 8 IT 端到端兜底」。
+
+**勘误（重要——推翻第二轮「6B xl 头」读法）**：第二轮结论「B 档 varlena 元组比 A 档多一个 0x00 字节插在 infomask2 后、datum@off+7」系字节序转录误读。本轮实测 + 复 dump 第二轮留存锚目录（`/tmp/vb-spike-a-enc` 与 `/tmp/vb-spike-b-enc`——两库不同 WAL 时间线，同值行）证实：**A/B 两档同值元组头区逐字节相同**（`0200020818000100000017 68656C6C6F...` 两边一致），"多出的字节"不存在——byte@5 是 vanilla `[自 tuple offset 23 起字节]` 区的标准成员（HASNULL 行 = t_bits 位图、无 NULL 行 = MAXALIGN(23)=24 的对齐垫零），datum 基 = off+(t_hoff−18)，t_hoff=24 时恒 off+6。这恰是既有 `TupleDecoder.decodePayload` 的模型（tupleStart=off+5−23、游标=tupleStart+t_hoff）——第二轮「零改动解码正确」的实证本就在此模型下成立（"剥字节"叙述与所引字节序不符；第二轮黄金 hex 自身"datum 基 off+6"亦与此互证）。**影响：Task 2 的「B 档 6B 头接缝」前提失效——按 brief 预置，回 spec §2.2 修订接缝设计后再继续；B 档 INSERT 块 data 解码在现有 TupleDecoder 下已零改动覆盖（①②③ 单 INSERT 面全部实测钉死）。**

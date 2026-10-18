@@ -42,7 +42,8 @@ public final class BModeEncodingSpike {
     /** 类型 -> 两行已知值（第二行更刁钻）。 */
     private static final Map<String, String[]> TYPES = new LinkedHashMap<>();
     static {
-        TYPES.put("text", new String[] {"'hello clob'", "'中文CLOB值'"});
+        // 第三轮补锚（M4 Task 1）：text/clob/nvarchar2/blob 第二行改 NULL——HASNULL 位图形态锚
+        TYPES.put("text", new String[] {"'hello clob'", "NULL"});
         TYPES.put("varchar(32)", new String[] {"'你好nvarchar'", "''"});
         TYPES.put("bytea", new String[] {"decode('DEADBEEF','hex')", "decode('00','hex')"});
         TYPES.put("int1", new String[] {"127", "-128"});
@@ -51,11 +52,11 @@ public final class BModeEncodingSpike {
         TYPES.put("uint4", new String[] {"4294967295", "1"});
         TYPES.put("uint8", new String[] {"18446744073709551615", "1"});
         TYPES.put("year", new String[] {"2026", "1901"});
-        TYPES.put("blob", new String[] {"decode('DEADBEEF','hex')", "decode('00','hex')"});
+        TYPES.put("blob", new String[] {"decode('DEADBEEF','hex')", "NULL"});
         TYPES.put("tinyblob", new String[] {"decode('00FF10','hex')", "decode('AA','hex')"});
         TYPES.put("raw(16)", new String[] {"decode('0102030405060708090A0B0C0D0E0F10','hex')", "decode('FF','hex')"});
-        TYPES.put("clob", new String[] {"'hello clob'", "'中文CLOB值'"});
-        TYPES.put("nvarchar2(32)", new String[] {"'你好nvarchar'", "''"});
+        TYPES.put("clob", new String[] {"'hello clob'", "NULL"});
+        TYPES.put("nvarchar2(32)", new String[] {"'你好nvarchar'", "NULL"});
         TYPES.put("binary(4)", new String[] {"decode('AABBCCDD','hex')", "decode('0000','hex')"});
         TYPES.put("varbinary(8)", new String[] {"decode('11223344','hex')", "decode('EE','hex')"});
         // -Db.types=csv 过滤（对照跑用——A 档 int1 值域不同等差异绕行）
@@ -132,6 +133,27 @@ public final class BModeEncodingSpike {
                     }
                 }
             }
+            copyProbe(c);
+        }
+    }
+
+    /**
+     * COPY 批量面锚：MULTI_INSERT entry 的 xl 头形态（6B 头是否同样适用）。
+     * 建 (id int, c clob) 表后经 {@code INSERT ... SELECT} 批量灌 5 行——普通批量插入在
+     * WAL 侧走 XLOG_HEAP2_MULTI_INSERT（opcode 0x50，rmid 9）路径，比 COPY 协议更稳（B 档
+     * COPY 语法面不必引入）；登记 filenode 供 phase2Dump 的 copy-multi 分支命中打印块 data
+     * hex（MULTI_INSERT 的块 data 为 offsets 数组 + entries，dump 出来供判读 entry 头形态）。
+     */
+    private void copyProbe(Connection c) throws SQLException {
+        try (Statement s = c.createStatement()) {
+            s.execute("drop table if exists vb_wal_enc_copy");
+            s.execute("create table vb_wal_enc_copy (id int, c clob)");
+            s.execute("insert into vb_wal_enc_copy select g, 'row' || g from generate_series(1, 5) g");
+            try (ResultSet rs = s.executeQuery("select relfilenode from pg_class where relname = 'vb_wal_enc_copy'")) {
+                rs.next();
+                filenodes.put(Long.parseLong(rs.getString(1).trim()), "copy(clob)");
+            }
+            System.out.println("== copy probe table ready");
         }
     }
 
@@ -140,8 +162,11 @@ public final class BModeEncodingSpike {
                 layout.walBlockSize(), 0);
         WalStreamWalker walker = new WalStreamWalker(layout, new WalStreamMetrics(), rec -> {
             census.merge("rmid=" + rec.rmid() + "/0x" + Integer.toHexString(rec.info()), 1, Integer::sum);
-            if (rec.rmid() != HeapOps.RM_HEAP_ID
-                    || (rec.info() & HeapOps.XLOG_XACT_OPMASK) != HeapOps.XLOG_HEAP_INSERT) {
+            boolean insert = rec.rmid() == HeapOps.RM_HEAP_ID
+                    && (rec.info() & HeapOps.XLOG_XACT_OPMASK) == HeapOps.XLOG_HEAP_INSERT;
+            boolean multiInsert = (rec.rmid() == HeapOps.RM_HEAP2_ID || rec.rmid() == HeapOps.RM_HEAP_ID)
+                    && (rec.info() & HeapOps.XLOG_XACT_OPMASK) == HeapOps.XLOG_HEAP2_MULTI_INSERT;
+            if (!insert && !multiInsert) {
                 return;
             }
             for (BlockRef blk : rec.blocks()) {
@@ -150,8 +175,8 @@ public final class BModeEncodingSpike {
                     byte[] raw = rec.raw();
                     int off = blk.dataOff();
                     int len = Math.min(72, raw.length - off);
-                    System.out.println("HEX [" + type + "] lsn=" + Lsn.format(rec.lsn())
-                            + " data(" + len + "B)=" + hex(raw, off, len));
+                    System.out.println("HEX [" + (multiInsert ? "copy-multi" : type) + "] lsn="
+                            + Lsn.format(rec.lsn()) + " data(" + len + "B)=" + hex(raw, off, len));
                 }
             }
         });
@@ -171,6 +196,8 @@ public final class BModeEncodingSpike {
                 for (var e : TYPES.entrySet()) {
                     s.execute("drop table if exists " + PREFIX + e.getKey().replaceAll("[^a-z0-9]", ""));
                 }
+                // copyProbe 的表不在 TYPES 表内，单独补清（真库卫生——vb_wal_enc_* 前缀全自清）
+                s.execute("drop table if exists vb_wal_enc_copy");
             }
         }
         System.out.println("== cleanup done");
