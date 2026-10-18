@@ -24,7 +24,10 @@ import java.time.ZoneOffset;
  * ISO-8601 字符串。值 → Java 类型映射：bool→Boolean、char→String（左引号单字符，
  * 与 spike 渲染逐字一致）、name/name128/text/timestamp→String、bytea→byte[]、int2→Short、
  * int4→Integer、int8/oid→Long（oid 无符号语义）、float4→Float、float8→Double、
- * int1→Byte（OG 独有单字节有符号，Task 7）、dropped/skip/null→null。</p>
+ * int1→Byte（OG 独有单字节有符号，Task 7）、dropped/skip/null→null。
+ * <b>M4（VastBase B 档）新增五 kind</b>：uint1/uint2→Integer、uint4/uint8→Long
+ * （uint8 交原码可负、无符号化归渲染层 {@code Long.toUnsignedString}）、year→Integer
+ * （u16 磁盘值解码期 +1900 归一为年值，MySQL YEAR 语义）。</p>
  *
  * <p><b>OG 虚拟前导槽（Task 7 catalog 适配）</b>：词典首位为 {@link #OIDHDR_KIND}
  * （"oidhdr"）时表示 openGauss 的 9.2 式元组头 oid（[t_hoff-4,t_hoff) 垫区内）——
@@ -223,6 +226,13 @@ public final class TupleDecoder {
             switch (kinds[i + base]) {
                 case "int1" -> { vals[i + base] = src[c]; c += 1; }   // OG 独有（relcmprs/attcmprmode/attkvtype）
                 case "int2" -> { c = tupleStart + align(c - tupleStart, 2); vals[i + base] = (short) u16(src, c); c += 2; }
+                // M4（VastBase B 档 MySQL 风格类型族）：uint1/uint2→Integer、uint4/uint8→Long
+                //（uint8 交原码——0xFFFF...FF 即 -1L，无符号化归渲染层）、year 解码期 +1900 归一为年值
+                case "uint1" -> { vals[i + base] = src[c] & 0xFF; c += 1; }   // 1B 无符号
+                case "uint2" -> { c = tupleStart + align(c - tupleStart, 2); vals[i + base] = u16(src, c) & 0xFFFF; c += 2; }
+                case "uint4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i + base] = u32(src, c) & 0xFFFFFFFFL; c += 4; }
+                case "uint8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i + base] = u64(src, c); c += 8; }   // 渲染期无符号化
+                case "year" -> { c = tupleStart + align(c - tupleStart, 2); vals[i + base] = (u16(src, c) & 0xFFFF) + 1900; c += 2; }   // 解码期归一为年值
                 case "int4" -> { c = tupleStart + align(c - tupleStart, 4); vals[i + base] = u32(src, c); c += 4; }
                 case "int8" -> { c = tupleStart + align(c - tupleStart, 8); vals[i + base] = u64(src, c); c += 8; }
                 case "oid" -> { c = tupleStart + align(c - tupleStart, 4); vals[i + base] = u32(src, c) & 0xFFFFFFFFL; c += 4; }
