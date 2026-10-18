@@ -18,8 +18,6 @@ B 档在 M3 交付的 VastBase 档上只动**三个面**，WAL 布局/词典几�
 ```
 WalSource.startOpenGauss（护栏）
   └ 兼容模式白名单按 layout 分档：WalLayoutVVastbase → {'PG','A','B'}；WalLayoutVOpenGauss → {'PG','A'} 不变
-TupleDecoder（layout 接缝 ×1）
-  └ B 档含 varlena 列元组的 6B xl_heap_header（多 1 字节 @infomask2 后）——档位感知的 datum 起点推算
 DecodeKinds + DiskValueRenderer（类型词典 ×13 oid）
   └ 定宽 6 种（int1/uint1/uint2/uint4/uint8/year）+ varlena 7 种（text 族 2 + bytea 族 5）
 WalLayoutVVastbase（附带修复）
@@ -64,7 +62,13 @@ kind 映射新增（oid 键控、档位无关——A 档 DDL 可达的 int1/blob
 
 blob 族渲染裁定理由：裸字节直出 String 会产出控制字符/替换符污染（CDC 下游不可用），`\x` hex 是既降级面（矩阵外 `0x`）同族的保守选择；`RenderOptions` 三参版合同不动。
 
-### 2.2 B 档 varlena 元组 6B xl 头接缝（`TupleDecoder` + `WalLayout`）
+### 2.2 ~~B 档 varlena 元组 6B xl 头接缝~~（已勘误取消——2026-10-18 实施期仲裁）
+
+> **勘误（M4 Task 1 实施期裁定，三重证据）**：第二轮 spike 的"6B 头"系分析期转录伪影——第二轮留存段目录仲裁重 dump、第三轮新跑双一致显示 B 档 varlena 元组与 A 档**同 5B 头**，现有 `TupleDecoder.decodePayload` 零改动直解正确。本节原设计（`tupleHeaderExtraShift` 接缝）整体取消；varlena oid 映射（§2.1）照常。证据链见 spike 报告「第三轮补锚（M4 Task 1）」节。
+
+<details><summary>原设计（作废存档）</summary>
+
+原设计
 
 spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_heap_header 是 6 字节（`[infomask2 u16][0x00 u8][infomask u16][t_hoff u8]`——比 vanilla/A 档 5B 头多一个 0x00 字节），datum 区整体 +1；**固定宽元组两档同 5B 头**。剥字节后现有解码零改动正确（'hello clob'/'中文CLOB值'/byte[] 全中）。
 
@@ -74,6 +78,8 @@ spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_he
 - `TupleDecoder.decodePayload`/`decodeEntry`/`decodePageTuple` 三入口统一经接缝平移 datum 起点（`decodeTupleData` 的 tupleStart 公式 `off+5-23+t_hoff` → `off+5+shift-23+t_hoff`）；页内完整 tuple 面（decodePageTuple）是否同构待锚（FPW/INPLACE 面在 B 档未采样——实施期补，初判同源）
 - **触发范围 = WalLayoutVVastbase 布局 + B 档库**：接缝值需要"当前库兼容模式"参与——layout 是静态单例，B 档信息不在其上。落点：`WalSource.startOpenGauss` 探测的 compat 值经既有装配线（`CatalogSynchronizer` → `ChangeStream` → `XactGrouper` → `TupleDecoder` 构造）以**档位参数**下传（`TupleDecoder` 增 dialect 构造参数或 `WalLayout` 增 mutable 档位字段的取舍在实施期定——倾向前者，decoder 实例按装配期创建，无并发面）
 - **A 档零回归锚**：A 档库（VastBase 档 layout + compat='A'）接缝恒 0——既有 VastDmlParityIT 15 用例全绿是回归门
+
+</details>
 
 ### 2.3 兼容模式护栏分档（`WalSource`）
 
@@ -90,7 +96,9 @@ spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_he
 
 ### 2.5 对拍与验收（手动档真库 IT）
 
-- **`VastDmlParityIT` 增 B 档参数化**：沿 M3 "场景体单方法双档委派零复制"先例扩展为三档（PG 库参数化跑法在 OG 容器，A/B 在真库——A/B 双档共用 `VastTestEnv`，B 档经 `-Dvb.it.vastbase.port=55443 -Dvb.it.vastbase.db=test_b` 或测试内第二 env 实例化，取舍实施期定）。**连接纪律（spike 教训）**：单持久连接 + acquire 重试环（≤15 次）进 `VastTestEnv`
+> **勘误（M4 终审，2026-10-18）**：本条"VastDmlParityIT 增 B 档参数化（三档）"的实际交付形态改为**新类 `VastBModeIT`**——连接面独立 `VastBEnv`（不复用/不参数化 `VastTestEnv`），场景面为 B 专形四场景（下方 ①-④ 照交付）；`VastDmlParityIT` 维持 M3 的 A 档 15 用例形态未动。B 档未复验面记档见 §8 追加行。
+
+- **~~`VastDmlParityIT` 增 B 档参数化~~**（勘误——交付形态为 `VastBModeIT`，见上）：沿 M3 "场景体单方法双档委派零复制"先例扩展为三档（PG 库参数化跑法在 OG 容器，A/B 在真库——A/B 双档共用 `VastTestEnv`，B 档经 `-Dvb.it.vastbase.port=55443 -Dvb.it.vastbase.db=test_b` 或测试内第二 env 实例化，取舍实施期定）。**连接纪律（spike 教训）**：单持久连接 + acquire 重试环（≤15 次）进 `VastTestEnv`
 - **B 专形场景**（新增，值面按 §2.1 锚）：
   - ①13 类型全矩阵（uint 边界值 0/max、int1 ±128、year 1901/2026、clob 中文、blob/tinyblob/raw/binary/varbinary 十六进制载荷、nvarchar2）
   - ②B 档语义面：'' 保留（vs A 档 NULL——A 档不跑同断言）、datetime 微秒截断（typmod=0 存整秒）
@@ -117,8 +125,8 @@ spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_he
 
 ## 6. 任务分解（writing-plans 展开骨架）
 
-1. 补锚：B 档 text/varchar 列 6B 头形态对照 + NULL 行/多列/FPW 页内 tuple 采样（spike harness 复用）——钉死接缝参数化形态
-2. `WalLayout.tupleHeaderExtraShift` 接缝 + `TupleDecoder` 三入口平移 + 档位参数下传（含 A 档恒 0 回归锚）
+1. ~~补锚 6B 头~~（已执行——结论推翻 6B 头，勘误回填 spike 报告第三轮节）
+2. ~~xl 头接缝~~（已取消——6B 头不存在，TupleDecoder 零改动；黄金字节改作 Task 3 的 5B 直解回归锚）
 3. `DecodeKinds` + `TupleDecoder` 定宽 6 kind + varlena 7 oid 映射
 4. `DiskValueRenderer` 渲染分支（blob 族 `\x` 分叉记档 + raw hex）
 5. `WalLayoutVVastbase.attrMinSystemAttnum = -9` + 离线锚
@@ -138,3 +146,4 @@ spike 实证：B 档库上**含 varlena 列的元组**在 WAL 块 data 的 xl_he
 - blob 族渲染与服务器 text 输出有意分叉（`\x` vs 裸字节）——对拍归一化承载，方言渲染分支记后续
 - 6B 头的语义成因（服务端标记位）未考——按几何接缝处理，升级内核版本时需复验
 - test_b 连接抖动的服务端根因未消——IT 重试环承载，非本 spec 范围
+- **B 档 2PC/事务内 DDL as-of/MULTI_INSERT 真几何/中途停续四面未在 B 档专项复验**——M3 全场景对拍面在 A/PG 档承载；B 档记录层已证同构（§2.2 的 6B 头勘误后 WAL 面零分叉），风险低（终审记档，2026-10-18）

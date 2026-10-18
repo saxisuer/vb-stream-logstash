@@ -109,6 +109,19 @@ class WalLayoutVVastbaseTest {
     }
 
     /**
+     * 系统列诊断下界 -9（M4 修复）：VastBase 6.0.0 内核 pg_attribute 系统列集
+     * [-9,-1]（xc_node_id=-9、rowid=-8——真库 A/B 双档实查同源），OG 5.0.0 布局
+     * 维持 -8——流内 CREATE TABLE 的 xc_node_id(-9) 行触发假阳性"疑似词典错位"
+     * WARN 的根因修复锚。
+     */
+    @Test
+    void vastbaseAttrMinSystemAttnumIsMinusNine() {
+        assertEquals(-9, WalLayoutVVastbase.INSTANCE.attrMinSystemAttnum());
+        assertEquals(-8, WalLayoutVOpenGauss.INSTANCE.attrMinSystemAttnum());
+        assertEquals(-6, WalLayoutV18.INSTANCE.attrMinSystemAttnum());
+    }
+
+    /**
      * 读区长度自检锚（nsp/partition 面，沿"偏移差恰 64B"先例）：VastBase 的
      * nsp/partition 读区相对 OG 各差恰 64B（name 加宽净效果——nsp 80→144、
      * partition 120→184）；且三行模型的 encodeReadRegion 实长必须与各自声明的

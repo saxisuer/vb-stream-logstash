@@ -411,7 +411,8 @@ public final class OgParityBaseline {
         private Pending cur;
 
         /**
-         * 单帧分发：类型字节路由到 B/R/I/U/D/C 六个已锚定分支，其余（'T' truncate、
+         * 单帧分发：类型字节路由到 B/R/I/U/D/C 六个已锚定分支 + 'Y'（VastBase B 档新
+         * 类型的 Type 描述帧——整帧跳过，见 case 注释）分支，其余（'T' truncate、
          * 两阶段族、未知）抛 ISE 显式拒绝——M2 对拍面外形态静默吞会产出缺行假绿。
          *
          * @param msg 一条完整帧的载荷（含类型字节，opengauss-jdbc CopyData 形态）
@@ -457,6 +458,13 @@ public final class OgParityBaseline {
                     // endLsn（第二 LSN 字段）与 ts（尾 Int64）不在 v2 头行对齐面，跳过
                     done.add(cur.closeBaseline(commitLsn));
                     cur = null;
+                }
+                case 'Y' -> {
+                    // VastBase B 档的 Type 消息（M4 Task 8 实跑首见：B 档新类型 year(17851)/uint 族
+                    // 的类型描述帧，如 `59 | 00 00 45 bb | 00 | "year" 00`——oid + namespace + name）。
+                    // 对拍渲染面只用 'R' 的列名序与 TupleData 文本值，类型描述零消费——整帧跳过
+                    // （帧体几何不作解析假设，A/OG 档无此帧零扰动）。
+                    LOG.debug("基准路跳过 Type 消息（VastBase B 档新类型描述帧，渲染面零消费）");
                 }
                 default -> throw new IllegalStateException("基准路收到 M2 对拍面外的帧类型 '"
                         + (char) type + "'（DDL/TRUNCATE/两阶段族归 T7+，未知类型显式拒绝）: "

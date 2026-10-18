@@ -48,6 +48,14 @@ import java.util.concurrent.ConcurrentHashMap;
  * 把复制会话时区设为 JVM 默认的 engine 侧 text 行为）；numeric 精度无损、永不科学
  * 计数法。</p>
  *
+ * <p><b>M4 VastBase B 档增量（13 oid，2026-10-18）</b>：int1/uint1/uint2/uint4 整数
+ * 十进制（uint 族无符号语义经解码层 Long 直传，{@code renderInt} 的 Number 兼容面天然
+ * 覆盖 Byte）、uint8 无符号十进制（{@code Long.toUnsignedString}）、year 十进制
+ * （解码期已 +1900 归一）、clob/nvarchar2 文本透传、raw 大写 hex 无前缀（Oracle RAW
+ * 风格）；blob 族四 oid（blob/tinyblob/binary/varbinary）<b>有意分叉</b>——服务端
+ * text 输出是裸字节（乱码形），本渲染取 {@code \x}+小写 hex（CDC 下游可用性优先，
+ * 与矩阵外 {@code 0x} 降级同族保守选择，spec §2.1 裁定记档）。</p>
+ *
  * <p><b>矩阵外 oid</b>（enum/域/jsonb/组合类型等动态或复杂格式）降级 {@code 0x}+小写
  * 十六进制，每 oid 仅 WARN 一次（类级 logger，观测节流防大事务刷屏）。定长类型载荷
  * 长度不符抛 {@link IllegalStateException} fail-fast（磁盘走读错位的信号）。已知
@@ -86,6 +94,22 @@ public final class DiskValueRenderer {
     private static final int OID_TIMESTAMPTZ = 1184;
     private static final int OID_NUMERIC = 1700;
     private static final int OID_UUID = 2950;
+
+    // ---- M4 VastBase B 档新类型 OID（spike 二轮实采锚）----
+
+    private static final int OID_INT1 = 5545;          // VastBase int1
+    private static final int OID_CLOB = 90;            // VastBase clob
+    private static final int OID_RAW = 86;             // VastBase raw（Oracle RAW——大写 hex 无前缀）
+    private static final int OID_VARBINARY = 95;       // B 档 varbinary
+    private static final int OID_NVARCHAR2 = 3969;     // VastBase nvarchar2
+    private static final int OID_BLOB = 88;            // VastBase blob
+    private static final int OID_BINARY = 9779;        // B 档 binary
+    private static final int OID_TINYBLOB = 17757;     // B 档 tinyblob
+    private static final int OID_UINT1 = 15705;        // B 档 uint1
+    private static final int OID_UINT2 = 15712;        // B 档 uint2
+    private static final int OID_UINT4 = 15719;        // B 档 uint4
+    private static final int OID_UINT8 = 15726;        // B 档 uint8
+    private static final int OID_YEAR = 17851;         // B 档 year
 
     /** date 纪元 2000-01-01 相对 LocalDate 纪元（1970-01-01）的天数。 */
     private static final long PG_EPOCH_DAY = 10957L;
@@ -200,6 +224,13 @@ public final class DiskValueRenderer {
             case OID_TIMESTAMPTZ -> renderTimestamptz(expectBytes(decoded, typeOid), opts.dateFormat());
             case OID_NUMERIC -> renderNumeric(expectBytes(decoded, typeOid));
             case OID_UUID -> renderUuid(expectBytes(decoded, typeOid));
+            case OID_INT1, OID_UINT1, OID_UINT2, OID_UINT4 -> renderInt(decoded);
+            case OID_UINT8 -> Long.toUnsignedString(expectNumber(decoded, typeOid).longValue());
+            case OID_YEAR -> String.valueOf(expectNumber(decoded, typeOid).intValue());
+            case OID_CLOB, OID_NVARCHAR2 -> renderTextFamily(decoded);
+            case OID_BLOB, OID_VARBINARY, OID_BINARY, OID_TINYBLOB ->
+                    "\\x" + HexFormat.of().formatHex(expectBytes(decoded, typeOid));
+            case OID_RAW -> HexFormat.of().formatHex(expectBytes(decoded, typeOid)).toUpperCase();
             default -> unknown(typeOid, decoded);
         };
     }

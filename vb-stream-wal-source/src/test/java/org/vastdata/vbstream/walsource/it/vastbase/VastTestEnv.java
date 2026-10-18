@@ -223,7 +223,9 @@ public final class VastTestEnv {
     /**
      * 新建一条普通 SQL 会话（opengauss-jdbc）——干扰线程/交错 DDL/对拍 probe 等并发面
      * 一律走本方法（共享会话非线程安全）；调用方负责关闭。经
-     * {@link #openConnectionWithRetry}（跨网段偶发丢首包面的有界重试）。
+     * {@link #openConnectionWithRetry}（跨网段偶发丢首包面的有界重试；M4 Task 7 起
+     * 该环也是 test_b 抖动纪律的承载面——8 次指数退避合计 ~75s 坏窗覆盖，宽于
+     * {@link VastBEnv} 的 15×1s 基准纪律，A/B 两档真库 IT 同源受益）。
      *
      * @return 已认证的 JDBC 连接
      * @throws SQLException 连接失败
@@ -234,7 +236,9 @@ public final class VastTestEnv {
 
     /**
      * 共享 SQL 会话（懒建单连接；已关则重建）——仅装配线程串行 DDL 用。经
-     * {@link #openConnectionWithRetry}（跨网段偶发丢首包面的有界重试）。
+     * {@link #openConnectionWithRetry}（跨网段偶发丢首包面的有界重试；M4 Task 7 起
+     * 该环也是 test_b 抖动纪律的承载面——8 次指数退避合计 ~75s 坏窗覆盖，宽于
+     * {@link VastBEnv} 的 15×1s 基准纪律，A/B 两档真库 IT 同源受益）。
      *
      * @return 已认证的共享连接
      * @throws SQLException 连接失败

@@ -97,7 +97,11 @@ git commit -m "spike(wal-source): B 档 6B 头第三轮补锚——text/NULL/MUL
 
 ---
 
-### Task 2: xl 头几何接缝（`WalLayout.xlHeaderExtraShift` + `TupleDecoder` 三入口）
+### Task 2: ~~xl 头几何接缝~~（已取消——2026-10-18 实施期裁定）
+
+> **勘误（Task 1 仲裁推翻前提）**：「B 档 varlena 元组 6B xl 头」系第二轮 spike 分析期转录伪影——第二轮留存段目录仲裁重 dump + 第三轮新跑双一致为 **5B 头**，现有 `TupleDecoder.decodePayload` 零改动直解正确（[1, hello clob] / blob→deadbeef 实证）。本任务整体取消；其黄金字节测试（B 档 varlena 行 5B 直解 + 固定宽行）**并入 Task 3 Step 1**（下方已增补）。原任务文本作废存档如下，不再执行。
+
+<details><summary>原 Task 2（作废）</summary>
 
 **Files:**
 - Modify: `vb-stream-wal-source/src/main/java/org/vastdata/vbstream/walsource/layout/WalLayout.java`（新增 default 接缝方法）
@@ -271,6 +275,8 @@ git commit -m "feat(wal-source): B 档 varlena 元组 6B xl 头接缝——WalLa
 
 ---
 
+</details>
+
 ### Task 3: 类型词典扩展（`DecodeKinds` 13 oid + `TupleDecoder` 5 新 kind）
 
 **Files:**
@@ -311,6 +317,28 @@ git commit -m "feat(wal-source): B 档 varlena 元组 6B xl 头接缝——WalLa
         assertEquals((byte) 127, i1[1]);
         Object[] i1n = dec.decodePayload(hex("0200000818000200000080"), 0, new String[] {"int4", "int1"});
         assertEquals((byte) -128, i1n[1]);
+    }
+
+    /**
+     * B 档 varlena/固定宽元组 5B 头直解锚（原 Task 2 并入——2026-10-18 仲裁后
+     * 现状回归锚）：B 档 varlena 行与 A 档同 5B xl 头，现有 decodePayload 零改动
+     * 直解（黄金字节实采 test_b）。
+     */
+    @Test
+    void vastbaseBModeTuplesDecodeWithVanillaFiveByteXlHeader() {
+        TupleDecoder dec = new TupleDecoder(WalLayoutVVastbase.INSTANCE);
+        byte[] row1 = hex("020002081800010000001768656C6C6F20636C6F62");
+        assertArrayEquals(new Object[] {1, "hello clob"}, dec.decodePayload(row1, 0, new String[] {"int4", "text"}));
+        byte[] row2 = hex("020002081800020000001DE4B8ADE69687434C4F42E580BC");
+        assertArrayEquals(new Object[] {2, "中文CLOB值"}, dec.decodePayload(row2, 0, new String[] {"int4", "text"}));
+        byte[] blob1 = hex("020002081800010000000BDEADBEEF");
+        Object[] v = dec.decodePayload(blob1, 0, new String[] {"int4", "bytea"});
+        assertEquals(1, v[0]);
+        assertArrayEquals(new byte[] {(byte) 0xDE, (byte) 0xAD, (byte) 0xBE, (byte) 0xEF}, (byte[]) v[1]);
+        byte[] fixed8 = hex("0200000818000100000000000000FFFFFFFFFFFFFFFF");
+        Object[] f = dec.decodePayload(fixed8, 0, new String[] {"int4", "int8"});
+        assertEquals(1, f[0]);
+        assertEquals(-1L, f[1]);
     }
 
     /**

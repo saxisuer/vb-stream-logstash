@@ -462,7 +462,8 @@ public interface WalLayout {
      * （og-plan 容器实查 {@code public.t_corpus} 负 attnum 集 [-8,-1] 无 -2）。
      * 缺省 -6＝V17/V18 现行 vanilla 口径，路径行为不变。</p>
      *
-     * @return 合法系统列 attnum 下界（V17/18=-6，OG=-8）
+     * @return 合法系统列 attnum 下界（V17/18=-6，OG=-8，VastBase=-9——M4：6.0.0 内核
+     *         多一列 rowid 把 xc_node_id 挤到 -9）
      */
     default int attrMinSystemAttnum() {
         return -6;

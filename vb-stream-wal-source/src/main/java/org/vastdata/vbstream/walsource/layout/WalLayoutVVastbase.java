@@ -214,4 +214,12 @@ public final class WalLayoutVVastbase extends WalLayoutVOpenGauss {
     public long remapDmlTypeOid(long typeOid) {
         return typeOid == 9040 ? 1114 : typeOid;
     }
+
+    /** {@inheritDoc}——VastBase 6.0.0 内核覆写 -9：系统列集 [-9,-1]（xc_node_id=-9/
+     *  rowid=-8，真库 A/B 双档实查同源——M4 修复流内建表 xc_node_id 行的假阳性
+     *  "疑似词典错位"WARN；OG 5.0.0 布局的 -8 不变）。 */
+    @Override
+    public int attrMinSystemAttnum() {
+        return -9;
+    }
 }

@@ -370,4 +370,94 @@ class TupleDecoderTest {
         Object[] vals = decoder.decodePayload(payload, 0, new String[]{"bytea"});
         assertArrayEquals(new byte[]{(byte) 0xAA, (byte) 0xBB}, (byte[]) vals[0]);
     }
+
+    /**
+     * M4 新 kind 黄金字节矩阵：uint1/uint2/uint4/uint8/year 五定宽类型 + int1 oid
+     * 解锁——值与对齐（'c'/'s'/'d'）按 spike 二轮实采锚（uint8 的 8B 对齐垫 4 零——
+     * int4 后相对 datum 基垫 [4,8) 共 4B 到 8B 边界）。
+     */
+    @Test
+    void m4FixedWidthKindsDecodeAgainstGoldenBytes() {
+        TupleDecoder dec = new TupleDecoder(WalLayoutVVastbase.INSTANCE);
+        Object[] u1 = dec.decodePayload(hex("02000008180001000000FF"), 0, new String[] {"int4", "uint1"});
+        assertEquals(255, u1[1]);
+        Object[] u2 = dec.decodePayload(hex("02000008180001000000FFFF"), 0, new String[] {"int4", "uint2"});
+        assertEquals(65535, u2[1]);
+        Object[] u4 = dec.decodePayload(hex("02000008180001000000FFFFFFFF"), 0, new String[] {"int4", "uint4"});
+        assertEquals(4294967295L, u4[1]);
+        Object[] u8 = dec.decodePayload(hex("0200000818000100000000000000FFFFFFFFFFFFFFFF"),
+                0, new String[] {"int4", "uint8"});
+        assertEquals(-1L, u8[1]);   // 0xFFFF...FF == -1L，渲染期 Long.toUnsignedString
+        Object[] yr = dec.decodePayload(hex("020000081800010000007E00"), 0, new String[] {"int4", "year"});
+        assertEquals(2026, yr[1]);
+        Object[] yr2 = dec.decodePayload(hex("020000081800020000000100"), 0, new String[] {"int4", "year"});
+        assertEquals(1901, yr2[1]);
+        Object[] i1 = dec.decodePayload(hex("020000081800010000007F"), 0, new String[] {"int4", "int1"});
+        assertEquals((byte) 127, i1[1]);
+        Object[] i1n = dec.decodePayload(hex("0200000818000200000080"), 0, new String[] {"int4", "int1"});
+        assertEquals((byte) -128, i1n[1]);
+    }
+
+    /**
+     * B 档 varlena/固定宽元组 5B 头直解锚（原 Task 2 并入——2026-10-18 仲裁后
+     * 现状回归锚）：B 档 varlena 行与 A 档同 5B xl 头，现有 decodePayload 零改动
+     * 直解（黄金字节实采 test_b）。
+     */
+    @Test
+    void vastbaseBModeTuplesDecodeWithVanillaFiveByteXlHeader() {
+        TupleDecoder dec = new TupleDecoder(WalLayoutVVastbase.INSTANCE);
+        byte[] row1 = hex("020002081800010000001768656C6C6F20636C6F62");
+        assertArrayEquals(new Object[] {1, "hello clob"}, dec.decodePayload(row1, 0, new String[] {"int4", "text"}));
+        byte[] row2 = hex("020002081800020000001DE4B8ADE69687434C4F42E580BC");
+        assertArrayEquals(new Object[] {2, "中文CLOB值"}, dec.decodePayload(row2, 0, new String[] {"int4", "text"}));
+        byte[] blob1 = hex("020002081800010000000BDEADBEEF");
+        Object[] v = dec.decodePayload(blob1, 0, new String[] {"int4", "bytea"});
+        assertEquals(1, v[0]);
+        assertArrayEquals(new byte[] {(byte) 0xDE, (byte) 0xAD, (byte) 0xBE, (byte) 0xEF}, (byte[]) v[1]);
+        byte[] fixed8 = hex("0200000818000100000000000000FFFFFFFFFFFFFFFF");
+        Object[] f = dec.decodePayload(fixed8, 0, new String[] {"int4", "int8"});
+        assertEquals(1, f[0]);
+        assertEquals(-1L, f[1]);
+    }
+
+    /**
+     * M4 oid 映射面：DecodeKinds.forTypeOid 对 13 新 oid 全命中——uint 族 4 + year +
+     * int1 + varlena 族 7（clob/nvarchar2→text、blob/tinyblob/raw/binary/varbinary→bytea）。
+     * 未注册 oid（如 enum 动态 oid）仍 ISE（矩阵外 fail-fast 语义不变）。
+     */
+    @Test
+    void m4TypeOidsResolveInDecodeKinds() {
+        assertEquals("int1", DecodeKinds.forTypeOid(5545));
+        assertEquals("uint1", DecodeKinds.forTypeOid(15705));
+        assertEquals("uint2", DecodeKinds.forTypeOid(15712));
+        assertEquals("uint4", DecodeKinds.forTypeOid(15719));
+        assertEquals("uint8", DecodeKinds.forTypeOid(15726));
+        assertEquals("year", DecodeKinds.forTypeOid(17851));
+        assertEquals("text", DecodeKinds.forTypeOid(90));
+        assertEquals("text", DecodeKinds.forTypeOid(3969));
+        assertEquals("bytea", DecodeKinds.forTypeOid(88));
+        assertEquals("bytea", DecodeKinds.forTypeOid(95));
+        assertEquals("bytea", DecodeKinds.forTypeOid(86));
+        assertEquals("bytea", DecodeKinds.forTypeOid(9779));
+        assertEquals("bytea", DecodeKinds.forTypeOid(17757));
+        assertThrows(IllegalStateException.class, () -> DecodeKinds.forTypeOid(24064));
+    }
+
+    /**
+     * 十六进制文本解码为字节数组（黄金字节用例的构造辅助）——空格不宽容、奇数长度
+     * 抛 IAE（手写字节串的笔误在构造期即暴露，不落入解码断言面）。
+     *
+     * @param hex 无分隔的十六进制文本（长度须为偶数）
+     * @return 对应字节数组
+     */
+    private static byte[] hex(String hex) {
+        if (hex.length() % 2 != 0) {
+            throw new IllegalArgumentException("odd hex length: " + hex);
+        }
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
 }

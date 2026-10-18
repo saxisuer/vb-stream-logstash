@@ -11,6 +11,10 @@ package org.vastdata.vbstream.walsource.layout;
  * 词典外六 oid（date/time/timetz/timestamptz/numeric/uuid）与文本族三 oid
  * （json/bpchar/varchar）、字节族 bytea、u32 族 xid/cid 一并收录——本映射与渲染矩阵
  * 的 oid 集合保持一致是值面自洽的前提（kind 解出 datum 字节 → 矩阵渲染）。
+ * <b>M4 扩容（VastBase B 档）</b>：uint 族四 oid + year + int1（既有 kind 解锁）
+ * 与 varlena 族七 oid（clob/nvarchar2→text、blob/tinyblob/raw/binary/varbinary→
+ * bytea）收录——uint8 交 {@code Long} 原码（可能为负、无符号化归渲染层）、year 解码
+ * 期 +1900 归一为年值。
  * 工具类不可实例化，静态方法纯函数并发安全。</p>
  */
 public final class DecodeKinds {
@@ -59,6 +63,15 @@ public final class DecodeKinds {
             case 1266 -> "timetz";    // timetz（i64 微秒 + i32 区偏移，12B 定宽）
             case 1700 -> "numeric";   // numeric（varlena 内容，格式头自证短/长/特殊）
             case 2950 -> "uuid";      // uuid（16B 网络序）
+            // M4（VastBase B 档 MySQL 风格类型族，spike 二轮实采 oid 锚）
+            case 5545 -> "int1";      // VastBase int1（1B 有符号——TupleDecoder 既有 kind 的 oid 解锁）
+            case 88, 95, 9779, 17757, 86 -> "bytea"; // blob/varbinary/binary/tinyblob/raw（varlena 字节流——渲染按 oid 分叉）
+            case 90, 3969 -> "text";  // clob/nvarchar2（varlena 文本）
+            case 15705 -> "uint1";    // VastBase B 档 uint1（1B 无符号）
+            case 15712 -> "uint2";    // uint2（2B 小端无符号）
+            case 15719 -> "uint4";    // uint4（4B 小端无符号）
+            case 15726 -> "uint8";    // uint8（8B 小端无符号，'d' 对齐）
+            case 17851 -> "year";     // year（u16 = 年-1900，MySQL YEAR 语义 1901-2155）
             default -> throw new IllegalStateException("unregistered type oid " + oid);
         };
     }
