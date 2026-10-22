@@ -18,7 +18,8 @@
 - 每个任务完成即 commit + push（跨机开发纪律）；commit message 首词 `feat(wal-source)`/`test(wal-source)`/`docs(wal-source)`
 - 常量必须标注出处（REL_STABLE 源码行/og-plan 实测/真库实测——沿 `HeapOps` 既有 javadoc 风格）
 - Windows 开发机：bash shell；Docker Desktop 本地可用（IT 需）；VastBase 真库 IT 以 `-Dvb.it.vastbase=true` 手动跑
-- vanilla 几何已实锚（REL_17/18_STABLE `heapam_xlog.h`，17/18 逐字同）：opcode 0x30、`{Oid dbId; uint32 nrelids; uint8 flags; Oid relids[]}`、`SizeOfHeapTruncate=9`、CASCADE=1<<0 / RESTART_SEQS=1<<1——**relids 起点偏移（@9 紧排 vs @12 MAXALIGN 垫）以 Task 0 真实字节为准**，视图常量单点可调
+- vanilla 几何已实锚（REL_17/18_STABLE `heapam_xlog.h` + Task 0 spike 黄金字节，17/18 逐字同）：opcode 0x30、`{Oid dbId; uint32 nrelids; uint8 flags; Oid relids[]}`、CASCADE=1<<0 / RESTART_SEQS=1<<1——**relids 起点已裁定 @12**（`Oid relids[]` 4 对齐使 offsetof=12；@9-11 是未初始化栈垫垃圾，**禁止读/禁止校验为零**）；`mainLen == 12 + 4×nrelids` 精确成立（序列重启走前置 RM_SEQ 记录，**无 relids 尾随**——heapam_xlog.h "followed by sequence relids" 注释是 pre-PG10 残留，spike §1.1 勘误）
+- **Task 0 spike 裁定**（`docs/wal-source-truncate-spike.md` 裁决表）：TRUNCATE 捕获是 **vanilla 17/18 独有**能力——OG 5.0.0 与 VastBase 双双裁决 C（WAL 无专用记录[纯 catalog 手术] + 逻辑流不发 'T' 帧）；Task 6/7 已按此重塑为"零事件不砖流 + 截后 DML 字典正确"断言与记档
 
 ---
 
@@ -100,19 +101,21 @@ import java.io.ByteArrayOutputStream;
 import static org.junit.jupiter.api.Assertions.*;
 
 /** {@link HeapViews.TruncateView} 的失败先行测试——vanilla 几何（REL_17/18_STABLE
- * heapam_xlog.h 实锚 + spike 黄金字节）：[dbId u32@0][nrelids u32@4][flags u8@8]
- * [relid u32×n @9 起]；错配 rmid/opcode 抛 ISE；relids 越界抛 ISE。 */
+ * heapam_xlog.h + spike 黄金字节，@12 裁定）：[dbId u32@0][nrelids u32@4][flags u8@8]
+ * [3B 未初始化栈垫@9-11][relid u32×n @12 起]；错配 rmid/opcode 抛 ISE；
+ * mainLen ≠ 12+4nrelids 抛 ISE（错位自检）。 */
 class TruncateViewTest {
 
     private final WalLayout layout = WalLayoutV18.INSTANCE;
 
-    /** 手造 main：9B 头 + relids 数组（spike §vanilla18 黄金几何）。 */
+    /** 手造 main：12B 头（含 @9-11 未初始化栈垫——spike 实测非零垃圾，视图不读）+ relids 数组。 */
     private byte[] buildMain(int flags, long... relids) {
         ByteArrayOutputStream m = new ByteArrayOutputStream();
         put32(m, 16385L);                        // dbId（视图不消费，占位真值）
         put32(m, relids.length);                 // nrelids
-        m.write(flags);                          // flags u8
-        for (long rel : relids) put32(m, rel);   // relids @9 起
+        m.write(flags);                          // flags u8@8
+        m.write(0xe4); m.write(0xdb); m.write(0x61);   // @9-11 栈垫（spike 黄金样本同形——非零）
+        for (long rel : relids) put32(m, rel);   // relids @12 起（spike 裁定）
         return m.toByteArray();
     }
 
@@ -165,6 +168,16 @@ class TruncateViewTest {
                 HeapOps.XLOG_HEAP_TRUNCATE, 100).main(new byte[5]).build(), 0x100000L, layout);
         assertThrows(IllegalStateException.class, () -> HeapViews.TruncateView.parse(r, layout));
     }
+
+    @Test
+    void rejectsTrailingBytesBeyondDeclaredNrelids() {
+        // nrelids=1 但 main 携带 2 个 relid 的空间——精确自检（mainLen == 12+4n）拒绝
+        byte[] bad = buildMain(0, 24600L, 24601L);
+        bad[4] = 1;
+        WalRecord r = WalRecordParser.parse(WalBytes.record(HeapOps.RM_HEAP_ID,
+                HeapOps.XLOG_HEAP_TRUNCATE, 100).main(bad).build(), 0x100000L, layout);
+        assertThrows(IllegalStateException.class, () -> HeapViews.TruncateView.parse(r, layout));
+    }
 }
 ```
 
@@ -179,8 +192,10 @@ Expected: FAIL——`TruncateView`/`XLOG_HEAP_TRUNCATE` 符号不存在（编译
 /** heapam_xlog.h：XLOG_HEAP_TRUNCATE（opcode 位段 0x30——事务性 TRUNCATE 的记录族，
  *  DELETE 0x10 与 HOT_UPDATE 0x40 之间；REL_17/18_STABLE 逐字同，2026-10-22 实锚。
  *  载荷 xl_heap_truncate{Oid dbId; uint32 nrelids; uint8 flags; Oid relids[]}——
- *  SizeOfHeapTruncate=9，relids 是 <b>oid 数组</b>；TRUNCATE 自 PG 12 不换 relfilenode。
- *  OG 系 9.2 内核形态见 spike 文档裁决表（docs/wal-source-truncate-spike.md）。 */
+ *  relids 是 <b>oid 数组</b>@12 起（@9-11 是未初始化栈垫，spike 字节裁定）；写点
+ *  tablecmds.c ExecuteTruncateGuts，仅 wal_level≥logical 时写（源码 Assert）。
+ *  OG 系 9.2 内核无此记录（TRUNCATE 纯 catalog 手术——spike 裁决 C，
+ *  docs/wal-source-truncate-spike.md）。 */
 public static final int XLOG_HEAP_TRUNCATE = 0x30;
 
 /** heapam_xlog.h：XLH_TRUNCATE_CASCADE（1&lt;&lt;0——级联截子表/分区）。 */
@@ -191,11 +206,11 @@ public static final int XLH_TRUNCATE_CASCADE = 1 << 0;
 public static final int XLH_TRUNCATE_RESTART_SEQS = 1 << 1;
 ```
 
-`HeapViews` 增嵌套 record（常量 `RELIDS_OFF = 9` 单点——spike 若裁定 @12 只改此一处 + javadoc 勘误）：
+`HeapViews` 增嵌套 record（几何已 spike 裁定 @12）：
 
 ```java
 /** XLOG_HEAP_TRUNCATE 记录视图：被截关系 oid 数组 + flags 位图（vanilla 几何，
- * REL_17/18_STABLE 实锚——OG 系差异经 layout 分派扩展，见 parse）。
+ * REL_17/18_STABLE 实锚 + spike 黄金字节 @12 裁定）。
  *
  * @param nrelids 被截关系数
  * @param relids  pg_class oid 数组（payload 序保持——engine relationOids 同源序）
@@ -204,17 +219,20 @@ public static final int XLH_TRUNCATE_RESTART_SEQS = 1 << 1;
  */
 record TruncateView(int nrelids, long[] relids, int flags) {
 
-    /** relids 数组起点（SizeOfHeapTruncate——spike 黄金字节裁定 @9 紧排）。 */
-    private static final int RELIDS_OFF = 9;
+    /** relids 数组起点（SizeOfHeapTruncate=12——Oid relids[] 4 对齐使 offsetof=12；
+     * @9-11 是未初始化栈垫垃圾，禁止读/禁止校验为零，spike §1 勘误）。 */
+    private static final int RELIDS_OFF = 12;
 
     /**
      * 解析一条 truncate 记录的 main data：校验 rmid==RM_HEAP_ID 且 opcode==
      * XLOG_HEAP_TRUNCATE（错配 ISE）；走读 [dbId u32@0][nrelids u32@4][flags u8@8]
-     * [relid u32×n]（RESTART 位时尾随序列 oid 不消费）。边界与异常语义：mainLen
-     * &lt; RELIDS_OFF 或 relids 越界抛 ISE；纯函数无 IO。
+     * [3B 栈垫][relid u32×n@12 起]。边界与异常语义：mainLen &lt; RELIDS_OFF 或
+     * mainLen != RELIDS_OFF + 4×nrelids 抛 ISE——精确等式自检（PG 17/18 序列重启
+     * 走前置 RM_SEQ 记录、relids 无尾随，spike §1.1 勘误）；纯函数无 IO。
      *
      * @param r      走读完成的记录（raw 契约只读）
-     * @param layout 版本布局（OG 系分派预留——vanilla 档不消费，Task 6 扩展）
+     * @param layout 版本布局（签名与既有视图对齐；OG 系无 truncate 记录——spike
+     *               裁决 C，恒走 vanilla 分支）
      * @return 视图
      */
     static TruncateView parse(WalRecord r, WalLayout layout) {
@@ -225,8 +243,9 @@ record TruncateView(int nrelids, long[] relids, int flags) {
         byte[] raw = r.raw();
         int off = r.mainOff();
         int n = (int) u32(raw, off + 4);
-        if (RELIDS_OFF + 4L * n > r.mainLen()) {
-            throw new IllegalStateException("truncate relids 越界: nrelids=" + n + ", mainLen=" + r.mainLen());
+        if (r.mainLen() != RELIDS_OFF + 4L * n) {
+            throw new IllegalStateException("truncate 几何错位: nrelids=" + n
+                    + ", mainLen=" + r.mainLen() + "（期望 " + (RELIDS_OFF + 4L * n) + "）");
         }
         long[] relids = new long[n];
         for (int i = 0; i < n; i++) {
@@ -237,7 +256,7 @@ record TruncateView(int nrelids, long[] relids, int flags) {
 }
 ```
 
-  注：`requireOp`/`u32` 若在 `HeapViews` 内为私有，将 `u32` 提为包内静态（或视图内内联四字节小端读）——与既有视图同风格即可。
+  注：`requireOp`/`u32` 若在 `HeapViews` 内为私有，将 `u32` 提为包内静态（或视图内内联四字节小端读）——与既有视图同风格即可。Task 1 Step 1 期望值随 @12 连动：n=1 → mainLen=16。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -419,20 +438,22 @@ Expected: PASS；`mvn test-compile` 无残留 `onTruncate` 未实现编译错（
 - [ ] **Step 1: 写失败测试**——`XactGrouperTest` Fixture 增构建器（置于既有 `insert(...)` 旁）：
 
 ```java
-/** 一条 TRUNCATE 记录（RM_HEAP_ID opcode 0x30，零块引用；main = 9B 头 + relids
- * 数组——relids 传 pg_class oid，与 stub 快照的 table 键同值）。 */
+/** 一条 TRUNCATE 记录（RM_HEAP_ID opcode 0x30，零块引用；main = 12B 头[含 @9-11
+ * 栈垫] + relids 数组——relids 传 pg_class oid，与 stub 快照的 table 键同值；
+ * spike @12 黄金几何）。 */
 WalRecord truncate(int xid, int toplevel, int flags, long... relids) {
     ByteArrayOutputStream m = new ByteArrayOutputStream();
     put32(m, 16385L);                        // dbId（视图不消费）
     put32(m, relids.length);                 // nrelids
-    m.write(flags);                          // flags u8
-    for (long rel : relids) put32(m, rel);   // relids @9 起（TruncateView.RELIDS_OFF 同源）
+    m.write(flags);                          // flags u8@8
+    m.write(0xe4); m.write(0xdb); m.write(0x61);   // @9-11 栈垫（非零垃圾——视图不读）
+    for (long rel : relids) put32(m, rel);   // relids @12 起（spike 裁定）
     return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_TRUNCATE, xid)
             .toplevel(toplevel).main(m.toByteArray()).build());
 }
 ```
 
-  用例群（每个一 @Test，方法名行为描述式）：
+  用例群（每个一 @Test，方法名行为描述式；测试类常量区增 `private static final long MOTHER_REL = 24603L;`——分区母表 oid，relkind 'p'，stub 快照按 'p' 注册）：
 
 ```java
 /** TRUNCATE 与行同桶按 WAL 序发射，expected 含 truncate 条目（对齐 engine unitCount）。 */
@@ -521,6 +542,26 @@ void truncateOnlyTransactionSetsPendingFloor() {
     WalRecord tr = fx.truncate(100, 0, 0, USER_REL);
     assertEquals(tr.lsn(), fx.grouper.pendingFloorLsn());
 }
+
+/** relkind='p' 分区母表从事件滤除（spike §5.2-2——pgoutput 'T' 帧面母表缺席，
+ * WAL relids 含母表；wal 路同构滤除）。 */
+@Test
+void partitionedMotherOidFilteredFromTruncateEvent() {
+    StubSnapshot snapshot = new StubSnapshot();
+    snapshot.table(MOTHER_REL, "public", "t_part_m", "p",
+            new CatalogSnapshot.Column(1, "i", 23, false));
+    snapshot.table(USER_REL, "public", "t_stream", "r",
+            new CatalogSnapshot.Column(1, "id", 23, false));
+    RecordingListener listener = new RecordingListener();
+    XactGrouper grouper = new XactGrouper(snapshot, null, layout, new ToastAssembler(null), listener);
+    Fixture fx = new Fixture(snapshot, new ToastAssembler(null), grouper, listener);
+    fx.truncate(100, 0, 0, MOTHER_REL, USER_REL);   // payload 序 [母表, 普通表]
+    fx.commit(100);
+    assertEquals(List.of(
+            "BEGIN xid=100 2p=false gid=null exp=1",
+            "TRUNCATE [public.t_stream] options=[]",
+            "END xid=100 emitted=1 exp=1"), listener.events);
+}
 ```
 
   `TableFilterTest` 增 `resolveByOid` 两用例：①oid 直查命中（stub 三表在册的普通表）；②**反查碰撞防御锚**——构造 relfilenode 反查会先命中的键值时 `resolveByOid` 仍按 oid 判（沿该文件既有 StubSnapshot 形态手造字典行）。
@@ -608,6 +649,11 @@ private void appendTruncateRecord(WalRecord rec) {
     long top = effectiveTop(rec, origin);
     List<TableMeta> tables = new ArrayList<>(v.relids().length);
     for (long oid : v.relids()) {
+        // spike §5.2-2：pgoutput 'T' 帧剔除 relkind='p' 分区母表（母表无存储不发布，
+        // WAL relids=[m,p1,p2] vs engine 渲 [p1,p2]）——wal 路同构滤除，否则对拍必 diff
+        if ("p".equals(snapshot.relkindOf(oid).orElse(""))) {
+            continue;
+        }
         filter.resolveByOid(oid).ifPresent(tables::add);
     }
     if (tables.isEmpty()) {
@@ -794,7 +840,7 @@ BEGIN; TRUNCATE t_tr_p1; ROLLBACK;
 
   断言：两路按 xid 交集逐行 diff 空（既有归一化：expectedChanges 语义 + 重复块容忍）；TRUNCATE 行在两路都出现且字面全等。
 
-- [ ] **Step 2: 对拍 parse 面认 TRUNCATE 行**——本类（或其行解析辅助）对 `TRUNCATE \[...\] options=\[...\]` 增分支：表列表原样、options 集内**排序归一**后比对（两路 toString 序理论同——EnumSet 声明序；归一化是防御 `Set.copyOf` 无规格迭代序的保险，注释记档）。
+- [ ] **Step 2: 对拍 parse 面认 TRUNCATE 行**——本类（或其行解析辅助）对 `TRUNCATE \[...\] options=\[...\]` 增分支：表列表原样、options 集内**排序归一**后比对（**spike §5.2-1 实证必须**：engine 侧 `TruncateChange` 的 `Set.copyOf` 迭代序 = 身份哈希探查序，双位形态实测渲 `[RESTART_IDENTITY, CASCADE]` 且 JVM run 间可漂移；wal 侧 EnumSet 恒声明序 `[CASCADE, RESTART_IDENTITY]`——归一化是对拍可行的前提而非保险）。场景断言面补充：**分区母表 TRUNCATE 断言只出叶子**（`[public.t_tr_pa, public.t_tr_pb]`——母表 relkind 'p' 两路皆滤）；RESTART 场景含 owned 序列（RM_SEQ 记录前置于 heap truncate、wal 路透明——spike §1.1）；engine 侧 TRUNCATE 事务 `changes=1`（一条语句一个变更单元，与 wal 桶一个 TruncateEntry 同口径）。
 
 - [ ] **Step 3: 跑场景确认通过**
 
@@ -805,59 +851,60 @@ Expected: PASS（既有 20 用例零回归 + 新场景绿；需本机 Docker）
 
 ---
 
-### Task 6: OG 系接缝落地（按 Task 0 裁决）+ OgParityBaseline 'T' 归一化 + OG 对拍 IT
+### Task 6: OG 档"TRUNCATE 双路不可见"语义钉（spike 裁决 C 重塑）
 
 **Files:**
-- Modify: `vb-stream-wal-source/src/main/java/org/vastdata/vbstream/walsource/layout/HeapOps.java`（OG 常量——仅当 spike 裁决 OG 系非 vanilla 同构）
-- Modify: `vb-stream-wal-source/src/main/java/org/vastdata/vbstream/walsource/layout/HeapViews.java`（`TruncateView.parse` 的 layout 分派 OG 分支——同上前提）
-- Modify: `vb-stream-wal-source/src/main/java/org/vastdata/vbstream/walsource/changes/XactGrouper.java`（OG 门控臂——仅当 spike 裁决 OG 记录归 XLOG rmgr：`onRecord` 增 `else if (layout.openGaussDialect() && rec.rmid() == HeapOps.RM_XLOG_ID && (rec.info() & 0x??) == OG_?)` 形态，骨架同 dispatchHeap case）
-- Modify: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/OgParityBaseline.java`（Normalizer 放开 'T' 拒绝 + 归一化——`OgParityBaseline.java:94/415/470` 三处连动）
-- Test: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/OgDmlParityIT.java`（增 TRUNCATE 场景，PG/A 双档参数化沿既有形态）；离线：`TruncateViewTest` 增 OG 黄金字节用例（spike §OG dump）
+- Test: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/OgDmlParityIT.java`（增 TRUNCATE 零事件场景，PG 档参数化——m2pg 库）
+- Modify: `vb-stream-wal-source/README.md` 与 `vb-stream-wal-source/CLAUDE.md` 的 OG 档支持面段（"TRUNCATE 对 OG 系双路不可见"记档——与 Task 8 合并执行亦可，此处只落测试）
 
 **Interfaces:**
-- Consumes: **Task 0 spike 裁决表**——三分支：
-  - **分支 A**（OG 系 = heap 0x30 同 vanilla，键=oid）：main 面零改动（视图/分派直接工作）——落码仅 IT + Normalizer
-  - **分支 B**（OG 系 = 9.2 老 rmgr/几何）：`HeapOps` 增 `OG_*` 常量 + `TruncateView.parse` layout 分派 OG 分支 + （若 XLOG rmgr）`onRecord` OG 门控臂——javadoc 逐常量标 og-plan/vastbase 实测出处（spike §OG/§VastBase）
-  - **分支 C**（OG/VastBase 基准路不发 'T' 帧）：main 面照 A/B 落（wal 路照常发射），对拍退化为 **wal 路字面锚**（OgDmlParityIT 场景内断言 wal 路 TRUNCATE 行字面 + 记档"基准路能力缺席"——沿 uuid/numeric 方言先例，spec §3.4 退化口径）
-- Produces: OG/VastBase 档 TRUNCATE 支持面
+- Consumes: **spike 裁决 C（OG 记录面+帧面双缺席）**——TRUNCATE 在 OG 上是纯 catalog 手术（rmid=10 零 0x30），逻辑流空 B..C 块；`RESTART IDENTITY` 被 OG SQL 层拒绝（`ERROR: PGXC does not support RESTART IDENTITY yet`）
+- Produces: OG 档 TRUNCATE 语义 = **零事件、不砖流、截后 DML 字典正确**（正式记档的行为锚，非缺陷）
 
-- [ ] **Step 1: 离线锚先行**——`TruncateViewTest` 增 OG 黄金字节用例（手造字节 = spike §OG dump；分支 A 则仅断言 vanilla 视图直解 OG 几何同构）——先红后绿。
+- [ ] **Step 1: OgDmlParityIT 增场景**——沿既有场景骨架（PG 档 m2pg 库）：
 
-- [ ] **Step 2: main 面按分支落码**——A 零改动；B 按 spike 几何写 OG 分支（代码骨架同 Task 1 vanilla 分支，常量/偏移全取 spike 值）。
+```sql
+-- 场景断言三面：
+-- ① TRUNCATE 事务两路零变更（wal 路无桶零发射；基准路空 B..C 块不进对拍面）——对拍 diff 空
+-- ② 截后 INSERT 正常捕获且 TableMeta 正确（catalog 手术换段号由既有字典面跟踪——
+--    端到端钉"TRUNCATE 后字典不倒"）
+-- ③ 全程无 ISE/无砖流（TRUNCATE 语句族的 WAL 记录流经 grouper 全静默）
+TRUNCATE vb_tr_og1;
+INSERT INTO vb_tr_og1 VALUES (...);   -- 截后行正常双路对拍
+TRUNCATE vb_tr_og1, vb_tr_og2;        -- 多表同形
+```
 
-- [ ] **Step 3: Normalizer 放开 'T'**——`OgParityBaseline` 的帧类型分派增 'T' 分支（oid 数组 + options 位解析→归一化块模型，沿既有 B/R/I 帧手法）；类 javadoc 的"显式拒绝 'T'"注记同步退役。分支 C 则跳过本步并记档。
+- [ ] **Step 2: 跑 OG 对拍**
 
-- [ ] **Step 4: OgDmlParityIT 增场景**——沿既有场景参数化形态（PG/A 双库）增 TRUNCATE 场景（SQL 面同 Task 5 但 OG 语法适配：分区配方沿 `OgPartitionIT` 的显式 FOR TABLE 母表两前提；**OG 分区 TRUNCATE 的身份断言按 spike §OG-基准路采样**——报母表则断言母表身份、报分区则跟随）；分支 C 时改 wal 路字面锚。
+Run: `mvn test -pl vb-stream-wal-source -Dtest='OgDmlParityIT,OgParitySmokeIT'`
+Expected: PASS（需本机 Docker；既有用例零回归；新场景绿=零事件语义钉死）
 
-- [ ] **Step 5: 跑 OG 全量**
-
-Run: `mvn test -pl vb-stream-wal-source -Dtest='OgDmlParityIT,OgParitySmokeIT,OgPartitionIT'`
-Expected: PASS（需本机 Docker；既有 58 用例零回归）
-
-- [ ] **Step 6: Commit**——`git commit -m "feat(wal-source): OG 系 TRUNCATE 接缝落地（spike 裁决分支 X）+ OgParityBaseline 'T' 归一化 + OG 对拍场景"`（分支 X 按实落填）+ push
+- [ ] **Step 3: Commit**——`git commit -m "test(wal-source): OG 档 TRUNCATE 双路不可见语义钉——零事件不砖流 + 截后 DML 字典正确（spike 裁决 C）"` + push
 
 ---
 
-### Task 7: VastBase 手动档 IT + 离线回放面确认
+### Task 7: VastBase 手动档 IT（spike 裁决 C 重塑）+ 真库槽健康前置检查
 
 **Files:**
-- Modify: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/vastbase/VastDmlParityIT.java`（增 TRUNCATE 场景）
-- Modify: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/vastbase/VastOfflineIT.java`（在线窗口加一条 TRUNCATE——离线重放对拍自然覆盖 truncate 面）
+- Modify: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/vastbase/VastDmlParityIT.java`（增 TRUNCATE 零事件场景——同 Task 6 三面断言，A 档语法适配）
+- Modify: `vb-stream-wal-source/src/test/java/org/vastdata/vbstream/walsource/it/vastbase/VastOfflineIT.java`（既有在线/离线对拍用例的在线窗口 SQL 加一条 `TRUNCATE`——离线重放同样零事件，对拍仍全等）
 
 **Interfaces:**
-- Consumes: `VastTestEnv`/`VastBEnv` 连接纪律（单持久连接/重试环）；Task 6 的 VastBase spike 裁决（几何/基准路 'T'）
-- Produces: 手动档 vastbase 族 28→30 用例
+- Consumes: spike 裁决 C（VastBase 记录面实锚——rmid=10 全窗零 0x30；帧面按 OG 同内核推定，未复验记档）；`VastTestEnv` 连接纪律
+- Produces: 手动档 vastbase 族 +1~2 用例；VastBase TRUNCATE 语义记档
 
-- [ ] **Step 1: VastDmlParityIT 增场景**——沿既有场景骨架（基准路 = opengauss-jdbc 逻辑流 + OgParityBaseline 复用）增 TRUNCATE（单表/多表/A 档语法适配；身份断言按 Task 6 裁决）。
+- [ ] **Step 0: 真库槽子系统健康前置检查（必做）**——spike §5.3 sticky-slot 事故残留 4 槽（vb_wal_spike_tr2-tr5_slot，drop 报 already active）。先试 `SELECT slot_name, active FROM pg_replication_slots` + 重试 DROP；**若新建逻辑槽仍撞 already active：报告 BLOCKED 附 pg_replication_slots 快照**，等真库重启窗口清理后再执行本任务（不硬闯——避免叠加毒化）。物理槽（direct 通道）不受影响可先行。
 
-- [ ] **Step 2: VastOfflineIT 连动**——既有在线/离线对拍用例的在线窗口 SQL 加一条 `TRUNCATE`，断言离线重放块含 TRUNCATE 行（离线档 grouper 零分叉的实证锚）。
+- [ ] **Step 1: VastDmlParityIT 增场景**——Task 6 三面断言的 A 档形态（`TRUNCATE vb_wal_tr1` 零事件 + 截后 INSERT 母表/普通表身份正确）。
+
+- [ ] **Step 2: VastOfflineIT 连动**——在线窗口加 `TRUNCATE`，离线重放对拍仍全等（truncate 零事件的离线一致性）。
 
 - [ ] **Step 3: 手动跑**
 
 Run: `mvn test -pl vb-stream-wal-source -Dtest='VastDmlParityIT,VastOfflineIT' -Dvb.it.vastbase=true`
 Expected: PASS（需真库可达；既有用例零回归）
 
-- [ ] **Step 4: Commit**——`git commit -m "test(wal-source): VastBase 手动档 TRUNCATE 对拍 + 离线回放面覆盖"` + push
+- [ ] **Step 4: Commit**——`git commit -m "test(wal-source): VastBase 手动档 TRUNCATE 零事件语义钉 + 离线面一致（spike 裁决 C）"` + push
 
 ---
 
@@ -867,7 +914,7 @@ Expected: PASS（需真库可达；既有用例零回归）
 - Modify: `vb-stream-wal-source/CLAUDE.md`（v2 DML 面节：`ChangeOutputListener` 行、场景支持矩阵增 TRUNCATE 行、对拍契约段、测试面对账）
 - Modify: `vb-stream-wal-source/README.md`（支持面/DML 输出面提 TRUNCATE；`trunc=` 观测键）
 - Modify: 根 `CLAUDE.md`（wal-source 段落一句记账——沿 M4 同位置惯例）
-- Modify: `docs/superpowers/specs/2026-10-22-wal-source-truncate-design.md`（状态行改"已实施"；spike 裁决回填如有出入勘误记档）
+- Modify: `docs/superpowers/specs/2026-10-22-wal-source-truncate-design.md`（状态行改"已实施"；spike 裁决回填勘误：①§2.1 relids@12（@9-11 未初始化栈垫不读）+ 无序列尾随（"followed by sequence relids"系 pre-PG10 残留注释）②§0"全档"裁定被服务端事实反转——OG/VastBase 裁决 C 双路不可见、TRUNCATE 收缩为 vanilla 17/18 独有能力、记档而非实现 ③写点勘误：tablecmds.c ExecuteTruncateGuts 非 heapam.c；仅 wal_level≥logical 时写）
 
 - [ ] **Step 1: 全量回归**
 
