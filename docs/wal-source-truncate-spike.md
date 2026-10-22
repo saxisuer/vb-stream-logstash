@@ -14,6 +14,7 @@
 | **vanilla PG 17** | 与 18 **逐字节同构**（同一 mainLen 系 42/46/50；头文件 truncate 区两版逐字同——实锚 REL_17/18_STABLE） | 同上 | **A（17≡18）** |
 | **openGauss 5.0.0** | **无任何专用 truncate 记录**（rmid=10 全窗零 0x30；census 实锚）；TRUNCATE = 纯 catalog 手术 | **不发 'T'**：TRUNCATE 事务解码为空 `B..C` 块（INSERT 对照正常 B/R/I/C）；分区母表 TRUNCATE 同样空块 | **C（记录面 + 帧面双 C）** |
 | **VastBase G100（test_a，A 档）** | **无专用记录**（同 OG——rmid=10 全窗零 0x30）；VastBase 分叉：heap UPDATE main 前缀 21B、LOCK info=0x01、**rmid=30 DDL-deparse rmgr**（语句文本 JSON，仅 DDL，TRUNCATE 不产生） | 帧面采样**受阻**（真库逻辑槽 sticky-active 事故，见 §5.3——记录面已定，帧面按 OG 同内核推定 C） | **C（记录面实锚）** |
+| **VastBase G100（B 档，test_b）** | **未直接采样，按内核同一性外推 C**——test_b 与 test_a 共享同一 OG 6.0.0 内核与 WAL 布局（`WalLayoutVVastbase`，M4 spike 已证 A/B 记录面零分叉），heap truncate 记录的存否是内核代码路径而非兼容档行为，A 档实测零 0x30 即 B 档同 | 同左（推定） | **C（外推）** |
 
 **Task 6 落码的直接含义**：TRUNCATE DML 捕获是 **vanilla 17/18 档独有**能力；OG 系两档 TRUNCATE 对 wal 直解路与逻辑解码路**双双不可见**（不砖流、无痕），文档化即可、无需护栏 ISE。
 
@@ -54,7 +55,7 @@ typedef struct xl_heap_truncate
 | 2 | `TRUNCATE t_tr1, t_tr2` | 0/01834538 | 46 | 0x30 | 20 | `05000000 02000000 00 eedb61 0e400000 13400000` |
 | 3 | `TRUNCATE t_tr1 RESTART IDENTITY`（无序列） | 0/01834ED8 | 42 | 0x30 | 16 | `05000000 01000000 02 eedb61 0e400000` |
 | 4 | `TRUNCATE t_ser RESTART IDENTITY`（有序列） | 0/01835E28 | 42 | 0x30 | 16 | `05000000 01000000 02 2cda61 25400000` |
-| 5 | `TRUNCATE t_trp CASCADE`（级联 t_trc） | 0/01836898 | 46 | 0x30 | 20 | `05000000 02000000 01 71da61 11640000 1c400000` |
+| 5 | `TRUNCATE t_trp CASCADE`（级联 t_trc） | 0/01836898 | 46 | 0x30 | 20 | `05000000 02000000 01 71da61 16400000 1c400000` |
 | 6 | 回滚事务内 `TRUNCATE t_tr2`（xid 779 后 ABORT） | 0/01836C90 | 42 | 0x30 | 16 | `05000000 01000000 00 eedb61 13400000` |
 | 7 | `TRUNCATE t_part_m`（分区母表；母 16455/p1 16458/p2 16461） | 0/020277B8 | 50 | 0x30 | 24 | waldump desc：`nrelids: 3, relids: [16455, 16458, 16461]` |
 | 8 | `TRUNCATE t_p1`（直接截分区） | 0/02027B88 | 42 | 0x30 | 16 | waldump desc：`nrelids: 1, relids: [16458]` |
@@ -148,6 +149,7 @@ TRUNCATE vb_prm（分区母表）：FRAME B → C           ← 同样无 'T'
 
 - **记录面 C 实锚**（与 OG 同构的 catalog 手术 + 零 heap truncate 记录）。
 - **帧面（'T' 采样）受阻**：真库逻辑槽子系统在采集过程中进入 sticky-active 态（事故全过程与处置见 §5.3），同内核推定与 OG 同为不发 'T'；标记为**未复验面**，可由控制器后续补。
+- **B 档（test_b）外推**：B 档未直接采样，按**内核同一性外推裁决 C**——test_b 与 test_a 共享同一 OG 6.0.0 内核与 WAL 布局（`WalLayoutVVastbase`；M4 spike 已证 A/B 两档记录面零分叉），heap truncate 记录的存否属内核代码路径而非兼容档行为（兼容档只改 SQL 解析/类型面），A 档实测零 0x30 对 B 档同样成立。
 
 ---
 
