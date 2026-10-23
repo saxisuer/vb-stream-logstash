@@ -37,6 +37,22 @@ public final class HeapOps {
     /** heapam_xlog.h：XLOG_HEAP_INPLACE（opcode 位段 0x70，原地改写）。 */
     public static final int XLOG_HEAP_INPLACE = 0x70;
 
+    /** heapam_xlog.h：XLOG_HEAP_TRUNCATE（opcode 位段 0x30——事务性 TRUNCATE 的记录族，
+     *  DELETE 0x10 与 HOT_UPDATE 0x40 之间；REL_17/18_STABLE 逐字同，2026-10-22 实锚。
+     *  载荷 xl_heap_truncate{Oid dbId; uint32 nrelids; uint8 flags; Oid relids[]}——
+     *  relids 是 <b>oid 数组</b>@12 起（@9-11 是未初始化栈垫，spike 字节裁定）；写点
+     *  tablecmds.c ExecuteTruncateGuts，仅 wal_level≥logical 时写（源码 Assert）。
+     *  OG 系 9.2 内核无此记录（TRUNCATE 纯 catalog 手术——spike 裁决 C，
+     *  docs/wal-source-truncate-spike.md）。 */
+    public static final int XLOG_HEAP_TRUNCATE = 0x30;
+
+    /** heapam_xlog.h：XLH_TRUNCATE_CASCADE（1&lt;&lt;0——级联截子表/分区）。 */
+    public static final int XLH_TRUNCATE_CASCADE = 1 << 0;
+
+    /** heapam_xlog.h：XLH_TRUNCATE_RESTART_SEQS（1&lt;&lt;1——RESTART IDENTITY；该位时
+     *  relids 数组尾随待重启序列 oid——解析面只消费前 nrelids 个）。 */
+    public static final int XLH_TRUNCATE_RESTART_SEQS = 1 << 1;
+
     /** heapam_xlog.h：XLOG_HEAP2_MULTI_INSERT（RM_HEAP2 下 opcode 位段 0x50）。 */
     public static final int XLOG_HEAP2_MULTI_INSERT = 0x50;
 

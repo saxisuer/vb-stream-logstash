@@ -4,10 +4,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * heap 家族六种记录的强类型视图 + 解析工厂——重放引擎（后续任务）在
+ * heap 家族七种记录的强类型视图 + 解析工厂——重放引擎（后续任务）在
  * {@link WalRecordParser} 走读结果之上按 rmid/opcode 分发到本类各视图。
  *
- * <p>六视图全部经各自 {@code static XxxView parse(WalRecord, WalLayout)} 工厂产出：
+ * <p>七视图全部经各自 {@code static XxxView parse(WalRecord, WalLayout)} 工厂产出：
  * main 区结构字段按 heapam_xlog.h（REL_18_STABLE）的成员偏移读取，随版本漂移的
  * 结构尺寸（{@code sizeOfHeapUpdate} 等）由 {@link WalLayout} 注入而非硬编码；
  * opcode/rmid 错配一律启动期 ISE fail-fast（消息带期望与实际值）。工厂为静态纯函数
@@ -34,6 +34,9 @@ import java.util.List;
  *       （main = xl_heap_clean 12B：u64 latestRemovedXid + nredirected/ndead，
  *       段计数在 main、unused 余长推导——两族 opcode 撞号，经
  *       {@link WalLayout#legacyHeap2Clean()} 分派，详见 PruneView）</li>
+ *   <li>xl_heap_truncate：dbId u32@0 + nrelids u32@4 + flags u8@8 + 3B 未初始化栈垫
+ *       @9-11（不读不校验）+ relid u32[]@12 起（SizeOfHeapTruncate=12，mainLen ==
+ *       12+4nrelids 精确自检；spike 黄金字节 @12 裁定）</li>
  * </ul>
  */
 public final class HeapViews {
@@ -617,6 +620,53 @@ public final class HeapViews {
     }
 
     /**
+     * XLOG_HEAP_TRUNCATE 记录视图：被截关系 oid 数组 + flags 位图（vanilla 几何，
+     * REL_17/18_STABLE 实锚 + spike 黄金字节 @12 裁定）。
+     *
+     * @param nrelids 被截关系数
+     * @param relids  pg_class oid 数组（payload 序保持——engine relationOids 同源序）
+     * @param flags   原样位图（{@link HeapOps#XLH_TRUNCATE_CASCADE}/
+     *                {@link HeapOps#XLH_TRUNCATE_RESTART_SEQS}）
+     */
+    record TruncateView(int nrelids, long[] relids, int flags) {
+
+        /** relids 数组起点（SizeOfHeapTruncate=12——Oid relids[] 4 对齐使 offsetof=12；
+         * @9-11 是未初始化栈垫垃圾，禁止读/禁止校验为零，spike §1 勘误）。 */
+        private static final int RELIDS_OFF = 12;
+
+        /**
+         * 解析一条 truncate 记录的 main data：校验 rmid==RM_HEAP_ID 且 opcode==
+         * XLOG_HEAP_TRUNCATE（错配 ISE）；走读 [dbId u32@0][nrelids u32@4][flags u8@8]
+         * [3B 栈垫][relid u32×n@12 起]。边界与异常语义：mainLen &lt; RELIDS_OFF 或
+         * mainLen != RELIDS_OFF + 4×nrelids 抛 ISE——精确等式自检（PG 17/18 序列重启
+         * 走前置 RM_SEQ 记录、relids 无尾随，spike §1.1 勘误）；纯函数无 IO。
+         *
+         * @param r      走读完成的记录（raw 契约只读）
+         * @param layout 版本布局（签名与既有视图对齐；OG 系无 truncate 记录——spike
+         *               裁决 C，恒走 vanilla 分支）
+         * @return 视图
+         */
+        static TruncateView parse(WalRecord r, WalLayout layout) {
+            requireOp(r, HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_TRUNCATE);
+            if (r.mainLen() < RELIDS_OFF) {
+                throw new IllegalStateException("truncate main too short: " + r.mainLen());
+            }
+            byte[] raw = r.raw();
+            int off = r.mainOff();
+            int n = (int) u32(raw, off + 4);
+            if (r.mainLen() != RELIDS_OFF + 4L * n) {
+                throw new IllegalStateException("truncate 几何错位: nrelids=" + n
+                        + ", mainLen=" + r.mainLen() + "（期望 " + (RELIDS_OFF + 4L * n) + "）");
+            }
+            long[] relids = new long[n];
+            for (int i = 0; i < n; i++) {
+                relids[i] = u32(raw, off + RELIDS_OFF + 4 * i);
+            }
+            return new TruncateView(n, relids, raw[off + 8] & 0xFF);
+        }
+    }
+
+    /**
      * 校验记录的 rmid 与 opcode（info &amp; 0x70）恰好符合期望，否则 ISE。
      *
      * @param r            走读完成的记录
@@ -656,5 +706,18 @@ public final class HeapViews {
      */
     private static int u16(byte[] b, int offset) {
         return (b[offset] & 0xFF) | ((b[offset + 1] & 0xFF) << 8);
+    }
+
+    /**
+     * 就地读 little-endian u32（包内静态——TruncateView 的 dbId/nrelids/relid 读取面，
+     * 后续 truncate 消费任务同包复用）。
+     *
+     * @param b      源数组（长度须覆盖 offset+4）
+     * @param offset 起始偏移
+     * @return 32 位无符号值（long 载体，0-4294967295 全域）
+     */
+    static long u32(byte[] b, int offset) {
+        return (b[offset] & 0xFFL) | ((b[offset + 1] & 0xFFL) << 8)
+                | ((b[offset + 2] & 0xFFL) << 16) | ((b[offset + 3] & 0xFFL) << 24);
     }
 }
