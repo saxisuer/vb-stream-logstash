@@ -21,6 +21,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -72,7 +73,9 @@ import static org.junit.jupiter.api.Assertions.fail;
  * 挂起期 wal-source 停机重启续传重放重建桶）/ 普通双段 DML 中途停续（Task 12 场景 6
  * ——at-least-once 重发双路一致）/ 流内 CREATE SCHEMA nsp 字典面（Task 4 延期项清账）
  * / COPY 批量装载 MULTI_INSERT 真几何（终审 I2——vanilla 侧修复 A 的真字节回归锚，
- * pgjdbc CopyManager STDIN 100 行）/ 干扰矩阵（Task 12——catalog 风暴线程下场景 1/TOAST
+ * pgjdbc CopyManager STDIN 100 行）/ TRUNCATE 语句矩阵（2026-10-23 TRUNCATE DML
+ * 支持验收——混排次序/多表一语句/RESTART 含 owned 序列/分区母表滤母表只出叶/
+ * 双位选项 parse 归一/回滚零输出）/ 干扰矩阵（Task 12——catalog 风暴线程下场景 1/TOAST
  * 复跑 ×2）。表形态
  * {@code REPLICA IDENTITY FULL}——UPDATE
  * 与 DELETE 双路恒携带整行前像（replica identity 面对称，BEFORE 渲染可对拍）。需要
@@ -89,7 +92,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * {@code twoPhasePreparedPendingSurvivesRestartResumeParity}；场景 6 生命周期 =
  * {@code midStreamStopResumePlainDmlParityAcrossPaths}；矩阵外补充 =
  * {@code createSchemaNamespaceDictionaryParityInStream}（Task 4 延期清账）+ 干扰矩阵
- * 2 个 @RepeatedTest(2)（Task 12）。</p>
+ * 2 个 @RepeatedTest(2)（Task 12）+ TRUNCATE 语句矩阵 =
+ * {@code truncateStatementMatrixParityAcrossPaths}（2026-10-23 TRUNCATE DML 支持验收）。</p>
  */
 class DualPathParityIT {
 
@@ -166,6 +170,22 @@ class DualPathParityIT {
             "ALTER TABLE parity.t_copy REPLICA IDENTITY FULL",
     };
 
+    /**
+     * 场景 18 表 DDL（TRUNCATE 语句矩阵）：p1 两列普通表（混排 INSERT 的宿主）；
+     * p2 带 owned 序列（{@code id serial}——{@code RESTART IDENTITY} 触发 RM_SEQ
+     * 重启记录前置于 heap truncate 记录，wal 路对该 rmgr 记录透明——spike §1.1）；
+     * m 分区母表 + pa/pb 两 range 叶（母表 TRUNCATE 的 WAL relids=[母,pa,pb]，两路
+     * 皆滤 relkind='p' 母表只出叶）。场景无 UPDATE/DELETE，REPLICA IDENTITY 面不设
+     * （TRUNCATE 无元组、INSERT 无前像）。
+     */
+    private static final String[] TRUNCATE_TABLE_DDL = {
+            "CREATE TABLE parity.t_tr_p1 (id int4, v text)",
+            "CREATE TABLE parity.t_tr_p2 (id serial)",
+            "CREATE TABLE parity.t_tr_m (i int4) PARTITION BY RANGE (i)",
+            "CREATE TABLE parity.t_tr_pa PARTITION OF parity.t_tr_m FOR VALUES FROM (0) TO (100)",
+            "CREATE TABLE parity.t_tr_pb PARTITION OF parity.t_tr_m FOR VALUES FROM (100) TO (200)",
+    };
+
     /** 场景 3 重启回查用例的检查点目录（@TempDir 每用例独立——一目录一活实例契约）。 */
     @TempDir
     Path toastStateDir;
@@ -191,6 +211,16 @@ class DualPathParityIT {
      */
     private static final Pattern ENGINE_LIFECYCLE = Pattern.compile(
             "^(BEGIN-PREPARE|PREPARE|COMMIT-PREPARED|ROLLBACK-PREPARED|STREAM-[A-Z]+)\\s+gid=.*");
+
+    /**
+     * TRUNCATE 行模式（对拍归一化目标面，2026-10-23 TRUNCATE 场景）：行形
+     * {@code "  [n] TRUNCATE [schema.t, ...] options=[...]"}——组 1 = 前缀（行号 +
+     * 表列表 + {@code options=[}），组 2 = options 集内文本（空或逗号分隔枚举名），
+     * 组 3 = 尾 {@code ]}。行尾锚定（TRUNCATE 行无后缀字段——streaming OFF 形态），
+     * DML 行（INSERT/UPDATE/DELETE 起头）天然不匹配，值文本不误伤。
+     */
+    private static final Pattern TRUNCATE_ROW = Pattern.compile(
+            "^(\\s*\\[\\d+] TRUNCATE \\[[^]]*] options=\\[)([^]]*)(])$");
 
     // ---- 场景 1：单行事务 ----
 
@@ -985,6 +1015,94 @@ class DualPathParityIT {
                 "CSV 空串应解为 NULL:\n" + copyRows.get(2));
     }
 
+    // ---- 场景 18：TRUNCATE 语句矩阵（wal-source TRUNCATE DML 支持对拍验收）----
+
+    /**
+     * TRUNCATE 语句矩阵对拍（TRUNCATE DML 支持的 vanilla 端到端验收）：单表/单事务
+     * 混排（INSERT → TRUNCATE → INSERT，次序按 WAL 序钉）/多表一语句/RESTART
+     * IDENTITY（p2 带 owned 序列——RM_SEQ 重启记录前置于 heap truncate 记录，两路
+     * 对其透明）/分区母表 TRUNCATE（WAL relids=[母,pa,pb] 而两路皆滤 relkind='p'
+     * 母表只出叶子）/双位选项（RESTART IDENTITY CASCADE——engine 侧 Set.copyOf
+     * 迭代序 JVM run 间漂移，{@link #parse} 的 options 排序归一承载）/回滚事务零输出
+     * ——双路按 xid 交集逐行 diff 空（TRUNCATE 行在两路都出现且字面全等即由该 diff
+     * 承载：两路 await 计数面保证 7 个场景事务全进交集）。
+     *
+     * <p><b>机制锚（spike {@code docs/wal-source-truncate-spike.md}）</b>：①wal 路识别
+     * RM_HEAP_ID opcode 0x30 的 heap truncate 记录（relids@12 逻辑 oid；flags 按语句
+     * 声明置位——CASCADE/RESTART 与是否实际级联/有无序列无关）；②一条 TRUNCATE 语句
+     * = 桶内一个变更单元（engine 'T' 帧事务 {@code changes=1} 同口径——
+     * {@link #assertParity} 的 changes 归一化式两路自洽）；③截断的 pg_class relfilenode
+     * 换段号 UPDATE 先于 heap truncate 记录到达而 relid 是逻辑 oid——字典解析不受段号
+     * 代际影响；④分区母表无 'R' 帧（服务端不发布 relkind='p'），wal 路经 relkind 判别
+     * 同构滤除（spike §5.2-2——不滤必 diff）；⑤回滚事务的 truncate 记录在场 WAL，
+     * aborted 过滤天然覆盖、零输出。</p>
+     *
+     * <p><b>断言面</b>：归一化 diff 空之外，wal 路字面钉五条已提交 TRUNCATE 行（单表/
+     * 多表/RESTART/分区双叶/双位——双位恒 EnumSet 声明序 {@code [CASCADE,
+     * RESTART_IDENTITY]}，engine 等价由归一化 diff 承载）+ 母表名全程零出现 + 恰 7 块
+     * + 混排块（唯一 3 行块）行序 INSERT→TRUNCATE→INSERT；归一化器自身以手造两种序
+     * 的输入钉确定锚（防单次 JVM run 两路恰好同序的漏验面）。</p>
+     */
+    @Test
+    void truncateStatementMatrixParityAcrossPaths() throws Exception {
+        List<String> walLines = runParityWal("TRUNCATE 语句矩阵", 7, TRUNCATE_TABLE_DDL, conn -> {
+            conn.setAutoCommit(true);
+            exec(conn, "INSERT INTO parity.t_tr_p1 VALUES (1, 'a'), (2, 'b')");   // txn 1：两行 INSERT
+            exec(conn, "INSERT INTO parity.t_tr_m VALUES (1), (150)");            // txn 2：路由两叶（叶身份渲染）
+            conn.setAutoCommit(false);                                           // txn 3：混排——次序钉
+            exec(conn, "INSERT INTO parity.t_tr_p1 VALUES (3, 'c')");
+            exec(conn, "TRUNCATE parity.t_tr_p1");
+            exec(conn, "INSERT INTO parity.t_tr_p1 VALUES (4, 'd')");
+            conn.commit();
+            conn.setAutoCommit(true);
+            exec(conn, "TRUNCATE parity.t_tr_p1, parity.t_tr_p2");                // txn 4：多表一语句（表序=语句序）
+            exec(conn, "TRUNCATE parity.t_tr_p2 RESTART IDENTITY");               // txn 5：RESTART（owned 序列 RM_SEQ 前置）
+            exec(conn, "TRUNCATE parity.t_tr_m");                                 // txn 6：分区母表（两路滤母表）
+            exec(conn, "TRUNCATE parity.t_tr_p1 RESTART IDENTITY CASCADE");       // txn 7：双位选项（序归一前提）
+            conn.setAutoCommit(false);                                           // 回滚：零输出
+            exec(conn, "TRUNCATE parity.t_tr_p1");
+            conn.rollback();
+            conn.setAutoCommit(true);
+        });
+
+        // 归一化器确定锚：漂移序输入归一到排序形 + 声明序输入幂等不变（Set.copyOf 序
+        // JVM run 间漂移——两路某次恰好同序时场景仍钉归一器自身行为）
+        assertEquals("  [1] TRUNCATE [public.t] options=[CASCADE, RESTART_IDENTITY]",
+                normalizeTruncateRowOptions("  [1] TRUNCATE [public.t] options=[RESTART_IDENTITY, CASCADE]"),
+                "options 排序归一应把漂移序归到同一比较基");
+        assertEquals("  [1] TRUNCATE [public.t] options=[CASCADE, RESTART_IDENTITY]",
+                normalizeTruncateRowOptions("  [1] TRUNCATE [public.t] options=[CASCADE, RESTART_IDENTITY]"),
+                "options 排序归一应幂等（声明序输入不变）");
+
+        String joined = String.join("\n", walLines);
+        assertEquals(5, countLiteral(joined, "TRUNCATE ["),
+                "五条已提交 TRUNCATE 语句应各恰一行（第 6 条随 ROLLBACK 零输出）:\n" + joined);
+        assertEquals(1, countLiteral(joined, "TRUNCATE [parity.t_tr_p1] options=[]"),
+                "混排事务的单表 TRUNCATE 行:\n" + joined);
+        assertEquals(1, countLiteral(joined, "TRUNCATE [parity.t_tr_p1, parity.t_tr_p2] options=[]"),
+                "多表一语句的表列表应按语句序渲染:\n" + joined);
+        assertEquals(1, countLiteral(joined, "TRUNCATE [parity.t_tr_p2] options=[RESTART_IDENTITY]"),
+                "RESTART IDENTITY 行（owned 序列的 RM_SEQ 记录不进输出——透明面）:\n" + joined);
+        assertEquals(1, countLiteral(joined, "TRUNCATE [parity.t_tr_pa, parity.t_tr_pb] options=[]"),
+                "分区母表 TRUNCATE 应只出两叶:\n" + joined);
+        assertEquals(1, countLiteral(joined, "TRUNCATE [parity.t_tr_p1] options=[CASCADE, RESTART_IDENTITY]"),
+                "双位 options 的 wal 路字面恒 EnumSet 声明序（engine 侧 Set.copyOf 序不定——"
+                        + "等价由 parse 归一承载）:\n" + joined);
+        assertFalse(joined.contains("parity.t_tr_m"),
+                "分区母表名应全程零出现（relkind='p' 两路皆滤）:\n" + joined);
+
+        Map<Long, TxBlock> blocks = parse(walLines);
+        assertEquals(7, blocks.size(), "场景已提交事务应恰 7 块:\n" + joined);
+        List<TxBlock> mixed = blocks.values().stream().filter(b -> b.rows.size() == 3).toList();
+        assertEquals(1, mixed.size(), "混排事务应是唯一的 3 行块:\n" + joined);
+        assertTrue(mixed.get(0).rows.get(0).contains("AFTER=[id=3, v=c]"),
+                "混排块首行应是 TRUNCATE 前的 INSERT:\n" + mixed.get(0).rows);
+        assertTrue(mixed.get(0).rows.get(1).contains("TRUNCATE [parity.t_tr_p1] options=[]"),
+                "混排块中行应是 TRUNCATE（按 WAL 序）:\n" + mixed.get(0).rows);
+        assertTrue(mixed.get(0).rows.get(2).contains("AFTER=[id=4, v=d]"),
+                "混排块尾行应是 TRUNCATE 后的 INSERT:\n" + mixed.get(0).rows);
+    }
+
     // ---- 对拍骨架 ----
 
     /**
@@ -1260,6 +1378,36 @@ class DualPathParityIT {
     }
 
     /**
+     * TRUNCATE 行的 options 集内排序归一（2026-10-23 TRUNCATE 场景，spike §5.2-1
+     * 实证前提——<b>非保险</b>）：engine 侧 {@code TruncateChange} 的 options 经
+     * {@code Set.copyOf}（ImmutableCollections.SetN）迭代序 = 身份哈希探查序——双位
+     * 形态实测渲 {@code [RESTART_IDENTITY, CASCADE]} 且 JVM run 间可漂移；wal 侧
+     * EnumSet 恒声明序 {@code [CASCADE, RESTART_IDENTITY]}。逐字节 diff 在该面必然
+     * 假红，故 {@link #parse} 对入块行先过本归一：表列表按 payload 序两路同源（WAL
+     * relids 序）原样保留，仅 options 逗号分隔项排序后重组。
+     *
+     * <p>边界与异常语义：空 options（{@code []}）与非 TRUNCATE 行（
+     * {@link #TRUNCATE_ROW} 不匹配——含 DML 行的值文本即使巧合含 {@code options=[}
+     * 也不在行尾锚定形态内）原样返回。</p>
+     *
+     * @param line 捕获行（{@code "  [n] "} 前缀原样）
+     * @return options 归一后的行（非 TRUNCATE 行 = 原引用）
+     */
+    private static String normalizeTruncateRowOptions(String line) {
+        Matcher m = TRUNCATE_ROW.matcher(line);
+        if (!m.matches()) {
+            return line;
+        }
+        String options = m.group(2);
+        if (options.isEmpty()) {
+            return line;
+        }
+        List<String> tokens = new ArrayList<>(List.of(options.split(", ")));
+        Collections.sort(tokens);
+        return m.group(1) + String.join(", ", tokens) + m.group(3);
+    }
+
+    /**
      * 断言捕获块中恰一个指定 gid 的 TWO_PHASE 块并返回其 xid（2PC 专项断言的公共面
      * ——gid 语义上唯一，多块/零块都是终态面破坏）。
      *
@@ -1331,7 +1479,9 @@ class DualPathParityIT {
 
     /**
      * 捕获行流 → xid 有序事务块：TXN-BEGIN 开块（正则解头字段），{@code "  [n] "} 行文本
-     * 逐条入块，TXN-END 闭块（尾行格式两路恒同——xid 相同即相等，不需单独保存）。
+     * 逐条入块（TRUNCATE 行先经 {@link #normalizeTruncateRowOptions} 做 options 序归一
+     * ——2026-10-23 TRUNCATE 场景起，双位 options 的两路序漂移在此吸收），TXN-END 闭块
+     * （尾行格式两路恒同——xid 相同即相等，不需单独保存）。
      *
      * <p><b>重复块容忍（Task 10）</b>：同 xid 的重复 TXN-BEGIN 允许——wal 路重启续传的
      * 页对齐重叠窗口会把已检查点的事务重发给 DML 面（at-least-once，engine 的
@@ -1360,7 +1510,9 @@ class DualPathParityIT {
                 }
             } else if (line.startsWith("  [")) {
                 assertNotNull(cur, "行文本先于 TXN-BEGIN: " + line);
-                cur.rows.add(line);
+                // TRUNCATE 行先过 options 序归一（spike §5.2-1——engine Set.copyOf 迭代
+                // 序 JVM 间漂移 vs wal EnumSet 恒声明序，双位形态不归一必假红）；余行原样
+                cur.rows.add(normalizeTruncateRowOptions(line));
             } else if (line.startsWith("TXN-END")) {
                 assertNotNull(cur, "TXN-END 先于 TXN-BEGIN: " + line);
                 cur.endLine = line;
