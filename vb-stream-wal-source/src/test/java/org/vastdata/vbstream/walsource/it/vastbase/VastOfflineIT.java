@@ -33,7 +33,10 @@ import static org.junit.jupiter.api.Assertions.fail;
  * VastBase G100 离线回放档真库 IT（手动档 {@code -Dvb.it.vastbase=true}，offline-replay
  * Task 5）：在线直解路（{@link WalSource#start()} direct 通道）vs 离线重放路
  * （{@link WalSource#startOffline()} 本地检查点 + 段快照目录）四用例——对拍全等 /
- * 离线→在线双向回切 / 离线截停再离线续传（at-least-once）/ endLsn 上界截停。
+ * 离线→在线双向回切 / 离线截停再离线续传（at-least-once）/ endLsn 上界截停；
+ * 2026-10-22 truncate 线 Task 7 起用例 1 在线窗口含 <b>TRUNCATE</b>（spike 裁决 C
+ * ——记录面实锚零专用记录：两路零事件、截后新段号行双路正常解析，离线一致性钉）。
+ * 全程零逻辑槽（物理槽 + direct 通道 + 本地检查点——逻辑槽子系统健康面与本 IT 正交）。
  *
  * <p><strong>"库死亡"的测试承载（spike 第二轮形态）</strong>：真库不可杀——离线前提由
  * "停在线门面（close 落最终检查点）+ {@link WalSegmentRecorder} 独立收集的段目录"构造：
@@ -97,14 +100,18 @@ class VastOfflineIT {
      * 用例 1 {@code offlineReplayMatchesOnlineBaseline}：recorder 起收集 → 门面 start()
      * （direct）在线跑两批 DDL/DML → 阶段中位拷检查点快照（pad 隔离带 + 外表 DDL 触发
      * 周期检查点——快照 C ∈ (填充段末, 阶段 B 首笔)，离线窗口起点确定性越过阶段 A）→
-     * 阶段 B（TOAST 大值 / 事务内 DDL as-of / 2PC / 回滚+控制行——检查点后，在线收过
+     * 阶段 B（TOAST 大值 / 事务内 DDL as-of / <b>TRUNCATE</b>（2026-10-22 truncate 线
+     * Task 7——spike 裁决 C 记录面实锚：纯 catalog 手术、rmid=10 零 0x30，置 DDL-in-txn
+     * 块之后使 2PC/控制行落在截后新段号上——在线路 live 消费换段号、离线路重放同一
+     * 手术后解析，双路"截后字典不倒"）/ 2PC / 回滚+控制行——检查点后，在线收过
      * 且离线窗口全量覆盖 → 双路交集的构造面）→ 停门面 → 阶段 C 仅离线可见事务 →
      * 同快照 startOffline() 读尽 → 两路按 xid 交集逐行全等。
      *
      * <p>专项断言：离线 2PC 块 TWO_PHASE+gid（重放重建桶终态钉）；仅离线可见的阶段 C
      * 块逐行字面（extra 列经阶段 B 的 ADD COLUMN 演进后渲 NULL——字典经检查点持久化后
      * 流内演进的离线面）；两路块数恰等（窗口隔离带的确定性推论——阶段 A 在线独有 /
-     * 阶段 C 离线独有，交集恰阶段 B 四块）。</p>
+     * 阶段 C 离线独有，交集恰阶段 B 四块）；<b>两路 {@code dmlEmittedTruncates} 恒 0</b>
+     * （TRUNCATE 的离线零事件一致性——catalog 手术重放对 DML 发射面零贡献）。</p>
      */
     @Test
     void offlineReplayMatchesOnlineBaseline() throws Exception {
@@ -159,6 +166,11 @@ class VastOfflineIT {
             exec(c, "INSERT INTO " + table + " VALUES (21, 'after-ddl', 'new-col')");
             exec(c, "UPDATE " + table + " SET name = 'before-ddl-upd', extra = 'filled' WHERE id = 20");
             exec(c, "COMMIT");
+            // TRUNCATE（2026-10-22 truncate 线 Task 7——spike 裁决 C：VastBase 记录面纯 catalog
+            // 手术、rmid=10 零 0x30）：两路都应零事件——在线路目录手术换段号后，后续 2PC/控制
+            // 行落在截后新段号上（在线路 live 消费 catalog 手术、离线路自检查点快照重放同一
+            // 手术后解析——"截后字典不倒"的双路受测面）；TRUNCATE 本身对块计数零贡献
+            exec(c, "TRUNCATE " + table);
             exec(c, "BEGIN");
             exec(c, "INSERT INTO " + table + " VALUES (30, 'twophase-row')");
             exec(c, "PREPARE TRANSACTION '" + gid + "'");
@@ -171,6 +183,8 @@ class VastOfflineIT {
                     + wal.dmlEmittedBuckets() + ", terminal=" + wal.receiverTerminalFailure() + "）");
         }
         wal.close();
+        assertEquals(0, wal.dmlEmittedTruncates(),
+                "在线路 TRUNCATE 应零发射（VastBase 记录面缺席——spike 裁决 C，catalog 手术零 heap 记录）");
 
         // 阶段 C（离线独有面）：门面已停——"库死亡"模拟，仅段目录在生长
         try (Connection c = VastTestEnv.newSqlConnection()) {
@@ -193,8 +207,10 @@ class VastOfflineIT {
         await(replay::eofReached, "离线对拍: 离线路未读尽（terminal=" + replay.receiverTerminalFailure() + "）");
         assertTrue(replay.receiverTerminalFailure().isEmpty(), "离线对拍: 离线回放不应终态失败");
         replay.close();
+        assertEquals(0, replay.dmlEmittedTruncates(),
+                "离线路 TRUNCATE 应零发射（重放窗口含 TRUNCATE 的 catalog 手术——离线一致性零事件面）");
 
-        assertEquals(5, online.blocks().size(), "在线路应恰 5 块（阶段 A 一块 + 阶段 B 四块）:\n" + online.blocks());
+        assertEquals(5, online.blocks().size(), "在线路应恰 5 块（阶段 A 一块 + 阶段 B 四块——TRUNCATE 零块贡献）:\n" + online.blocks());
         assertEquals(5, offline.blocks().size(), "离线路应恰 5 块（阶段 B 四块 + 阶段 C 一块）:\n" + offline.blocks());
         OgParityBaseline.assertParity(online.blocks(), offline.blocks(), "在线 vs 离线", 0);
 

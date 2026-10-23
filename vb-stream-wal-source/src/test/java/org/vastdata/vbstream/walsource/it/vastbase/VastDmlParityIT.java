@@ -13,6 +13,7 @@ import org.vastdata.vbstream.walsource.changes.ChangeOutputListener;
 import org.vastdata.vbstream.walsource.it.OgParityBaseline;
 import org.vastdata.vbstream.walsource.it.OgParityBaseline.BaselineEndpoint;
 import org.vastdata.vbstream.walsource.it.OgParityBaseline.OgBlock;
+import org.vastdata.vbstream.walsource.layout.Lsn;
 
 import java.io.IOException;
 import java.io.StringReader;
@@ -41,7 +42,9 @@ import static org.junit.jupiter.api.Assertions.fail;
  * {@code vb_wal_} 前缀）vs WalSource 直解路（{@code WalLayoutVVastbase} 判别 + direct
  * 通道 + opengauss-jdbc 前缀——门面装配面经 T5 {@code VastCatalogSyncIT} 验收），六场景
  * 按 xid 交集逐行 diff 空（+ COPY 批量装载补充——vastbase T7 场景 1g，MULTI_INSERT
- * 真几何的端到端收口）——{@code OgDmlParityIT} 场景面的真库翻译（无 CompatMode 维度
+ * 真几何的端到端收口；+ <b>场景 7 TRUNCATE 双路不可见</b>——spike 裁决 C 记录面实锚
+ * [rmid=10 全窗零 0x30] + 帧面按 OG 同内核推定，2026-10-22 truncate 线 Task 7）
+ * ——{@code OgDmlParityIT} 场景面的真库翻译（无 CompatMode 维度
  * ——真库 test_a 恒 A 兼容档，M3 起护栏白名单内）。
  *
  * <p><b>A 档专面（真库恒 A 档）</b>：①<b>{@code date} 列落私有类型 {@code oradate}
@@ -736,6 +739,108 @@ class VastDmlParityIT {
         assertTrue(capture.blocks().size() >= 3,
                 "wal 路并集应至少含段一 2 块 + 段二 1 块（重发只增不改）:\n" + capture.blocks());
         LOG.info("生命周期停续重发观测: wal 块总数={}（含 at-least-once 重发面）", capture.blocks().size());
+    }
+
+    // ---- 场景 7：VastBase 档 TRUNCATE 双路不可见（spike 裁决 C） ----
+
+    /**
+     * 场景 7：VastBase 档 TRUNCATE「双路不可见」语义钉（spike 裁决 C——记录面<b>实锚</b>：
+     * 真库 test_a rmid=10 全窗 50318 条零 0x30，TRUNCATE 纯 catalog 手术；帧面按 OG 同内核
+     * 推定不发 'T'——本场景即该未复验面的端到端补验，首跑红即按真值改锚记档，
+     * {@code docs/wal-source-truncate-spike.md} §4）。三面断言（Task 6 OG 档同构，A 档
+     * 语法形态）：
+     * <ul>
+     *   <li><b>① 零事件</b>：两笔 TRUNCATE 事务（单表 + 多表）wal 路零桶零发射——接收
+     *       前沿越过末笔 TRUNCATE 的 write 位点后才 close（杜绝未消费窄窗的假绿），精确
+     *       断言桶数 = 三笔 INSERT、{@code dmlEmittedTruncates} 恒 0、块内零 TRUNCATE 行；
+     *       基准路恰 2 个空 {@code B..C} 块（VastBase pgoutput proto v1 无 'T' 帧——spike
+     *       §4.2 推定面，DDL 事务空块先例场景 6）且按 xid 交集外不进对拍面，三笔 INSERT
+     *       对拍 diff 空。</li>
+     *   <li><b>② 截后字典不倒</b>：种子行（截前段号）与截后 INSERT（TRUNCATE 的 catalog
+     *       手术换段号后的新段号行——VastBase 分叉：pg_class UPDATE main 前缀 21B，既有
+     *       ctid 重放字典面跟踪）双路同捕获，逐字面钉 TableMeta（表名/列序/值渲染）。</li>
+     *   <li><b>③ 不砖流</b>：全程接收器无终态失败——TRUNCATE 语句族的 WAL 记录（Standby
+     *       LOCK info=0x01 / SMGR CREATE / NEW_CID / pg_class UPDATE / Btree / NEWPAGE FPI /
+     *       HOT_UPDATE / XACT 大记录）流经 grouper 全静默，无 ISE。</li>
+     * </ul>
+     * 不用 {@code RESTART IDENTITY}——A 档 SQL 层拒绝（{@code ERROR: TRUNCATE .. RESTART
+     * IDENTITY is only supported in PG compatibility}，spike §4 实锚）；单表/多表形态沿
+     * spike 工作负载实测语法（{@code TRUNCATE t1} / {@code TRUNCATE t1, t2}）。
+     */
+    @Test
+    void truncateInvisibleOnBothPathsPostTruncateDmlParity() throws Exception {
+        String[] ddl = {
+                "CREATE TABLE vb_wal_par.t_trunc (id int4 NOT NULL, name text, PRIMARY KEY (id))",
+                "ALTER TABLE vb_wal_par.t_trunc REPLICA IDENTITY FULL",
+                "CREATE TABLE vb_wal_par.t_trunc2 (id int4 NOT NULL, name text, PRIMARY KEY (id))",
+                "ALTER TABLE vb_wal_par.t_trunc2 REPLICA IDENTITY FULL",
+        };
+        resetScenario(ddl, new String[]{"vb_wal_par.t_trunc", "vb_wal_par.t_trunc2"});
+        slots("trunc1");
+        OgParityBaseline.createLogicalSlot(endpoint(), logicalSlot);
+        OgParityBaseline.WalCapture capture = new OgParityBaseline.WalCapture();
+        wal = new WalSource(walSourceConfig(physicalSlot,
+                new String[]{"vb_wal_par.t_trunc", "vb_wal_par.t_trunc2"}, null), capture);
+        long boundary;
+        try {
+            wal.start();
+            assertTrue(wal.dmlEnabled(), "TRUNCATE 双路不可见: wal 直解路 DML 面应装配");
+            try (Connection conn = VastTestEnv.newSqlConnection()) {
+                conn.setAutoCommit(true);
+                // 种子行：截前段号上的正常捕获（对照面——截后行与它同走字典解析）
+                exec(conn, "INSERT INTO vb_wal_par.t_trunc VALUES (1, 'seed-1')");
+                exec(conn, "INSERT INTO vb_wal_par.t_trunc2 VALUES (1, 'seed-2')");
+                // TRUNCATE 事务一（单表）：spike 锚——纯 catalog 手术、零 heap 记录
+                exec(conn, "TRUNCATE vb_wal_par.t_trunc");
+                // 截后 INSERT：catalog 手术换段号后的新段号行——字典正确性受测面
+                exec(conn, "INSERT INTO vb_wal_par.t_trunc VALUES (2, 'after-truncate')");
+                // TRUNCATE 事务二（多表同形）
+                exec(conn, "TRUNCATE vb_wal_par.t_trunc, vb_wal_par.t_trunc2");
+                boundary = VastTestEnv.writeLsn(conn);
+            }
+            await(() -> wal.dmlEmittedBuckets() >= 3,
+                    "TRUNCATE 双路不可见: wal 路未发射 3 个 INSERT 桶（buckets=" + wal.dmlEmittedBuckets()
+                            + ", terminal=" + wal.receiverTerminalFailure() + "）");
+            // 接收前沿越过末笔 TRUNCATE 后才收尾——“零桶零发射”的精确断言不容未消费窄窗
+            await(() -> wal.consumedLsn() >= boundary,
+                    "TRUNCATE 双路不可见: wal 路接收前沿未越过末笔 TRUNCATE（consumed="
+                            + Lsn.format(wal.consumedLsn()) + ", boundary=" + Lsn.format(boundary)
+                            + ", terminal=" + wal.receiverTerminalFailure() + "）");
+        } finally {
+            wal.close();
+        }
+        List<OgBlock> baseline = OgParityBaseline.capture(endpoint(), BASELINE_APP, logicalSlot,
+                PUBLICATION, 5, CAPTURE_MS);
+        List<OgBlock> walBlocks = capture.blocks();
+        OgParityBaseline.assertParity(baseline, walBlocks, "TRUNCATE 双路不可见", 0);
+
+        // ③ 不砖流：全程无终态失败（TRUNCATE 语句族 WAL 记录流经 grouper 全静默——无 ISE）
+        assertTrue(wal.receiverTerminalFailure().isEmpty(),
+                "全程应无接收器终态失败（TRUNCATE 语句族 WAL 记录流经 grouper 应全静默）: "
+                        + wal.receiverTerminalFailure());
+        // ① 零事件——wal 路无桶零发射（接收前沿已越过末笔 TRUNCATE，精确断言）
+        assertEquals(3, wal.dmlEmittedBuckets(), "桶数应恰 = 三笔 INSERT（两笔 TRUNCATE 事务零桶）");
+        assertEquals(3, wal.dmlEmittedRows(), "行数应恰 = 三笔 INSERT 各一行");
+        assertEquals(0, wal.dmlEmittedTruncates(),
+                "VastBase 档 TRUNCATE 记录面缺席（rmid=10 全窗零 0x30）——truncate 发射计数应恒 0（spike 裁决 C）");
+        assertEquals(3, walBlocks.size(), "wal 捕获应恰 3 块:\n" + walBlocks);
+        assertTrue(walBlocks.stream().flatMap(b -> b.rows().stream()).noneMatch(r -> r.startsWith("TRUNCATE")),
+                "wal 块内不应有任何 TRUNCATE 行（两笔 TRUNCATE 事务零发射）:\n" + walBlocks);
+        // ① 零事件——基准路恰 2 个空 B..C 块（无 'T' 帧，spike §4.2 推定面）且不进对拍交集
+        assertEquals(5, baseline.size(), "基准路应恰 5 块（3 INSERT 块 + 2 TRUNCATE 空块）:\n" + baseline);
+        assertEquals(2, baseline.stream().filter(b -> b.rows().isEmpty()).count(),
+                "两笔 TRUNCATE 事务应解码为恰 2 个空 B..C 块（VastBase pgoutput 无 'T' 帧——推定面）:\n" + baseline);
+        // ② 截后字典不倒：种子行（截前段号）与截后行（换段号后）逐字面钉 TableMeta
+        assertEquals(1, walBlocks.get(0).rows().size(), "块一应恰一行:\n" + walBlocks.get(0));
+        assertEquals(1, walBlocks.get(1).rows().size(), "块二应恰一行:\n" + walBlocks.get(1));
+        assertEquals(1, walBlocks.get(2).rows().size(), "块三应恰一行:\n" + walBlocks.get(2));
+        assertEquals("INSERT vb_wal_par.t_trunc BEFORE=- AFTER=[id=1, name=seed-1]",
+                walBlocks.get(0).rows().get(0), "种子行（截前段号）应按正确 TableMeta 渲染");
+        assertEquals("INSERT vb_wal_par.t_trunc2 BEFORE=- AFTER=[id=1, name=seed-2]",
+                walBlocks.get(1).rows().get(0), "第二表种子行应按正确 TableMeta 渲染");
+        assertEquals("INSERT vb_wal_par.t_trunc BEFORE=- AFTER=[id=2, name=after-truncate]",
+                walBlocks.get(2).rows().get(0),
+                "截后 INSERT 应按正确 TableMeta 渲染——TRUNCATE 的 pg_class 换段号 UPDATE（main 前缀 21B 分叉）由既有 ctid 重放字典面跟踪");
     }
 
     // ---- 对拍骨架 ----
