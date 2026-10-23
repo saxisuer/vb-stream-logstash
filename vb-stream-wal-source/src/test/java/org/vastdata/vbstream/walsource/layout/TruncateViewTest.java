@@ -23,6 +23,7 @@ class TruncateViewTest {
         return m.toByteArray();
     }
 
+    /** 向流写 little-endian u32（buildMain 的字段装配辅助——dbId/nrelids/relid 三字段共用）。 */
     private static void put32(ByteArrayOutputStream m, long v) {
         for (int i = 0; i < 4; i++) m.write((int) (v >>> (8 * i)) & 0xFF);
     }
