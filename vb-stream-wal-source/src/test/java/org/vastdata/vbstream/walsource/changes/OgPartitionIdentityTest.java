@@ -394,6 +394,13 @@ class OgPartitionIdentityTest {
                     + " before=" + row.before() + " after=" + row.after());
         }
 
+        /** TRUNCATE 事件录音：表集映 schema.table 的列表文本 + 选项集（与 onRow 同缝）。 */
+        @Override
+        public void onTruncate(TruncateEvent event) {
+            events.add("TRUNCATE " + event.tables().stream()
+                    .map(t -> t.schema() + "." + t.table()).toList() + " options=" + event.options());
+        }
+
         @Override
         public void onEnd(BatchEnd end) {
             events.add("END xid=" + end.xid() + " emitted=" + end.emittedChanges()

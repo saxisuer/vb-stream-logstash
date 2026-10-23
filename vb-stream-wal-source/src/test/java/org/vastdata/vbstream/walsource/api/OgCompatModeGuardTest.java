@@ -157,6 +157,7 @@ class OgCompatModeGuardTest {
         ChangeOutputListener noop = new ChangeOutputListener() {
             @Override public void onBegin(ChangeOutputListener.BatchBegin begin) { }
             @Override public void onRow(ChangeOutputListener.RowChange row) { }
+            @Override public void onTruncate(ChangeOutputListener.TruncateEvent event) { }
             @Override public void onEnd(ChangeOutputListener.BatchEnd end) { }
             @Override public void onAborted(ChangeOutputListener.BatchAborted aborted) { }
         };
@@ -203,6 +204,7 @@ class OgCompatModeGuardTest {
         ChangeOutputListener noop = new ChangeOutputListener() {
             @Override public void onBegin(ChangeOutputListener.BatchBegin begin) { }
             @Override public void onRow(ChangeOutputListener.RowChange row) { }
+            @Override public void onTruncate(ChangeOutputListener.TruncateEvent event) { }
             @Override public void onEnd(ChangeOutputListener.BatchEnd end) { }
             @Override public void onAborted(ChangeOutputListener.BatchAborted aborted) { }
         };
@@ -254,6 +256,7 @@ class OgCompatModeGuardTest {
         ChangeOutputListener noop = new ChangeOutputListener() {
             @Override public void onBegin(ChangeOutputListener.BatchBegin begin) { }
             @Override public void onRow(ChangeOutputListener.RowChange row) { }
+            @Override public void onTruncate(ChangeOutputListener.TruncateEvent event) { }
             @Override public void onEnd(ChangeOutputListener.BatchEnd end) { }
             @Override public void onAborted(ChangeOutputListener.BatchAborted aborted) { }
         };

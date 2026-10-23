@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -235,5 +236,40 @@ class OutputRendererTest {
 
         assertTrue(capturedMessages().get(1).contains("s=01234...(10B)"),
                 "截 5 字符 + 原长尾注:\n" + capturedMessages().get(1));
+    }
+
+    // ---- TRUNCATE 事件渲染（2026-10-22 TRUNCATE DML 支持，契约层 Task 2）----
+
+    /** TRUNCATE 行渲染字面锚——engine ConsoleRenderer renderChange 的 TruncateChange 分支
+     * L148-151 逐字节同形：`TRUNCATE [public.t1, public.t2] options=[...]`。 */
+    @Test
+    void truncateEventRendersEngineIdenticalLine() {
+        OutputRenderer renderer = new OutputRenderer();
+        renderer.onBegin(new ChangeOutputListener.BatchBegin(9L, false, null, 0x100L, 0x108L, Instant.EPOCH, 1));
+        renderer.onTruncate(new ChangeOutputListener.TruncateEvent(
+                List.of(meta("public", "t1"), meta("public", "t2")),
+                EnumSet.of(ChangeOutputListener.TruncateOption.CASCADE)));
+        renderer.onEnd(new ChangeOutputListener.BatchEnd(9L, 1, 1));
+        assertEquals(List.of(
+                "TXN-BEGIN xid=9 kind=NORMAL gid=null commitLsn=0x100 commitTs=1970-01-01T00:00:00Z changes=1",
+                "  [1] TRUNCATE [public.t1, public.t2] options=[CASCADE]",
+                "TXN-END   xid=9"), capturedMessages());
+    }
+
+    /** 双选项位 toString 序锚——EnumSet 声明序（CASCADE 在前），与 engine 同形。 */
+    @Test
+    void truncateBothOptionsRenderInDeclarationOrder() {
+        OutputRenderer renderer = new OutputRenderer();
+        renderer.onBegin(new ChangeOutputListener.BatchBegin(9L, false, null, 0x100L, 0x108L, Instant.EPOCH, 1));
+        renderer.onTruncate(new ChangeOutputListener.TruncateEvent(
+                List.of(meta("public", "t1")),
+                EnumSet.allOf(ChangeOutputListener.TruncateOption.class)));
+        renderer.onEnd(new ChangeOutputListener.BatchEnd(9L, 1, 1));
+        assertEquals("  [1] TRUNCATE [public.t1] options=[CASCADE, RESTART_IDENTITY]", capturedMessages().get(1));
+    }
+
+    /** TRUNCATE 用例的最小表身份（零列——truncate 无值面，列序空即可）。 */
+    private static TableMeta meta(String schema, String table) {
+        return new TableMeta(24600L, schema, table, List.of());
     }
 }

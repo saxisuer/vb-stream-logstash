@@ -720,6 +720,20 @@ public final class OgParityBaseline {
         }
 
         /**
+         * 单语句 TRUNCATE：渲染行文本攒进当前桶（渲染面镜像
+         * {@code OutputRenderer.renderTruncate}——表集映 schema.table 的 List.toString +
+         * options EnumSet.toString，对拍 parse 面按行文本消费）。
+         *
+         * @param event truncate 事件
+         */
+        @Override
+        public void onTruncate(TruncateEvent event) {
+            assertTrue(cur != null, "onTruncate 先于 onBegin（契约违背）");
+            cur.rows.add("TRUNCATE " + event.tables().stream()
+                    .map(t -> t.schema() + "." + t.table()).toList() + " options=" + event.options());
+        }
+
+        /**
          * 批量回放结束：闭桶（changes 取 {@code BatchEnd.expectedChanges} 记账终值——
          * 头行语义与 DualPathParityIT 的 wal 路记账面一致，对拍归一化按 aborted 差吸收）。
          *

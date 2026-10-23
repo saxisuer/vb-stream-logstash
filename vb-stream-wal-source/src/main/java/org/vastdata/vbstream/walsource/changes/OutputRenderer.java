@@ -25,7 +25,7 @@ import java.util.Map;
  *
  * <p><b>pending 缓冲</b>：头行的 {@code changes} 是终值语义（Begin 发射时点可为 0
  * 或部分值，预检 #6 裁定）——onBegin 只缓存头字段（xid/kind/gid/commitLsn/
- * commitTs）并开桶，onRow 把渲染好的行文本攒进当前桶，<b>onEnd 时才以
+ * commitTs）并开桶，onRow/onTruncate 把渲染好的行文本攒进当前桶，<b>onEnd 时才以
  * {@code BatchEnd.expectedChanges} 组装头行</b>并整桶 flush（头行 + 行文本 + 尾行
  * 逐条 INFO）。onAborted 丢弃整桶——零输出（回滚事务在输出面不留痕迹，事务计数
  * 对齐由事件面而非日志面承担）。</p>
@@ -138,6 +138,22 @@ public final class OutputRenderer implements ChangeOutputListener {
     }
 
     /**
+     * 单语句 TRUNCATE（契约源：engine ConsoleRenderer renderChange 的 TruncateChange
+     * 分支 L148-151——{@code TRUNCATE [schema.t, ...] options=[...]}，表集 List.toString、
+     * options EnumSet.toString）。无开桶 ISE（同 onRow 契约）。线程约束：单写者。
+     *
+     * @param event truncate 事件
+     * @throws IllegalStateException 无开桶（onTruncate 先于任何未终结的 onBegin）
+     */
+    @Override
+    public void onTruncate(TruncateEvent event) {
+        if (current == null) {
+            throw new IllegalStateException("onTruncate 先于 onBegin 到达（契约：Begin 先于本事务任何事件）");
+        }
+        current.rows.add(renderTruncate(event));
+    }
+
+    /**
      * 批量回放结束（契约源：engine ConsoleRenderer onTransaction L108-116 的整块
      * 输出形态）——以 {@code BatchEnd.expectedChanges} 终值组装头行（Begin 时点值
      * 不进头行，预检 #6 裁定），头行 + 攒齐的行文本（行号此刻分配）+ 尾行
@@ -198,6 +214,21 @@ public final class OutputRenderer implements ChangeOutputListener {
         return "%s %s.%s BEFORE=%s AFTER=%s".formatted(row.op(), row.table().schema(),
                 row.table().table(), tupleOf(row.before(), row.table()),
                 tupleOf(row.after(), row.table()));
+    }
+
+    /**
+     * truncate 行文本：表集映 schema.table 后 List.toString，options 直接 toString
+     * （EnumSet 声明序）。线程约束：单写者线程。
+     *
+     * @param event truncate 事件
+     * @return 行文本（不含 {@code "  [seq] "} 前缀——行号 flush 期分配）
+     */
+    private String renderTruncate(TruncateEvent event) {
+        List<String> names = new ArrayList<>();
+        for (TableMeta t : event.tables()) {
+            names.add(t.schema() + "." + t.table());
+        }
+        return "TRUNCATE %s options=%s".formatted(names, event.options());
     }
 
     /**

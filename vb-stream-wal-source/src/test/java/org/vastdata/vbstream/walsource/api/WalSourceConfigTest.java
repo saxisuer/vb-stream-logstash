@@ -96,6 +96,10 @@ class WalSourceConfigTest {
             }
 
             @Override
+            public void onTruncate(TruncateEvent event) {
+            }
+
+            @Override
             public void onEnd(BatchEnd end) {
             }
 

@@ -191,6 +191,16 @@ public class VastCorpusBenchmark {
         }
 
         /**
+         * TRUNCATE 事件 no-op（计数面只数行事件——truncate 不是行，下游替身不消费）。
+         *
+         * @param event truncate 事件
+         */
+        @Override
+        public void onTruncate(TruncateEvent event) {
+            // 下游替身不消费
+        }
+
+        /**
          * 事务尾 no-op。
          *
          * @param end 事务尾事件

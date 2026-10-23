@@ -158,7 +158,7 @@ class CatalogOfflineTest {
     /**
      * 全空操作的输出 listener（接线测试只关心装配开关，不消费事件）。
      *
-     * @return 四回调全 no-op 的 {@link ChangeOutputListener}
+     * @return 五回调全 no-op 的 {@link ChangeOutputListener}
      */
     private static ChangeOutputListener noopListener() {
         return new ChangeOutputListener() {
@@ -168,6 +168,10 @@ class CatalogOfflineTest {
 
             @Override
             public void onRow(RowChange row) {
+            }
+
+            @Override
+            public void onTruncate(TruncateEvent event) {
             }
 
             @Override

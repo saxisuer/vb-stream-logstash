@@ -1,20 +1,24 @@
 package org.vastdata.vbstream.walsource.changes;
 
 import java.time.Instant;
+import java.util.EnumSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 变更事件输出契约（v2 MS2）——发射层把一笔已提交事务以
- * {@code onBegin(BatchBegin) → onRow(RowChange)* → onEnd(BatchEnd)} 的单回调序列
- * 交付下游（对拍/落地渲染），回滚事务单发 {@code onAborted(BatchAborted)}。
- * 事件 record 家族与 {@link DmlKind} 枚举按仓库收纳惯例（参照 replay 包
- * {@code CatalogRow} 的 record 收纳方式）嵌套于本文件。
+ * {@code onBegin(BatchBegin) → (onRow(RowChange) | onTruncate(TruncateEvent))* →
+ * onEnd(BatchEnd)} 的单回调序列交付下游（对拍/落地渲染），回滚事务单发
+ * {@code onAborted(BatchAborted)}。事件 record 家族与 {@link DmlKind} 枚举按仓库
+ * 收纳惯例（参照 replay 包 {@code CatalogRow} 的 record 收纳方式）嵌套于本文件。
  *
- * <p><strong>回调语义</strong>：onBegin 先于本事务任何 onRow；onEnd 返回 = 下游确认
- * 完整消费（调用方据此推进输出前沿——与引擎 2.0 的 End 锚定语义同构）；onAborted
- * 与 Begin/Row 序列互斥（回滚事务不回放行）。值面：RowChange 的 before/after 是
- * {@code DiskValueRenderer} 解码后的列名→值 map（INSERT 的 before 为 null、DELETE
- * 的 after 为 null、UPDATE 双像齐——replica identity 面由发射层裁剪）。</p>
+ * <p><strong>回调语义</strong>：onBegin 先于本事务任何 onRow/onTruncate；onEnd 返回 =
+ * 下游确认完整消费（调用方据此推进输出前沿——与引擎 2.0 的 End 锚定语义同构）；
+ * onAborted 与 Begin/Row/Truncate 序列互斥（回滚事务不回放行）。值面：RowChange 的
+ * before/after 是 {@code DiskValueRenderer} 解码后的列名→值 map（INSERT 的 before
+ * 为 null、DELETE 的 after 为 null、UPDATE 双像齐——replica identity 面由发射层
+ * 裁剪）。</p>
  *
  * <p>线程约束：实现方按发射线程（consumer）单线程回调假设；接口自身无状态，
  * 任意实现形态自由。</p>
@@ -79,6 +83,43 @@ public interface ChangeOutputListener {
     }
 
     /**
+     * 单语句 TRUNCATE 事件（一条语句可截多表——payload relids 数组，过滤后命中表集）。
+     *
+     * <p>位址三字段语义与 {@link RowChange} 同源：发射层（Grouper）在 End 发射期填充
+     * （到达期 commitLsn 未知占位 0）。{@code options} 经 EnumSet 拷贝——迭代序恒为
+     * 声明序（渲染 toString 与 engine 逐字节同形的保证，Set.copyOf 迭代序无规格保证）。</p>
+     *
+     * @param xid        事务归属 id（与 Begin/End 同源；发射时填充）
+     * @param commitLsn  提交记录 lsn（与 BatchBegin.commitLsn 同值；发射时填充）
+     * @param lsn        truncate 记录起始 LSN（发射时填充）
+     * @param tables     过滤后命中的表身份（payload 序保持；至少一表——全 miss 不产事件）
+     * @param options    选项位集
+     */
+    record TruncateEvent(long xid, long commitLsn, long lsn, List<TableMeta> tables,
+                         Set<TruncateOption> options) {
+
+        /**
+         * 两参便捷构造（位址三字段占位 0）：手造事件的单测/宿主装配面。
+         *
+         * @param tables   表身份集
+         * @param options  选项位集
+         */
+        TruncateEvent(List<TableMeta> tables, Set<TruncateOption> options) {
+            this(0L, 0L, 0L, tables, options);
+        }
+
+        /** 紧凑构造器：tables 防御拷贝；options 经 EnumSet 拷贝保声明序迭代。
+         * （显式 public：接口嵌套 record 的无修饰紧凑构造器 javac 17 拒编——访问级
+         * 与 record 同为 public，显式化后等义通过。） */
+        public TruncateEvent {
+            tables = List.copyOf(tables);
+            options = options.isEmpty()
+                    ? EnumSet.noneOf(TruncateOption.class)
+                    : EnumSet.copyOf(options);
+        }
+    }
+
+    /**
      * 一笔事务的批量回放结束。
      *
      * @param xid             事务 id（与 {@link BatchBegin#xid()} 同源）
@@ -113,6 +154,17 @@ public interface ChangeOutputListener {
         DELETE
     }
 
+    /** TRUNCATE 选项位（wal-source 自有枚举——声明序与 engine TruncateOption 一致，
+     * EnumSet.toString 渲染同形；不 import 引擎，DmlKind 同惯例）。 */
+    enum TruncateOption {
+
+        /** heapam_xlog.h XLH_TRUNCATE_CASCADE（1<<0——级联截子表/分区）。 */
+        CASCADE,
+
+        /** heapam_xlog.h XLH_TRUNCATE_RESTART_SEQS（1<<1——RESTART IDENTITY）。 */
+        RESTART_IDENTITY
+    }
+
     /**
      * 批量回放开始回调（回放线程；先于本事务任何 onRow）。
      *
@@ -126,6 +178,14 @@ public interface ChangeOutputListener {
      * @param row 行变更事件
      */
     void onRow(RowChange row);
+
+    /**
+     * 单语句 TRUNCATE 回调（回放线程；Begin 之后、End 之前，按 WAL 序——与 onRow
+     * 同缝互排）。回滚事务的 truncate 随桶丢弃，不回调。
+     *
+     * @param event truncate 事件
+     */
+    void onTruncate(TruncateEvent event);
 
     /**
      * 批量回放结束回调（回放线程；返回 = 下游确认完整消费，输出前沿随之推进）。

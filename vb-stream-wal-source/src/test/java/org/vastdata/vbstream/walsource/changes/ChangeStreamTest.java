@@ -236,6 +236,11 @@ class ChangeStreamTest {
             }
 
             @Override
+            public void onTruncate(TruncateEvent event) {
+                // 位址断言面只消费行事件，truncate 不消费
+            }
+
+            @Override
             public void onEnd(BatchEnd end) {
             }
 
@@ -404,6 +409,13 @@ class ChangeStreamTest {
             rows.add(row);
             events.add("ROW " + row.op() + " " + row.table().schema() + "." + row.table().table()
                     + " before=" + row.before() + " after=" + row.after());
+        }
+
+        /** TRUNCATE 事件录音：表集映 schema.table 的列表文本 + 选项集（与 onRow 同缝）。 */
+        @Override
+        public void onTruncate(TruncateEvent event) {
+            events.add("TRUNCATE " + event.tables().stream()
+                    .map(t -> t.schema() + "." + t.table()).toList() + " options=" + event.options());
         }
 
         @Override
