@@ -896,7 +896,7 @@ VastBase 手动档真库 IT 29（`it/vastbase` 包——常规跑全 skip，`@En
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
 超时]——pg_receivexlog 文件通道族在 Windows 的已知限制，非回归）**
-（2026-10-23 TRUNCATE DML 支持收口 +22：离线 +19[TruncateViewTest 新 6——四档黄金字节/
+（2026-10-23 TRUNCATE DML 支持收口 +22：离线 +19[TruncateViewTest 新 6——vanilla 黄金字节/
 错配 ISE/越界与尾随字节负例；XactGrouperTest +8——入桶与 expectedChanges 记账/混排次序/
 回滚整桶弃/子回滚扣减/白名单 per-table 部分命中/全 miss 零记账/truncate-only 事务 floor/
 母表 oid 滤除；TableFilterTest +2——resolveByOid 三闸语义与 relfilenode 反查豁免；OutputRenderer
