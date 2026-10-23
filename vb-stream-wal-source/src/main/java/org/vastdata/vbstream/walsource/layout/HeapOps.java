@@ -46,11 +46,17 @@ public final class HeapOps {
      *  docs/wal-source-truncate-spike.md）。 */
     public static final int XLOG_HEAP_TRUNCATE = 0x30;
 
-    /** heapam_xlog.h：XLH_TRUNCATE_CASCADE（1&lt;&lt;0——级联截子表/分区）。 */
+    /** heapam_xlog.h：XLH_TRUNCATE_CASCADE（1&lt;&lt;0——级联截子表/分区）；REL_17/18_STABLE
+     *  逐字同 + spike 黄金字节实锚（记录 5：TRUNCATE … CASCADE flags=0x01、级联子表
+     *  oid 并入 relids，docs/wal-source-truncate-spike.md §1.2）。 */
     public static final int XLH_TRUNCATE_CASCADE = 1 << 0;
 
-    /** heapam_xlog.h：XLH_TRUNCATE_RESTART_SEQS（1&lt;&lt;1——RESTART IDENTITY；该位时
-     *  relids 数组尾随待重启序列 oid——解析面只消费前 nrelids 个）。 */
+    /** heapam_xlog.h：XLH_TRUNCATE_RESTART_SEQS（1&lt;&lt;1——RESTART IDENTITY）；
+     *  REL_17/18_STABLE 逐字同（docs/wal-source-truncate-spike.md §1.1/§1.2）。
+     *  序列重启走 heap 记录**之前**的独立 RM_SEQ 记录、relids 无尾随——heapam_xlog.h
+     *  "followed by all sequence relids" 注释是 pre-PG10 残留（spike §1.1 勘误：
+     *  RESTART IDENTITY 的 heap 记录 nrelids 不含序列 oid）；解析面
+     *  mainLen == 12+4nrelids 精确自检与此一致。 */
     public static final int XLH_TRUNCATE_RESTART_SEQS = 1 << 1;
 
     /** heapam_xlog.h：XLOG_HEAP2_MULTI_INSERT（RM_HEAP2 下 opcode 位段 0x50）。 */

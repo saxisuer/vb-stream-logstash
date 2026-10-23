@@ -42,7 +42,7 @@ import java.util.List;
 public final class HeapViews {
 
     /**
-     * 工具类防实例化：六视图经各自 parse 工厂产出。
+     * 工具类防实例化：七视图经各自 parse 工厂产出。
      */
     private HeapViews() {
     }
