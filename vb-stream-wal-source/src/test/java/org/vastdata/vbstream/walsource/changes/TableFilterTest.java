@@ -585,4 +585,44 @@ class TableFilterTest {
         assertEquals("t_swap", plain.table(),
                 "普通表换绑后的新段号（原分区段号，不在第四字典）经 relfilenode 反查照常解析");
     }
+
+    /**
+     * 用例 ⑱（truncate 面，Task 3）：{@code resolveByOid} oid 直查命中——stub 三表
+     * 在册的普通表按 pg_class oid 解析出全等 TableMeta（truncate 载荷 relids 是 oid
+     * 数组，服务端 decode.c 即 oid 直开关系）；三道闸语义与 resolve 同构——索引
+     * relkind / 系统模式 / 字典缺行 oid 照常 miss。
+     */
+    @Test
+    void resolveByOidDirectlyHitsOrdinaryTableAndKeepsGateSemantics() {
+        TableFilter filter = new TableFilter(snapshot(), Set.of());
+        TableMeta meta = filter.resolveByOid(1001).orElseThrow();
+        assertEquals("t1", meta.table(), "oid 直查应解析出该 oid 的表身份");
+        assertEquals(1001L, meta.relOid(), "TableMeta 携查询 oid 本身");
+        assertTrue(filter.resolveByOid(1004).isEmpty(), "索引 relkind 的 oid 直查仍 miss 形态闸");
+        assertTrue(filter.resolveByOid(1009).isEmpty(), "pg_catalog 系统模式的 oid 直查仍 miss 系统模式闸");
+        assertTrue(filter.resolveByOid(9999).isEmpty(), "字典缺行的 oid 直查 miss");
+    }
+
+    /**
+     * 用例 ⑲（反查碰撞防御锚，Task 3）：构造 relfilenode 反查会先命中的键值——
+     * 另一张表的 relfilenode 数值 == t1 的 oid 1001（FakeSnapshot 的 {@code relOidOf}
+     * 反查先行、oid 直认殿后）——{@code resolveByOid} <b>不经 relOidOf 反查</b>、
+     * 仍按 oid 判：应解析出 t1 而非碰撞属主 t_collide；对照组 {@code resolve} 走
+     * 反查恰命中碰撞属主，差分钉死两入口的语义分界（EXCHANGE 换绑段号/oid 数值碰撞
+     * 面同型——M3 T5 已证该碰撞类真实存在，truncate 载荷键是 oid 故必须直判）。
+     */
+    @Test
+    void resolveByOidIgnoresRelfilenodeReverseLookupOnOidCollision() {
+        FakeSnapshot s = snapshot();
+        s.relation(5001, 1001, "t_collide", 11, "public", "r");   // filenode 与 t1 的 oid 1001 碰撞
+        TableFilter filter = new TableFilter(s, Set.of());
+
+        TableMeta byOid = filter.resolveByOid(1001).orElseThrow();
+        assertEquals("t1", byOid.table(), "resolveByOid 按 oid 直判——不受 relfilenode 反查碰撞影响");
+        assertEquals(1001L, byOid.relOid());
+
+        TableMeta viaReverse = filter.resolve(1001).orElseThrow();
+        assertEquals("t_collide", viaReverse.table(),
+                "对照组：既有 resolve 经 relOidOf 反查先命中碰撞属主（heap 块形态语义不变）");
+    }
 }

@@ -154,8 +154,9 @@ public final class TableFilter {
     }
 
     /**
-     * 三表（pg_class/pg_attribute/pg_namespace）解析面——v2 既有路径逐字节不变：
-     * relOidOf 归一 → relkind[OG 档含 parttype]/系统模式/白名单 → TableMeta 组装。
+     * 三表（pg_class/pg_attribute/pg_namespace）解析面——v2 既有路径行为不变：
+     * relOidOf 归一后委派 {@link #resolveByOid} 的三道闸 + TableMeta 组装（后半段
+     * 抽出共用，Task 3 truncate 面）。
      *
      * <p>边界与异常语义同 {@link #resolve}（vanilla 档即本方法的全部语义）。
      * 线程约束：并发安全（见类 javadoc）。</p>
@@ -168,8 +169,22 @@ public final class TableFilter {
         if (oidOpt.isEmpty()) {
             return Optional.empty();
         }
-        long oid = oidOpt.getAsLong();
+        return resolveByOid(oidOpt.getAsLong());
+    }
 
+    /**
+     * 按关系 oid 直查表身份（truncate 载荷键是 oid——服务端 decode.c 即 oid 直开关系）：
+     * 三道闸（relkind[OG 档含 parttype]/系统模式/白名单）与 {@link #resolveThreeTable}
+     * 同构，但<b>不经 relOidOf 的 relfilenode 反查</b>——反查优先在 EXCHANGE 换绑段号/
+     * oid 数值碰撞面会产出错误属主（M3 T5 已证该碰撞类真实存在）。
+     *
+     * <p>边界与异常语义：任一闸不过或字典缺行返回 empty（不抛）。线程约束：并发安全
+     * （持不可变引用，同 {@link #resolve}）。</p>
+     *
+     * @param oid 关系 oid（pg_class.oid）
+     * @return 表身份 + 列序；miss 为 empty
+     */
+    public Optional<TableMeta> resolveByOid(long oid) {
         Optional<String> relkind = snapshot.relkindOf(oid);
         if (relkind.isEmpty() || !isUserTableKind(relkind.get(), oid)) {
             return Optional.empty();

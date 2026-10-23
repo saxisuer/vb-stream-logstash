@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -30,7 +31,9 @@ import java.util.Set;
 /**
  * WAL 事务组装状态机（v2 MS2）——把流经的 heap/XACT 记录组装为
  * {@link ChangeOutputListener} 的批量事务事件：heap I/U/D 行入桶累积（解码 +
- * {@link DiskValueRenderer} 渲染在到达时完成），XACT 终态记录驱动发射/弃桶/挂起。
+ * {@link DiskValueRenderer} 渲染在到达时完成），事务性 TRUNCATE（RM_HEAP 0x30
+ * ——零块引用、relids 是 pg_class oid 数组）同桶入 truncate 条目（表集/选项
+ * 到达期定格，spike §5.2-2 母表滤除），XACT 终态记录驱动发射/弃桶/挂起。
  *
  * <p><b>发射语义（控制器 2026-10 裁定修正，与 spec §4 "即时发射"的偏差记档）</b>：
  * 行在桶内累积、<b>COMMIT / COMMIT_PREPARED 时按序批量发射</b>（Begin → 过滤后行
@@ -239,6 +242,10 @@ public final class XactGrouper {
 
     /** 已发射行计数（过滤后实付口径，emitBucket 累加 emitted——volatile 跨线程读）。 */
     private volatile long emittedRows;
+
+    /** 已发射 truncate 事件计数（过滤后实付口径，emitBucket 累加；Main 周期 smoke 行
+     * 的 DML 观测面之一——Task 4 穿线——volatile 跨线程读）。 */
+    private volatile long emittedTruncates;
 
     /** 截断 UPDATE 行级跳过计数（liveness guard 观测面——Task 8；volatile 跨线程读）。 */
     private volatile long skippedTruncatedRows;
@@ -534,7 +541,7 @@ public final class XactGrouper {
                         + "（正常业务下挂起窗口为秒级，持续增长指向终态记录丢失/消费停滞）",
                         preparedPending, PREPARED_PENDING_WARN_THRESHOLD);
             }
-            LOG.info("两阶段事务挂起: xid={}, gid={}, 行数={}", xid, gid, b.rows.size());
+            LOG.info("两阶段事务挂起: xid={}, gid={}, 条目数={}", xid, gid, b.entries.size());
         }
         terminalCleanup(xid);
     }
@@ -617,13 +624,13 @@ public final class XactGrouper {
         Bucket dst = buckets.get(to);
         if (dst == null) {
             Bucket promoted = new Bucket(to, src.firstLsn);
-            promoted.rows.addAll(src.rows);
+            promoted.entries.addAll(src.entries);
             promoted.abortedSubxids.addAll(src.abortedSubxids);
             promoted.gid = src.gid;
             buckets.put(to, promoted);
             return;
         }
-        dst.rows.addAll(src.rows);
+        dst.entries.addAll(src.entries);
         dst.abortedSubxids.addAll(src.abortedSubxids);
         if (src.gid != null && dst.gid == null) {
             dst.gid = src.gid;
@@ -685,7 +692,8 @@ public final class XactGrouper {
     }
 
     /**
-     * heap（RM_HEAP）记录：INSERT/UPDATE/DELETE 解码行入桶；INPLACE 是 catalog 专用
+     * heap（RM_HEAP）记录：TRUNCATE（0x30，零块引用——须先于 blocks 早退分派）入桶
+     * 为 truncate 条目；INSERT/UPDATE/DELETE 解码行入桶；INPLACE 是 catalog 专用
      * 形态（用户表不走），静默忽略。
      *
      * <p>关键步骤：块链首块取 relfilenode → TableFilter 解析（缓存）；命中用户表则
@@ -695,10 +703,14 @@ public final class XactGrouper {
      * @param rec heap 记录
      */
     private void dispatchHeap(WalRecord rec) {
+        int op = rec.info() & HeapOps.XLOG_XACT_OPMASK;
+        if (op == HeapOps.XLOG_HEAP_TRUNCATE) {
+            appendTruncateRecord(rec);   // 零块引用的事务性 TRUNCATE——先于 blocks 早退
+            return;
+        }
         if (rec.blocks().isEmpty()) {
             return;
         }
-        int op = rec.info() & HeapOps.XLOG_XACT_OPMASK;
         if (op == HeapOps.XLOG_HEAP_INPLACE) {
             return;   // catalog 专用（pg_class 统计面等），用户表不变更语义
         }
@@ -761,6 +773,49 @@ public final class XactGrouper {
             default -> { /* 未预期 opcode 静默忽略 */ }
         }
         resetToastWindow();
+    }
+
+    /**
+     * 事务性 TRUNCATE 记录入桶：TruncateView 解析 → 逐 oid resolveByOid 过滤 →
+     * 命中表集（payload 序）入桶；全 miss 零记账零追加（对齐 pgoutput 服务端
+     * nrelids==0 不发 'T' 帧语义）；桶不存在则新建并记 firstLsn（truncate-only
+     * 事务的 pendingFloorLsn 覆盖）。低频记录不走 metaCache（oid 键与 filenode 键
+     * 混入会碰撞，CatalogStores 五索引 O(1) 直查本就廉价）。线程约束：单写者。
+     *
+     * @param rec truncate 记录（RM_HEAP_ID opcode 0x30）
+     */
+    private void appendTruncateRecord(WalRecord rec) {
+        HeapViews.TruncateView v = HeapViews.TruncateView.parse(rec, layout);
+        long origin = rec.xid() & 0xFFFFFFFFL;
+        if (origin == 0) {
+            return;   // 无事务归属（truncate 恒事务性，防御面同 heap 行）
+        }
+        long top = effectiveTop(rec, origin);
+        List<TableMeta> tables = new ArrayList<>(v.relids().length);
+        for (long oid : v.relids()) {
+            // spike §5.2-2：pgoutput 'T' 帧剔除 relkind='p' 分区母表（母表无存储不发布，
+            // WAL relids=[m,p1,p2] vs engine 渲 [p1,p2]）——wal 路同构滤除，否则对拍必 diff
+            if ("p".equals(snapshot.relkindOf(oid).orElse(""))) {
+                continue;
+            }
+            filter.resolveByOid(oid).ifPresent(tables::add);
+        }
+        if (tables.isEmpty()) {
+            return;
+        }
+        EnumSet<ChangeOutputListener.TruncateOption> options = EnumSet.noneOf(ChangeOutputListener.TruncateOption.class);
+        if ((v.flags() & HeapOps.XLH_TRUNCATE_CASCADE) != 0) {
+            options.add(ChangeOutputListener.TruncateOption.CASCADE);
+        }
+        if ((v.flags() & HeapOps.XLH_TRUNCATE_RESTART_SEQS) != 0) {
+            options.add(ChangeOutputListener.TruncateOption.RESTART_IDENTITY);
+        }
+        Bucket b = buckets.get(top);
+        if (b == null) {
+            b = new Bucket(top, rec.lsn());
+            buckets.put(top, b);
+        }
+        b.entries.add(new TruncateEntry(origin, rec.lsn(), tables, options));
     }
 
     /**
@@ -1169,7 +1224,7 @@ public final class XactGrouper {
             b = new Bucket(top, recLsn);
             buckets.put(top, b);
         }
-        b.rows.add(new RowEntry(origin, recLsn, new ChangeOutputListener.RowChange(meta, op, beforeMap, afterMap)));
+        b.entries.add(new RowEntry(origin, recLsn, new ChangeOutputListener.RowChange(meta, op, beforeMap, afterMap)));
     }
 
     /**
@@ -1222,11 +1277,13 @@ public final class XactGrouper {
     }
 
     /**
-     * 桶批量发射：Begin（expected=桶记账终值）→ 过滤后行（来源 xid ∈ abortedSubxids
-     * 的行扣减）→ End（emitted=过滤后实付，expected 同 Begin 终值）。
+     * 桶批量发射：Begin（expected=桶记账终值，行+truncate 条目合计——aborted 过滤前）
+     * → 过滤后条目（来源 xid ∈ abortedSubxids 的条目扣减；RowEntry 发 onRow、
+     * TruncateEntry 发 onTruncate，按 WAL 序混排）→ End（emitted=过滤后实付合计，
+     * expected 同 Begin 终值）。
      *
      * <p>边界与异常语义：全过滤（emitted=0）仍发 Begin/End 骨架——桶存在即事务
-     * 曾有用户表行，计数面下游可对齐。线程约束：单写者（回调与喂入同线程）。</p>
+     * 曾有用户表条目，计数面下游可对齐。线程约束：单写者（回调与喂入同线程）。</p>
      *
      * @param b         待发射桶
      * @param twoPhase  两阶段形态标记
@@ -1236,29 +1293,39 @@ public final class XactGrouper {
      * @param commitTs  提交时间戳
      */
     private void emitBucket(Bucket b, boolean twoPhase, String gid, long commitLsn, long endLsn, Instant commitTs) {
-        long expected = b.rows.size();
-        // OG 子桶合并后的行序保真（M2 T2）：按行所在记录 lsn 稳定排序——vanilla 桶内
+        long expected = b.entries.size();
+        // OG 子桶合并后的行序保真（M2 T2）：按条目所在记录 lsn 稳定排序——vanilla 桶内
         // 行本就按 WAL 到达序（= lsn 序）追加，稳定排序为恒等操作（行为零变化）；
-        // OG 合并进来的子行按真序归位
-        b.rows.sort(Comparator.comparingLong(RowEntry::recLsn));
+        // OG 合并进来的子行按真序归位；truncate 条目与 DML 行混排同按 WAL 序
+        b.entries.sort(Comparator.comparingLong(BucketEntry::recLsn));
         out.onBegin(new ChangeOutputListener.BatchBegin(b.xid, twoPhase, gid, commitLsn, endLsn, commitTs, expected));
         long emitted = 0;
-        for (RowEntry e : b.rows) {
+        long emittedTruncates = 0;
+        for (BucketEntry e : b.entries) {
             if (b.abortedSubxids.contains(e.originXid())) {
                 continue;
             }
-            // 位址三字段发射期重建（2026-10-17 契约扩展）：到达期 commitLsn 未知（提交
-            // 记录未到），桶内行占位 0；此处从 RowEntry 的记账面（recLsn）+ 桶/终态
-            // 位址（b.xid/commitLsn）重建全参 record——table/op/before/after 均为已
-            // 渲染引用，重建是纯 record 拷贝零重算
-            ChangeOutputListener.RowChange r = e.row();
-            out.onRow(new ChangeOutputListener.RowChange(b.xid, commitLsn, e.recLsn(),
-                    r.table(), r.op(), r.before(), r.after()));
-            emitted++;
+            if (e instanceof RowEntry re) {
+                // 位址三字段发射期重建（2026-10-17 契约扩展）：到达期 commitLsn 未知（提交
+                // 记录未到），桶内行占位 0；此处从 RowEntry 的记账面（recLsn）+ 桶/终态
+                // 位址（b.xid/commitLsn）重建全参 record——table/op/before/after 均为已
+                // 渲染引用，重建是纯 record 拷贝零重算
+                ChangeOutputListener.RowChange r = re.row();
+                out.onRow(new ChangeOutputListener.RowChange(b.xid, commitLsn, e.recLsn(),
+                        r.table(), r.op(), r.before(), r.after()));
+                emitted++;
+            } else if (e instanceof TruncateEntry te) {
+                // truncate 事件的位址三字段同面（表集/选项已到达期定格，仅补位址）
+                out.onTruncate(new ChangeOutputListener.TruncateEvent(b.xid, commitLsn, e.recLsn(),
+                        te.tables(), te.options()));
+                emitted++;
+                emittedTruncates++;
+            }
         }
         out.onEnd(new ChangeOutputListener.BatchEnd(b.xid, emitted, expected));
         emittedBuckets++;
-        emittedRows += emitted;
+        emittedRows += emitted - emittedTruncates;
+        this.emittedTruncates += emittedTruncates;
     }
 
     /**
@@ -1282,6 +1349,18 @@ public final class XactGrouper {
      */
     public long emittedRows() {
         return emittedRows;
+    }
+
+    /**
+     * DML 观测面：已发射 truncate 事件数（aborted 过滤后的实付口径——只计
+     * TruncateEntry，不含行）。
+     *
+     * <p>单写者递增、volatile 读；与 {@link #emittedBuckets()} 同批更新。</p>
+     *
+     * @return 已发射 truncate 事件数（会话累计）
+     */
+    public long emittedTruncates() {
+        return emittedTruncates;
     }
 
     /**
@@ -1547,15 +1626,15 @@ public final class XactGrouper {
     }
 
     /**
-     * 待决事务桶：行到达期累积（RowEntry 携带来源 xid 供 aborted 过滤），终态记录
-     * 发射/弃。挂起（PREPARE）= 桶留存 + gid 悬置。firstLsn = 首行记录 lsn
-     * （{@link XactGrouper#pendingFloorLsn()} 的重放下界源——Task 11；OG 子桶合并
-     * （M2 T2）取两桶较小值，重放窗口语义保真，故非 final）。
+     * 待决事务桶：条目（行/truncate）到达期累积（BucketEntry 携带来源 xid 供 aborted
+     * 过滤），终态记录发射/弃。挂起（PREPARE）= 桶留存 + gid 悬置。firstLsn = 首条目
+     * 记录 lsn（{@link XactGrouper#pendingFloorLsn()} 的重放下界源——Task 11；OG 子桶
+     * 合并（M2 T2）取两桶较小值，重放窗口语义保真，故非 final）。
      */
     private static final class Bucket {
         final long xid;
         long firstLsn;
-        final List<RowEntry> rows = new ArrayList<>();
+        final List<BucketEntry> entries = new ArrayList<>();
         final Set<Long> abortedSubxids = new HashSet<>();
         String gid;
 
@@ -1572,6 +1651,18 @@ public final class XactGrouper {
     }
 
     /**
+     * 桶内条目公共面：来源 xid（aborted 过滤键）+ 记录 lsn（发射排序键）。
+     */
+    private sealed interface BucketEntry permits RowEntry, TruncateEntry {
+
+        /** 行/事件来源事务 id（记录头 xid——aborted 过滤的私有记账键）。 */
+        long originXid();
+
+        /** 所在记录 lsn（emitBucket 稳定排序键——DML 与 truncate 混排按 WAL 序）。 */
+        long recLsn();
+    }
+
+    /**
      * 桶内行条目：RowChange + 来源 xid（记录头 xid——子事务行即子 xid，aborted
      * 过滤的私有记账键，不泄漏进输出契约——预检 #5 裁定）+ 行所在记录 lsn
      * （{@link #emitBucket} 稳定排序的键——OG 子桶合并后的行序保真，M2 T2）。
@@ -1580,6 +1671,19 @@ public final class XactGrouper {
      * @param recLsn    行所在记录的 lsn
      * @param row       行变更事件
      */
-    private record RowEntry(long originXid, long recLsn, ChangeOutputListener.RowChange row) {
+    private record RowEntry(long originXid, long recLsn, ChangeOutputListener.RowChange row)
+            implements BucketEntry {
+    }
+
+    /**
+     * 桶内 truncate 条目：表集与选项在到达期定格（as-of），发射期补位址三字段。
+     *
+     * @param originXid truncate 来源事务 id（子事务 truncate 即子 xid——aborted 过滤键）
+     * @param recLsn    truncate 记录的 lsn
+     * @param tables    过滤后命中的表身份（payload 序保持；至少一表——全 miss 不建条目）
+     * @param options   选项位集（EnumSet——迭代序恒声明序）
+     */
+    private record TruncateEntry(long originXid, long recLsn, List<TableMeta> tables,
+            EnumSet<ChangeOutputListener.TruncateOption> options) implements BucketEntry {
     }
 }

@@ -628,7 +628,7 @@ public final class HeapViews {
      * @param flags   原样位图（{@link HeapOps#XLH_TRUNCATE_CASCADE}/
      *                {@link HeapOps#XLH_TRUNCATE_RESTART_SEQS}）
      */
-    record TruncateView(int nrelids, long[] relids, int flags) {
+    public record TruncateView(int nrelids, long[] relids, int flags) {
 
         /** relids 数组起点（SizeOfHeapTruncate=12——Oid relids[] 4 对齐使 offsetof=12；
          * @9-11 是未初始化栈垫垃圾，禁止读/禁止校验为零，spike §1 勘误）。 */
@@ -646,7 +646,7 @@ public final class HeapViews {
          *               裁决 C，恒走 vanilla 分支）
          * @return 视图
          */
-        static TruncateView parse(WalRecord r, WalLayout layout) {
+        public static TruncateView parse(WalRecord r, WalLayout layout) {
             requireOp(r, HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_TRUNCATE);
             if (r.mainLen() < RELIDS_OFF) {
                 throw new IllegalStateException("truncate main too short: " + r.mainLen());

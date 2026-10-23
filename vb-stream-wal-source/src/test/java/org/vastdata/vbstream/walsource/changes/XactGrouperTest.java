@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,6 +65,10 @@ class XactGrouperTest {
     /** 用户表三：oid == relfilenode == 24602，public.t_bitmap（十列 int4——natts=10 使
      * null 位图 2B、t_hoff=32 与无位图的 24 拉开位图宽差，Task 9 补例）。 */
     private static final long BITMAP_REL = 24602L;
+
+    /** 分区母表：oid == relfilenode == 24603，public.t_part_m（relkind 'p'——spike
+     * §5.2-2：pgoutput 'T' 帧面母表缺席，wal 路同构滤除的测试面）。 */
+    private static final long MOTHER_REL = 24603L;
 
     /** toast 关系：oid == relfilenode == 33657（relkind 't'）。 */
     private static final long TOAST_REL = 33657L;
@@ -597,6 +602,113 @@ class XactGrouperTest {
         }
     }
 
+    /** TRUNCATE 与行同桶按 WAL 序发射，expected 含 truncate 条目（对齐 engine unitCount）。 */
+    @Test
+    void truncateEmitsInBucketOrderAndCountsExpected() {
+        Fixture fx = fixture();
+        fx.insert(100, 0, 1, "a");
+        fx.truncate(100, 0, 0, USER_REL);
+        fx.commit(100);
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=2",
+                "ROW INSERT public.t_stream before=null after={id=1, name=a}",
+                "TRUNCATE [public.t_stream] options=[]",
+                "END xid=100 emitted=2 exp=2"), fx.listener.events);
+    }
+
+    /** 多表一语句：payload 序全量入列；选项双位 toString 声明序。 */
+    @Test
+    void truncateMultiTableWithBothOptionsKeepsPayloadOrder() {
+        Fixture fx = fixture();
+        fx.truncate(100, 0, HeapOps.XLH_TRUNCATE_CASCADE | HeapOps.XLH_TRUNCATE_RESTART_SEQS,
+                USER_REL, WIDE_REL);
+        fx.commit(100);
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=1",
+                "TRUNCATE [public.t_stream, public.t_wide] options=[CASCADE, RESTART_IDENTITY]",
+                "END xid=100 emitted=1 exp=1"), fx.listener.events);
+    }
+
+    /** 回滚整桶弃——truncate 随桶零输出。 */
+    @Test
+    void truncatedTransactionDiscardsTruncateWithBucket() {
+        Fixture fx = fixture();
+        fx.truncate(300, 0, 0, USER_REL);
+        fx.abort(300, 0);
+        assertEquals(List.of("ABORTED xid=300"), fx.listener.events);
+    }
+
+    /** SAVEPOINT 子回滚扣减 truncate 条目——expected=过滤前、emitted=过滤后。 */
+    @Test
+    void savepointSubTruncateDeductedLikeRows() {
+        Fixture fx = fixture();
+        fx.insert(5, 0, 1, "top");
+        fx.truncate(7, 5, 0, USER_REL);        // 子事务 truncate（TOPLEVEL 标记归并到 5）
+        fx.abort(7, 5);
+        fx.commit(5);
+        assertEquals(List.of(
+                "BEGIN xid=5 2p=false gid=null exp=2",
+                "ROW INSERT public.t_stream before=null after={id=1, name=top}",
+                "END xid=5 emitted=1 exp=2"), fx.listener.events);
+    }
+
+    /** 白名单 per-table 过滤——部分命中事件只携命中表（对齐 pgoutput per-relation 语义）。 */
+    @Test
+    void whitelistFiltersTruncatePerTable() {
+        StubSnapshot snapshot = new StubSnapshot();
+        snapshot.table(USER_REL, "public", "t_stream", "r",
+                new CatalogSnapshot.Column(1, "id", 23, false));
+        snapshot.table(WIDE_REL, "public", "t_wide", "r",
+                new CatalogSnapshot.Column(1, "id", 23, false));
+        RecordingListener listener = new RecordingListener();
+        XactGrouper grouper = new XactGrouper(snapshot, Set.of("public.t_stream"),
+                layout, new ToastAssembler(null), listener);
+        Fixture fx = new Fixture(snapshot, new ToastAssembler(null), grouper, listener);
+        fx.truncate(100, 0, 0, USER_REL, WIDE_REL);
+        fx.commit(100);
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=1",
+                "TRUNCATE [public.t_stream] options=[]",
+                "END xid=100 emitted=1 exp=1"), listener.events);
+    }
+
+    /** 全 miss（oid 不在字典）零记账零追加——对齐 pgoutput nrelids==0 不发帧。 */
+    @Test
+    void truncateAllTablesMissedEmitsNothing() {
+        Fixture fx = fixture();
+        fx.truncate(100, 0, 0, 24999L);
+        fx.commit(100);
+        assertEquals(List.of(), fx.listener.events);
+    }
+
+    /** truncate-only 事务建桶——pendingFloorLsn 覆盖（重放下界源）。 */
+    @Test
+    void truncateOnlyTransactionSetsPendingFloor() {
+        Fixture fx = fixture();
+        WalRecord tr = fx.truncate(100, 0, 0, USER_REL);
+        assertEquals(tr.lsn(), fx.grouper.pendingFloorLsn());
+    }
+
+    /** relkind='p' 分区母表从事件滤除（spike §5.2-2——pgoutput 'T' 帧面母表缺席，
+     * WAL relids 含母表；wal 路同构滤除）。 */
+    @Test
+    void partitionedMotherOidFilteredFromTruncateEvent() {
+        StubSnapshot snapshot = new StubSnapshot();
+        snapshot.table(MOTHER_REL, "public", "t_part_m", "p",
+                new CatalogSnapshot.Column(1, "i", 23, false));
+        snapshot.table(USER_REL, "public", "t_stream", "r",
+                new CatalogSnapshot.Column(1, "id", 23, false));
+        RecordingListener listener = new RecordingListener();
+        XactGrouper grouper = new XactGrouper(snapshot, null, layout, new ToastAssembler(null), listener);
+        Fixture fx = new Fixture(snapshot, new ToastAssembler(null), grouper, listener);
+        fx.truncate(100, 0, 0, MOTHER_REL, USER_REL);   // payload 序 [母表, 普通表]
+        fx.commit(100);
+        assertEquals(List.of(
+                "BEGIN xid=100 2p=false gid=null exp=1",
+                "TRUNCATE [public.t_stream] options=[]",
+                "END xid=100 emitted=1 exp=1"), listener.events);
+    }
+
     // ---- 测试基建 ----
 
     /**
@@ -663,6 +775,20 @@ class XactGrouperTest {
             byte[] main = new byte[3];
             return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_INSERT, xid)
                     .toplevel(toplevel).block(0, SPC, DB, USER_REL, 0).data(payload).main(main).build());
+        }
+
+        /** 一条 TRUNCATE 记录（RM_HEAP_ID opcode 0x30，零块引用；main = 12B 头[含 @9-11
+         * 栈垫] + relids 数组——relids 传 pg_class oid，与 stub 快照的 table 键同值；
+         * spike @12 黄金几何）。 */
+        WalRecord truncate(int xid, int toplevel, int flags, long... relids) {
+            ByteArrayOutputStream m = new ByteArrayOutputStream();
+            put32(m, 16385L);                        // dbId（视图不消费）
+            put32(m, relids.length);                 // nrelids
+            m.write(flags);                          // flags u8@8
+            m.write(0xe4); m.write(0xdb); m.write(0x61);   // @9-11 栈垫（非零垃圾——视图不读）
+            for (long rel : relids) put32(m, rel);   // relids @12 起（spike 裁定）
+            return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_TRUNCATE, xid)
+                    .toplevel(toplevel).main(m.toByteArray()).build());
         }
 
         /**
