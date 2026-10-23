@@ -228,9 +228,10 @@ public final class Main {
      * 快照为空（尚无记录交付）时 censusTop3 渲染为空串；{@code vb.wal.state.dir} 配置时
      * 追加 {@code ckpt=LSN adv=LSN}（检查点与槽推进前沿——二者相等即"落盘后必推过"，
      * 落后即推进失败被 WARN 吞掉的形态）；DML 面启用时追加
-     * {@code dml=[buckets=N rows=M partMiss=K]}（ChangeStream 的会话累计发射计数 +
-     * OG 档分区身份链断计数 K——vanilla 档恒 0，链断两形态[M3 T2]的 fail-safe
-     * 观测面；纯 v1 形态 {@code vb.wal.dml=false} 下不追加）。数据面均只读（volatile
+     * {@code dml=[buckets=N rows=M partMiss=K trunc=T]}（ChangeStream 的会话累计
+     * 发射计数 + OG 档分区身份链断计数 K——vanilla 档恒 0，链断两形态[M3 T2]的
+     * fail-safe 观测面 + truncate 事件计数 T——不并入 rows 的独立口径；纯 v1 形态
+     * {@code vb.wal.dml=false} 下不追加）。数据面均只读（volatile
      * 镜像 + {@code sum()} 快照），任意时点打行安全。</p>
      *
      * @param source 运行中的门面
@@ -248,7 +249,8 @@ public final class Main {
         String dml = source.dmlEnabled()
                 ? " dml=[buckets=" + source.dmlEmittedBuckets()
                         + " rows=" + source.dmlEmittedRows()
-                        + " partMiss=" + source.dmlPartitionChainMisses() + "]"
+                        + " partMiss=" + source.dmlPartitionChainMisses()
+                        + " trunc=" + source.dmlEmittedTruncates() + "]"
                 : "";
         LOG.info("smoke: lsn={} records={} resyncs={} reconnects={} censusTop3=[{}]{}{}",
                 Lsn.format(source.consumedLsn()),

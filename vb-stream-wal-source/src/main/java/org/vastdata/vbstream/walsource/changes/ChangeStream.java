@@ -71,7 +71,8 @@ public final class ChangeStream {
 
     /**
      * 喂一条走读完成的 WAL 记录（wal-receiver 线程）——委派内建 XactGrouper 的
-     * rmid 分发（XACT 终态 / heap 行入桶 + toast chunk 采集 / 其余静默）。
+     * rmid 分发（XACT 终态 / heap 行入桶 + TRUNCATE 事件入桶 + toast chunk 采集 /
+     * 其余静默）。
      *
      * <p>边界与异常语义：解码/走读错位抛 ISE fail-fast（与组装器同面）；非变更承载
      * 记录（catalog 字典表 heap、PRUNE、XLOG 等）无害跳过。线程约束：单写者。</p>
@@ -99,6 +100,16 @@ public final class ChangeStream {
      */
     public long emittedRows() {
         return grouper.emittedRows();
+    }
+
+    /**
+     * DML 观测面：已发射 TRUNCATE 事件数（不并入 emittedRows——行口径保持纯净；
+     * 透传 {@link XactGrouper#emittedTruncates()}）。
+     *
+     * @return 会话累计发射 truncate 事件数（任意线程可读）
+     */
+    public long emittedTruncates() {
+        return grouper.emittedTruncates();
     }
 
     /**

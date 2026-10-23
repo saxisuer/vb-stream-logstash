@@ -196,6 +196,17 @@ class ChangeStreamTest {
         assertEquals(3, fx.stream.emittedRows(), "2 + 1 行");
     }
 
+    /** 计数穿线：truncate 发射后 emittedTruncates 递增且不并入 emittedRows。 */
+    @Test
+    void truncateCounterThreadedThroughWithoutPollutingRowCount() {
+        Fixture fx = fixture(null, null);
+        fx.truncate(100, 0, USER_REL);
+        fx.commit(100);
+
+        assertEquals(1L, fx.stream.emittedTruncates());
+        assertEquals(0L, fx.stream.emittedRows());
+    }
+
     /** 白名单：表不命中时零事件（TableFilter 三闸经门面透传）。 */
     @Test
     void whitelistFiltersOutUnlistedTable() {
@@ -355,6 +366,20 @@ class ChangeStreamTest {
                     .block(0, SPC, DB, PG_ATTRIBUTE_RELNODE, 0).data(new byte[] {1}).main(new byte[3]).build());
         }
 
+        /** 一条 TRUNCATE 记录（RM_HEAP_ID opcode 0x30，零块引用；main = 12B 头[含 @9-11
+         * 栈垫] + relids 数组——与 XactGrouperTest 同一 spike @12 黄金几何；relids 传
+         * pg_class oid，与 stub 快照的 table 键同值）。 */
+        WalRecord truncate(int xid, int flags, long... relids) {
+            ByteArrayOutputStream m = new ByteArrayOutputStream();
+            put32(m, 16385L);                              // dbId（视图不消费）
+            put32(m, relids.length);                       // nrelids
+            m.write(flags);                                // flags u8@8
+            m.write(0xe4); m.write(0xdb); m.write(0x61);   // @9-11 栈垫（非零垃圾——视图不读）
+            for (long rel : relids) put32(m, rel);         // relids @12 起（spike 裁定）
+            return feed(WalBytes.record(HeapOps.RM_HEAP_ID, HeapOps.XLOG_HEAP_TRUNCATE, xid)
+                    .main(m.toByteArray()).build());
+        }
+
         /** 一条 COMMIT。 */
         WalRecord commit(int xid) {
             return feed(WalBytes.xactRecord(HeapOps.XLOG_XACT_COMMIT, xid, 2_000_000_000_000L, 0));
@@ -491,5 +516,13 @@ class ChangeStreamTest {
     private static void put16(ByteArrayOutputStream out, int v) {
         out.write(v);
         out.write(v >>> 8);
+    }
+
+    /** 向流写 little-endian u32。 */
+    private static void put32(ByteArrayOutputStream out, long v) {
+        out.write((int) (v & 0xFF));
+        out.write((int) (v >>> 8) & 0xFF);
+        out.write((int) (v >>> 16) & 0xFF);
+        out.write((int) (v >>> 24) & 0xFF);
     }
 }

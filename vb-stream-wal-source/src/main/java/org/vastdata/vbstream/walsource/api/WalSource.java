@@ -795,6 +795,17 @@ public final class WalSource implements AutoCloseable {
     }
 
     /**
+     * DML 观测面：已发射 TRUNCATE 事件数（不并入 {@link #dmlEmittedRows()}——行口径
+     * 保持纯净；DML 面未装配/尚无记录为 0）。
+     *
+     * @return 会话累计发射 truncate 事件数
+     */
+    public long dmlEmittedTruncates() {
+        ChangeStream cs = changeStream;
+        return cs == null ? 0L : cs.emittedTruncates();
+    }
+
+    /**
      * DML 观测面：截断 UPDATE 行级跳过计数（liveness guard 观测面，Task 8——对拍 IT
      * 的回归哨兵；停机后读安全：close 含接收线程 join，happens-before 成立）。
      *
