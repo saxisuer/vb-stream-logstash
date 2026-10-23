@@ -27,7 +27,11 @@ DML（仅 VastBase 档；库 API `WalSource.startOffline` + Main `-Dvb.wal.mode=
 "离线回放档"节；**M4（2026-10-18 spec，同日 Task 1-9 收官）B 兼容模式（MySQL 风格）
 DML 开门**——护栏白名单按 layout 分档（VastBase {'PG','A','B'} / OG 5.0.0 维持
 {'PG','A'}）+ 13 类型词典/渲染 + attnum -9 修复 + 6B 头裁定不存在（勘误记档），见
-"VastBase G100 档 M4"节）。设计全文见
+"VastBase G100 档 M4"节；**TRUNCATE DML 支持（2026-10-22 spec + spike，2026-10-23
+Task 0-8）——vanilla PG 17/18 独有**（`TruncateView` relids@12 / `resolveByOid` oid 直查 /
+relkind='p' 母表滤除 / `BucketEntry` 桶泛化 / `onTruncate` 契约 engine 逐字节同形 + `trunc=`
+观测；OG 5.0.0 与 VastBase 裁决 C 双路不可见记档——见 v2 DML 面"事务性 TRUNCATE"条目））。
+设计全文见
 `docs/superpowers/specs/2026-10-05-wal-source-module-design.md`、
 `docs/superpowers/specs/2026-10-06-wal-source-v2-design.md` 与
 `docs/superpowers/specs/2026-10-11-wal-source-opengauss-m1-design.md` 与
@@ -36,7 +40,9 @@ DML 开门**——护栏白名单按 layout 分档（VastBase {'PG','A','B'} / O
 `docs/superpowers/specs/2026-10-13-wal-source-vastbase-adaptation-design.md` 与
 `docs/superpowers/specs/2026-10-15-wal-source-offline-replay-design.md` 与
 `docs/superpowers/specs/2026-10-18-wal-source-vastbase-b-mode-m4-design.md`（M4 B 档，
-spike `docs/wal-source-vastbase-b-mode-spike.md` 三轮——差异面/编码锚/6B 头勘误）
+spike `docs/wal-source-vastbase-b-mode-spike.md` 三轮——差异面/编码锚/6B 头勘误）与
+`docs/superpowers/specs/2026-10-22-wal-source-truncate-design.md`（TRUNCATE DML 支持，
+spike `docs/wal-source-truncate-spike.md` 四档裁决——OG/VastBase 双路不可见）
 （M2 DML 面已收官，
 2026-10-12 同日落地——兼容模式护栏[PG 档 only，A/B 档启动期 ISE 附 M3/M4 指引] +
 XACT/MULTI_INSERT/列压缩/分区四接缝 + v2 六场景双路对拍[基准路=OG 逻辑解码]全量验收，
@@ -63,11 +69,11 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | `WalLayout`/`WalLayouts` | `layout` | 版本化布局常量（`WalLayoutV17`/`WalLayoutV18`/`WalLayoutVOpenGauss`/`WalLayoutVVastbase`，逐常量标注 REL_STABLE/og-plan/真库实测出处）；`forServerVersion` 按 `server_version_num` 分发，未注册版本/显式错配布局启动期 ISE fail-fast；OG 档 90204 与 vanilla 9.2 撞号，经 `forServer(int, String)` 以 version() 文本判别；VastBase 档再撞号（无 branding），经 `forServer(int, String, int)` 三参版以 relname attlen 探测判别（见"VastBase G100 档"节） |
 | `WalStreamReceiver` + `WalStreamWalker` + `PhysicalSlotManager` | `receive` | 物理复制流接收（readPending drain 轮询 + 断流指数退避重连 1s→16s、5 次失败停机）；walker 是字节流走读状态机（chunk 拼接/contrecord 缝合/**pageaddr 锚定协议**；**稳态零拷贝（2026-10-17）**——feed 契约：喂后数组不得复用（walker 可能原地移位且 `WalRecord.raw` 引用其字节；三路字节源均为一次性数组））；槽管理（`immediately_reserve=true` 建槽，restart_lsn 自建即保留——推进通道与保留窗口同时成立；OG 变体 `ensureSlotOg`：第二参 dummy_standby） |
 | `WalByteSource` + `FileWalSource`/`ReceivexlogProcess`/`DirectWalSource`（+ direct 子包 `V3ProtocolChannel`/`OgAuth`） | `receive` | **OG 档双通道字节源（M1，详见"openGauss 5.0.0 档"节）**——推模式字节源接口（`start(LongConsumer, BiConsumer<Long,byte[]>)`）；file 通道=sidecar pg_receivexlog 落目录 + FileWalSource tail（managed 自管子进程 / external 只读既有目录）；direct 通道=裸 v3 协议客户端直连收流；**`FileWalSource.staticDirectory` 静态目录档**（离线回放 2026-10-15——启动期审计三项 fail-fast + 清单读尽确定性 EOF + 可选 endLsn 上界，tail 档行为零改动，见"离线回放档"节） |
-| `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码）；**2026-10-17 热路径两接缝**——`WalRecordParser` 增 (buf,recOff) 偏移重载（`WalRecord.raw` 契约放宽为宿主缓冲+绝对偏移，单页记录免缝合拷贝的前置）与 `TupleDecoder` varlenaEnd 终点前置（每 text/numeric/bytea/skip 列的逐列 int[] 分配与每 HASNULL 行位图拷贝归零）；**M4（2026-10-18）**`DecodeKinds` 增 13 oid（uint 族四/year/int1 五定宽 + varlena 族七——clob/nvarchar2→text、blob 族/raw→bytea）+ `TupleDecoder` 五新 kind（uint1/2/4/8/year 黄金字节锚；B 档 varlena 元组 5B 头零改动直解——"6B 头"经第三轮 spike 勘误裁定不存在，见"VastBase G100 档 M4"节） |
+| `WalRecordParser` + `WalRecord`/`BlockRef`/`HeapViews`/`PageImages`/`TupleDecoder`/`DecodeKinds` | `layout` | 记录头/block 头/heap 家族（INS/UPD/DEL/HOT/INPLACE/MULTI_INSERT/PRUNE + **TRUNCATE**——2026-10-23 truncate 线增第七视图 `TruncateView`，vanilla 独有）→ 强类型 record，纯函数；FPW 页镜像重建（hole 拼接 → ItemId 走读 → 页内 tuple 解码）；**2026-10-17 热路径两接缝**——`WalRecordParser` 增 (buf,recOff) 偏移重载（`WalRecord.raw` 契约放宽为宿主缓冲+绝对偏移，单页记录免缝合拷贝的前置）与 `TupleDecoder` varlenaEnd 终点前置（每 text/numeric/bytea/skip 列的逐列 int[] 分配与每 HASNULL 行位图拷贝归零）；**M4（2026-10-18）**`DecodeKinds` 增 13 oid（uint 族四/year/int1 五定宽 + varlena 族七——clob/nvarchar2→text、blob 族/raw→bytea）+ `TupleDecoder` 五新 kind（uint1/2/4/8/year 黄金字节锚；B 档 varlena 元组 5B 头零改动直解——"6B 头"经第三轮 spike 勘误裁定不存在，见"VastBase G100 档 M4"节） |
 | `CatalogSynchronizer` + `CatalogReplay`/`CatalogStores`/`CatalogBootstrap`/`CatalogRow`/`SelfHealer`/`JdbcProbe(Impl)`/`HeapEvent`/`Reconstruction` | `replay` | 通用 ctid 重放引擎（watched 表注册制、relfilenode/toast 跟踪、JDBC 一致性引导、竞速三修正）；单记录施加次序固定 PRUNE → INPLACE → attr 行事件 → class 行事件；**CatalogStores 五二级索引（2026-10-17 热路径：oid/filenode/attrelid/nspOid/partitionFilenode，0 键不入 + 同键最后-put-者胜）+ 写点包装方法 + shapeEpoch 代际戳**（SnapshotView 六查询自字典值域线性扫降 O(1)，shapeEpoch 随行变更自增供消费端懒失效比对）；**`startOffline` 无库装配档**（离线回放 2026-10-15——检查点入口凭证 + 复用运行期管线零复制，见"离线回放档"节） |
 | `StateStore` + `StateConfig` | `state` | 检查点持久化：单文件 `wal-source-state.bin`（magic 'VBWS' + header/ footer 双 CRC + lsn 双验；formatVersion 3 增 `dmlFloorLsn`——DML 待决桶重放下界，Task 11），全量序列化 `.part` → fsync → 原子 rename；损坏/版本不符（含 pgVersion 与 layout 错配——写与 load 校验同 `layout.majorVersion()`，17 写 17、18 写 18）拒载回落全新引导（安全侧：宁可重引导，不可错位窗口重放） |
 | `WalSource`（api 门面）+ `CatalogSnapshot` | `api` | 一次 `start()` 装配全管线（SQL 会话 → 版本分发 → 同步器），`consumedLsn()`/`metrics()`/`lastCheckpointLsn()`/`lastSlotAdvanceLsn()`/`resumedFromState()` 观测面——v2 起接收 sink 单 pass 分发两消费者（catalog 先施加、DML 后解码，as-of 次序天然成立）；v2 DML 配置面 `vb.wal.tables`/`vb.wal.dml` 与发射计数观测同在此门面；**OG 档（M1）**判别命中 `instanceof WalLayoutVOpenGauss`（VastBase 子类同命中，vastbase T4）时转 `startOpenGauss`（`vb.wal.og.*` 五键——见"openGauss 5.0.0 档"节；内含**兼容模式护栏按 layout 分档**——M4 起 VastBase 档 {'PG','A','B'} / OG 5.0.0 维持 {'PG','A'}，'C' 两档均拒，见"VastBase G100 档 M4"节）；**离线回放档（2026-10-15）**`startOffline()`（与 start 互斥——`vb.wal.offline.dir/endLsn` 两键 + `eofReached()` 终态位，见"离线回放档"节） |
-| `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`Lz4`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/lz4/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger |
+| `ChangeStream` + `XactGrouper`/`TableFilter`/`ToastAssembler`/`ToastProbe(Impl→JdbcToastProbe)`/`Pglz`/`Lz4`/`DiskValueRenderer`/`PgFloatFormat`/`OutputRenderer`/`ChangeOutputListener` | `changes` | **v2 DML 面**（详见下节"v2 DML 面"）——TableFilter 白名单过滤 → XactGrouper 事务组装（提交时批量发射）→ TOAST 重组三形态（external 未压缩/pglz/lz4/行内压缩）+ 窗口前指针回查兜底 → 磁盘格式值渲染 PG text → OutputRenderer 复刻 engine `ConsoleRenderer` 事务块格式输出 CDC logger；**事务性 TRUNCATE 事件（2026-10-23——vanilla 17/18 独有，OG/VastBase 双路不可见记档）见 v2 DML 面"事务性 TRUNCATE"条** |
 
 单线程直通执行模型（接收 → 解析 → 重放/解码 → 周期落盘全在 wal-receiver 线程，sink
 同步执行——检查点取当前已消费 LSN 即天然一致点，无需快照冻结）；组件接口化留解耦位。
@@ -112,16 +118,16 @@ NOP 静默零日志；runtime 不进编译面，库形态宿主自带绑定/配�
 | 类 | 职责 |
 |---|---|
 | `ChangeStream` | DML 门面：单入口 `onRecord(WalRecord)`，WalSource sink 分发的第二消费者（catalog 同步器之后）；内建组装三件套装配（ToastAssembler probe 取 SQL 会话建 JdbcToastProbe，null 连接 = 纯回放禁回查档） |
-| `XactGrouper` | 事务组装状态机：heap I/U/D 行入桶累积（到达期解码 + 渲染），XACT 终态驱动发射/弃桶/挂起；子事务归并双通道（TOPLEVEL_XID 收割优先 + ASSIGNMENT 兜底）；TableMeta 按 relfilenode 缓存（2026-10-17 起失效两条触发键：shape-oid 字典记录到达即清 + `shapeEpoch` 代际戳变化时 `resolveCached` 入口懒全清[bootstrap/PRUNE/INPLACE 等不经 shape-oid 的字典变更兜底全覆盖]，toastRels 判定缓存随同清理——长会话单调增长关闭） |
-| `TableFilter` | relkind 'r'/'p' + `vb.wal.tables` 白名单（`schema.table` 逗号分隔，空 = 全放行）；从 v1 三表字典 as-of 解析表身份与列序 |
+| `XactGrouper` | 事务组装状态机：heap I/U/D 行入桶累积（到达期解码 + 渲染），事务性 TRUNCATE（RM_HEAP opcode 0x30，零块引用——`dispatchHeap` 头部 case 先于 blocks 早退，2026-10-23 truncate 线）同桶入 `TruncateEntry`（表集/选项到达期定格；桶条目泛化 sealed `BucketEntry` 行/truncate 两实现——`recLsn` 稳定排序跨类保真 DML/truncate 混排次序、aborted 扣减/2PC/floor/离线回放既有桶机制白拿，`emittedTruncates` 独立计数不并入 rows）；XACT 终态驱动发射/弃桶/挂起；子事务归并双通道（TOPLEVEL_XID 收割优先 + ASSIGNMENT 兜底）；TableMeta 按 relfilenode 缓存（2026-10-17 起失效两条触发键：shape-oid 字典记录到达即清 + `shapeEpoch` 代际戳变化时 `resolveCached` 入口懒全清[bootstrap/PRUNE/INPLACE 等不经 shape-oid 的字典变更兜底全覆盖]，toastRels 判定缓存随同清理——长会话单调增长关闭） |
+| `TableFilter` | relkind 'r'/'p' + `vb.wal.tables` 白名单（`schema.table` 逗号分隔，空 = 全放行）；从 v1 三表字典 as-of 解析表身份与列序；`resolveByOid` oid 直查三闸入口（truncate 载荷键是 oid——**不经 relfilenode 反查**，EXCHANGE 换绑段号/oid 数值碰撞面防误属主，2026-10-23） |
 | `ToastAssembler` | TOAST 重组：toast 关系 chunk 行采集（valueid→seq→bytes TreeMap）+ external 18B 指针剥解（rawsize/extinfo/valueid/toastrelid）+ pglz/lz4 双方法解压（`inflate` 分派面）+ 窗口前指针 JDBC 回查兜底 + unchanged-TOAST 哨兵 + **INSERT 新元组空面回查视图**（`insertTupleResolver`——重放窗口切断 chunk 的补全通道，2026-10-13 flake 根因修复）；实现 `TupleDecoder.VarlenaResolver` 接缝（external 指针 + 行内压缩 varlena 同一解压面） |
 | `Pglz` | PG pglz 解压纯移植（`pg_lzcompress.c` 主循环逐行转录，control byte 分组 + match 回拷，L705-790 源码锚） |
 | `Lz4` | lz4 裸 block 解压（lz4-java safeDecompressor 定长目标形态；PG `toast_decompress_datum`→`LZ4_decompress_safe` 同格式，JNI 优先纯 Java回落；2026-10-07 随 lz4 值面支持引入） |
 | `DiskValueRenderer` | 磁盘格式值 → PG text（17 类型首发矩阵：bool/int2/int4/int8/float4/float8/numeric/text/varchar/bpchar/json/bytea/date/time/timetz/timestamp/timestamptz/uuid；矩阵外 `0x` + WARN 一次、dropped 列 ∅；**2026-10-17 三参版 `render(decoded, oid, RenderOptions)`**——float plain 定点展开 + date/time 自定义 pattern 三族分支，两参版委托 `RenderOptions.PG` 逐字节不变；**M4（2026-10-18）+13 oid**——uint 族/year/int1 十进制（uint8 `Long.toUnsignedString`）、clob/nvarchar2 透传、raw 大写 hex 无前缀、blob 族 `\x`+小写 hex 有意分叉——渲染 oid 键控（blob/raw 复用 bytea kind，spec"raw 新 kind"的简化落地），见"VastBase G100 档 M4"节） |
 | `RenderOptions` | **渲染面四键载体（2026-10-17 配置化）**：`vb.wal.render.float.style/date.format/time.format/truncate` 四键解析（缺省 pg 档 + 64——对拍锚）与穿线（门面 → ChangeStream → XactGrouper → DiskValueRenderer；OutputRenderer 消费 truncateLimit）；`default` 内建档 date=`yyyy-MM-dd HH:mm:ss`/time=`HH:mm:ss`；非法档位/pattern/负阈值构造期 IAE 附键名 |
 | `PgFloatFormat` | PG 风格浮点格式化器（Ryū 最短往返 + %g 定点门限——`1e+20`/`0.0001`/`-0`，补 `Double.toString` 的 `1.0E20` 分叉；前提会话 `extra_float_digits=1` 缺省档） |
-| `OutputRenderer` | pending 缓冲 + TXN-BEGIN/逐行/TXN-END 输出（**engine `ConsoleRenderer` 格式复刻契约**——头行 changes 终值在 End 组装、值截 64 附 `...(NB)`、dropped ∅/NULL 字面同形）；onAborted 丢桶零输出 |
-| `ChangeOutputListener` | 中立事件接口：`BatchBegin`/`RowChange`/`BatchEnd`(expectedChanges)/`BatchAborted`；**2026-10-17 RowChange 增位址三字段**（xid/commitLsn/lsn——END 发射期由 Grouper 重建填充，行级 heap 记录位址；originXid 仍私有） |
+| `OutputRenderer` | pending 缓冲 + TXN-BEGIN/逐行/TXN-END 输出（**engine `ConsoleRenderer` 格式复刻契约**——头行 changes 终值在 End 组装、值截 64 附 `...(NB)`、dropped ∅/NULL 字面同形）；`onTruncate` 渲 `TRUNCATE [schema.t, ...] options=[...]`（options 恒 EnumSet 声明序——engine 逐字节同形，2026-10-23）；onAborted 丢桶零输出 |
+| `ChangeOutputListener` | 中立事件接口：`BatchBegin`/`RowChange`/`BatchEnd`(expectedChanges)/`BatchAborted`；**2026-10-17 RowChange 增位址三字段**（xid/commitLsn/lsn——END 发射期由 Grouper 重建填充，行级 heap 记录位址；originXid 仍私有）；**2026-10-23 增 `TruncateEvent`/`onTruncate` 契约**（Begin/End 之间与 onRow 同缝互排按 WAL 序；自有枚举 `TruncateOption` 声明序=engine、options 经 EnumSet 拷贝保迭代序——toString 渲染与 engine 逐字节同形的保证，`Set.copyOf` 迭代序无规格保证不可用） |
 
 **双路对拍契约与执行机制**：输出格式以 engine `ConsoleRenderer` 为**契约源**（streaming
 形态的 TXN-BEGIN/逐行/TXN-END 三段样板 + 行值截断规则），改动需双端同步（debezium19
@@ -137,7 +143,11 @@ UPDATE）②17 类型边界值矩阵 ③TOAST 三存储形态 + 重启后未变�
 `<toast-unchanged>` ④事务内 ADD COLUMN 前后段 as-of ⑤2PC 四形态（挂起零输出/弃桶/
 COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 重发双路一致）；
 矩阵外补充：流内 CREATE SCHEMA（nsp 字典面）+ 干扰矩阵（catalog 风暴线程下场景 1/TOAST
-复跑 ×2）。parity 环境定 `logical_decoding_work_mem=64MB` 禁驱逐（两侧都走 NORMAL 形态）。
+复跑 ×2）+ **TRUNCATE 语句矩阵**（2026-10-23 truncate 线——单表/单事务混排次序[INSERT→TRUNCATE→
+INSERT 按 WAL 序钉]/多表一语句/RESTART IDENTITY 含 owned 序列[序列重启走前置 RM_SEQ 记录，两路
+透明]/分区母表 TRUNCATE[WAL relids 含母表而两路皆滤 relkind='p' 只出叶]/双位选项/回滚零输出；
+双位 options 的 engine 侧 `Set.copyOf` 迭代序 JVM run 间漂移 vs wal 侧 EnumSet 恒声明序——对拍
+parse 面排序归一承载，归一器自身以两种序输入钉确定锚）。parity 环境定 `logical_decoding_work_mem=64MB` 禁驱逐（两侧都走 NORMAL 形态）。
 
 **关键机制**：
 
@@ -163,12 +173,35 @@ COMMIT PREPARED/挂起重启续传）⑥普通 DML 中途停续（at-least-once 
   旧元组字节拼装重建（Task 8.5）；非 FULL 保留 liveness guard（行级跳过 + WARN/表 +
   skipped 计数）。逻辑流下省略门与 CONTAINS_OLD 互斥（heapam.c 实源钉），双计数恒 0 作
   回归哨兵。
+- **事务性 TRUNCATE**（2026-10-22 spec/spike、2026-10-23 落地——**vanilla PG 17/18 独有**，
+  spec `2026-10-22-wal-source-truncate-design.md` + spike `docs/wal-source-truncate-spike.md`）：
+  RM_HEAP_ID opcode **0x30** 记录（零块引用——`dispatchHeap` 头部 case 先于 blocks 早退；写点
+  tablecmds.c `ExecuteTruncateGuts`，**仅 wal_level≥logical 时写**[源码 Assert，与 DML 面既有前提
+  一致零新增护栏]）→ `TruncateView` 解析（dbId u32@0 / nrelids u32@4 / flags u8@8 / **@9-11 未初始化
+  栈垫不读不校验** / relids **oid 数组** u32×n@12 起——`Oid relids[]` 4 对齐使 SizeOfHeapTruncate=12，
+  spike 黄金字节裁定；`mainLen == 12+4nrelids` 精确等式自检；**序列重启（PG 10+）走前置 RM_SEQ
+  记录、relids 无尾随**——heapam_xlog.h "followed by sequence relids" 注释系 pre-PG10 残留）→
+  逐 oid `TableFilter.resolveByOid` 三闸 + **relkind='p' 分区母表滤除**（对齐 pgoutput 'T' 帧母表
+  缺席——spike §5.2-2，WAL relids=[母,p1,p2] vs engine 渲 [p1,p2]，不滤必 diff）→ 过滤后表集
+  （payload 序）+ options（EnumSet 声明序）入桶 `TruncateEntry`；**全 miss 零记账零追加**（对齐
+  pgoutput 服务端 nrelids==0 不发 'T' 帧语义）；桶条目泛化 sealed `BucketEntry`（行/truncate 两实现
+  ——recLsn 稳定排序跨类保真混排次序、aborted 子回滚扣减/整桶弃/2PC 挂起续传/pendingFloorLsn/
+  离线回放**全部既有桶机制白拿零新增状态机**）；`OutputRenderer.onTruncate` 渲 `TRUNCATE
+  [schema.t, ...] options=[...]` 与 engine 逐字节同形；观测面 `emittedTruncates`（**不并入 rows**）
+  穿线 ChangeStream/WalSource + Main 冒烟行 `trunc=`。**OG 5.0.0 与 VastBase（A 档实锚/B 档内核
+  同一性外推）裁决 C 双路不可见**——WAL 纯 catalog 手术（rmid=10 全窗零 0x30）+ 逻辑流不发 'T' 帧
+  （TRUNCATE 事务解码为空 B..C 块），**正式行为锚而非缺陷**（零代码零护栏记档；`RESTART IDENTITY`
+  两档 SQL 层均拒绝——`PGXC does not support` / `only supported in PG compatibility`）；截断的
+  pg_class 换段号 UPDATE 先于 heap truncate 记录到达，截后行按新段号正常解析（"截后字典不倒"
+  OG/VastBase IT 同钉）。
 
 **场景支持矩阵**（v2 终局盘点——支持 = 双路对拍验收过；不支持 = 触发时的处理方式）：
 
 | 场景 | 支持状态 | 不支持时的处理方式 |
 |---|---|---|
 | **INSERT / UPDATE / DELETE**（wal_level=logical + REPLICA IDENTITY FULL） | ✅ 双路对拍逐字节等价 | — |
+| **TRUNCATE**（事务性——单语句多表/CASCADE/RESTART IDENTITY 含 owned 序列/分区母表/回滚/与 DML 混排次序） | ✅ 双路对拍逐字节等价（**vanilla 17/18 独有**，spike 裁决 A；DualPathParityIT TRUNCATE 语句矩阵 + 离线矩阵，2026-10-23） | — |
+| **TRUNCATE 事件（OG 5.0.0 / VastBase 档）** | ❌ 双路不可见（**服务端能力非缺陷**——spike 裁决 C：WAL 纯 catalog 手术零专用记录 + 逻辑流不发 'T' 帧空 B..C 块；B 档按内核同一性外推） | 零事件不砖流（OgDmlParityIT/VastDmlParityIT 场景 7 语义钉——截后 DML 字典正确性同钉）；`RESTART IDENTITY` 两档 SQL 层拒绝——正式行为锚记档 |
 | **事务组装**：普通/交错/SAVEPOINT 子事务回滚剔除/整体回滚零输出 | ✅ 场景 1 | — |
 | **两阶段提交**：PREPARE 挂起/COMMIT PREPARED 发射/ROLLBACK PREPARED 弃/挂起重启续传 | ✅ 场景 5（kind=TWO_PHASE + gid 双路一致） | — |
 | **TOAST**：external 重组/pglz 与 lz4 解压/行内压缩/UPDATE 未变列 `<toast-unchanged>`/重启后窗口前指针 probe 回查 | ✅ 场景 3（三存储形态 + 重启回查）+ lz4 专项场景（`SET COMPRESSION lz4` 双形态，2026-10-07） | — |
@@ -527,7 +560,9 @@ REPLICA IDENTITY FULL 传播分区行；白名单四形态[母表名基准/分�
 都不中——每形态独立全量 reset，防共表连续跑的跨用例重放尾窗污染桶计数]；流内
 ADD·DROP PARTITION 竞速 as-of；EXCHANGE 后 TableMeta 失效双向身份钉；UPDATE 跨分区
 迁移 DELETE+INSERT 两行形态）、`OgDmlParityIT` 27（= M2 13 场景 × PG/A + A 专形
-date 1）、`OgCompatGuardIT` 3（m2b B 档 ISE + 槽副作用缺席 / A 档放行 / A 档列存表
+date 1；**2026-10-22 truncate 线 +1 场景 7 → 28**——OG 档 TRUNCATE 双路不可见语义钉[仅 PG 档
+参数化：零桶零发射 + 基准路恰 2 空 B..C 块 + 截后字典不倒 + 不砖流，spike 裁决 C]）、
+`OgCompatGuardIT` 3（m2b B 档 ISE + 槽副作用缺席 / A 档放行 / A 档列存表
 ISE）、`OgParitySmokeIT` 2（单事务冒烟 + 分区冒烟）；M1 五组 IT 零改动全绿。
 
 **已知限制（M3 增量）**：B/'C' 档整库不支持（ISE 附 M4 指引——B 档 MySQL 风格归
@@ -573,11 +608,14 @@ openGauss/VastBase branding**（branding 只在 `v$version` 视图）且 `server
 **验收（手动档 IT，`-Dvb.it.vastbase=true`，连真库 172.16.107.133:55433/test_a——非
 Testcontainers 长活共享环境；常规 `mvn test` 全 skip）**：`VastCatalogSyncIT` 2（干扰 + 全
 DDL 场景四字典 vs JDBC REPEATABLE READ 逐行全等——对拍器包内自持复刻 `WalSyncItBase` 语义
-+ pg_partition 行级/身份链两面 + 门面判别链 v6 检查点排他锚）、`VastDmlParityIT` 15（v2
++ pg_partition 行级/身份链两面 + 门面判别链 v6 检查点排他锚）、`VastDmlParityIT` 16（v2
 六场景 + A 档 date 专形 + **COPY 批量 MULTI_INSERT 真几何[T7 补]**——基准路 = opengauss-jdbc
 逻辑流 + `OgParityBaseline` 复用[T0 spike 裁定"同形"：认证 md5 码 5 一次过、B 帧 xid Int64/
 TupleData Int16 ncols 前缀两处帧级差异原样成立]、DDL-in-txn 双块全量 parity[VastBase 解码器
-不丢弃 DDL 后续行——与 OG 的静默丢弃裁定反转]、2PC/中途停续 state.dir 两轮）、`VastLifecycleIT`
+不丢弃 DDL 后续行——与 OG 的静默丢弃裁定反转]、2PC/中途停续 state.dir 两轮；**2026-10-22
+truncate 线 +场景 7——VastBase 档 TRUNCATE 双路不可见语义钉[spike 裁决 C 记录面实锚 rmid=10
+全窗零 0x30；断言面与 OgDmlParityIT 场景 7 同构]——代码落地，**执行面延期记档**（见测试面
+"待复验持久锚"）**）、`VastLifecycleIT`
 3（检查点续传两轮启停对拍 / state 截断回落全新引导 / 门面全装配 direct 通道两轮启停——对拍
 断言复用 `VastCatalogSyncIT.assertVastCatalogMatchesJdbc` 包内共享面）。环境/连接参数经
 `-Dvb.it.vastbase.{host,port,db,user,pass}` 可覆盖（缺省真库实测值，`VastTestEnv` 单一来源）。
@@ -591,7 +629,10 @@ branding 发行版仍拒（探测假阳性面：未来 NAMEDATALEN=128 的其他
 scale 值避开；方言渲染分支（wal 路按档切文本风格）记档归后续任务；③INIT_PAGE + CONTAINS_OLD
 的 UPDATE/DELETE 前像偏移是**离线手造字节锚**（OgXactGrouperSeamTest 双档用例——真库该
 角落未独立构造，推导形态与 OG INSERT INIT_PAGE 探针同型）；④file 通道（pg_receivexlog
-sidecar）未在 VastBase 专项验证（direct 通道真库全链验证）。
+sidecar）未在 VastBase 专项验证（direct 通道真库全链验证）；⑤**TRUNCATE 双路不可见**（A 档
+实锚 rmid=10 零 0x30 / B 档按内核同一性外推——spike 裁决 C，**正式行为锚非缺陷**；`RESTART
+IDENTITY` A 档 SQL 层拒绝，PG 档库理论可达但真库无 PG 档库未采样）——TRUNCATE 事件捕获是
+vanilla 17/18 档独有能力。
 
 ## VastBase G100 档 M4（B 兼容模式 DML 开门，2026-10-18 spec / 同日 Task 1-9 收官）
 
@@ -839,9 +880,10 @@ DML 两键照常生效。
 冒烟 Main 周期行（10s，logger `org.vastdata.vbstream.walsource.Main`）：
 `smoke: lsn=… records=N resyncs=N reconnects=N censusTop3=[rmid/XX=count,…]`，state
 启用时追加 `ckpt=LSN adv=LSN`（二者相等即"落盘后必推过"，落后即推进失败被 WARN
-吞掉的形态），DML 面启用时追加 `dml=[buckets=N rows=M partMiss=K]`（ChangeStream 会话
+吞掉的形态），DML 面启用时追加 `dml=[buckets=N rows=M partMiss=K trunc=T]`（ChangeStream 会话
 累计发射计数——过滤后实付口径；`partMiss`= OG 档分区身份链断 fail-safe 跳过计数
-[vanilla 恒 0]，M3 T6 透出）。启动失败 ERROR + exit 1；接收器终态死亡（5 次重连失败/解析
+[vanilla 恒 0]，M3 T6 透出；`trunc`= truncate 事件计数——不并入 rows 的独立口径，
+2026-10-23 truncate 线）。启动失败 ERROR + exit 1；接收器终态死亡（5 次重连失败/解析
 ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 best-effort 检查点 +
 槽推进）。DML 数据输出走 CDC 专用 logger `org.vastdata.vbstream.walsource.cdc`（INFO，
 与 engine 的 `org.vastdata.vbstream.cdc` 分流惯例同构）。
@@ -849,11 +891,19 @@ ISE）周期行检测 → ERROR + exit 1；Ctrl-C hook 优雅 close（含最终 
 ## 测试面
 
 `mvn test -pl vb-stream-wal-source` 单命令全跑（surefire 显式补 `**/*IT.java`）：
-**581 用例 = 离线 454 + Testcontainers IT 99（PG 41 + openGauss 58；需本机 Docker）+
-VastBase 手动档真库 IT 28（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
+**603 用例 = 离线 473 + Testcontainers IT 101（PG 42 + openGauss 59；需本机 Docker）+
+VastBase 手动档真库 IT 29（`it/vastbase` 包——常规跑全 skip，`@EnabledIfSystemProperty`
 计入 Tests run/Skipped；Windows 开发机另有环境性存量 7 例已知记档：FileWalSourceTest
 6[.partial rename 撞 Windows 文件锁] + OgDualChannelParityIT 1[file 通道 sidecar 追平
 超时]——pg_receivexlog 文件通道族在 Windows 的已知限制，非回归）**
+（2026-10-23 TRUNCATE DML 支持收口 +22：离线 +19[TruncateViewTest 新 6——四档黄金字节/
+错配 ISE/越界与尾随字节负例；XactGrouperTest +8——入桶与 expectedChanges 记账/混排次序/
+回滚整桶弃/子回滚扣减/白名单 per-table 部分命中/全 miss 零记账/truncate-only 事务 floor/
+母表 oid 滤除；TableFilterTest +2——resolveByOid 三闸语义与 relfilenode 反查豁免；OutputRenderer
+Test +2——engine 同形字面与双位声明序；ChangeStreamTest +1——emittedTruncates 穿线不并入
+rows] + IT +2[DualPathParityIT +1 TRUNCATE 语句矩阵；OgDmlParityIT +1 场景 7 OG 档双路
+不可见] + 手动档 +1[VastDmlParityIT 场景 7——代码落地、真库双故障执行面延期记档，见下
+"待复验持久锚"]——离线 454→473、IT 99→101[PG 41→42 + OG 58→59]、手动档 28→29、总 581→603）
 （2026-10-18 M4 收口 +12：离线 +8[TupleDecoderTest +3——五定宽 kind 黄金字节[uint8 8B
 对齐垫 4 零]/B 档 varlena 5B 头直解锚[原 Task 2 并入]/13 oid 映射含 enum 负例；
 DiskValueRendererTest +2——server-text 同形 9 型/blob 族 `\x` 分叉；WalLayoutVVastbase
@@ -888,7 +938,9 @@ WalStreamWalkerTest +2[feed 稳态零拷贝/单页记录偏移直读免缝合] +
 离线 438→446、总 561→569）
 
 - **离线**（秒级）：`layout` 手造字节走读（WalRecordParserTest 13（2026-10-17 +1 (buf,recOff) 偏移重载绝对偏移契约）/ TupleDecoderTest 20（2026-10-18 M4 +3：五定宽 kind 黄金字节——uint8 8B 对齐垫 4 零 / B 档 varlena 5B 头直解锚[原 6B 头 Task 2 勘误后并入] / 13 oid 映射含 enum 负例）
-  / HeapViewsTest 12 / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
+  / HeapViewsTest 12 / **TruncateViewTest 6（2026-10-23 truncate 线：vanilla 黄金字节单表/
+  多表双选项位[spike §1.2 锚] + rmid/opcode 错配 ISE + relids 越界/mainLen 过短/声明外
+  尾随字节三负例）** / PageImagesTest 6 / WalLayoutV17Test 9 / WalLayoutV18Test 9——含
   "两版 toast 偏移差恰 4B"自检锚；**OG 档**：OgWalRecordParserTest 4（真实语料 283 条
   全窗走读 + 四锚记录 + prev 链自洽）/ OgPruneViewTest 6（9.2 系 CLEAN 老格式 + 撞号
   门控）/ WalLayoutVOpenGaussTest 5 / WalLayoutsOgDiscriminatorTest 6（90204 撞号
@@ -926,14 +978,19 @@ WalStreamWalkerTest +2[feed 稳态零拷贝/单页记录偏移直读免缝合] +
   往返 + OG 档 majorVersion=5；**M3：formatVersion 4 第四字典序列化往返 + v3 检查点
   拒载回落全新引导**；**2026-10-15：`StoredState.pgVersion` 回读往返——离线档位判定的
   供数面，decode 自 header 填充不改 VBWS 格式**）/ StateConfigTest 5；`changes`（v2 DML 面：
-  DiskValueRendererTest 25（2026-10-17 +5 渲染选项档：plain float/date pattern 三族/timestamptz 时区字母/time 与 timetz 偏移/24:00:00 特判；2026-10-18 M4 +2：server-text 同形 9 型/blob 族 `\x` 有意分叉）/ XactGrouperTest 23（含 M2 T7 修复 A 的 MULTI_INSERT
-  SHORTALIGN 真几何锚；2026-10-17 +1 shapeEpoch 代际戳变化懒全清锚）/ ToastAssemblerTest 16（含 lz4 双形态
-  解压往返与未知方法码 ISE）/ OutputRendererTest 9（2026-10-17 +2 截断阈值 0/自定义）/ TableFilterTest 17（M2 T5 OG 档
+  DiskValueRendererTest 25（2026-10-17 +5 渲染选项档：plain float/date pattern 三族/timestamptz 时区字母/time 与 timetz 偏移/24:00:00 特判；2026-10-18 M4 +2：server-text 同形 9 型/blob 族 `\x` 有意分叉）/ XactGrouperTest 31（含 M2 T7 修复 A 的 MULTI_INSERT
+  SHORTALIGN 真几何锚；2026-10-17 +1 shapeEpoch 代际戳变化懒全清锚；**2026-10-23 truncate 线
+  +8：truncate 入桶与 expectedChanges 记账/混排按 WAL 序/回滚整桶弃/子回滚扣减/白名单
+  per-table 部分命中/全 miss 零记账/truncate-only 事务 pendingFloor 参与位/母表 oid 滤除**）/ ToastAssemblerTest 16（含 lz4 双形态
+  解压往返与未知方法码 ISE）/ OutputRendererTest 11（2026-10-17 +2 截断阈值 0/自定义；**2026-10-23
+  truncate 线 +2：`TRUNCATE [public.t1] options=[]` engine 同形字面 + 双位恒声明序
+  `[CASCADE, RESTART_IDENTITY]`**）/ TableFilterTest 19（M2 T5 OG 档
   parttype 判别闸——V17/V18 用例零改动零回归；**M3：分区身份链四用例[母表身份/白名单
   双匹配含分区名不外溢负例/链断 WARN 恰一次+计数/vanilla 无视分区链] + EXCHANGE 换绑
-  段号 oid 碰撞属主优先双向锚，T5 修复**）/
+  段号 oid 碰撞属主优先双向锚，T5 修复**；**2026-10-23 truncate 线 +2：resolveByOid
+  直查普通表三闸语义 + relfilenode 反查豁免[oid 碰撞面]**）/
   PgFloatFormatTest 11（2026-10-17 +4 plain 档展开锚）/ PglzTest 5 / Lz4Test 6（lz4 裸 block：手造黄金字节 +
-  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 9（2026-10-17 +1 RenderOptions 穿线 seam +1 RowChange 位址三字段）；**渲染面：RenderOptionsTest 6（2026-10-17 四键解析矩阵）；OG 档（M2）**：
+  库压缩器往返 + 截断/长度不符 ISE）/ ChangeStreamTest 10（2026-10-17 +1 RenderOptions 穿线 seam +1 RowChange 位址三字段；**2026-10-23 truncate 线 +1：emittedTruncates 穿线递增且不并入 emittedRows**）；**渲染面：RenderOptionsTest 6（2026-10-17 四键解析矩阵）；OG 档（M2）**：
   OgXactGrouperSeamTest 7（OG XACT 接缝——终态 subxacts 归并/COMMIT_COMPACT/2PC 面，
   T2；**+2 INIT_PAGE + CONTAINS_OLD 的 UPDATE/DELETE 旧元组偏移角落——OG 13/11+8 与
   VastBase 21/19 常态 + INIT_PAGE 29/27 双档，`ogInitShift` 的 +8 面（vastbase T7 补钉，
@@ -958,7 +1015,7 @@ WalStreamWalkerTest +2[feed 稳态零拷贝/单页记录偏移直读免缝合] +
   ModuleBuildTest 1。
 - **IT**（postgres:18 `WalTestEnv`/`Interference`/`ParityEnv` + postgres:17
   `Wal17TestEnv` 矩阵，`WalSyncItBase` 对拍器 = 停流后 ctid 键控行字典 vs JDBC
-  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 20（v2 双路对拍——engine
+  REPEATABLE READ 实查**逐行全等**）：`DualPathParityIT` 21（v2 双路对拍——engine
   逻辑解码路 in-process vs wal 直解路 DML 面同容器对拍，xid 交集逐行 diff 空：场景
   1 系基础 DML 六形态 + 类型矩阵边界值 + DDL-in-txn as-of + TOAST 三存储形态/重启
   unchanged + 2PC 四形态 + **普通 DML 中途停续（Task 12——at-least-once 重发双路一致，
@@ -966,12 +1023,15 @@ WalStreamWalkerTest +2[feed 稳态零拷贝/单页记录偏移直读免缝合] +
   （Task 4 延期清账）+ 干扰矩阵（Task 12——catalog 风暴线程[autovacuum toggle +
   ANALYZE 循环]下场景 1/TOAST 复跑 @RepeatedTest(2)）** + lz4 压缩列双形态值面
   （2026-10-07：`SET COMPRESSION lz4` external/行内 lz4，`pg_column_compression`
-  钉前提）、`WalReceiveTest` 6（接收
+  钉前提）+ **TRUNCATE 语句矩阵（2026-10-23 truncate 线——单表/单事务混排次序/多表
+  一语句/RESTART 含 owned 序列[RM_SEQ 前置透明]/分区母表滤母表只出叶/双位选项 parse
+  序归一/回滚零输出；wal 路五条字面锚 + 母表名全程零出现 + 恰 7 块 + 混排块行序钉）**、
+  `WalReceiveTest` 6（接收
   锚定 + 杀后端原地重连 + 首连失败）、`WalAdversarialIT` 3（autovacuum 拉满/ANALYZE
   风暴/随机 CHECKPOINT 干扰下 DDL 全场景对拍，@RepeatedTest(2) + RENAME 最小复现）、
   `WalLifecycleIT` 5（检查点续传/损坏回落全新引导/丢页末态追平 resyncs==0/门面全装配/
   引导窗口并发 DDL 不丢行）、`Wal17SyncIT` 7（17 对抗精简版 + 生命周期 + 跨版本分发
-  拒绝与 V18 注入 fail-fast 零副作用）；**openGauss 档 58 用例**（`opengauss/opengauss:5.0.0`
+  拒绝与 V18 注入 fail-fast 零副作用）；**openGauss 档 59 用例**（`opengauss/opengauss:5.0.0`
   `OgTestEnv` 单例——M1 五组：`OgCatalogSyncIT` 1 / `OgLifecycleIT` 3 /
   `OgInstanceSurvivalIT` 1 / `OgGoldenWireIT` 1 / `OgDualChannelParityIT` 1；**M2 四组
   （2026-10-12）**：`OgParitySmokeIT`（对拍冒烟）/ `OgDmlParityIT`（v2 六场景 OG
@@ -980,17 +1040,37 @@ WalStreamWalkerTest +2[feed 稳态零拷贝/单页记录偏移直读免缝合] +
   **M3（2026-10-13）**：`OgParitySmokeIT` 增至 2（+分区冒烟）/ `OgDmlParityIT` 增至
   27（13 场景参数化 PG/A 双库 + A 专形 date）/ `OgCompatGuardIT` 增至 3（+A 档列存表
   ISE）/ 新增 `OgPartitionIT` 16（分区专项 PG+A 双档——详见"openGauss 5.0.0 档 M3"
-  节验收段））；**VastBase 手动档 28 用例（2026-10-13 vastbase T5-T7 + 2026-10-15 离线回放
-  + 2026-10-18 M4，`it/vastbase` 包
+  节验收段）；**2026-10-22 truncate 线 +1**：`OgDmlParityIT` 增至 28——场景 7 OG 档
+  TRUNCATE 双路不可见语义钉[仅 PG 档参数化：wal 路零桶零发射[接收前沿越过末笔后精确
+  断言] + 基准路恰 2 空 B..C 块 + 截后字典不倒 + 不砖流，spike 裁决 C]）；**VastBase
+  手动档 29 用例（2026-10-13 vastbase T5-T7 + 2026-10-15 离线回放 + 2026-10-18 M4 +
+  2026-10-22 truncate 线场景 7，`it/vastbase` 包
   `VastTestEnv` 真库静态单例——非 Testcontainers，`-Dvb.it.vastbase=true` 才跑，常规
   `mvn test` 全 skip）**：`VastCatalogSyncIT` 2（T5：干扰 DDL 四字典对拍 + 门面判别链
-  v6 排他锚——对拍器包内自持复刻 `WalSyncItBase` 语义）、`VastDmlParityIT` 15（T6 六
+  v6 排他锚——对拍器包内自持复刻 `WalSyncItBase` 语义）、`VastDmlParityIT` 16（T6 六
   场景 + A 档 date 专形 + T7 补 COPY 批量 MULTI_INSERT 真几何——基准路复用
-  `OgParityBaseline`）、`VastLifecycleIT` 3（T7：检查点续传两轮启停对拍 / state 截断
+  `OgParityBaseline`；**2026-10-22 truncate 线 +场景 7 VastBase 档双路不可见语义钉
+  [断言面与 OgDmlParityIT 场景 7 同构]——代码落地、执行面延期记档，见下"待复验
+  持久锚"**）、`VastLifecycleIT` 3（T7：检查点续传两轮启停对拍 / state 截断
   回落全新引导 / 门面全装配 direct 通道两轮启停）、`VastOfflineIT` 4（2026-10-15 离线
   回放：在线/离线按 xid 交集逐块全等 / 离线→在线双向回切 / 离线中崩溃再离线续传 /
   endLsn 截停——段目录经 `WalSegmentRecorder`[测试树工具，DirectWalSource 收流按 LSN
-  落段]独立收集，详见"离线回放档"节）、`VastBModeIT` 4（2026-10-18 M4 B 档专形四场景
+  落段]独立收集，详见"离线回放档"节；**2026-10-22 truncate 线起用例 1 在线窗口含
+  TRUNCATE——两路 `dmlEmittedTruncates` 恒 0 离线零事件一致性钉 + 截后新段号行双路
+  正常解析[4/4 真库绿]**）、`VastBModeIT` 4（2026-10-18 M4 B 档专形四场景
   ——13 类型全矩阵[对拍 9 型 + blob 族 wal 路字面锚] / `''` 保留与 datetime 微秒截断 /
   varlena 混合 + TOAST 宽值 / 新类型前像；`VastBEnv` test_b 55443 独立 env + 连接重试环，
   详见"VastBase G100 档 M4"节验收段）。
+
+**待复验持久锚（2026-10-23 truncate 线记档——VastDmlParityIT 场景 7 执行面延期）**：
+场景 7 的基准路帧面两行断言（**恰 5 块 / 其中恰 2 个空 B..C 块**——spike §4.2 推定面：
+VastBase 帧面采样受阻[真库 sticky-slot 事故]，按 OG 同内核推定不发 'T' 帧）**待真库
+重启窗口首跑复验**——首跑红即按真值改锚记档（改锚点仅此两行）。真库当前双故障钉死该 IT
+整类执行：①**逻辑槽子系统毒化**（新建逻辑槽悬挂/attach-drop 一律 "already active"——spike
+§5.3 sticky-active 事故残留，需重启窗口或 wal_sender_timeout 到期清僵尸）；②**孤儿 2PC
+`gtx`**（2026-10-18、VastDmlParityIT 场景 5b 遗留、其 AfterEach 缺 2PC gid 兜底——**复发向量
+记档，补验会话顺手补 gids 兜底[沿 VastOfflineIT 的 gids 列表 + ROLLBACK PREPARED 模式]**）
+持 AccessExclusiveLock 钉死 `vb_wal_par` schema（resetScenario 首语句必悬挂）——需用户授权
+`ROLLBACK PREPARED 'gtx'` 或运维窗口清理。补验命令：`mvn test -pl vb-stream-wal-source
+-Dtest='VastDmlParityIT,VastOfflineIT' -Dvb.it.vastbase=true`（预期 16+4 全绿）；wal 腿
+真库证据已由探针补齐（探针 10/10——桶 3 行 3 truncates 0、三条字面全等，task-7 报告）。

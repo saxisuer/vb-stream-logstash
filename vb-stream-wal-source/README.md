@@ -30,8 +30,9 @@ java -cp "vb-stream-wal-source/target/classes:$(cat vb-stream-wal-source/target/
 （macOS/Linux classpath 分隔符 `:`，Windows 为 `;`。无需 `--add-opens`——本模块零
 Chronicle 依赖。运行期每 10s 打一行 `smoke:` 周期统计 INFO——消费前沿 LSN + 计数器 +
 census 前 3 形态，state 启用时附 `ckpt=`/`adv=` 检查点与槽推进观测，DML 面启用时附
-`dml=[buckets=N rows=M partMiss=K]` 发射计数与 OG 分区链断跳过计数（vanilla 恒 0，
-M3）；事务块（TXN-BEGIN/逐行/TXN-END）走 CDC 专用 logger
+`dml=[buckets=N rows=M partMiss=K trunc=T]` 发射计数与 OG 分区链断跳过计数（vanilla
+恒 0，M3）与 truncate 事件计数 T（不并入 rows 的独立口径，2026-10-23）；事务块
+（TXN-BEGIN/逐行/TXN-END）走 CDC 专用 logger
 `org.vastdata.vbstream.walsource.cdc`；Ctrl-C 优雅退出含最终 best-effort 检查点 + 槽
 推进；启动失败 exit 1。）
 
@@ -111,6 +112,12 @@ dummy_standby 非 immediately_reserve）；收流通道 `-Dvb.wal.og.source=file
   DBCOMPATIBILITY 'PG'/'A' 库；B 档支持面在 **VastBase 档**落地，见下文 M4 条目）；
   MultiXactId 变体未锚（到达即错位 ISE）；页字典压缩表
   （MULTI_INSERT isCompressed≠0）ISE。
+- ❌ **TRUNCATE 事件双路不可见**（服务端能力，非缺陷——spike 裁决 C）：OG 5.0.0 的
+  TRUNCATE 在 WAL 是纯 catalog 手术（无专用 heap truncate 记录）、pgoutput 逻辑流不发
+  'T' 帧（事务解码为空 `B..C` 块）——wal 直解路与逻辑解码路**双双零事件**，不砖流、
+  截后 DML 按正确字典解析（OgDmlParityIT 场景 7 语义钉）；`RESTART IDENTITY` 被 SQL 层
+  拒绝（`ERROR: PGXC does not support RESTART IDENTITY yet`）。TRUNCATE 事件捕获是
+  **vanilla PG 17/18 档独有**能力（见"场景支持速览"）。
 
 ## VastBase G100 快速开始（V3.0 / OG 6.0.0 内核——第四布局档）
 
@@ -161,6 +168,14 @@ mvn test -pl vb-stream-wal-source -Dtest='Vast*IT' -Dvb.it.vastbase=true
 实例实测 ~10-20% 握手读超时且快速连续建连触发连片失败）：测试/装配面按**单持久连接 +
 建连重试环**（8 次指数退避 1s→15s，~75s 坏窗覆盖）设计；直连收流（direct 通道）实测
 不受抖动影响。详版见模块 `CLAUDE.md`"VastBase G100 档 M4"节。
+
+**TRUNCATE 事件双路不可见（spike 裁决 C，2026-10-22）**：与 OG 同内核——A 档实锚
+（WAL 纯 catalog 手术，rmid=10 全窗零专用记录）、B 档按内核同一性外推；pgoutput 逻辑流
+不发 'T' 帧。两路均零事件、不砖流，截后 DML 按新段号正常解析（VastDmlParityIT 场景 7
+语义钉）；`RESTART IDENTITY` A 档 SQL 层拒绝。**场景 7 执行面延期记档**：真库双故障
+（逻辑槽子系统毒化——新建逻辑槽悬挂需重启窗口；2026-10-18 孤儿 2PC `gtx` 持锁钉死
+`vb_wal_par` schema——需授权 `ROLLBACK PREPARED 'gtx'` 或运维清理），基准路帧面两行
+断言（5 块/2 空块）待重启窗口首跑复验；wal 腿真库证据已由探针补齐（10/10）。
 
 ## 离线回放模式（VastBase 档，2026-10-15）
 
@@ -276,21 +291,28 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
   码 11 的认证死角绕开）** + **M3（分区专项十六用例[range/list 捕获对拍/白名单四形态/
   流内 DDL 竞速/EXCHANGE 失效/跨分区迁移] + A 档全量复验[13 场景 × PG/A 参数化 + date
   专形] + A 档列存 ISE，2026-10-13）**。
-- **VastBase G100 档（vastbase 2026-10-13）**：手动档真库 IT 三组（`-Dvb.it.vastbase=true`
-  ——非容器长活真库，常规 `mvn test` 全 skip）——catalog 四字典干扰对拍逐行全等 + 门面
-  判别链（relname 探测 → `WalLayoutVVastbase` → v6 检查点排他锚）/ DML 双路对拍 15 场景
-  （v2 六场景 + A 档 date 专形 + COPY 批量 MULTI_INSERT 真几何——基准路 = opengauss-jdbc
-  逻辑流 + `OgParityBaseline` 复用，认证 md5 码 5 一次过无 OG 码 11 死角）/ 生命周期 3
+- **VastBase G100 档（vastbase 2026-10-13 + truncate 线场景 7）**：手动档真库 IT
+  （`-Dvb.it.vastbase=true`——非容器长活真库，常规 `mvn test` 全 skip）——catalog 四字典
+  干扰对拍逐行全等 + 门面判别链（relname 探测 → `WalLayoutVVastbase` → v6 检查点排他锚）/
+  DML 双路对拍 16 场景（v2 六场景 + A 档 date 专形 + COPY 批量 MULTI_INSERT 真几何 + 场景 7
+  TRUNCATE 双路不可见——基准路 = opengauss-jdbc 逻辑流 + `OgParityBaseline` 复用，认证 md5
+  码 5 一次过无 OG 码 11 死角）/ 生命周期 3
   （检查点续传两轮启停对拍 / state 截断回落全新引导 / 门面全装配 direct 通道两轮启停）。
 - **离线回放档（2026-10-15，仅 VastBase 档）**：离线单测 +15（StateStore pgVersion 回读 /
   FileWalSource 静态目录档六用例——确定性 EOF·三审计 fail-fast·endLsn 截停·partial 前沿 /
   CatalogOfflineTest 无库装配四用例——含终审 F1 离线 DML 发射计数接线 / 配置面 +4）+
   `VastOfflineIT` 真库手动档 4 用例
   （在线/离线按 xid 交集逐块全等 + 离线→在线双向回切 + 崩溃再离线 + endLsn 截停）。
-- `mvn test -pl vb-stream-wal-source` 单命令全跑（536 用例 = 离线 413 + Testcontainers
-  IT 99——PG 41 + openGauss 58（需本机 Docker）+ VastBase 手动档真库 24（全 skip，
-  `-Dvb.it.vastbase=true` 才跑——catalog 对拍 2 / DML 对拍 15 / 生命周期 3 / 离线回放
-  4[VastOfflineIT，2026-10-15]）；Windows 开发机另有环境性存量 7 例已知记档——
+- **TRUNCATE DML 事件（2026-10-22 spec/spike、2026-10-23 落地）**：vanilla PG 17/18 档
+  双路对拍验收（DualPathParityIT TRUNCATE 语句矩阵——混排次序/多表/RESTART 含 owned
+  序列/分区母表滤除/双位选项/回滚零输出 + 离线矩阵）；OG/VastBase 档双路不可见语义钉
+  （OgDmlParityIT 场景 7 + VastDmlParityIT 场景 7 + VastOfflineIT 用例 1 连动——零事件
+  不砖流 + 截后字典不倒）。详版见模块 `CLAUDE.md` v2 DML 面"事务性 TRUNCATE"条目。
+- `mvn test -pl vb-stream-wal-source` 单命令全跑（603 用例 = 离线 473 + Testcontainers
+  IT 101——PG 42 + openGauss 59（需本机 Docker）+ VastBase 手动档真库 29（全 skip，
+  `-Dvb.it.vastbase=true` 才跑——catalog 对拍 2 / DML 对拍 16[场景 7 TRUNCATE 双路
+  不可见——代码落地、真库双故障执行面延期记档，见上文 VastBase 节] / 生命周期 3 /
+  离线回放 4 / B 档 4）；Windows 开发机另有环境性存量 7 例已知记档——
   pg_receivexlog 文件通道族[FileWalSourceTest 6 + OgDualChannelParityIT 1]，非回归）。
 
 ## 场景支持速览（详版矩阵见模块 CLAUDE.md）
@@ -298,8 +320,10 @@ slf4j-api + lz4-java（TOAST lz4 压缩值解压）+ logback-classic（runtime �
 **✅ 支持（双路对拍验收过）**：INSERT/UPDATE/DELETE（`wal_level=logical` + REPLICA IDENTITY
 FULL）、事务组装（交错/SAVEPOINT/回滚零输出/2PC 四形态）、TOAST 全形态（external 重组/
 pglz 与 lz4 解压/行内压缩/未变列 `<toast-unchanged>`/重启回查）、17 类型矩阵、事务内 DDL
-as-of、RENAME/TRUNCATE/CREATE SCHEMA、检查点续传/损坏回落/at-least-once 重发、PG 17+18
-双版本。
+as-of、**事务性 TRUNCATE 事件（vanilla 17/18 独有——单语句多表/CASCADE/RESTART
+IDENTITY 含 owned 序列/分区母表滤除只出叶/与 DML 混排按 WAL 序/回滚零输出，2026-10-23）**、
+RENAME/TRUNCATE/CREATE SCHEMA（catalog 字典面）、检查点续传/损坏回落/at-least-once 重发、
+PG 17+18 双版本。
 
 **✅ 支持（openGauss 5.0.0 档，M1 catalog + M2 DML[PG/A 兼容库]）**：catalog 同步（引导 +
 ctid 重放 + 末态对拍全等）、双通道收流（file/direct 对拍一致）、检查点续传与槽推进、
@@ -322,6 +346,9 @@ WAL 段快照目录离线续传 DML（`-Dvb.wal.mode=offline`——启动期目�
 **❌ 不支持（触发时的行为）**：
 - **replica 形态 UPDATE**（`wal_level=replica`）→ 行级跳过 + WARN + 计数——系统性缺行，
   **DML 面需 `wal_level=logical`**
+- **TRUNCATE 事件（openGauss/VastBase 档）** → 双路不可见（服务端无专用 WAL 记录、
+  逻辑流不发 'T' 帧——零事件不砖流，截后 DML 字典正确；**正式行为锚非缺陷**，
+  spike 裁决 C）；`RESTART IDENTITY` 两档 SQL 层拒绝
 - **压缩 FPW** → ISE fail-fast——运维前提 `wal_compression=off`
 - **矩阵外类型**（enum/jsonb/域等）→ `0x` 十六进制降级 + WARN，流不断
 - **VACUUM FULL/CLUSTER** → 字典跟踪但 DML 语义未承诺

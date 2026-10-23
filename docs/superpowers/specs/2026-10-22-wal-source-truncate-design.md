@@ -1,9 +1,24 @@
 # vb-stream-wal-source TRUNCATE DML 支持设计（XLOG_TRUNCATE 解析与事件发射）
 
-日期：2026-10-22　状态：待用户审阅（2026-10-22 同日勘误——见下）
+日期：2026-10-22　状态：已实施（2026-10-23）
 前置：spike 报告 `docs/wal-source-truncate-spike.md`（**本 spec 的 Task 0**——四档记录形态锚定，未先行；spec 设计面与 spike 结果解耦，全部字节级常量以 spike 锚为准回填）
 
 > **勘误（2026-10-22 实施期源码实锚，REL_17/18_STABLE `src/include/access/heapam_xlog.h` 逐字）**：设计期"XLOG rmgr + RelFileLocator 键数组"的推断**整体作废**——`XLOG_HEAP_TRUNCATE` 是 **RM_HEAP_ID 下的 opcode 0x30**（17/18 同值，落在 heap opcode 块 DELETE 0x10 与 HOT_UPDATE 0x40 之间），载荷 `xl_heap_truncate{Oid dbId; uint32 nrelids; uint8 flags; Oid relids[]}`——**键是 oid 数组**、flags u8 **前置于** relids（`XLH_TRUNCATE_CASCADE` 1<<0 / `XLH_TRUNCATE_RESTART_SEQS` 1<<1；RESTART 位时 relids 数组尾随待重启序列 oid——解析面只消费前 nrelids 个）。推论：该记录现状正落在 `XactGrouper.dispatchHeap` 的 `default` 分支被静默忽略，修复落点从"onRecord 新增第四臂"**缩为 dispatchHeap 头部加一个 case**（须置于 blocks-empty 早退之前——truncate 记录零块引用）。"XLOG rmgr 老形态"的记忆源自 pre-PG12（9.2 系），恰是 OG/VastBase 内核待 spike 的分叉面。本文各节已按实锚改写。
+
+> **落地状态与勘误回填（2026-10-23 收口，Task 0-8 完成于分支 feat/wal-source-truncate）**：本 spec 已按
+> spike `docs/wal-source-truncate-spike.md`（Task 0）四档实测裁定实施完毕——TRUNCATE 事件面落在
+> vanilla PG 17/18 档（`TruncateView`[layout] → `XactGrouper.dispatchHeap` 头部 case[先于 blocks
+> 早退] → `TableFilter.resolveByOid` 三闸 + relkind='p' 母表滤除 → sealed `BucketEntry` 桶泛化 →
+> `TruncateEvent`/`onTruncate` 契约 → `OutputRenderer` engine 逐字节同形；观测面 `emittedTruncates`
+> 独立计数 + Main 冒烟行 `trunc=`）；OG 5.0.0 与 VastBase 档零代码零护栏（行为记档）。**下表勘误**为
+> spike 实测对本文若干设计期断言的修正（原段落保留作历史，以表为准）：
+
+| 设计期断言 | spike 实测裁定 | 依据 |
+|---|---|---|
+| §2.1 relids 起点 @9（"`SizeOfHeapTruncate = 9`，@9/@12 以 spike 黄金字节定"）+ RESTART 位时 relids 尾随序列 oid（本文文首勘误块同句） | **relids@12**——`Oid relids[]` 4 字节对齐使 `SizeOfHeapTruncate = offsetof(relids) = 12`，@9-11 是**未初始化栈垫**（实测非零垃圾，禁止读/禁止校验为零）；**无序列尾随**——序列重启（PG 10+）走 heap 记录**之前**的独立 RM_SEQ 记录，heapam_xlog.h "followed by all sequence relids" 注释是 pre-PG10 残留；解析面以 `mainLen == 12 + 4×nrelids` 精确等式自检（落地 `HeapViews.TruncateView`） | spike §1.1/§1.2 黄金字节（@12 读法 oid 恰合、6 条全一致、17 同构逐字节同） |
+| §0 "**全档支持**：V17/V18 + OG 5.0.0 + VastBase 一次到位"（用户裁定被服务端事实反转，非选择变更） | **TRUNCATE 捕获收缩为 vanilla 17/18 独有**——OG 5.0.0 与 VastBase（A 档实锚 / B 档按内核同一性外推）**裁决 C 双路不可见**：WAL 纯 catalog 手术（rmid=10 全窗零 0x30，无专用 heap truncate 记录）+ 逻辑流不发 'T' 帧（TRUNCATE 事务解码为空 B..C 块）——**正式行为锚而非缺陷**，零代码零护栏记档；`RESTART IDENTITY` OG 系两档 SQL 层均拒绝（`PGXC does not support RESTART IDENTITY yet` / `only supported in PG compatibility`）；§3.4 分区身份表的 OG/VastBase 行随裁决 C 退役（不适用——两档根本无 TRUNCATE 事件面），§5 的 OG/VastBase IT 前提（放开 'T' 拒绝并归一化）随之作废——Task 6/7 重塑为"零事件不砖流 + 截后 DML 字典正确"语义钉 | spike 裁决表 + §3/§4 census 实锚（OG 16 项 / VastBase 50318 条全窗）+ OG 帧面采样（VastBase 帧面受阻按同内核推定，未复验面记档） |
+| 写点未锚（heap 记录族按惯例推 heapam.c 写出） | 写点是 **tablecmds.c `ExecuteTruncateGuts`**（非 heapam.c）；`Assert(XLogLogicalInfoActive())`——**仅 wal_level≥logical 时写该记录**（与 DML 面既有前提一致，无需新增护栏）；flags 按语句声明置位（无 owned 序列的 `RESTART IDENTITY` 也置 bit1）；截断的 pg_class 换段号 UPDATE **先于** heap truncate 记录到达——消费时字典已见新段号而 relid 是逻辑 oid，解析不受段号代际影响 | spike §1.1/§1.3 源码实锚（REL_17/18_STABLE，原文留档 `spike/truncate/heapam_xlog-17/18.h`、`tablecmds-18.c`） |
+
 背景：DML 事件面现状只有 INSERT/UPDATE/DELETE（`ChangeOutputListener.DmlKind` 三值）——`XLOG_TRUNCATE` 记录（XLOG rmgr，非 heap）对 `XactGrouper` 是 no-op，**静默零输出**（无事件、无 WARN、无计数）；engine pgoutput 路对 'T' 消息全链路支持（`PgOutputMessage.Truncate` → `TruncateChange` → `ConsoleRenderer` 渲染），两路输出在 TRUNCATE 语句上分叉且从未被对拍暴露（v2 六场景无 TRUNCATE 场景）。
 
 ## 0. 范围裁定（用户确认，2026-10-22）
